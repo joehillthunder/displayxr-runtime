@@ -11,8 +11,10 @@
 #pragma once
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_config_os.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 
 
 #ifdef __cplusplus
@@ -127,6 +129,64 @@ qwerty_process_macos(struct xrt_device **xdevs,
                      void *ns_event_ptr);
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Kind of X11 input handed to @ref qwerty_process_xcb.
+ *
+ * @ingroup drv_qwerty
+ */
+enum qwerty_x11_input_type
+{
+	QWERTY_X11_KEY_PRESS,
+	QWERTY_X11_KEY_RELEASE,
+	QWERTY_X11_BUTTON_PRESS,
+	QWERTY_X11_BUTTON_RELEASE,
+	QWERTY_X11_MOTION,
+	//! Window gained focus. @ref qwerty_x11_input::state carries the LIVE
+	//! modifier mask (used for CTRL/ALT only — never for button bits).
+	QWERTY_X11_FOCUS_IN,
+	//! Window lost focus, was unmapped or is being destroyed: release every
+	//! held key and button, drop CTRL/ALT focus and mouse look.
+	QWERTY_X11_FOCUS_OUT,
+};
+
+/*!
+ * One X11 input event, already decoded by the window that received it.
+ *
+ * Kept free of xcb types so the driver does not depend on libxcb and a unit
+ * test can synthesise events. Keysyms are the X11 `XK_*` values; the window
+ * resolves them from the keycode at shift level 0 (unshifted), so `XK_w` is W
+ * with or without SHIFT — the same case-independence as a Win32 virtual key.
+ *
+ * @ingroup drv_qwerty
+ */
+struct qwerty_x11_input
+{
+	enum qwerty_x11_input_type type;
+	uint32_t keysym; //!< KEY_*: level-0 keysym (XK_*).
+	uint8_t button;  //!< BUTTON_*: X button number (1=L, 2=M, 3=R, 4/5=wheel).
+	uint16_t state;  //!< X modifier mask at the event (ShiftMask, ControlMask, Mod1Mask).
+	int32_t root_x;  //!< Pointer position in root-window pixels (BUTTON_*, MOTION).
+	int32_t root_y;
+};
+
+/*!
+ * Process an X11 input event from the runtime's self-created XCB window and
+ * dispatch it to the qwerty devices. The Linux equivalent of
+ * qwerty_process_win32, with the same key and mouse map.
+ *
+ * Buttons act on EVENT EDGES only (#1700): a press is delivered once per
+ * ButtonPress, a release once per ButtonRelease, a press while already down or
+ * a release while already up is dropped, and a MOTION event's button bits are
+ * never read. FOCUS_OUT releases everything, so a button held across a window
+ * teardown cannot survive into the next session.
+ *
+ * @ingroup drv_qwerty
+ */
+void
+qwerty_process_xcb(struct xrt_device **xdevs, size_t xdev_count, const struct qwerty_x11_input *input);
+#endif
+
 /*!
  * Create all qwerty devices.
  *
@@ -137,6 +197,23 @@ qwerty_create_devices(enum u_logging_level log_level,
                       struct xrt_device **out_hmd,
                       struct xrt_device **out_left,
                       struct xrt_device **out_right);
+
+/*!
+ * Create the qwerty devices, publishing the emulated controller pair only
+ * when @p publish_controllers is true (ADR-054 N7, the `EmulatedControllers`
+ * gate). With it false, `*out_left` / `*out_right` are NULL: the caller gets
+ * the look-around HMD alone, and the pair — which the driver's input
+ * front-ends still require internally — stays private to the driver (in no
+ * device list, no role, freed with the HMD).
+ *
+ * @ingroup drv_qwerty
+ */
+xrt_result_t
+qwerty_create_devices_ex(enum u_logging_level log_level,
+                         bool publish_controllers,
+                         struct xrt_device **out_hmd,
+                         struct xrt_device **out_left,
+                         struct xrt_device **out_right);
 
 /*!
  * Get the current qwerty HMD pose without side effects.

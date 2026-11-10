@@ -43,10 +43,12 @@ jobs:
           # (PR base lags main after a main push). Shallow clones miss
           # those refs and the diff fails with "fatal: bad object".
           fetch-depth: 0
-          # fetch-depth alone is not enough: actions/checkout fetches with
-          # --no-tags unless this is set, so `git describe --match 'v*'` could
-          # not see the very tag it was building. v2.14.1's APK reported
-          # versionName='v2.14.0-4-gd1b3c174c'.
+          # fetch-depth: 0 already fetches every tag, which the versionCode /
+          # versionName `git describe` needs, so fetch-tags is redundant with
+          # it. It is kept only as a guard if the clone is ever made shallow
+          # again (actions/checkout then fetches with --no-tags unless it is
+          # set). The v2.14.1 APK that reported versionName='v2.14.0-4-gd1b3c174c'
+          # (#1235) was built before describe took --tags (#1379).
           fetch-tags: true
       - id: filter
         run: |
@@ -175,7 +177,66 @@ jobs:
       #
       # NOT credited: 0.10.69 also carries two foreground-status fixes that CNSDK reports as
       # untested on any device. Nothing observed after this bump should be attributed to them.
-      CNSDK_TAG: v0.10.69
+      #
+      # 0.10.75: "2D under the lens" (LeiaInc/CNSDK#746). The Vulkan interlacer composites the
+      # caller's 2D layer INSIDE the weave and band-limits it for the lens, with a cached
+      # two-pass prefilter reused while the layer is unchanged (XR_DXR_weave v14) - the DP
+      # half of the Android whole-page overlay (runtime #1835 v18 + #1845, browser-pvt#242).
+      # Moved in lockstep with leia_plugin v2.12.0 (the first plug-in release built against
+      # 0.10.75, set_overlay_2d on Android) and versions.json cnsdk_services.
+      # v0.10.78: matches leia-plugin v2.15.3 (built against
+      # cnsdk-android-0.10.78+198.2a9d252.zip). Brings CNSDK #748 (the weave
+      # submits on the queue the plug-in passes via
+      # leia_interlacer_vulkan_initialize_with_queue -- the runtime's own weave
+      # queue -- instead of the app's family-0/idx-0 queue; renderSceneFence
+      # ringed per in-flight frame; semaphore waits at FRAGMENT_SHADER so the
+      # interlace pass's sampling of the prefilter output is covered) and
+      # CNSDK #724 (Android head tracking moves from the Blink detector to
+      # MediaPipe; service APKs are variant-suffixed, the bundle takes -63mm).
+      # v0.10.76/77 are tags without a release and 0.10.77's loader mis-declares
+      # the _with_queue slot -- 0.10.78 is the first pinnable tag (CNSDK #751).
+      # v0.10.79: matches leia-plugin v2.15.6 (built against
+      # cnsdk-android-0.10.79+200.9aa8ce9.zip). Only CNSDK #752: the tracking
+      # camera becomes config data with a per-unit override
+      # (persist.debug.cnsdk.cam / debug.cnsdk.cam) in the service APKs; no API
+      # the plug-in calls changes. Moved in lockstep with versions.json
+      # cnsdk_services so the bundle ships the 0.10.79 -63mm services.
+      # v0.10.80: matches leia-plugin v2.15.8 (built against
+      # cnsdk-android-0.10.80+202.528800d.zip). CNSDK #753: the Vulkan weaver's
+      # per-RenderState fence, UBOs and descriptor set are ringed per in-flight
+      # frame -- layer 2 of the GPU-side weave-sync chain (ADR-055 / #2095;
+      # layer 1 = this runtime's semaphores, layer 3 = leia-plugin #374). Only
+      # RendererVulkan.cpp changed; no API, loader or INTRODUCED_IN change.
+      # v0.10.81: matches leia-plugin v2.15.9 (built against
+      # cnsdk-android-0.10.81+204.2e95902.zip). CNSDK #754: the head-tracking
+      # service reopens a lost camera (ISP fault, another app taking the front
+      # camera, HAL restart) by rebuilding the tracking session with a 1 s -> 30 s
+      # back-off instead of staying untracked until the service restarts.
+      # Service-side only; no API, loader or INTRODUCED_IN change.
+      # v0.10.83: matches leia-plugin v2.16.4 (built against
+      # cnsdk-android-0.10.83+208.5d40493.zip). CNSDK #755: head-tracking service
+      # deadlock after boot (every app 2D until the service was force-stopped);
+      # CNSDK #756: panel SPR wake guard (Lume phone class: double image in every
+      # 3D app after a sleep/wake). Service-side only; no API/loader change.
+      # v0.10.85: matches leia-plugin v2.18.2 (built against
+      # cnsdk-android-0.10.85+210.7647837.zip). CNSDK #758: the head-tracking engine
+      # rebuilds the session when the camera stops delivering frames without an
+      # error (2 s stall, #754 back-off) instead of waiting ~30 s for the plug-in
+      # watchdog; CNSDK #757: a tracking-camera override uses that camera's pose.
+      # No API, loader or INTRODUCED_IN change. (v0.10.84 = #757 only, no release.)
+      # v0.10.87: matches leia-plugin v2.19.3 (built against
+      # cnsdk-android-0.10.87+211.ec09441.zip). CNSDK #761: the display service
+      # sends one lens command at a time, >= 100 ms apart (a burst after a service
+      # restart left the panel in 3D while every state said 2D), SPR wake guard
+      # keyed on the phone-class product name; CNSDK #759: lls_gyro weave predictor
+      # default, 40 ms weave horizon. No loader API change. (v0.10.86 = #761 only.)
+      # v0.10.95: matches leia-plugin v2.19.7 (built against
+      # cnsdk-android-0.10.95+217.ec01903). CNSDK #763: tracking-camera data;
+      # #766: stereo calibrations; #768: don_mm -> donopx auto-conversion; #769:
+      # GL late-latching null/size guard; #770: the service connection rebinds
+      # after the head-tracking engine dies (lives in the service APK, so older
+      # loaders get it too). (v0.10.92/.93 were intermediate releases.)
+      CNSDK_TAG: v0.10.98
 
     steps:
 
@@ -403,6 +464,27 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # XR_DXR_stereo_camera consumer probe (stereo-camera-android §12.3): the
+      # Android stand-in for `displayxr-cli camera probe`. Built so the module
+      # keeps compiling; it needs a stereo-camera plug-in + a device to RUN.
+      - name: Build the stereo camera consumer probe (camera_probe_android)
+        id: build_camera_probe
+        if: needs.DetectChanges.outputs.docs_only != 'true' && matrix.variant == 'neutral' && steps.build.outcome == 'success'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./gradlew :test_apps:camera_probe_android:assembleDebug --no-daemon --stacktrace
+
+      - name: Upload the camera probe APK
+        if: steps.build_camera_probe.outcome == 'success'
+        uses: actions/upload-artifact@v6
+        with:
+          name: camera_probe_android
+          path: test_apps/camera/camera_probe_android/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
       # #1403 Option B — MiniWindowLayout is a CROSS-APK contract, not internals.
       # The DisplayXR Browser's XrSession lives in Chromium's GPU process (an
       # isolated Service with no Activity), so its BROWSER process reflects into
@@ -493,7 +575,10 @@ jobs:
             exit 1
           fi
 
-          describe=$(git describe --tags --long --match 'v[0-9]*')
+          # Same patterns as build.gradle and cmake/DisplayXRVersion.cmake:
+          # canonical vX.Y.Z tags only, or an rc tag would make the gate
+          # disagree with what the APK was stamped with.
+          describe=$(git describe --tags --long --match 'v[0-9]*' --exclude 'v*[!0-9.]*')
           want_code=$(python3 scripts/android_version_code.py --describe "$describe" --print code)
           want_name=$(python3 scripts/android_version_code.py --describe "$describe" --print name)
           echo "expected from '$describe': versionCode=$want_code versionName=$want_name"
@@ -517,6 +602,20 @@ jobs:
           fi
           echo "  ok: versionCode=$vcode versionName=$vname (monotonic vs 214500291, matches $describe)"
 
+          # #1790: the runtime .so inside reports the same version. Its
+          # runtimeName tag is the same `git describe` as versionName (never
+          # -dirty), and cmake/DisplayXRVersion.cmake derives its runtimeVersion
+          # NUMBER from that one describe, so this string pins both. Before
+          # #1790 every APK's runtime reported 1.6.0 whatever versionName said.
+          # grep -c (not -q) reads to EOF: no SIGPIPE race under pipefail.
+          so_desc="${vname%-dirty}"
+          so_hits=$(unzip -p "$APK" lib/arm64-v8a/libopenxr_displayxr.so | strings -a | grep -cxF -- "$so_desc" || true)
+          if [ "${so_hits:-0}" -lt 1 ]; then
+            echo "::error::lib/arm64-v8a/libopenxr_displayxr.so does not carry '$so_desc' -- the runtime would report another version than the APK it ships in (#1790)."
+            exit 1
+          fi
+          echo "  ok: libopenxr_displayxr.so carries '$so_desc' (runtimeName / runtimeVersion)"
+
           need() {
             if ! grep -q "lib/arm64-v8a/$1" <<<"$APK_LIST"; then
               echo "::error::APK is missing lib/arm64-v8a/$1 — $2"
@@ -537,6 +636,10 @@ jobs:
           # silently dropped this plug-in from a build once — and without this
           # line CI would not have noticed a device with zero plug-ins.
           need libdxrp200_sim_display.so "drv_sim_display_plugin dropped out of the CMake target list"
+          # #1905: the queue-lock Vulkan layer (per-queue). The Android loader
+          # finds it by file name on its layer search path, so the exact name
+          # is the contract (libVkLayer*.so).
+          need libVkLayer_DXR_queue_lock.so "VkLayer_DXR_queue_lock dropped out of the CMake target list"
 
           if [ "${{ matrix.variant }}" = "neutral" ]; then
             # ADR-019 guard for the vendor-neutral APK. Note this is the EXACT
@@ -653,9 +756,10 @@ jobs:
           retention-days: 14
 
       # ---- the client wake library --------------------------------------
-      # Built in the NEUTRAL leg only. The library is pure Kotlin and carries no
-      # vendor payload, so it is identical in both variants -- building it twice
-      # would race two jobs to attach the same asset name.
+      # Built in the NEUTRAL leg only. The library (Kotlin + the vendor-neutral
+      # queue-lock layer, #1919) carries no vendor payload, so it is identical in
+      # both variants -- building it twice would race two jobs to attach the same
+      # asset name.
       #
       # It has to ship as an AAR rather than as source. Its manifest is load-bearing:
       # it declares the <queries> entries without which Android 11+ package
@@ -664,9 +768,19 @@ jobs:
       # two Kotlin files would have to replicate both by hand -- and hand-copied
       # wake code drifting across five demo repos is the exact bug this replaces
       # (#1453). An AAR merges them into the consumer's manifest.
+      #
+      # #1919: the AAR also carries jni/arm64-v8a/libVkLayer_DXR_queue_lock.so,
+      # the #1905 queue-lock Vulkan layer, so it lands in every consuming app's
+      # own nativeLibraryDir -- the only place Android's loader finds a layer for
+      # a NON-debuggable app. It is built by a standalone CMake project
+      # (displayxr_client/src/main/cpp) that builds only the layer, so this step
+      # needs the NDK but no CNSDK and no runtime tree.
       - name: Build the client wake library (AAR)
         id: clientlib
         if: steps.build.outcome == 'success' && matrix.variant == 'neutral'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
           ./gradlew :src:xrt:targets:displayxr_client:assembleRelease --no-daemon --stacktrace
@@ -682,6 +796,67 @@ jobs:
           unzip -p "outlib/DisplayXR-Client-${VER}.aar" AndroidManifest.xml > /tmp/m.xml
           grep -q '<queries>' /tmp/m.xml || { echo "::error::AAR manifest lost <queries>"; exit 1; }
           grep -q 'RuntimeWakeInitializer' /tmp/m.xml || { echo "::error::AAR manifest lost the startup initializer"; exit 1; }
+
+          # #1919: the queue-lock layer must be IN the AAR, under the exact
+          # path/name the Android loader looks for (libVkLayer*.so in the app's
+          # lib dir). If it drops out, every shipped app silently resolves
+          # mid-frame fill to OFF -- nothing on device announces the absence.
+          LAYER=jni/arm64-v8a/libVkLayer_DXR_queue_lock.so
+          unzip -l "outlib/DisplayXR-Client-${VER}.aar" | grep " ${LAYER}\$" >/dev/null \
+            || { echo "::error::AAR is missing ${LAYER} (#1919) -- apps depending on it will not get the queue-lock layer"; exit 1; }
+          echo "  ok: AAR carries ${LAYER}"
+          if unzip -l "outlib/DisplayXR-Client-${VER}.aar" | grep -E ' jni/' | grep -v -E " jni/(arm64-v8a/)?(libVkLayer_DXR_queue_lock\.so)?\$"; then
+            echo "::error::AAR carries native libs other than the queue-lock layer -- the client AAR must not ship runtime code into apps"
+            exit 1
+          fi
+          echo "  ok: no other native libs in the AAR"
+
+          rm -rf _aarchk && mkdir -p _aarchk/aar _aarchk/apk
+          unzip -q -o "outlib/DisplayXR-Client-${VER}.aar" "$LAYER" -d _aarchk/aar
+          APK=$(find src/xrt/targets/openxr_android/build/outputs/apk/release -name '*.apk' | head -1)
+          [ -n "$APK" ] || { echo "::error::no runtime APK to compare the AAR's layer against"; exit 1; }
+          unzip -q -o "$APK" lib/arm64-v8a/libVkLayer_DXR_queue_lock.so -d _aarchk/apk
+          A=_aarchk/aar/$LAYER
+          R=_aarchk/apk/lib/arm64-v8a/libVkLayer_DXR_queue_lock.so
+
+          # Same commit + same NDK + same flags => the same bytes. Both builds
+          # pin DW_AT_comp_dir (-fdebug-compilation-dir=., vk_layer/CMakeLists)
+          # so the build-tree path is not baked in; verified locally that the
+          # root build and the standalone AAR build produce identical files.
+          # A mismatch means the AAR's standalone CMake project has drifted from
+          # the root build's flags/NDK -- fix the drift, do not loosen this.
+          ha=$(sha256sum "$A" | cut -d' ' -f1); hr=$(sha256sum "$R" | cut -d' ' -f1)
+          echo "  AAR layer: $(stat -c %s "$A") bytes sha256=$ha"
+          echo "  APK layer: $(stat -c %s "$R") bytes sha256=$hr"
+          if [ "$ha" != "$hr" ]; then
+            echo "::error::the AAR's libVkLayer_DXR_queue_lock.so differs from the runtime APK's (same commit) -- displayxr_client/src/main/cpp/CMakeLists.txt has drifted from the root build (flags, NDK, STL or platform)"
+            exit 1
+          fi
+          echo "  ok: AAR layer is byte-identical to the runtime APK's"
+
+          # Loader contract, from the artifact (queue_lock_layer.c header,
+          # docs/roadmap/vk-late-weave-queue-serialization.md section 7): the
+          # four enumerate entry points + GIPA/GDPA exported, the #902 marker
+          # name present (it is resolved through GDPA, not exported), and NO
+          # libvulkan dependency (a layer linking the loader recurses).
+          # (No `grep -q` at the end of a pipe here: under pipefail its early
+          # exit SIGPIPEs the producer and fails a check that matched.)
+          LLVM="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          syms=$("$LLVM/llvm-nm" -D --defined-only "$A" | awk '{print $3}')
+          for s in vkEnumerateInstanceLayerProperties vkEnumerateInstanceExtensionProperties \
+                   vkEnumerateDeviceLayerProperties vkEnumerateDeviceExtensionProperties \
+                   vkGetInstanceProcAddr vkGetDeviceProcAddr; do
+            grep -qx "$s" <<<"$syms" || { echo "::error::layer does not export $s -- Android's loader will reject it"; exit 1; }
+          done
+          echo "  ok: Android loader exports present"
+          strings -a "$A" | grep -x vkGetQueueLockMarkerDXR >/dev/null \
+            || { echo "::error::layer lacks the vkGetQueueLockMarkerDXR marker -- the compositor's handshake (#902/#1910) can never resolve"; exit 1; }
+          echo "  ok: vkGetQueueLockMarkerDXR marker present"
+          if "$LLVM/llvm-readelf" -d "$A" | grep NEEDED | grep libvulkan >/dev/null; then
+            echo "::error::layer DT_NEEDEDs libvulkan.so -- a layer must not link the loader"
+            exit 1
+          fi
+          echo "  ok: no libvulkan dependency"
           echo "name=DisplayXR-Client-${VER}.aar" >> "$GITHUB_OUTPUT"
           ls -la outlib
 

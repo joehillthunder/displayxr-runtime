@@ -16,6 +16,7 @@
 #endif
 
 #include "cli_query.h"
+#include "cli_metres_check.h"
 
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
@@ -30,20 +31,28 @@
 #include "os/os_time.h" // #1380 rig-role sampling window
 #include "util/u_git_tag.h"
 #include "util/u_setting.h" // #1252 settings chain (env > per-user > machine)
+#include "util/u_screen_info.h" // multi-screen M1 per-screen info
+#include "util/u_openxr_layers.h"   // Ultraleap implicit-layer advisory
+#include "util/u_status_snapshot.h" // ADR-053 conversion provider row JSON
 #ifdef XRT_OS_WINDOWS
 #include "util/u_windows.h" // #1201 DPI awareness reporting
 #endif
 
 #include "target_plugin_loader.h"
+#include "target_screens.h"
 #include "target_input_plugin_loader.h"
+#include "target_tracking_plugin_loader.h"
+#include "target_viewer_tracking.h"
 #include "target_builder_input_provider.h"
 #include "target_input_arbiter.h"
+#include "target_conv_status.h" // ADR-053 selftest `conversion_providers` (#2006)
 
 #include <cjson/cJSON.h>
 
 #include <math.h> // #1380 isfinite() over the sampled rig poses
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h> // calloc (conversion status)
 #include <string.h>
 
 #ifdef XRT_OS_WINDOWS
@@ -54,6 +63,13 @@
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "d3d/d3d_scanout_helpers.h" // panel rect -> scanout adapter LUID (#918)
 #include "d3d/d3d_render_adapter.h"  // ADR-037 §2 resolver — the service's ingest adapter (#1153)
+#endif
+
+#ifdef CLI_HAVE_WORKSPACE_CONFIG
+// Display dashboard phase 8: workspace_controllers[] (after <windows.h>: the
+// registry header falls back to its own MAX_PATH otherwise).
+#include "service_config.h"
+#include "service_workspace_registry.h"
 #endif
 
 
@@ -71,7 +87,93 @@ or_q(const char *s)
 	return (s != NULL && s[0] != '\0') ? s : "?";
 }
 
+/*!
+ * ADR-043 `stereo_camera_caps`: enumerate the plug-in's stereo cameras straight
+ * through the iface (this is the in-process no-comp instance — the service's
+ * camera manager is not involved) and validate each description.
+ */
+static void
+probe_stereo_camera(struct cli_query_result *r, const struct xrt_plugin_iface *iface)
+{
+	r->stereo_camera_count = 0;
+	r->stereo_camera_malformed = false;
+	if (!xrt_plugin_iface_has_stereo_camera(iface)) {
+		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
+		         "plug-in has no stereo camera slots (OK)");
+		return;
+	}
+	struct xrt_plugin_instance *inst = target_plugin_get_active_instance();
+	struct xrt_plugin_stereo_camera_info infos[4];
+	memset(infos, 0, sizeof(infos));
+	for (int i = 0; i < 4; i++) {
+		infos[i].struct_size = (uint32_t)sizeof(infos[i]);
+	}
+	uint32_t n = iface->stereo_camera_enumerate(inst, 4, infos);
+	r->stereo_camera_count = n;
+	if (n == 0) {
+		snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "0 cameras (OK)");
+		return;
+	}
+	for (uint32_t i = 0; i < n && i < 4; i++) {
+		const struct xrt_plugin_stereo_camera_info *c = &infos[i];
+		const char *why = NULL;
+		if (c->eye_width == 0 || c->eye_height == 0 || (c->eye_width & 1u) || (c->eye_height & 1u)) {
+			why = "zero or odd eye extent";
+		} else if (c->native_format < 1 || c->native_format > 3) {
+			why = "unknown native format";
+		} else if (!(c->max_frame_rate >= 0.0f && c->max_frame_rate <= 1000.0f)) {
+			// 0 is legal: "unknown until measured" (the service measures it).
+			why = "max_frame_rate negative, NaN or > 1000";
+		} else if (c->flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) {
+			struct xrt_plugin_stereo_camera_calibration k;
+			memset(&k, 0, sizeof(k));
+			k.struct_size = (uint32_t)sizeof(k);
+			const double *t = k.translation_right_from_left_mm;
+			if (iface->stereo_camera_get_calibration(inst, i, &k) != XRT_SUCCESS) {
+				why = "CALIBRATED but get_calibration failed";
+			} else if (!(k.k[0][0] > 0.0) || !(k.k[1][0] > 0.0) ||
+			           !(t[0] * t[0] + t[1] * t[1] + t[2] * t[2] > 0.0)) {
+				why = "CALIBRATED with a non-positive focal length or zero baseline";
+			}
+		}
+		if (why != NULL) {
+			r->stereo_camera_malformed = true;
+			snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note), "camera %u \"%.60s\": %s", i,
+			         c->display_name, why);
+			return;
+		}
+	}
+	snprintf(r->stereo_camera_note, sizeof(r->stereo_camera_note),
+	         "%u camera(s); [0] \"%.60s\" %ux%u/eye, advertised %.1f Hz (0 = unknown), flags 0x%x", n,
+	         infos[0].display_name, infos[0].eye_width, infos[0].eye_height, (double)infos[0].max_frame_rate,
+	         infos[0].flags);
+}
+
+//! Drop a trailing INCOMPLETE UTF-8 sequence, so a string cut to a fixed
+//! buffer is still valid UTF-8 (cJSON / any JSON reader rejects a half
+//! character). Plug-in text is arbitrary; never trust its byte length.
+static inline void
+dxr_utf8_trim_partial(char *s)
+{
+	size_t n = strlen(s);
+	size_t i = n;
+	size_t back = 0;
+	while (i > 0 && back < 4 && (((unsigned char)s[i - 1]) & 0xC0) == 0x80) {
+		i--;
+		back++;
+	}
+	if (i == 0) {
+		return;
+	}
+	const unsigned char lead = (unsigned char)s[i - 1];
+	size_t need = (lead & 0x80) == 0 ? 1 : (lead & 0xE0) == 0xC0 ? 2 : (lead & 0xF0) == 0xE0 ? 3 : (lead & 0xF8) == 0xF0 ? 4 : 0;
+	if (need == 0 || back + 1 < need) {
+		s[i - 1] = '\0'; // a lone or cut-off lead byte (and its tail)
+	}
+}
+
 #ifdef XRT_OS_WINDOWS
+
 /*!
  * #224 / ADR-027 P4 — headless zone-caps probe. Creates a D3D11 WARP device
  * (no GPU / display required), asks the active plug-in's D3D11 DP factory
@@ -157,6 +259,115 @@ probe_zone_caps_d3d11(struct cli_query_result *r, const struct xrt_plugin_iface 
 	ID3D11DeviceContext_Release(context);
 	ID3D11Device_Release(device);
 }
+
+#endif // XRT_OS_WINDOWS (the zone probe above)
+
+/*
+ * ADR-042 lift caps. The headless WARP probe (`probe_lift_caps_d3d11`, which
+ * instantiated a SECOND copy of the vendor module and waited up to 8 s) is
+ * retired by ADR-053 §7.1: the CLI never loads a second model instance. The
+ * headless pass reports the static `dp-lift` row (target_conv_status); live
+ * caps come from the running service (cli_query_lift_caps_from_service, in the
+ * CLI executable) through the same `lift_caps` shape.
+ */
+bool
+cli_query_lift_caps_malformed(const struct xrt_dp_lift_caps *caps)
+{
+	const uint32_t known =
+	    XRT_DP_LIFT_MODE_DEPTH | XRT_DP_LIFT_MODE_SBS | XRT_DP_LIFT_MODE_NVIEW | XRT_DP_LIFT_MODE_GAUSSIANS;
+	return (caps->modes & ~known) != 0 || caps->state > XRT_DP_LIFT_STATE_READY ||
+	       (caps->modes != 0 && caps->state == XRT_DP_LIFT_STATE_READY && caps->max_streams == 0) ||
+	       ((caps->modes & XRT_DP_LIFT_MODE_NVIEW) != 0 && caps->max_views < 2) ||
+	       caps->depth_semantics > XRT_DP_LIFT_DEPTH_METRIC;
+}
+
+void
+cli_query_set_lift_caps(struct cli_query_result *r, const struct xrt_dp_lift_caps *caps, const char *source)
+{
+	r->lift_caps_probed = true;
+	r->lift_caps = *caps;
+	const bool malformed = cli_query_lift_caps_malformed(caps);
+	r->lift_caps_malformed = malformed;
+	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note),
+	         "%smodes=0x%x state=%u streams=%u views=%u depth=%s latency=%.1fms backend='%s' (%s)",
+	         malformed ? "MALFORMED caps: " : "", caps->modes, caps->state, caps->max_streams, caps->max_views,
+	         caps->depth_semantics == XRT_DP_LIFT_DEPTH_METRIC ? "metric" : "relative",
+	         (double)caps->typical_latency_ns / 1e6, caps->backend, source != NULL ? source : "?");
+	// Version + detail travel in their own fields; the note only names the status.
+	const char *ms = xrt_dp_lift_module_status_str(caps->module_status);
+	if (ms != NULL) {
+		const size_t used = strlen(r->lift_probe_note);
+		snprintf(r->lift_probe_note + used, sizeof(r->lift_probe_note) - used, " module=%s", ms);
+	}
+	if (malformed && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_LIFT_CAPS;
+	}
+}
+
+/*!
+ * ADR-053 `conversion_providers` (#2006): the headless pass, then the verdict.
+ * Absence never fails; a malformed descriptor is CLI_SELFTEST_BAD_CONVERSION.
+ */
+static void
+probe_conversion_providers(struct cli_query_result *r, const struct xrt_plugin_iface *active)
+{
+	struct target_conv_status *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "not evaluated: out of memory");
+		return;
+	}
+	target_conv_status_build_headless(active, st);
+	cli_query_apply_conversion(r, st);
+	free(st);
+}
+
+void
+cli_query_apply_conversion(struct cli_query_result *r, const struct target_conv_status *st)
+{
+	r->conv_evaluated = true;
+	r->conv_count = st->provider_count;
+	r->conv_registered = st->registered;
+	r->conv_negotiated = st->negotiated;
+	r->conv_malformed_rows = st->malformed_rows;
+	r->conv_bad_descriptors = st->bad_descriptors;
+	r->conv_task_count = st->task_count;
+	r->conv_dp_lift_declared = st->dp_lift_declared;
+	memcpy(r->conv_providers, st->providers, sizeof(r->conv_providers));
+
+	snprintf(r->conv_kill_switch, sizeof(r->conv_kill_switch), "%s", st->kill_switch);
+
+	if (st->kill_switch[0] != '\0') {
+		// Discovery spec §3.2 (#2029). This is the CLI's own environment: the
+		// service reads ITS own, so say where to set it for the service.
+		snprintf(r->conv_note, sizeof(r->conv_note),
+		         "%s=0: no conversion service (kill switch in this process's environment; the service honours "
+		         "it only when set in the service's own environment) -- OK",
+		         st->kill_switch);
+	} else if (st->bad_descriptors > 0) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "MALFORMED descriptor (%u): %s", st->bad_descriptors,
+		         st->bad_note);
+	} else if (st->registered == 0) {
+		snprintf(r->conv_note, sizeof(r->conv_note), "no conversion provider registered (OK); %s",
+		         st->dp_lift_note);
+	} else {
+		snprintf(r->conv_note, sizeof(r->conv_note),
+		         "%u registered, %u negotiated, %u provider row%s, %u task row%s, %u malformed registry row%s",
+		         st->registered, st->negotiated, st->provider_count, st->provider_count == 1 ? "" : "s",
+		         st->task_count, st->task_count == 1 ? "" : "s", st->malformed_rows,
+		         st->malformed_rows == 1 ? "" : "s");
+	}
+
+	// The lift_caps row reads the dp-lift row headless (no module instantiated).
+	snprintf(r->lift_probe_note, sizeof(r->lift_probe_note), "%s; live caps come from the service",
+	         st->dp_lift_note);
+
+	// Absence never fails; a malformed descriptor does (when nothing failed before).
+	if (r->conv_bad_descriptors > 0 && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_CONVERSION;
+	}
+}
+
+#ifdef XRT_OS_WINDOWS
 
 //! Pack a Windows LUID the way Vulkan reports deviceLUID (raw bytes, LowPart
 //! first) — the same packing @ref d3d_scanout_adapter_luid returns, so the two
@@ -275,7 +486,7 @@ describe_service_ingest(
 	 * "FORCED" for an override that did not take is worse than no report.
 	 */
 	// #1252: "was it set" now spans the whole settings chain, not just getenv —
-	// otherwise a value set from the Control Panel would read as unset here.
+	// otherwise a value set from the Dashboard would read as unset here.
 	// The provenance the resolver returned names the source it actually used
 	// ("env-forced:" / "user-forced:" / "machine-forced:"), so match the shared
 	// "-forced" suffix rather than one specific source.
@@ -346,6 +557,25 @@ probe_native_display_mode(struct cli_query_result *r, const struct xrt_plugin_di
 }
 
 /*!
+ * One managed on-by-default setting as THIS process resolves it (the settings
+ * chain: env, then the per-user and machine stores): whether it is set, its
+ * raw value, and where it came from ("env" / "user" / "machine" / "default").
+ */
+static void
+probe_managed_setting(
+    const char *name, bool *out_set, char *out_value, size_t value_size, char *out_source, size_t source_size)
+{
+	char buf[64];
+	enum u_setting_source src = U_SETTING_SOURCE_DEFAULT;
+	const char *v = u_setting_get_raw(name, buf, sizeof(buf), &src);
+	snprintf(out_source, source_size, "%s", u_setting_source_str(src));
+	*out_set = v != NULL && v[0] != '\0';
+	if (*out_set) {
+		snprintf(out_value, value_size, "%s", v);
+	}
+}
+
+/*!
  * #918 — GPU topology. Enumerates the hardware adapters, names the one that
  * scans out the 3D panel, names the one the runtime would suggest to render
  * on, and states whether the weave-on-scanout split has anything to do on this
@@ -366,15 +596,17 @@ probe_gpu_topology(struct cli_query_result *r, const struct xrt_plugin_display_i
 
 	// #1252: through the settings chain, not getenv alone — otherwise this
 	// report would disagree with what the runtime does the moment anyone sets
-	// the lever from the Control Panel instead of the environment.
-	char weave_buf[64];
-	enum u_setting_source weave_src = U_SETTING_SOURCE_DEFAULT;
-	const char *env = u_setting_get_raw("DXR_WEAVE_ON_SCANOUT", weave_buf, sizeof(weave_buf), &weave_src);
-	r->gpu_weave_env_set = env != NULL && env[0] != '\0';
-	if (r->gpu_weave_env_set) {
-		snprintf(r->gpu_weave_env, sizeof(r->gpu_weave_env), "%s", env);
-	}
-	snprintf(r->gpu_weave_source, sizeof(r->gpu_weave_source), "%s", u_setting_source_str(weave_src));
+	// the lever from the Dashboard instead of the environment.
+	// The managed split / hub kill switches, read as the runtime reads them
+	// (through the settings chain): DXR_WEAVE_ON_SCANOUT, DXR_HUB (#2317 step
+	// 2) and the D3D12 hybrid reroute (#2375).
+	probe_managed_setting("DXR_WEAVE_ON_SCANOUT", &r->gpu_weave_env_set, r->gpu_weave_env, sizeof(r->gpu_weave_env),
+	                      r->gpu_weave_source, sizeof(r->gpu_weave_source));
+	probe_managed_setting("DXR_HUB", &r->gpu_hub_env_set, r->gpu_hub_env, sizeof(r->gpu_hub_env), r->gpu_hub_source,
+	                      sizeof(r->gpu_hub_source));
+	probe_managed_setting("DXR_SPLIT_D3D12_HYBRID_REROUTE", &r->gpu_d3d12_reroute_env_set, r->gpu_d3d12_reroute_env,
+	                      sizeof(r->gpu_d3d12_reroute_env), r->gpu_d3d12_reroute_source,
+	                      sizeof(r->gpu_d3d12_reroute_source));
 	// Answered from the env alone here, so every early return below still
 	// reports it; re-stated at the end once the topology is known.
 	describe_service_split(r);
@@ -634,12 +866,17 @@ dp_confidence_label(uint32_t c)
  * shell path uses the registry's primary entry — reproduced here with the same
  * `os_display_edid_enumerate` → `target_plugin_build_descriptors` →
  * `target_plugin_resolve_displays` sequence the compositor builds it from, then
- * reading entries[0] exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
- * MONITOR)` does. Runs after the active plug-in is known; safe headless (no
- * service, no GPU). Off-Windows the EDID enumerator yields no monitors, so the
- * registry is empty and the service path falls back to the scalar — reported as
- * agreement, never a false mismatch.
+ * picking the entry exactly as `comp_dp_factory_for_window(COMP_DP_PRIMARY_
+ * MONITOR)` does (`xrt_dp_registry_primary_entry`: the active plug-in's
+ * monitor, else entries[0]). Runs after the active plug-in is known; safe headless (no
+ * service, no GPU). On Android the EDID enumerator yields no monitors, so
+ * the registry is empty and the service path falls back to the scalar — reported
+ * as agreement, never a false mismatch.
  */
+//! The registry @ref probe_dp_selection resolved — reused for the per-screen
+//! list so the plug-ins' probe_displays run once per CLI invocation.
+static struct xrt_dp_factory_registry g_cli_dp_registry;
+
 static void
 probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *active)
 {
@@ -657,11 +894,12 @@ probe_dp_selection(struct cli_query_result *r, const struct xrt_plugin_iface *ac
 	struct xrt_dp_factory_registry reg = {0};
 	target_plugin_resolve_displays(descs, dn, &reg);
 	r->dp_sel_claim_count = reg.entry_count;
+	g_cli_dp_registry = reg;
 
 	if (reg.entry_count > 0) {
-		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects
-		// entries[0]; mirror that exactly.
-		const struct xrt_dp_registry_entry *e = &reg.entries[0];
+		// The compositor passes COMP_DP_PRIMARY_MONITOR, which selects via
+		// xrt_dp_registry_primary_entry; mirror that exactly.
+		const struct xrt_dp_registry_entry *e = xrt_dp_registry_primary_entry(&reg, r->dp_sel_inproc_id);
 		snprintf(r->dp_sel_service_id, sizeof(r->dp_sel_service_id), "%s", e->plugin_id);
 		snprintf(r->dp_sel_service_conf, sizeof(r->dp_sel_service_conf), "%s",
 		         dp_confidence_label(e->confidence));
@@ -735,7 +973,10 @@ rig_distance(const struct xrt_vec3 *a, const struct xrt_vec3 *b)
  *   1. `xrt_system_roles::rig` resolves to that device (the arbiter walk).
  *   2. The HEAD's pose -- which IS the composed rig -- changes over a 1.6 s
  *      window and every sample is finite (the composer really took the
- *      provider's navigation frame as the rig source).
+ *      provider's navigation frame as the rig source). Judged against the
+ *      provider's own pose: a still head fails only when the provider moved.
+ *      A user-driven provider (touch, a pad) is idle in a headless run, so
+ *      head and provider both still is "at rest", reported and passed.
  *   3. If the device fired at least two recenters during that window (watched
  *      on its own durable RECENTER timestamp -- never inferred from an env
  *      knob, so a real provider that recenters only on user intent stays
@@ -830,12 +1071,38 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 	uint32_t count = 0;
 	bool finite = true;
 
+	// The provider's own N(t), read next to every head sample. It is what
+	// tells a broken composition (the provider moved, the head did not) from
+	// a rig at rest (nobody touched the screen / the stick): a user-driven
+	// provider is idle during a headless run, and that is not a fault.
+	struct xrt_vec3 nav_first = {0};
+	bool nav_have_first = false;
+	float nav_travel = 0.0f;
+
 	for (int i = 0; i < CLI_RIG_SAMPLES; i++) {
 		struct xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
 		if (xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, (int64_t)os_monotonic_get_ns(),
 		                                &rel) == XRT_SUCCESS) {
 			finite = finite && rig_pose_finite(&rel.pose);
 			samples[count++] = rel.pose.position;
+		}
+
+		// After the head poll, so this reads the pose the composer was just
+		// handed. Navigation pose reads are side-effect free (sim-input,
+		// touch-input and gamepad all only sample).
+		struct xrt_space_relation nav_rel = XRT_SPACE_RELATION_ZERO;
+		if (xrt_device_get_tracked_pose(nav, XRT_INPUT_GENERIC_NAVIGATION_POSE, (int64_t)os_monotonic_get_ns(),
+		                                &nav_rel) == XRT_SUCCESS &&
+		    rig_pose_finite(&nav_rel.pose)) {
+			if (!nav_have_first) {
+				nav_first = nav_rel.pose.position;
+				nav_have_first = true;
+			} else {
+				const float d = rig_distance(&nav_first, &nav_rel.pose.position);
+				if (d > nav_travel) {
+					nav_travel = d;
+				}
+			}
 		}
 
 		// The head poll above is what drives the composer's own
@@ -862,7 +1129,13 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 		}
 	}
 	r->rig_travel_m = travel;
-	r->rig_moves_ok = finite && count >= 2 && travel > 1e-4f;
+	r->rig_nav_travel_m = nav_travel;
+	// A still head is a fault only when the provider moved: then the composer
+	// did not take its frame as the rig source. Both still = a rig at rest
+	// (a user-driven provider with no input during the window), which says
+	// nothing about composition either way.
+	r->rig_at_rest = finite && count >= 2 && travel <= 1e-4f && nav_have_first && nav_travel <= 1e-4f;
+	r->rig_moves_ok = finite && count >= 2 && (travel > 1e-4f || r->rig_at_rest);
 
 	// A recenter lands the rig on `rig_initial` EXACTLY (the one deliberate
 	// jump), so two or more recenters put the same value in the sample set
@@ -888,8 +1161,13 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
 
 	if (!r->rig_moves_ok) {
 		snprintf(r->rig_note, sizeof(r->rig_note),
-		         "FAIL: rig role on '%s' but the head %s (travel %.4f m over %u samples)", r->rig_nav_str,
-		         finite ? "never moved" : "went non-finite", (double)travel, count);
+		         "FAIL: rig role on '%s' but the head %s (head %.4f m, provider %.4f m over %u samples)",
+		         r->rig_nav_str, finite ? "never moved" : "went non-finite", (double)travel, (double)nav_travel,
+		         count);
+	} else if (r->rig_at_rest) {
+		snprintf(r->rig_note, sizeof(r->rig_note),
+		         "rig held by '%s': at rest (no navigation input in %u samples; composition not exercised)",
+		         r->rig_nav_str, count);
 	} else if (!r->rig_recenter_ok) {
 		snprintf(r->rig_note, sizeof(r->rig_note),
 		         "FAIL: %u recenter(s) fired on '%s' but the head never returned to one pose",
@@ -913,21 +1191,159 @@ probe_rig_role(struct cli_query_result *r, struct cli_query_handles *h, struct x
  * profile flips the verdict — applied at the end of cli_query_fill so
  * display failures keep their more fundamental result codes.
  */
+/*!
+ * ADR-054 N6 Part 2: the tracking class's view — what is registered and
+ * resident, and the primary screen's viewer source as the trunk arbitrates it
+ * (the DP's policy slot, whether it tracks, the best resident provider).
+ * Headless: the provider is loaded and probed, never started.
+ */
+static void
+probe_tracking_providers(struct cli_query_result *r,
+                         const struct xrt_plugin_iface *iface,
+                         uint32_t dp_supported,
+                         uint32_t dp_default)
+{
+	struct target_viewer_decision d;
+	target_viewer_tracking_evaluate(iface, target_plugin_get_active_instance(), dp_supported, &d);
+	target_tracking_plugin_get_scan_result(&r->tracking_registered, &r->tracking_enabled,
+	                                       &r->tracking_scan_declined, &r->tracking_scan_failed,
+	                                       &r->tracking_scan_untrusted);
+	// A scan that did not run (the display tracks / is FIXED) still lists the rows.
+	if (r->tracking_registered == 0) {
+		struct target_tracking_plugin_desc descs[16];
+		const int n = target_tracking_plugin_enumerate(descs, 16);
+		r->tracking_registered = n;
+		r->tracking_enabled = 0;
+		for (int i = 0; i < n; i++) {
+			r->tracking_enabled += descs[i].enabled ? 1 : 0;
+		}
+	}
+	r->tracking_ranked_count = 0;
+	const int resident = target_tracking_plugin_get_count();
+	for (int i = 0; i < resident && r->tracking_ranked_count < 16; i++) {
+		snprintf(r->tracking_ranked[r->tracking_ranked_count++], sizeof(r->tracking_ranked[0]), "%s",
+		         target_tracking_plugin_get_row_id(i));
+	}
+	target_viewer_source_label(&d, r->tracking_viewer_source, sizeof(r->tracking_viewer_source));
+	snprintf(r->tracking_viewer_reason, sizeof(r->tracking_viewer_reason), "%s", d.reason);
+	snprintf(r->tracking_viewer_policy, sizeof(r->tracking_viewer_policy), "%s",
+	         target_viewer_policy_str(d.dp_policy));
+	uint32_t def = 0;
+	bool mark = false;
+	target_viewer_compose_advertisement(dp_supported, dp_default, &d, &r->tracking_composed_modes, &def, &mark);
+	r->tracking_evaluated = true;
+}
+
+//! Case-insensitive "contains", for spotting an Ultraleap row by id or binary name.
+static bool
+contains_nocase(const char *hay, const char *needle)
+{
+	if (hay == NULL || needle == NULL) {
+		return false;
+	}
+	const size_t n = strlen(needle);
+	for (; *hay != '\0'; hay++) {
+		size_t i = 0;
+		while (i < n && hay[i] != '\0' &&
+		       (hay[i] | 0x20) == (needle[i] | 0x20)) { // ASCII letters only; fine for "ultraleap"
+			i++;
+		}
+		if (i == n) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * Ultraleap's implicit OpenXR layer vs DisplayXR's `ultraleap` provider. The
+ * layer is in every OpenXR app (the loader's doing, not ours) and resets the
+ * Leap service to Head-mounted mode, so a desk-mounted Leap read by our
+ * provider comes back L/R-swapped with sideways motion turned into depth.
+ * Selftest runs headless — no loader — so it would never see the layer act;
+ * this reads the registration instead. Advisory: never a failure.
+ */
+static void
+check_ultraleap_layer(struct cli_query_result *r, const struct target_input_plugin_desc *descs, int count)
+{
+	r->input_ultraleap_layer_warn = false;
+	r->input_ultraleap_layer_note[0] = '\0';
+	bool have_provider = false;
+	for (int i = 0; i < count; i++) {
+		if (descs[i].enabled &&
+		    (contains_nocase(descs[i].id, "ultraleap") || contains_nocase(descs[i].binary_path, "ultraleap"))) {
+			have_provider = true;
+			break;
+		}
+	}
+	if (!have_provider) {
+		return;
+	}
+	struct u_openxr_implicit_layer layer;
+	if (!u_openxr_implicit_layer_find(U_OPENXR_LAYER_ULTRALEAP_HAND_TRACKING, &layer) || !layer.active) {
+		return;
+	}
+	r->input_ultraleap_layer_warn = true;
+	u_openxr_layer_ultraleap_advice(&layer, r->input_ultraleap_layer_note, sizeof(r->input_ultraleap_layer_note));
+}
+
 static void
 probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 {
 	struct target_input_plugin_desc descs[16];
 	r->input_provider_count = target_input_plugin_enumerate(descs, 16);
 	r->input_force_qwerty = target_input_plugin_get_force_qwerty();
+	// N7: the gate, and the device list it shapes — recorded before any of
+	// the early returns below, so they are data whatever the verdict.
+	{
+		const char *src = "default";
+		r->input_emulated_controllers = target_input_plugin_get_emulated_controllers(&src) ? 1 : 0;
+		snprintf(r->input_emulated_source, sizeof(r->input_emulated_source), "%s", src);
+		r->input_device_count = 0;
+		if (h->xsysd != NULL) {
+			for (uint32_t i = 0; i < h->xsysd->xdev_count && r->input_device_count < CLI_INPUT_MAX_DEVICES;
+			     i++) {
+				struct xrt_device *xdev = h->xsysd->xdevs[i];
+				if (xdev == NULL) {
+					continue;
+				}
+				const int k = r->input_device_count++;
+				snprintf(r->input_device_str[k], sizeof(r->input_device_str[k]), "%s", xdev->str);
+				r->input_device_type[k] = (int)xdev->device_type;
+			}
+		}
+	}
+	r->input_enabled_count = 0;
+	for (int i = 0; i < r->input_provider_count; i++) {
+		if (descs[i].enabled) {
+			r->input_enabled_count++;
+		}
+	}
+	check_ultraleap_layer(r, descs, r->input_provider_count);
+	// N7: what "nobody holds the hands" means depends on the gate — the
+	// qwerty floor, or no role at all. Either is OK; the note must not claim
+	// a pair that was not published.
+	const char *floor = r->input_emulated_controllers != 0
+	                        ? "qwerty keeps the hand roles"
+	                        : "the hand roles stay unassigned, EmulatedControllers=0";
 
 	if (r->input_provider_count == 0) {
-		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: no input provider registered (OK — qwerty keeps the hand roles)");
+		snprintf(r->input_note, sizeof(r->input_note), "not evaluated: no input provider registered (OK — %s)",
+		         floor);
 		return;
 	}
 	if (r->input_force_qwerty) {
+		snprintf(r->input_note, sizeof(r->input_note), "not evaluated: ForceQwerty override set (OK — %s)",
+		         floor);
+		return;
+	}
+	// ADR-054 N4: Enabled=0 is the user saying "not this one"; the loader
+	// never touches a disabled row, so with every row disabled there is
+	// nothing to evaluate and qwerty correctly keeps the hand roles.
+	if (r->input_enabled_count == 0) {
 		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: ForceQwerty override set (OK — qwerty keeps the hand roles)");
+		         "not evaluated: all %d registered provider(s) disabled (Enabled=0) (OK — %s)",
+		         r->input_provider_count, floor);
 		return;
 	}
 
@@ -936,6 +1352,21 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	if (iface != NULL) {
 		snprintf(r->input_provider_id, sizeof(r->input_provider_id), "%s", iface->id ? iface->id : "");
 	}
+	// N3b: the resident rows in priority order, by REGISTRATION id —
+	// `PreferredPlugin` names a row, and two rows of one DLL share iface->id.
+	r->input_ranked_count = 0;
+	const int resident = target_input_plugin_get_count();
+	for (int i = 0; i < resident && r->input_ranked_count < 16; i++) {
+		snprintf(r->input_ranked[r->input_ranked_count], sizeof(r->input_ranked[0]), "%s",
+		         target_input_plugin_get_row_id(i));
+		r->input_ranked_count++;
+	}
+	// The scan tally is reported whether or not somebody claimed the system:
+	// a provider that could not be dispatched (load failure, ABI-major
+	// mismatch) is a misconfiguration worth seeing even when a lower-ranked
+	// one fell through and took the roles (ADR-054 N4 conformance).
+	target_input_plugin_get_scan_result(&r->input_scan_declined, &r->input_scan_failed);
+	r->input_scan_untrusted = target_input_plugin_get_scan_untrusted();
 
 	// Nobody claimed the system. That is only a fault if a provider
 	// failed to LOAD (bad entry point, ABI-major mismatch); providers
@@ -943,19 +1374,24 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	// DXR_SIM_INPUT opt-in left unset — is the ordinary state of most
 	// boxes and leaves qwerty correctly holding the hand roles.
 	if (!r->input_provider_active) {
-		int declined = 0;
-		int failed = 0;
-		target_input_plugin_get_scan_result(&declined, &failed);
-		if (failed > 0) {
+		if (r->input_scan_untrusted > 0) {
+			// ADR-054 N4b: a refused provider is the trust policy speaking, not a
+			// broken DLL — say so, and where the row to write is shown.
 			r->input_evaluated = true;
 			snprintf(r->input_note, sizeof(r->input_note),
-			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)", failed,
-			         declined);
+			         "FAIL: %d registered provider(s) refused by the provenance gate (unsigned, not "
+			         "allowlisted; `input list --json` names the Trust\\Allowlist row), %d failed to load "
+			         "(%d declined cleanly)",
+			         r->input_scan_untrusted, r->input_scan_failed, r->input_scan_declined);
+		} else if (r->input_scan_failed > 0) {
+			r->input_evaluated = true;
+			snprintf(r->input_note, sizeof(r->input_note),
+			         "FAIL: %d registered provider(s) failed to load (%d declined cleanly)",
+			         r->input_scan_failed, r->input_scan_declined);
 		} else {
 			snprintf(r->input_note, sizeof(r->input_note),
-			         "not evaluated: all %d registered provider(s) declined "
-			         "(OK — qwerty keeps the hand roles)",
-			         declined);
+			         "not evaluated: all %d registered provider(s) declined (OK — %s)",
+			         r->input_scan_declined, floor);
 		}
 		return;
 	}
@@ -966,9 +1402,8 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 	r->input_provider_present = t_input_arbiter_provider_holds_roles();
 	if (!r->input_provider_present) {
 		snprintf(r->input_note, sizeof(r->input_note),
-		         "not evaluated: provider '%s' loaded but its hardware is absent "
-		         "(OK — qwerty holds the hand roles)",
-		         r->input_provider_id);
+		         "not evaluated: provider '%s' loaded but its hardware is absent (OK — %s)",
+		         r->input_provider_id, floor);
 		return;
 	}
 
@@ -980,6 +1415,20 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 
 	struct xrt_system_roles roles = XRT_SYSTEM_ROLES_INIT;
 	xrt_system_devices_get_roles(h->xsysd, &roles);
+
+	// A provider is asserted only on the hands it SUPPLIED. One controller
+	// is a complete provider: Android touch-input supplies a single
+	// ANY_HAND_CONTROLLER (it fills left, per the builder), a navigation- or
+	// gamepad-only provider supplies none, and the side it leaves is the
+	// floor's (qwerty) by design, not a role the provider failed to fill.
+	if (!claimed_left) {
+		r->input_left_ok = true;
+		snprintf(r->input_left_str, sizeof(r->input_left_str), "%s", "n/a (not supplied by the provider)");
+	}
+	if (!claimed_right) {
+		r->input_right_ok = true;
+		snprintf(r->input_right_str, sizeof(r->input_right_str), "%s", "n/a (not supplied by the provider)");
+	}
 
 	if (claimed_left && roles.left >= 0 && (uint32_t)roles.left < h->xsysd->xdev_count) {
 		struct xrt_device *xdev = h->xsysd->xdevs[roles.left];
@@ -1034,9 +1483,16 @@ probe_input_providers(struct cli_query_result *r, struct cli_query_handles *h)
 		    : r->input_ht_right_ok      ? "ok"
 		                                : "missing");
 	} else {
-		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s",
+		char scan[112] = {0};
+		if (r->input_scan_failed > 0 || r->input_scan_untrusted > 0) {
+			// Not a failure of THIS provider, but a better-ranked one that
+			// could not be dispatched is a misconfiguration worth a word.
+			snprintf(scan, sizeof(scan), "; %d other provider(s) failed to load, %d refused by the provenance gate",
+			         r->input_scan_failed, r->input_scan_untrusted);
+		}
+		snprintf(r->input_note, sizeof(r->input_note), "provider '%s': left='%s' right='%s'%s%s",
 		         r->input_provider_id, r->input_left_str, r->input_right_str,
-		         (r->input_ht_left_ok || r->input_ht_right_ok) ? " (+hand-tracking roles)" : "");
+		         (r->input_ht_left_ok || r->input_ht_right_ok) ? " (+hand-tracking roles)" : "", scan);
 	}
 }
 
@@ -1217,12 +1673,420 @@ probe_vk_queue_lock_layer(struct cli_query_result *r)
 }
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2036 — the desktop-Linux twin of the Windows probe above: is a
+ * `VkLayer_DXR_queue_lock.json` manifest on the Vulkan loader's explicit-layer
+ * search path, and does its `library_path` resolve to a file that exists?
+ *
+ * Same contract as the Windows one: answered from the FILES, never by loading
+ * libvulkan (this tool needs no GPU), INFORMATIONAL ONLY, and every exit path
+ * writes `vk_layer_note`. It reimplements the loader's directory list
+ * (docs: LoaderLayerInterface.md, "Linux Layer Discovery"):
+ *
+ *   VK_LAYER_PATH set   -> ONLY those directories (it REPLACES the defaults)
+ *   otherwise           -> VK_ADD_LAYER_PATH, then <dir>/vulkan/explicit_layer.d
+ *                          for $XDG_CONFIG_HOME (~/.config), $XDG_CONFIG_DIRS
+ *                          (/etc/xdg), /etc, $XDG_DATA_HOME (~/.local/share),
+ *                          $XDG_DATA_DIRS (/usr/local/share:/usr/share)
+ *
+ * The .deb ships the manifest in /usr/share/vulkan/explicit_layer.d with an
+ * ABSOLUTE library_path; the tarball's install.sh writes one into
+ * $XDG_DATA_HOME (or /usr/local/share for --system). A library_path with a
+ * '/' that is not absolute is joined to the manifest's directory, as the
+ * loader does; a bare name goes to dlopen()'s own search and is reported as
+ * unverified rather than guessed at.
+ */
+static bool
+vk_layer_try_dir(char *out, size_t out_size, const char *dir, size_t dir_len, const char *suffix)
+{
+	if (dir_len == 0) {
+		return false;
+	}
+	char path[512];
+	int n = snprintf(path, sizeof(path), "%.*s%s/VkLayer_DXR_queue_lock.json", (int)dir_len, dir, suffix);
+	if (n <= 0 || (size_t)n >= sizeof(path)) {
+		return false;
+	}
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	fclose(f);
+	snprintf(out, out_size, "%s", path);
+	return true;
+}
+
+//! Walk a ':'-separated list (or @p fallback when @p list is unset/empty).
+static bool
+vk_layer_try_list(char *out, size_t out_size, const char *list, const char *fallback, const char *suffix)
+{
+	const char *p = (list != NULL && list[0] != '\0') ? list : fallback;
+	while (p != NULL && *p != '\0') {
+		const char *colon = strchr(p, ':');
+		size_t len = colon != NULL ? (size_t)(colon - p) : strlen(p);
+		if (vk_layer_try_dir(out, out_size, p, len, suffix)) {
+			return true;
+		}
+		p = colon != NULL ? colon + 1 : NULL;
+	}
+	return false;
+}
+
+#define VKL_OUT r->vk_layer_manifest, sizeof(r->vk_layer_manifest)
+
+static void
+probe_vk_queue_lock_layer(struct cli_query_result *r)
+{
+	r->vk_layer_probed = true;
+
+	static const char *k_sub = "/vulkan/explicit_layer.d";
+	const char *home = getenv("HOME");
+	char home_config[512] = "";
+	char home_data[512] = "";
+	if (home != NULL && home[0] != '\0') {
+		snprintf(home_config, sizeof(home_config), "%s/.config", home);
+		snprintf(home_data, sizeof(home_data), "%s/.local/share", home);
+	}
+
+	const char *layer_path = getenv("VK_LAYER_PATH");
+	bool found = false;
+	if (layer_path != NULL && layer_path[0] != '\0') {
+		found = vk_layer_try_list(VKL_OUT, layer_path, NULL, "");
+	} else {
+		found = vk_layer_try_list(VKL_OUT, getenv("VK_ADD_LAYER_PATH"), NULL, "") ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
+		        vk_layer_try_list(VKL_OUT, NULL, "/etc", k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
+		        vk_layer_try_list(VKL_OUT, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
+	}
+	if (!found) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "NOT found: no VkLayer_DXR_queue_lock.json on the Vulkan loader's explicit-layer path%s "
+		         "(#868 repaint unavailable on a single-graphics-queue GPU)",
+		         (layer_path != NULL && layer_path[0] != '\0') ? " (VK_LAYER_PATH replaces the defaults)" : "");
+		return;
+	}
+	r->vk_layer_registered = true;
+	r->vk_layer_enabled = true; // no per-manifest disable flag on Linux
+
+	FILE *f = fopen(r->vk_layer_manifest, "rb");
+	if (f == NULL) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "manifest vanished while reading: %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+	char json[4096];
+	size_t got = fread(json, 1, sizeof(json) - 1, f);
+	fclose(f);
+	json[got] = '\0';
+
+	cJSON *root = cJSON_Parse(json);
+	cJSON *layer = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, "layer") : NULL;
+	cJSON *name = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "name") : NULL;
+	cJSON *lib = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "library_path") : NULL;
+	if (!cJSON_IsString(name) || strcmp(name->valuestring, "VK_LAYER_DXR_queue_lock") != 0 ||
+	    !cJSON_IsString(lib) || lib->valuestring == NULL || lib->valuestring[0] == '\0') {
+		cJSON_Delete(root);
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "manifest does not parse as VK_LAYER_DXR_queue_lock with a library_path: %s",
+		         r->vk_layer_manifest);
+		return;
+	}
+	r->vk_layer_manifest_ok = true;
+	snprintf(r->vk_layer_library, sizeof(r->vk_layer_library), "%s", lib->valuestring);
+	cJSON_Delete(root);
+
+	const char *p = r->vk_layer_library;
+	char resolved[1024];
+	if (p[0] == '/') {
+		snprintf(resolved, sizeof(resolved), "%s", p);
+	} else if (strchr(p, '/') != NULL) {
+		char dir[512];
+		snprintf(dir, sizeof(dir), "%s", r->vk_layer_manifest);
+		char *slash = strrchr(dir, '/');
+		if (slash != NULL) {
+			*slash = '\0';
+		}
+		const char *rel = (p[0] == '.' && p[1] == '/') ? p + 2 : p;
+		snprintf(resolved, sizeof(resolved), "%s/%s", dir, rel);
+	} else {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "found, but library_path '%s' is a bare name left to dlopen()'s search — not verified (%s)", p,
+		         r->vk_layer_manifest);
+		return;
+	}
+	FILE *so = fopen(resolved, "rb");
+	if (so == NULL) {
+		snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
+		         "manifest found but the layer library is MISSING: %s", resolved);
+		return;
+	}
+	fclose(so);
+	r->vk_layer_library_ok = true;
+
+	// Not phrased as "repaint is on" — see the Windows probe.
+	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note), "VK_LAYER_DXR_queue_lock reachable (%s)", resolved);
+}
+#undef VKL_OUT
+
+/*!
+ * #886 — the IMPLICIT twin of the manifest above: the same layer for
+ * vulkan_enable1 apps (they create their own VkInstance, so the runtime cannot
+ * inject it), loaded only when the app's environment has DXR_VK_QUEUE_LOCK=1.
+ * Same contract as the explicit probe — files only, informational — plus the
+ * one property that makes an implicit layer safe to ship: its
+ * enable_environment gate. An UNGATED implicit layer would load into every
+ * Vulkan process on the box, so that is reported loudly.
+ *
+ * Loader search order for implicit layers mirrors the explicit one with
+ * implicit_layer.d, VK_IMPLICIT_LAYER_PATH (replaces) and
+ * VK_ADD_IMPLICIT_LAYER_PATH (prepends).
+ */
+static void
+probe_vk_queue_lock_implicit_layer(struct cli_query_result *r)
+{
+	r->vk_ilayer_probed = true;
+
+	static const char *k_sub = "/vulkan/implicit_layer.d";
+	const char *home = getenv("HOME");
+	char home_config[512] = "";
+	char home_data[512] = "";
+	if (home != NULL && home[0] != '\0') {
+		snprintf(home_config, sizeof(home_config), "%s/.config", home);
+		snprintf(home_data, sizeof(home_data), "%s/.local/share", home);
+	}
+
+	char *m = r->vk_ilayer_manifest;
+	const size_t ms = sizeof(r->vk_ilayer_manifest);
+	const char *ipath = getenv("VK_IMPLICIT_LAYER_PATH");
+	bool found = false;
+	if (ipath != NULL && ipath[0] != '\0') {
+		found = vk_layer_try_list(m, ms, ipath, NULL, "");
+	} else {
+		found = vk_layer_try_list(m, ms, getenv("VK_ADD_IMPLICIT_LAYER_PATH"), NULL, "") ||
+		        vk_layer_try_list(m, ms, getenv("XDG_CONFIG_HOME"), home_config, k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_CONFIG_DIRS"), "/etc/xdg", k_sub) ||
+		        vk_layer_try_list(m, ms, NULL, "/etc", k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_DATA_HOME"), home_data, k_sub) ||
+		        vk_layer_try_list(m, ms, getenv("XDG_DATA_DIRS"), "/usr/local/share:/usr/share", k_sub);
+	}
+	if (!found) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "NOT found: no implicit VkLayer_DXR_queue_lock.json (vulkan_enable1 apps can only get the "
+		         "layer by naming it themselves)");
+		return;
+	}
+
+	FILE *f = fopen(m, "rb");
+	if (f == NULL) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note), "manifest vanished while reading: %s", m);
+		return;
+	}
+	char json[4096];
+	size_t got = fread(json, 1, sizeof(json) - 1, f);
+	fclose(f);
+	json[got] = '\0';
+
+	cJSON *root = cJSON_Parse(json);
+	cJSON *layer = (root != NULL) ? cJSON_GetObjectItemCaseSensitive(root, "layer") : NULL;
+	cJSON *name = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "name") : NULL;
+	cJSON *lib = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "library_path") : NULL;
+	cJSON *en = (layer != NULL) ? cJSON_GetObjectItemCaseSensitive(layer, "enable_environment") : NULL;
+	cJSON *en_v = (en != NULL) ? cJSON_GetObjectItemCaseSensitive(en, "DXR_VK_QUEUE_LOCK") : NULL;
+	if (!cJSON_IsString(name) || strcmp(name->valuestring, "VK_LAYER_DXR_queue_lock") != 0 ||
+	    !cJSON_IsString(lib) || lib->valuestring == NULL || lib->valuestring[0] == '\0') {
+		cJSON_Delete(root);
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest does not parse as VK_LAYER_DXR_queue_lock with a library_path: %s", m);
+		return;
+	}
+	r->vk_ilayer_gated = cJSON_IsString(en_v) && strcmp(en_v->valuestring, "1") == 0;
+	snprintf(r->vk_ilayer_library, sizeof(r->vk_ilayer_library), "%s", lib->valuestring);
+	cJSON_Delete(root);
+
+	if (!r->vk_ilayer_gated) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest is NOT gated by enable_environment DXR_VK_QUEUE_LOCK=1 — the layer loads "
+		         "into EVERY Vulkan process: %s",
+		         m);
+		return;
+	}
+	// The packaged manifests use an absolute library_path; anything else is
+	// reported as unverified rather than re-deriving the loader's rules twice.
+	if (r->vk_ilayer_library[0] != '/') {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest found, library_path '%s' not absolute — not verified (%s)",
+		         r->vk_ilayer_library, m);
+		return;
+	}
+	FILE *so = fopen(r->vk_ilayer_library, "rb");
+	if (so == NULL) {
+		snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+		         "implicit manifest found but the layer library is MISSING: %s", r->vk_ilayer_library);
+		return;
+	}
+	fclose(so);
+	r->vk_ilayer_library_ok = true;
+	snprintf(r->vk_ilayer_note, sizeof(r->vk_ilayer_note),
+	         "VK_LAYER_DXR_queue_lock implicit twin reachable (%s), opt-in DXR_VK_QUEUE_LOCK=1",
+	         r->vk_ilayer_library);
+}
+#endif
+
+/*!
+ * ADR-045: snapshot every registered plug-in's load outcome + platform state.
+ * Registered entries come from the discovery root (so a plug-in the loader
+ * never had to try still shows, as NOT_ATTEMPTED); the loader's records add
+ * what each attempt found. On Android, where enumeration is a stub, the
+ * loader's records alone are the list.
+ */
+static void
+fill_plugin_states(struct cli_query_result *r)
+{
+	struct target_plugin_desc descs[16];
+	struct target_plugin_status st[16];
+	int nd = target_plugin_enumerate(descs, 16);
+	int ns = target_plugin_get_status(st, 16);
+	int n = 0;
+
+	for (int i = 0; i < nd && n < 16; i++) {
+		struct target_plugin_status *o = &r->plugin_states[n++];
+		bool found = false;
+		for (int j = 0; j < ns; j++) {
+			if (strcmp(st[j].id, descs[i].id) == 0) {
+				*o = st[j];
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			memset(o, 0, sizeof(*o));
+			snprintf(o->id, sizeof(o->id), "%s", descs[i].id);
+			o->result = TARGET_PLUGIN_RESULT_NOT_ATTEMPTED;
+			o->fallback = strcmp(descs[i].id, "sim-display") == 0;
+		}
+		// The registration is the authority for name / version / order.
+		snprintf(o->display_name, sizeof(o->display_name), "%s", descs[i].display_name);
+		snprintf(o->version, sizeof(o->version), "%s", descs[i].version);
+		o->probe_order = descs[i].probe_order;
+	}
+	for (int j = 0; j < ns && n < 16; j++) {
+		bool listed = false;
+		for (int i = 0; i < nd; i++) {
+			if (strcmp(st[j].id, descs[i].id) == 0) {
+				listed = true;
+				break;
+			}
+		}
+		if (!listed) {
+			r->plugin_states[n++] = st[j];
+		}
+	}
+	// Insertion sort by ProbeOrder (n <= 16).
+	for (int i = 1; i < n; i++) {
+		struct target_plugin_status tmp = r->plugin_states[i];
+		int k = i - 1;
+		while (k >= 0 && r->plugin_states[k].probe_order > tmp.probe_order) {
+			r->plugin_states[k + 1] = r->plugin_states[k];
+			k--;
+		}
+		r->plugin_states[k + 1] = tmp;
+	}
+	r->plugin_state_count = n;
+}
+
+//! Find the ADR-045 record for @p id in @p r, or NULL.
+static const struct target_plugin_status *
+find_plugin_state(const struct cli_query_result *r, const char *id)
+{
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		if (strcmp(r->plugin_states[i].id, id) == 0) {
+			return &r->plugin_states[i];
+		}
+	}
+	return NULL;
+}
+
+/*!
+ * One human line per registered plug-in, e.g.
+ *   vendor plug-in 'Example 3D Display' 2.8.3 — PLATFORM_ABSENT: install the ... (DECLINED; id=..., ProbeOrder=50)
+ * Name and version are the registration's own; nothing vendor-specific here.
+ */
+static void
+format_plugin_state_line(const struct target_plugin_status *p, char *out, size_t cap)
+{
+	const char *name = p->display_name[0] != '\0' ? p->display_name : p->id;
+	char state[192];
+	if (p->platform_state == XRT_PLUGIN_PLATFORM_STATE_UNKNOWN) {
+		snprintf(state, sizeof(state), "UNKNOWN (platform state not reported)");
+	} else {
+		snprintf(state, sizeof(state), "%s%s%s", target_plugin_platform_state_str(p->platform_state),
+		         p->hint[0] != '\0' ? ": " : "", p->hint);
+	}
+	char detail[224];
+	int used = snprintf(detail, sizeof(detail), "%s", target_plugin_load_result_str(p->result));
+	if (used > 0 && (size_t)used < sizeof(detail) && p->reason[0] != '\0') {
+		used += snprintf(detail + used, sizeof(detail) - (size_t)used, ", %s", p->reason);
+	} else if (used > 0 && (size_t)used < sizeof(detail) && p->os_error != 0) {
+		used += snprintf(detail + used, sizeof(detail) - (size_t)used, ", err=%u", (unsigned)p->os_error);
+	}
+	snprintf(out, cap, "%s plug-in '%s'%s%s — %s (%s; id=%s, ProbeOrder=%u, provenance=%s%s%s)",
+	         p->fallback ? "fallback" : "vendor", name, p->version[0] != '\0' ? " " : "", p->version, state, detail,
+	         p->id, (unsigned)p->probe_order, target_component_provenance_str(p->provenance),
+	         p->signer[0] != '\0' ? " by " : "", p->signer);
+}
+
+static void
+print_plugin_states_text(const struct cli_query_result *r)
+{
+	// P()/PT() are defined further down; spelled out here.
+	printf(" :: Registered display plug-ins (ADR-045 platform state)\n");
+	if (r->plugin_state_count == 0) {
+		printf("\tnone registered\n");
+		return;
+	}
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		char line[640];
+		format_plugin_state_line(&r->plugin_states[i], line, sizeof(line));
+		printf("\t%s\n", line);
+	}
+}
+
+static void
+add_plugin_states_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *arr = cJSON_AddArrayToObject(root, "plugins");
+	for (int i = 0; i < r->plugin_state_count; i++) {
+		const struct target_plugin_status *p = &r->plugin_states[i];
+		cJSON *o = cJSON_CreateObject();
+		cJSON_AddStringToObject(o, "id", p->id);
+		cJSON_AddStringToObject(o, "display_name", p->display_name);
+		cJSON_AddStringToObject(o, "version", p->version);
+		cJSON_AddNumberToObject(o, "probe_order", (double)p->probe_order);
+		cJSON_AddBoolToObject(o, "fallback", p->fallback);
+		cJSON_AddStringToObject(o, "load_result", target_plugin_load_result_str(p->result));
+		cJSON_AddStringToObject(o, "platform_state", target_plugin_platform_state_str(p->platform_state));
+		cJSON_AddStringToObject(o, "hint", p->hint);
+		cJSON_AddStringToObject(o, "reason", p->reason);
+		cJSON_AddNumberToObject(o, "os_error", (double)p->os_error);
+		// ADR-054 N4b provenance, as the shared loader classified the binary.
+		cJSON_AddStringToObject(o, "provenance", target_component_provenance_str(p->provenance));
+		cJSON_AddStringToObject(o, "signer", p->signer);
+		cJSON_AddStringToObject(o, "provenance_reason", p->provenance_reason);
+		cJSON_AddItemToArray(arr, o);
+	}
+}
+
 void
 cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const struct xrt_instance_info *ii)
 {
 	memset(r, 0, sizeof(*r));
 	memset(h, 0, sizeof(*h));
 	snprintf(r->runtime_description, sizeof(r->runtime_description), "%s", u_runtime_description);
+	snprintf(r->version, sizeof(r->version), "%u.%u.%u", (unsigned)u_version_major, (unsigned)u_version_minor,
+	         (unsigned)u_version_patch);
 	snprintf(r->git_tag, sizeof(r->git_tag), "%s", u_git_tag);
 	r->plugin_abi_version = (uint32_t)XRT_PLUGIN_API_VERSION_CURRENT;
 	r->result_code = CLI_SELFTEST_INIT_FAIL;
@@ -1257,6 +2121,8 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->instance_ok = true;
 
 	xrt_result_t xret = xrt_instance_create_system(h->xi, &h->xsys, &h->xsysd, &h->xso, NULL);
+	// ADR-045: discovery has run (or failed) by now either way.
+	fill_plugin_states(r);
 	if (xret != XRT_SUCCESS || h->xsysd == NULL) {
 		r->result_code = CLI_SELFTEST_INIT_FAIL;
 		return;
@@ -1312,15 +2178,34 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	struct target_plugin_discovery_summary disc;
 	target_plugin_get_discovery_summary(&disc);
 	r->vendor_dp_ok = (disc.rejected_count == 0);
+	// N3b: a disabled better-ranked plug-in is the user's choice, not a
+	// fault — but say so, or "sim-display is active" on a vendor box reads
+	// as a mystery.
+	r->skipped_disabled_count = 0;
+	for (int i = 0; i < disc.skipped_disabled_count && i < 8; i++) {
+		snprintf(r->skipped_disabled[r->skipped_disabled_count], sizeof(r->skipped_disabled[0]), "%s",
+		         disc.skipped_disabled_ids[i]);
+		r->skipped_disabled_count++;
+	}
+	snprintf(r->active_row_id, sizeof(r->active_row_id), "%s", disc.active_id);
 	if (r->vendor_dp_ok) {
 		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
 		         "no better-ranked plug-in failed to load (active ProbeOrder=%u, %d declined their probe)",
 		         (unsigned)disc.active_probe_order, disc.declined_count);
 	} else {
+		// ADR-045: add what the rejected plug-in said about its platform
+		// (UNKNOWN when it never got far enough to be asked).
+		const struct target_plugin_status *rp = find_plugin_state(r, disc.best_rejected_id);
+		char pstate[160] = "";
+		if (rp != NULL) {
+			snprintf(pstate, sizeof(pstate), " [platform %s%s%s]",
+			         target_plugin_platform_state_str(rp->platform_state), rp->hint[0] != '\0' ? ": " : "",
+			         rp->hint);
+		}
 		snprintf(r->vendor_dp_note, sizeof(r->vendor_dp_note),
-		         "'%s' (ProbeOrder=%u) out-ranks the active plug-in but was rejected: %s — the runtime "
+		         "'%s' (ProbeOrder=%u) out-ranks the active plug-in but was rejected: %s%s — the runtime "
 		         "fell back to '%s'",
-		         disc.best_rejected_id, (unsigned)disc.best_rejected_order, disc.best_rejected_reason,
+		         disc.best_rejected_id, (unsigned)disc.best_rejected_order, disc.best_rejected_reason, pstate,
 		         iface->id ? iface->id : "?");
 	}
 
@@ -1355,6 +2240,10 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	r->display_info = info;
 	r->display_info_ok = true;
 
+	// ADR-054 N6 Part 2: the viewer-tracking class, as data (never a verdict:
+	// absence of a provider, or one in standby, is normal).
+	probe_tracking_providers(r, iface, info.supported_eye_tracking_modes, info.default_eye_tracking_mode);
+
 	// #1301 — resolve the full monitor rect apps are told to place their window
 	// in. Same resolver, same inputs as the runtime (origin, native pixel size
 	// and physical size), so `info` reports what an app would actually receive,
@@ -1367,8 +2256,19 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 		    .pixel_height = info.display_pixel_height,
 		    .width_m = info.display_width_m,
 		    .height_m = info.display_height_m,
+		    .origin_valid = (info.display_flags & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0,
 		};
-		r->desktop_info_ok = os_display_desktop_info_for_panel(&hint, &r->desktop_info, &r->desktop_match);
+		// The claim rule first, exactly as fill_display_desktop_info runs it
+		// (displayxr-leia-plugin#430), over the registry probe_dp_selection
+		// just resolved.
+		if (target_screens_panel_from_claims(&g_cli_dp_registry, iface->id, &hint, &r->desktop_info, NULL)) {
+			memset(&r->desktop_match, 0, sizeof(r->desktop_match));
+			r->desktop_match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
+			r->desktop_info_ok = true;
+		} else {
+			r->desktop_info_ok =
+			    os_display_desktop_info_for_panel(&hint, &r->desktop_info, &r->desktop_match);
+		}
 	}
 	// Caller-DPI space on both sides — the plug-in's dims are virtualised
 	// whenever this process is DPI-unaware, so the physical rect is the wrong
@@ -1377,6 +2277,45 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	                           info.display_pixel_height > 0 &&
 	                           r->desktop_info.width_in_caller_dpi == info.display_pixel_width &&
 	                           r->desktop_info.height_in_caller_dpi == info.display_pixel_height;
+
+	// Multi-screen M1 — the per-screen list xrEnumerateDisplaysDXR reports. The
+	// system-default screen gets the active plug-in's panel info, with the
+	// view-scale baseline derived from the mode table exactly as
+	// apply_plugin_display_info does when the plug-in leaves it 0.
+	{
+		struct target_screens_system sys;
+		memset(&sys, 0, sizeof(sys));
+		u_screen_info_from_plugin(&info, XRT_SCREEN_INFO_SOURCE_SYSTEM, &sys.info);
+		if (!(sys.info.recommended_view_scale_x > 0.0f) || !(sys.info.recommended_view_scale_y > 0.0f)) {
+			float min_x = 1.0f, min_y = 1.0f;
+			for (uint32_t mi = 0; mi < head->rendering_mode_count; mi++) {
+				const struct xrt_rendering_mode *rm = &head->rendering_modes[mi];
+				if (rm->view_scale_x > 0.0f && rm->view_scale_x < min_x) {
+					min_x = rm->view_scale_x;
+				}
+				if (rm->view_scale_y > 0.0f && rm->view_scale_y < min_y) {
+					min_y = rm->view_scale_y;
+				}
+			}
+			sys.info.recommended_view_scale_x = min_x;
+			sys.info.recommended_view_scale_y = min_y;
+		}
+		sys.info_valid = info.display_width_m > 0.0f && info.display_height_m > 0.0f;
+		if (r->desktop_info_ok) {
+			sys.desktop_left = r->desktop_info.left;
+			sys.desktop_top = r->desktop_info.top;
+			sys.desktop_width = r->desktop_info.width;
+			sys.desktop_height = r->desktop_info.height;
+			sys.native_width = r->desktop_info.native_width;
+			sys.native_height = r->desktop_info.native_height;
+			sys.desktop_scale = (float)r->desktop_info.scale;
+			sys.is_primary = r->desktop_info.is_primary;
+			snprintf(sys.device_name, sizeof(sys.device_name), "%.*s", (int)(sizeof(sys.device_name) - 1),
+			         r->desktop_info.device_name);
+		}
+		target_screens_build(&g_cli_dp_registry, iface->id, &sys, &r->screens);
+		r->screens_probed = true;
+	}
 
 	// #1252 — the allow-listed performance settings, resolved through the same
 	// chain the runtime uses. Platform-independent, and deliberately BEFORE the
@@ -1462,14 +2401,30 @@ cli_query_fill(struct cli_query_result *r, struct cli_query_handles *h, const st
 	snprintf(r->zone_probe_note, sizeof(r->zone_probe_note), "not probed: zone-caps probe is Windows-only (OK)");
 #endif
 
+	// ADR-053 (#2006) — conversion providers: enumerate, negotiate, probe,
+	// describe; never warm. Absence never fails; only a malformed descriptor
+	// does. Also fills the headless lift_caps note from the static dp-lift row
+	// (ADR-042 lift_caps / exit 11 now read live caps from the service only).
+	probe_conversion_providers(r, iface);
+
+	// ADR-043 — stereo camera slots. Absence never fails; only a camera the
+	// plug-in describes out of contract flips the verdict.
+	probe_stereo_camera(r, iface);
+	if (r->stereo_camera_malformed && r->result_code == CLI_SELFTEST_PASS) {
+		r->result_code = CLI_SELFTEST_BAD_STEREO_CAMERA;
+	}
+
 	// #1234 / #902 — can the Vulkan loader still reach the queue-lock layer?
 	// Pure reporting: never touches result_code. See the field comment in
 	// cli_query.h for why this must not be fatal.
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 	probe_vk_queue_lock_layer(r);
+#ifdef XRT_OS_LINUX_DESKTOP
+	probe_vk_queue_lock_implicit_layer(r);
+#endif
 #else
 	snprintf(r->vk_layer_note, sizeof(r->vk_layer_note),
-	         "not probed: the queue-lock layer is a Windows-only registration (OK)");
+	         "not probed: the queue-lock layer is registered only on Windows and desktop Linux (OK)");
 #endif
 
 	// ADR-034 / #823 — a registered, non-overridden input provider whose
@@ -1650,7 +2605,7 @@ print_x11_scale_text(const struct cli_query_result *r)
 	printf("\n");
 	PT("drag snap:    %s\n", x11_snap_capability(r));
 	PT("X root:       %ux%u X11 px (native width of matched outputs: %u px)%s\n", s->root_w, s->root_h,
-	   s->native_sum_w, s->drm_available ? "" : " [no DRM modes in /sys/class/drm]");
+	   s->native_sum_w, s->drm_available ? "" : " [no device modes: no Mutter DisplayConfig, no /sys/class/drm]");
 	for (uint32_t i = 0; i < s->output_count; i++) {
 		const struct u_x11_output_sizes *o = &s->outputs[i];
 		if (o->native_w > 0) {
@@ -1675,6 +2630,7 @@ cli_query_print_info_text(const struct cli_query_result *r)
 {
 	P(" :: Runtime\n");
 	PT("description: '%s'\n", r->runtime_description);
+	PT("version:     %s\n", r->version);
 	PT("git-tag:     '%s'\n", r->git_tag);
 	PT("plug-in ABI: v%u (runtime speaks XRT_PLUGIN_API_VERSION_CURRENT)\n", (unsigned)r->plugin_abi_version);
 
@@ -1684,6 +2640,8 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	}
 
 	print_x11_scale_text(r);
+
+	print_plugin_states_text(r);
 
 	P(" :: Display processor\n");
 	if (!r->head_ok) {
@@ -1697,6 +2655,14 @@ cli_query_print_info_text(const struct cli_query_result *r)
 
 	PT("plug-in: id='%s' name='%s' vendor='%s' version='%s'\n", or_q(r->plugin_id), or_q(r->plugin_name),
 	   or_q(r->plugin_vendor), or_q(r->plugin_version));
+	if (r->skipped_disabled_count > 0) {
+		PT("skipped: selected over %d disabled higher-ranked plug-in(s) (Enabled=0):",
+		   r->skipped_disabled_count);
+		for (int i = 0; i < r->skipped_disabled_count; i++) {
+			printf("%s %s", i > 0 ? "," : "", r->skipped_disabled[i]);
+		}
+		printf("\n");
+	}
 	PT("ABI:     v%u (loader-verified match)\n", (unsigned)r->plugin_abi_version);
 	PT("device:  '%s'\n", r->head_str);
 
@@ -1733,13 +2699,17 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	// they differ — a bug report needs the plug-in's raw answer too.
 	{
 		const bool overridden =
-		    r->desktop_info_ok && r->desktop_info_is_panel &&
-		    r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
+		    r->desktop_info_ok &&
+		    ((r->desktop_info_is_panel && r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH) ||
+		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ||
+		     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM) &&
 		    (r->desktop_info.left != i->display_screen_left || r->desktop_info.top != i->display_screen_top);
 		if (overridden) {
-			PT("screen pos:   (%d, %d)  [runtime override by size match; plug-in reported "
+			PT("screen pos:   (%d, %d)  [runtime override by %s; plug-in reported "
 			   "(%d, %d)]\n",
-			   r->desktop_info.left, r->desktop_info.top, i->display_screen_left, i->display_screen_top);
+			   r->desktop_info.left, r->desktop_info.top,
+			   os_display_desktop_rule_str(r->desktop_match.rule), i->display_screen_left,
+			   i->display_screen_top);
 		} else {
 			PT("screen pos:   (%d, %d)\n", i->display_screen_left, i->display_screen_top);
 		}
@@ -1755,7 +2725,22 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	   r->desktop_info.device_name[0] != 0 ? r->desktop_info.device_name : "?",
 	   r->desktop_info.is_primary ? " [primary]" : "", os_display_desktop_rule_str(r->desktop_match.rule),
 	   r->desktop_info_is_panel ? "panel-confirmed" : "not panel-confirmed");
-	if (r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && r->desktop_match.candidate_count > 1) {
+	if (r->desktop_info.native_width > 0 && r->desktop_info.native_height > 0) {
+		const int one_to_one = os_display_desktop_info_is_1to1(&r->desktop_info);
+		PT("              connector mode %ux%u", r->desktop_info.native_width, r->desktop_info.native_height);
+		if (r->desktop_info.scale > 0.0) {
+			printf(" at %.0f%%", r->desktop_info.scale * 100.0);
+		}
+		printf(" (%s) - %s\n", os_display_native_source_str(r->desktop_info.native_source),
+		       r->desktop_info.native_source == OS_DISPLAY_NATIVE_SOURCE_COREGRAPHICS
+		           ? "the rect is in points; the mode is the backing store's pixels"
+		       : one_to_one == 1 ? "the rect is device pixels (X11 windows land 1:1)"
+		                         : "the rect is NOT device pixels: X11 windows there are resampled, so they "
+		                           "present 2D (#1831)");
+	}
+	if ((r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
+	     r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
+	    r->desktop_match.candidate_count > 1) {
 		PT("              ** AMBIGUOUS: %u of %u monitors match the panel size; tie broken on physical "
 		   "size / non-primary\n",
 		   r->desktop_match.candidate_count, r->desktop_match.monitor_count);
@@ -1794,6 +2779,39 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		}
 	}
 
+	P(" :: Displays (XR_DXR_display_info v22 — what xrEnumerateDisplaysDXR reports)\n");
+	if (!r->screens_probed) {
+		PT("not evaluated\n");
+	} else if (r->screens.count == 0) {
+		PT("none (no monitor enumerated and no display info)\n");
+	} else {
+		for (uint32_t i = 0; i < r->screens.count; i++) {
+			const struct xrt_screen *sc = &r->screens.screens[i];
+			const struct xrt_screen_info *si = &sc->info;
+			char et[64];
+			PT("[%u] 0x%016llx '%s' plug-in='%s'%s%s%s\n", i, (unsigned long long)sc->id,
+			   or_q(sc->device_name), or_q(sc->plugin_id),
+			   (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) ? " SYSTEM_DEFAULT" : "",
+			   (sc->flags & XRT_SCREEN_FLAG_PRIMARY) ? " PRIMARY" : "",
+			   (sc->flags & XRT_SCREEN_FLAG_TRACKED) ? " TRACKED" : "");
+			PT("    desktop %ux%u @ (%d,%d)  native %ux%u  scale %.2f  edid %ux%u mm\n", sc->desktop_width,
+			   sc->desktop_height, (int)sc->desktop_left, (int)sc->desktop_top, sc->native_width,
+			   sc->native_height, (double)sc->desktop_scale, sc->physical_width_mm, sc->physical_height_mm);
+			PT("    info[%s]: %.4f x %.4f m  %ux%u px  nominal=(%.3f, %.3f, %.3f) m  view scale %.3f x "
+			   "%.3f  "
+			   "eye tracking %s%s%s%s\n",
+			   u_screen_info_source_str(si->source), (double)si->width_m, (double)si->height_m,
+			   si->pixel_width, si->pixel_height, (double)si->nominal_viewer_x_m,
+			   (double)si->nominal_viewer_y_m, (double)si->nominal_viewer_z_m,
+			   (double)si->recommended_view_scale_x, (double)si->recommended_view_scale_y,
+			   eye_modes_label(si->supported_eye_tracking_modes, et, sizeof(et)),
+			   si->supported_eye_tracking_modes != 0 ? " (default " : "",
+			   si->supported_eye_tracking_modes != 0 ? eye_default_label(si->default_eye_tracking_mode)
+			                                         : "",
+			   si->supported_eye_tracking_modes != 0 ? ")" : "");
+		}
+	}
+
 	P(" :: GPU topology (#918 — does the weave cross adapters to reach the panel?)\n");
 	if (!r->gpu_probed) {
 		PT("%s\n", r->gpu_verdict[0] != '\0' ? r->gpu_verdict : "not evaluated");
@@ -1822,6 +2840,16 @@ cli_query_print_info_text(const struct cli_query_result *r)
 		PT("%s\n", r->gpu_verdict);
 		PT("DXR_WEAVE_ON_SCANOUT=%s (kill switch; the split is ON by default)\n",
 		   r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		PT("DXR_HUB=%s [%s] (kill switch; in-process D3D11 apps weave through the D3D11 hub by default, "
+		   "cross-adapter and on one adapter, where VK/D3D12/D3D11 read frames in place, ADR-059 Am. 4 -- "
+		   "each app's log 'hub placement:' line says what it did)\n",
+		   r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>",
+		   r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
+		PT("DXR_SPLIT_D3D12_HYBRID_REROUTE=%s [%s] (kill switch; in-process D3D12 apps on a cross-adapter box "
+		   "weave through the D3D11 hub by default, #2375 -- each app's log 'hub placement:' line says what it "
+		   "did)\n",
+		   r->gpu_d3d12_reroute_env_set ? r->gpu_d3d12_reroute_env : "<unset>",
+		   r->gpu_d3d12_reroute_source[0] ? r->gpu_d3d12_reroute_source : "default");
 		PT("%s\n", r->gpu_service_split);
 		PT("%s\n", r->gpu_service_ingest);
 	}
@@ -1835,12 +2863,32 @@ cli_query_print_info_text(const struct cli_query_result *r)
 			PT("library_path: %s%s\n", r->vk_layer_library, r->vk_layer_library_ok ? "" : "  (UNUSABLE)");
 		}
 	}
+	// #886: the implicit twin for vulkan_enable1 apps (desktop Linux).
+	if (r->vk_ilayer_probed) {
+		PT("%s\n", r->vk_ilayer_note[0] != '\0' ? r->vk_ilayer_note : "implicit: not evaluated");
+		if (r->vk_ilayer_manifest[0] != '\0') {
+			PT("implicit:     %s%s\n", r->vk_ilayer_manifest, r->vk_ilayer_gated ? "" : "  (UNGATED)");
+		}
+	}
 
 	P(" :: Input providers (ADR-034)\n");
 	PT("registered:   %d%s\n", r->input_provider_count,
 	   r->input_force_qwerty ? "  (ForceQwerty override SET)" : "");
+	PT("emulated:     %s (%s)%s\n", r->input_emulated_controllers != 0 ? "on" : "off", r->input_emulated_source,
+	   r->input_emulated_controllers != 0 ? "" : "  — no qwerty pair; hand roles unassigned without a provider");
+	if (r->input_provider_count > 0) {
+		PT("enabled:      %d  (scan: %d declined, %d failed to load, %d refused by the provenance gate)\n",
+		   r->input_enabled_count, r->input_scan_declined, r->input_scan_failed, r->input_scan_untrusted);
+	}
 	if (r->input_evaluated) {
 		PT("active:       %s\n", r->input_provider_active ? r->input_provider_id : "<none claimed>");
+		if (r->input_ranked_count > 0) {
+			PT("ranked:      ");
+			for (int i = 0; i < r->input_ranked_count; i++) {
+				printf(" %s", r->input_ranked[i]);
+			}
+			printf("  (registration ids, priority order)\n");
+		}
 		PT("hardware:     %s\n", r->input_provider_present ? "present (provider holds the hand roles)"
 		                                                   : "absent (qwerty holds the hand roles)");
 		PT("left:         %s\n", r->input_left_ok ? r->input_left_str : "<missing>");
@@ -1855,12 +2903,19 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	} else {
 		PT("%s\n", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
 	}
+	if (r->input_ultraleap_layer_warn) {
+		P("WARN: ULTRALEAP_OPENXR_LAYER — %s\n", r->input_ultraleap_layer_note);
+	}
 
 	P(" :: Rig (navigation) role (ADR-034 Amendment 4)\n");
 	if (r->rig_evaluated) {
 		PT("device:       %s\n", r->rig_nav_str);
 		PT("role:         %s\n", r->rig_role_ok ? "held (xrt_system_roles::rig)" : "NOT HELD");
-		PT("head travel:  %.4f m%s\n", (double)r->rig_travel_m, r->rig_moves_ok ? "" : "  (STALLED)");
+		PT("head travel:  %.4f m%s\n", (double)r->rig_travel_m,
+		   !r->rig_moves_ok ? "  (STALLED)"
+		   : r->rig_at_rest ? "  (at rest: no navigation input)"
+		                    : "");
+		PT("nav travel:   %.4f m\n", (double)r->rig_nav_travel_m);
 		PT("recenters:    %u%s\n", r->rig_recenter_seen,
 		   !r->rig_recenter_expected ? "  (none to assert)"
 		   : r->rig_recenter_ok      ? "  (returned to rig_initial)"
@@ -1884,12 +2939,71 @@ cli_query_print_info_text(const struct cli_query_result *r)
 	} else {
 		PT("%s\n", r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
 	}
+
+	P(" :: 2D->3D conversion module (XR_DXR_lift / ADR-042; live caps from the service, else the static dp-lift row)\n");
+	PT("%s\n", r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+	P(" :: Conversion providers (ADR-053; headless describe, no model load)\n");
+	PT("%s\n", r->conv_note[0] != '\0' ? r->conv_note : "not evaluated");
+	for (uint32_t i = 0; i < r->conv_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
+		const struct xrt_status_conv_provider *cp = &r->conv_providers[i];
+		PT("  %-16s %-14s order %3u  caps %u%s%s\n", cp->id, cp->load, cp->probe_order, cp->cap_count,
+		   cp->enabled ? "" : "  (disabled)", cp->hidden ? "  (hidden)" : "");
+	}
+}
+
+static void
+add_conversion_providers_json(cJSON *root, const struct cli_query_result *r);
+
+/*!
+ * N7: the EmulatedControllers gate and the device list, as data, on the
+ * `input_providers` object of both `info --json` and `selftest --json`.
+ */
+static void
+add_input_emulated_json(cJSON *ip, const struct cli_query_result *r)
+{
+	cJSON *em = cJSON_AddObjectToObject(ip, "emulated_controllers");
+	cJSON_AddNumberToObject(em, "value", (double)r->input_emulated_controllers);
+	cJSON_AddStringToObject(em, "source", r->input_emulated_source);
+	cJSON *devs = cJSON_AddArrayToObject(ip, "devices");
+	for (int i = 0; i < r->input_device_count; i++) {
+		cJSON *d = cJSON_CreateObject();
+		cJSON_AddStringToObject(d, "str", r->input_device_str[i]);
+		cJSON_AddNumberToObject(d, "type", (double)r->input_device_type[i]);
+		cJSON_AddItemToArray(devs, d);
+	}
+}
+
+/*!
+ * ADR-054 N6 Part 2: the `tracking_providers` object of both `info --json`
+ * and `selftest --json` — what is registered and resident, and the primary
+ * screen's viewer source as the trunk arbitrates it. Data, never a verdict.
+ */
+static void
+add_tracking_providers_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *tp = cJSON_AddObjectToObject(root, "tracking_providers");
+	cJSON_AddNumberToObject(tp, "registered", (double)r->tracking_registered);
+	cJSON_AddNumberToObject(tp, "enabled", (double)r->tracking_enabled);
+	cJSON_AddNumberToObject(tp, "scan_declined", (double)r->tracking_scan_declined);
+	cJSON_AddNumberToObject(tp, "scan_failed", (double)r->tracking_scan_failed);
+	cJSON_AddNumberToObject(tp, "scan_untrusted", (double)r->tracking_scan_untrusted);
+	cJSON *rk = cJSON_AddArrayToObject(tp, "ranked");
+	for (int i = 0; i < r->tracking_ranked_count; i++) {
+		cJSON_AddItemToArray(rk, cJSON_CreateString(r->tracking_ranked[i]));
+	}
+	cJSON_AddStringToObject(tp, "active_id", r->tracking_ranked_count > 0 ? r->tracking_ranked[0] : "");
+	cJSON_AddBoolToObject(tp, "evaluated", r->tracking_evaluated);
+	cJSON_AddStringToObject(tp, "viewer_source", r->tracking_viewer_source);
+	cJSON_AddStringToObject(tp, "viewer_reason", r->tracking_viewer_reason);
+	cJSON_AddStringToObject(tp, "display_viewer_policy", r->tracking_viewer_policy);
+	cJSON_AddNumberToObject(tp, "composed_eye_tracking_modes", (double)r->tracking_composed_modes);
 }
 
 cJSON *
 cli_query_info_to_cjson(const struct cli_query_result *r)
 {
 	cJSON *root = cJSON_CreateObject();
+	cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 
 	if (r->x11_scale_ok) {
 		cJSON *xs = cJSON_AddObjectToObject(root, "x11_coordinate_space");
@@ -1917,6 +3031,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 
 	cJSON *rt = cJSON_AddObjectToObject(root, "runtime");
 	cJSON_AddStringToObject(rt, "description", r->runtime_description);
+	cJSON_AddStringToObject(rt, "version", r->version);
 	cJSON_AddStringToObject(rt, "git_tag", r->git_tag);
 	cJSON_AddNumberToObject(rt, "plugin_abi_version", (double)r->plugin_abi_version);
 
@@ -1929,6 +3044,8 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddNullToObject(ar, "value");
 		}
 	}
+
+	add_plugin_states_json(root, r);
 
 	if (r->plugin_ok) {
 		cJSON *pl = cJSON_AddObjectToObject(root, "plugin");
@@ -1996,11 +3113,13 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		// True when the runtime publishes THIS rect's origin to apps in place
 		// of the (0, 0) the plug-in reported. `screen_pos` above stays the
 		// plug-in's raw answer.
-		cJSON_AddBoolToObject(dr, "origin_overrides_plugin",
-		                      r->desktop_info_ok && r->desktop_info_is_panel &&
-		                          r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH &&
-		                          (r->desktop_info.left != i->display_screen_left ||
-		                           r->desktop_info.top != i->display_screen_top));
+		cJSON_AddBoolToObject(
+		    dr, "origin_overrides_plugin",
+		    r->desktop_info_ok &&
+		        ((r->desktop_info_is_panel && r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH) ||
+		         r->desktop_match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM) &&
+		        (r->desktop_info.left != i->display_screen_left ||
+		         r->desktop_info.top != i->display_screen_top));
 		cJSON *et = cJSON_AddObjectToObject(d, "eye_tracking");
 		cJSON_AddNumberToObject(et, "supported_modes", (double)i->supported_eye_tracking_modes);
 		cJSON_AddNumberToObject(et, "default_mode", (double)i->default_eye_tracking_mode);
@@ -2042,6 +3161,45 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddNumberToObject(ds, "claim_count", (double)r->dp_sel_claim_count);
 	}
 
+	// Multi-screen M1 — the per-screen list (xrEnumerateDisplaysDXR).
+	{
+		cJSON *arr = cJSON_AddArrayToObject(root, "displays");
+		for (uint32_t i = 0; r->screens_probed && i < r->screens.count; i++) {
+			const struct xrt_screen *sc = &r->screens.screens[i];
+			const struct xrt_screen_info *si = &sc->info;
+			cJSON *d = cJSON_CreateObject();
+			char idbuf[32];
+			snprintf(idbuf, sizeof(idbuf), "0x%016llx", (unsigned long long)sc->id);
+			cJSON_AddStringToObject(d, "id", idbuf);
+			cJSON_AddStringToObject(d, "device_name", sc->device_name);
+			cJSON_AddStringToObject(d, "plugin_id", sc->plugin_id);
+			cJSON_AddBoolToObject(d, "system_default", (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0);
+			cJSON_AddBoolToObject(d, "primary", (sc->flags & XRT_SCREEN_FLAG_PRIMARY) != 0);
+			cJSON_AddBoolToObject(d, "tracked", (sc->flags & XRT_SCREEN_FLAG_TRACKED) != 0);
+			cJSON_AddNumberToObject(d, "desktop_left", (double)sc->desktop_left);
+			cJSON_AddNumberToObject(d, "desktop_top", (double)sc->desktop_top);
+			cJSON_AddNumberToObject(d, "desktop_width", (double)sc->desktop_width);
+			cJSON_AddNumberToObject(d, "desktop_height", (double)sc->desktop_height);
+			cJSON_AddNumberToObject(d, "native_width", (double)sc->native_width);
+			cJSON_AddNumberToObject(d, "native_height", (double)sc->native_height);
+			cJSON_AddNumberToObject(d, "desktop_scale", (double)sc->desktop_scale);
+			cJSON_AddStringToObject(d, "info_source", u_screen_info_source_str(si->source));
+			cJSON_AddNumberToObject(d, "width_m", (double)si->width_m);
+			cJSON_AddNumberToObject(d, "height_m", (double)si->height_m);
+			cJSON_AddNumberToObject(d, "pixel_width", (double)si->pixel_width);
+			cJSON_AddNumberToObject(d, "pixel_height", (double)si->pixel_height);
+			cJSON_AddNumberToObject(d, "nominal_viewer_x_m", (double)si->nominal_viewer_x_m);
+			cJSON_AddNumberToObject(d, "nominal_viewer_y_m", (double)si->nominal_viewer_y_m);
+			cJSON_AddNumberToObject(d, "nominal_viewer_z_m", (double)si->nominal_viewer_z_m);
+			cJSON_AddNumberToObject(d, "recommended_view_scale_x", (double)si->recommended_view_scale_x);
+			cJSON_AddNumberToObject(d, "recommended_view_scale_y", (double)si->recommended_view_scale_y);
+			cJSON_AddNumberToObject(d, "supported_eye_tracking_modes",
+			                        (double)si->supported_eye_tracking_modes);
+			cJSON_AddNumberToObject(d, "default_eye_tracking_mode", (double)si->default_eye_tracking_mode);
+			cJSON_AddItemToArray(arr, d);
+		}
+	}
+
 	// #1234 / #902 - VK late-weave repaint reachability (informational).
 	{
 		cJSON *vl = cJSON_AddObjectToObject(root, "vk_repaint_tier");
@@ -2053,6 +3211,14 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddStringToObject(vl, "manifest", r->vk_layer_manifest);
 		cJSON_AddStringToObject(vl, "library_path", r->vk_layer_library);
 		cJSON_AddStringToObject(vl, "note", r->vk_layer_note);
+		// #886: the implicit twin (desktop Linux only; probed=false elsewhere).
+		cJSON *il = cJSON_AddObjectToObject(vl, "implicit");
+		cJSON_AddBoolToObject(il, "probed", r->vk_ilayer_probed);
+		cJSON_AddBoolToObject(il, "gated", r->vk_ilayer_gated);
+		cJSON_AddBoolToObject(il, "library_ok", r->vk_ilayer_library_ok);
+		cJSON_AddStringToObject(il, "manifest", r->vk_ilayer_manifest);
+		cJSON_AddStringToObject(il, "library_path", r->vk_ilayer_library);
+		cJSON_AddStringToObject(il, "note", r->vk_ilayer_note);
 	}
 
 	// #918 GPU topology.
@@ -2064,6 +3230,12 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		cJSON_AddBoolToObject(gt, "applies", r->gpu_split_applies);
 		cJSON_AddStringToObject(gt, "weave_on_scanout_env",
 		                        r->gpu_weave_env_set ? r->gpu_weave_env : "<unset>");
+		cJSON_AddStringToObject(gt, "hub_env", r->gpu_hub_env_set ? r->gpu_hub_env : "<unset>");
+		cJSON_AddStringToObject(gt, "hub_source", r->gpu_hub_source[0] ? r->gpu_hub_source : "default");
+		cJSON_AddStringToObject(gt, "d3d12_hybrid_reroute_env",
+		                        r->gpu_d3d12_reroute_env_set ? r->gpu_d3d12_reroute_env : "<unset>");
+		cJSON_AddStringToObject(gt, "d3d12_hybrid_reroute_source",
+		                        r->gpu_d3d12_reroute_source[0] ? r->gpu_d3d12_reroute_source : "default");
 		cJSON_AddStringToObject(gt, "service_split", r->gpu_service_split);
 		cJSON_AddStringToObject(gt, "split_ingress", r->gpu_split_ingress);
 		cJSON_AddStringToObject(gt, "service_ingest", r->gpu_service_ingest);
@@ -2107,10 +3279,18 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 	{
 		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
 		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
+		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
+		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
+		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
+		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
 		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		add_input_emulated_json(ip, r);
 		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
 		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
 		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+		if (r->input_ultraleap_layer_warn) {
+			cJSON_AddStringToObject(ip, "ultraleap_openxr_layer_warning", r->input_ultraleap_layer_note);
+		}
 		if (r->input_evaluated) {
 			cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
 			cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
@@ -2126,6 +3306,9 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		}
 	}
 
+	// ADR-054 N6 Part 2: the viewer-tracking class (the Dashboard's Components page).
+	add_tracking_providers_json(root, r);
+
 	// ADR-034 Amendment 4 / #1380 rig (navigation) role.
 	{
 		cJSON *rg = cJSON_AddObjectToObject(root, "rig_role");
@@ -2136,12 +3319,46 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 			cJSON_AddBoolToObject(rg, "role_ok", r->rig_role_ok);
 			cJSON_AddBoolToObject(rg, "moves_ok", r->rig_moves_ok);
 			cJSON_AddNumberToObject(rg, "head_travel_m", (double)r->rig_travel_m);
+			cJSON_AddNumberToObject(rg, "nav_travel_m", (double)r->rig_nav_travel_m);
+			cJSON_AddBoolToObject(rg, "at_rest", r->rig_at_rest);
 			cJSON_AddNumberToObject(rg, "recenters", (double)r->rig_recenter_seen);
 			cJSON_AddBoolToObject(rg, "recenter_expected", r->rig_recenter_expected);
 			cJSON_AddBoolToObject(rg, "recenter_ok", r->rig_recenter_ok);
 			cJSON_AddNumberToObject(rg, "repeat_max", (double)r->rig_repeat_max);
 		}
 	}
+
+	// ADR-042 lift-caps probe.
+	{
+		cJSON *lc = cJSON_AddObjectToObject(root, "lift_caps");
+		cJSON_AddBoolToObject(lc, "probed", r->lift_caps_probed);
+		cJSON_AddBoolToObject(lc, "malformed", r->lift_caps_malformed);
+		cJSON_AddStringToObject(lc, "note", r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+		if (r->lift_caps_probed) {
+			cJSON_AddNumberToObject(lc, "modes", (double)r->lift_caps.modes);
+			cJSON_AddNumberToObject(lc, "state", (double)r->lift_caps.state);
+			cJSON_AddNumberToObject(lc, "max_streams", (double)r->lift_caps.max_streams);
+			cJSON_AddNumberToObject(lc, "max_views", (double)r->lift_caps.max_views);
+			cJSON_AddStringToObject(lc, "backend", r->lift_caps.backend);
+			// XRT_DP_LIFT_HAS_MODULE_INFO: only when the plug-in reports it, so an
+			// older plug-in's JSON is byte-for-byte what it was (absent = unknown).
+			const char *ms = xrt_dp_lift_module_status_str(r->lift_caps.module_status);
+			if (ms != NULL) {
+				char ver[sizeof(r->lift_caps.module_version)];
+				char det[sizeof(r->lift_caps.module_detail)];
+				snprintf(ver, sizeof(ver), "%s", r->lift_caps.module_version);
+				snprintf(det, sizeof(det), "%s", r->lift_caps.module_detail);
+				dxr_utf8_trim_partial(ver);
+				dxr_utf8_trim_partial(det);
+				cJSON_AddStringToObject(lc, "module_status", ms);
+				cJSON_AddStringToObject(lc, "module_version", ver);
+				cJSON_AddStringToObject(lc, "module_detail", det);
+			}
+		}
+	}
+
+	// ADR-053 (#2006) conversion providers (same object as selftest --json).
+	add_conversion_providers_json(root, r);
 
 	// #224 / ADR-027 P4 zone-caps probe.
 	{
@@ -2169,7 +3386,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 
 	/*
 	 * #918 GPU topology. Printed in the human dump since Phase 0; serialized
-	 * here so the Control Panel (which only parses `--json`) can show the same
+	 * here so the Dashboard (which only parses `--json`) can show the same
 	 * answer instead of being blind to the one thing a hybrid box needs.
 	 *
 	 * The split is deliberate and load-bearing: everything at the top level is
@@ -2251,7 +3468,7 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 	/*
 	 * #1252 — the allow-listed performance settings, resolved through the same
 	 * chain the runtime uses (env > per-user file > machine default). This is
-	 * what the Control Panel's three controls read and write.
+	 * what the Dashboard's three controls read and write.
 	 *
 	 * Every row carries its `source`, and consumers must not drop it: a value
 	 * sourced from `env` is a property of THIS process and says nothing about
@@ -2285,6 +3502,28 @@ cli_query_info_to_cjson(const struct cli_query_result *r)
 		}
 	}
 
+#ifdef CLI_HAVE_WORKSPACE_CONFIG
+	/*
+	 * Display dashboard phase 8: the registered workspace controllers with
+	 * their launch settings — the same objects as `workspace list --json`,
+	 * headless (`connected` / `pid` null; `workspace list` asks the service).
+	 */
+	{
+		struct service_config wcfg;
+		service_config_load(&wcfg);
+		struct workspace_controller_entry wentries[WORKSPACE_REGISTRY_MAX_ENTRIES];
+		const int wn = service_workspace_registry_enumerate(wentries, WORKSPACE_REGISTRY_MAX_ENTRIES);
+		cJSON *wdoc = (cJSON *)service_workspace_controllers_to_cjson(&wcfg, wentries, wn, NULL);
+		cJSON *warr = wdoc != NULL ? cJSON_DetachItemFromObjectCaseSensitive(wdoc, "controllers") : NULL;
+		if (warr != NULL) {
+			cJSON_AddItemToObject(root, "workspace_controllers", warr);
+		} else {
+			cJSON_AddArrayToObject(root, "workspace_controllers");
+		}
+		cJSON_Delete(wdoc);
+	}
+#endif
+
 	return root;
 }
 
@@ -2295,6 +3534,7 @@ cli_query_print_info_json(const struct cli_query_result *r)
 	char *out = cJSON_Print(root);
 	if (out != NULL) {
 		printf("%s\n", out);
+		fflush(stdout); // #1892: the tail must be out before any teardown
 		cJSON_free(out);
 	}
 	cJSON_Delete(root);
@@ -2313,6 +3553,67 @@ struct check
 	bool ok;
 	char detail[256];
 };
+
+/*!
+ * ADR-053 (#2006): `conversion_providers` in `selftest --json` (CI gates on
+ * `count`) and `info --json`. Provider rows use the status snapshot's shape.
+ */
+static void
+add_conversion_providers_json(cJSON *root, const struct cli_query_result *r)
+{
+	cJSON *cp = cJSON_AddObjectToObject(root, "conversion_providers");
+	cJSON_AddBoolToObject(cp, "evaluated", r->conv_evaluated);
+	cJSON_AddNumberToObject(cp, "count", (double)r->conv_count);
+	cJSON_AddNumberToObject(cp, "registered", (double)r->conv_registered);
+	cJSON_AddNumberToObject(cp, "negotiated", (double)r->conv_negotiated);
+	cJSON_AddNumberToObject(cp, "malformed_rows", (double)r->conv_malformed_rows);
+	cJSON_AddNumberToObject(cp, "bad_descriptors", (double)r->conv_bad_descriptors);
+	cJSON_AddNumberToObject(cp, "task_rows", (double)r->conv_task_count);
+	cJSON_AddBoolToObject(cp, "dp_lift_declared", r->conv_dp_lift_declared);
+	// #2029: DXR_CONV=0 / DXR_LIFT=0 in this process ("" = none).
+	cJSON_AddStringToObject(cp, "kill_switch", r->conv_kill_switch);
+	cJSON_AddStringToObject(cp, "note", r->conv_note);
+	cJSON *arr = cJSON_AddArrayToObject(cp, "providers");
+	for (uint32_t i = 0; i < r->conv_count && i < XRT_STATUS_MAX_CONV_PROVIDERS; i++) {
+		cJSON_AddItemToArray(arr, u_status_conv_provider_to_cjson(&r->conv_providers[i]));
+	}
+}
+
+/*!
+ * Display dashboard phase 0 (ADR-051 `NO_PHYSICAL_SIZE`): count the screens
+ * claimed at VERIFIED confidence and those among them that resolved to 0 m.
+ * Returns the number missing metres; pure over @p r, so the check row, the
+ * WARN lines and the JSON `warnings[]` can never disagree.
+ */
+static uint32_t
+count_verified_without_metres(const struct cli_query_result *r, uint32_t *out_verified)
+{
+	uint32_t verified = 0;
+	uint32_t missing = 0;
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		const struct xrt_screen *sc = &r->screens.screens[i];
+		if (sc->confidence >= (uint32_t)XRT_DISPLAY_CLAIM_VERIFIED) {
+			verified++;
+		}
+		if (cli_screen_verified_without_metres(sc)) {
+			missing++;
+		}
+	}
+	if (out_verified != NULL) {
+		*out_verified = verified;
+	}
+	return missing;
+}
+
+//! The one-sentence `NO_PHYSICAL_SIZE` text for screen @p sc.
+static void
+no_physical_size_text(const struct xrt_screen *sc, char *out, size_t cap)
+{
+	snprintf(out, cap,
+	         "Screen 0x%016llx ('%s') is claimed VERIFIED by '%s' but has no physical size from the plug-in "
+	         "or EDID, so a window spanning it gets one view set for the whole window instead of one per screen.",
+	         (unsigned long long)sc->id, or_q(sc->device_name), or_q(sc->plugin_id));
+}
 
 /*!
  * Build the ordered list of checks the self-test reports. Returns the count
@@ -2346,8 +3647,13 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->name = "active_plugin";
 	c->ok = r->plugin_ok;
 	if (r->plugin_ok) {
-		snprintf(c->detail, sizeof(c->detail), "id='%s' name='%s' (ABI v%u)", or_q(r->plugin_id),
-		         or_q(r->plugin_name), (unsigned)r->plugin_abi_version);
+		int used = snprintf(c->detail, sizeof(c->detail), "id='%s' name='%s' (ABI v%u)", or_q(r->plugin_id),
+		                    or_q(r->plugin_name), (unsigned)r->plugin_abi_version);
+		// N3b: say when a disabled higher-ranked plug-in was passed over.
+		for (int i = 0; i < r->skipped_disabled_count && used > 0 && (size_t)used < sizeof(c->detail); i++) {
+			used += snprintf(c->detail + used, sizeof(c->detail) - (size_t)used, "%s%s",
+			                 i == 0 ? "; selected over disabled: " : ", ", r->skipped_disabled[i]);
+		}
 	} else {
 		snprintf(c->detail, sizeof(c->detail), "%s", "no active vendor plug-in");
 	}
@@ -2396,11 +3702,34 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	// #224 / ADR-027 P4 — zone-caps probe. ABSENCE NEVER FAILS: ok stays
 	// true for legacy plug-ins / no factory / non-Windows; only a
 	// present-but-malformed caps struct fails (BAD_ZONE_CAPS).
+	// ADR-043 — stereo camera slots. ABSENCE NEVER FAILS.
+	c = &out[n++];
+	c->name = "stereo_camera_caps";
+	c->ok = !r->stereo_camera_malformed;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->stereo_camera_note[0] != '\0' ? r->stereo_camera_note : "not evaluated");
+
 	c = &out[n++];
 	c->name = "zone_caps";
 	c->ok = !r->zone_caps_malformed;
 	snprintf(c->detail, sizeof(c->detail), "%s",
 	         r->zone_probe_note[0] != '\0' ? r->zone_probe_note : "not evaluated");
+
+	// ADR-042 — lift-caps probe (XR_DXR_lift). ABSENCE NEVER FAILS: modes 0
+	// passes; only a present-but-malformed caps struct fails (BAD_LIFT_CAPS).
+	c = &out[n++];
+	c->name = "lift_caps";
+	c->ok = !r->lift_caps_malformed;
+	snprintf(c->detail, sizeof(c->detail), "%s",
+	         r->lift_probe_note[0] != '\0' ? r->lift_probe_note : "not evaluated");
+
+	// ADR-053 (#2006) — conversion providers. ABSENCE NEVER FAILS: no provider
+	// registered, a declined probe or a loader reject pass; only a malformed
+	// descriptor fails (BAD_CONVERSION, exit 13).
+	c = &out[n++];
+	c->name = "conversion_providers";
+	c->ok = r->conv_bad_descriptors == 0;
+	snprintf(c->detail, sizeof(c->detail), "%s", r->conv_note[0] != '\0' ? r->conv_note : "not evaluated");
 
 	// ADR-034 / #823 — input-provider check. ABSENCE NEVER FAILS: ok
 	// stays true with no provider registered, ForceQwerty set, every
@@ -2453,6 +3782,28 @@ build_checks(const struct cli_query_result *r, struct check *out)
 	c->ok = !r->rig_evaluated || (r->rig_role_ok && r->rig_moves_ok && r->rig_recenter_ok);
 	snprintf(c->detail, sizeof(c->detail), "%s", r->rig_note[0] != '\0' ? r->rig_note : "not evaluated");
 
+	// Display dashboard phase 0 (ADR-051): every VERIFIED claim has metres.
+	// NON-FAILING: a 0 m screen is a warning (the per-segment view layout
+	// refuses it, so a straddling window gets one view set), never an exit
+	// code; the WARN lines and `warnings[]` carry the per-screen detail.
+	{
+		uint32_t verified = 0;
+		const uint32_t missing = count_verified_without_metres(r, &verified);
+		c = &out[n++];
+		c->name = "verified_metres";
+		c->ok = true;
+		if (!r->screens_probed) {
+			snprintf(c->detail, sizeof(c->detail), "%s", "not evaluated");
+		} else if (missing > 0) {
+			snprintf(c->detail, sizeof(c->detail),
+			         "WARNING: %u of %u VERIFIED screen(s) have no physical size (NO_PHYSICAL_SIZE)",
+			         missing, verified);
+		} else {
+			snprintf(c->detail, sizeof(c->detail), "%u VERIFIED screen(s), all with physical metres",
+			         verified);
+		}
+	}
+
 	// X11 window-placement quantum. INFORMATIONAL — always ok: a scaled
 	// output is a user display setting, not a broken install, and failing
 	// selftest on it would make CI and every HiDPI laptop red. The detail
@@ -2480,6 +3831,23 @@ cli_query_print_selftest_text(const struct cli_query_result *r)
 		P("%s: %s — %s\n", checks[i].ok ? "PASS" : "FAIL", checks[i].name, checks[i].detail);
 	}
 
+	// ADR-051 NO_PHYSICAL_SIZE: warnings only, never the exit code.
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (cli_screen_verified_without_metres(&r->screens.screens[i])) {
+			char text[320];
+			no_physical_size_text(&r->screens.screens[i], text, sizeof(text));
+			P("WARN: NO_PHYSICAL_SIZE — %s\n", text);
+		}
+	}
+
+	// Advisory, never the exit code: the layer is a third party's, and the fix is the user's.
+	if (r->input_ultraleap_layer_warn) {
+		P("WARN: ULTRALEAP_OPENXR_LAYER — %s\n", r->input_ultraleap_layer_note);
+	}
+
+	// ADR-045: informational — never changes the verdict or the exit code.
+	print_plugin_states_text(r);
+
 	if (r->result_code == CLI_SELFTEST_PASS) {
 		P(" :: SELF-TEST PASSED\n");
 	} else {
@@ -2503,7 +3871,73 @@ cli_query_selftest_to_cjson(const struct cli_query_result *r)
 		cJSON_AddItemToArray(arr, c);
 	}
 
+	// ADR-051 warnings as data: {code, level, text}; never changes the verdict.
+	cJSON *warnings = cJSON_AddArrayToObject(root, "warnings");
+	for (uint32_t i = 0; r->screens_probed && i < r->screens.count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (cli_screen_verified_without_metres(&r->screens.screens[i])) {
+			char text[320];
+			no_physical_size_text(&r->screens.screens[i], text, sizeof(text));
+			cJSON *w = cJSON_CreateObject();
+			cJSON_AddStringToObject(w, "code", "NO_PHYSICAL_SIZE");
+			cJSON_AddStringToObject(w, "level", "warn");
+			cJSON_AddStringToObject(w, "text", text);
+			cJSON_AddItemToArray(warnings, w);
+		}
+	}
+	if (r->input_ultraleap_layer_warn) {
+		cJSON *w = cJSON_CreateObject();
+		cJSON_AddStringToObject(w, "code", "ULTRALEAP_OPENXR_LAYER");
+		cJSON_AddStringToObject(w, "level", "warn");
+		cJSON_AddStringToObject(w, "text", r->input_ultraleap_layer_note);
+		cJSON_AddItemToArray(warnings, w);
+	}
+
 	cJSON_AddStringToObject(root, "dpi_awareness", r->dpi_awareness);
+	add_plugin_states_json(root, r);
+	// N3b: the display-processor selection as data — which plug-in is
+	// active and which better-ranked ones discovery skipped because they are
+	// DISABLED (user / machine Enabled=0, manifest "enabled": false, or a
+	// disabled PreferredPlugin). Why THIS one is active; never a failure.
+	{
+		cJSON *dp = cJSON_AddObjectToObject(root, "display_processor");
+		cJSON_AddBoolToObject(dp, "active", r->plugin_ok);
+		// The REGISTRATION id of the winning row (what `Enabled` /
+		// `PreferredPlugin` name); `plugin.id` elsewhere is iface->id.
+		cJSON_AddStringToObject(dp, "active_id", r->plugin_ok ? r->active_row_id : "");
+		cJSON *sk = cJSON_AddArrayToObject(dp, "skipped_disabled");
+		for (int i = 0; i < r->skipped_disabled_count; i++) {
+			cJSON_AddItemToArray(sk, cJSON_CreateString(r->skipped_disabled[i]));
+		}
+	}
+	add_conversion_providers_json(root, r);
+	// ADR-054 N4: the input-provider loader's view, as data — what was
+	// registered, what was enabled, who claimed, and how many could not be
+	// dispatched — so the per-class conformance gate reads a field, not a
+	// detail string. Same shape as `info --json`'s object, minus the roles.
+	{
+		cJSON *ip = cJSON_AddObjectToObject(root, "input_providers");
+		cJSON_AddNumberToObject(ip, "registered", (double)r->input_provider_count);
+		cJSON_AddNumberToObject(ip, "enabled", (double)r->input_enabled_count);
+		cJSON_AddNumberToObject(ip, "scan_declined", (double)r->input_scan_declined);
+		cJSON_AddNumberToObject(ip, "scan_failed", (double)r->input_scan_failed);
+		cJSON_AddNumberToObject(ip, "scan_untrusted", (double)r->input_scan_untrusted);
+		cJSON_AddBoolToObject(ip, "force_qwerty", r->input_force_qwerty);
+		add_input_emulated_json(ip, r); // N7: {value, source} + the device list
+		cJSON_AddBoolToObject(ip, "active", r->input_provider_active);
+		cJSON_AddStringToObject(ip, "active_id", r->input_provider_id);
+		// N3b: registration ids of the resident rows, priority order —
+		// index 0 is the PreferredPlugin row when one is set and claimed.
+		cJSON *rk = cJSON_AddArrayToObject(ip, "ranked");
+		for (int i = 0; i < r->input_ranked_count; i++) {
+			cJSON_AddItemToArray(rk, cJSON_CreateString(r->input_ranked[i]));
+		}
+		cJSON_AddBoolToObject(ip, "hardware_present", r->input_provider_present);
+		cJSON_AddBoolToObject(ip, "evaluated", r->input_evaluated);
+		cJSON_AddStringToObject(ip, "note", r->input_note[0] != '\0' ? r->input_note : "not evaluated");
+	}
+	// ADR-054 N6 Part 2: the viewer-tracking class, as data (the N4 conformance
+	// cells read these fields; a provider in standby is not a fault).
+	add_tracking_providers_json(root, r);
 	cJSON_AddStringToObject(root, "verdict", r->result_code == CLI_SELFTEST_PASS ? "PASS" : "FAIL");
 	cJSON_AddNumberToObject(root, "result_code", (double)r->result_code);
 

@@ -151,6 +151,10 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 		XrEventDataEyeTrackingStateChangedDXR *changed = (XrEventDataEyeTrackingStateChangedDXR *)type;
 		return changed->session == session;
 	}
+	case XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR: {
+		XrEventDataDisplaysChangedDXR *changed = (XrEventDataDisplaysChangedDXR *)type;
+		return changed->session == session;
+	}
 	case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR: {
 		XrEventDataDisplayModeRequestDeniedDXR *denied = (XrEventDataDisplayModeRequestDeniedDXR *)type;
 		return denied->session == session;
@@ -171,6 +175,34 @@ is_session_link_to_event(struct oxr_event *event, XrSession session)
 	case XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
 		XrEventDataMCPToolCallDXR *call = (XrEventDataMCPToolCallDXR *)type;
 		return call->session == session;
+	}
+#endif
+#ifdef OXR_HAVE_DXR_desktop_control
+	case XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR: {
+		XrEventDataDesktopControlStateChangedDXR *changed = (XrEventDataDesktopControlStateChangedDXR *)type;
+		return changed->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR: {
+		XrEventDataDesktopActionCompletedDXR *done = (XrEventDataDesktopActionCompletedDXR *)type;
+		return done->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR: {
+		XrEventDataDesktopCaptureStateChangedDXR *changed = (XrEventDataDesktopCaptureStateChangedDXR *)type;
+		return changed->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR: {
+		XrEventDataDesktopCaptureCompletedDXR *done = (XrEventDataDesktopCaptureCompletedDXR *)type;
+		return done->session == session;
+	}
+#endif
+#ifdef OXR_HAVE_DXR_lift
+	case XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR: {
+		XrEventDataLiftTaskStateChangedDXR *changed = (XrEventDataLiftTaskStateChangedDXR *)type;
+		return changed->session == session;
+	}
+	case XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR: {
+		XrEventDataLiftProvidersChangedDXR *changed = (XrEventDataLiftProvidersChangedDXR *)type;
+		return changed->session == session;
 	}
 #endif
 #ifdef OXR_HAVE_DXR_android_surface_binding
@@ -463,6 +495,31 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
 
 	// One-off lifecycle edge, not per-frame — WARN is the visible tier (#441).
 	U_LOG_W("OXR EVENT: Eye tracking state changed: isTracking=%d mode=%d", isTracking, (int)activeMode);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_session *sess, uint32_t displayCount)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDisplaysChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_DISPLAYS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->displayCount = displayCount;
+	event->result = XR_SUCCESS;
+
+	// One-off topology change (a display plugged or unplugged), not per frame.
+	U_LOG_W("OXR EVENT: Displays changed: %u display(s)", displayCount);
 
 	lock(inst);
 	push(inst, event);
@@ -836,6 +893,285 @@ oxr_event_push_XrEventDataMCPToolCall(struct oxr_logger *log,
 }
 #endif // OXR_HAVE_DXR_mcp_tools
 
+#ifdef OXR_HAVE_DXR_desktop_control
+XrResult
+oxr_event_push_XrEventDataDesktopControlStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopControlStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->state = state;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
+                                                 struct oxr_session *sess,
+                                                 uint64_t actionId,
+                                                 XrResult result,
+                                                 const char *message)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopActionCompletedDXR *done;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &done);
+
+	done->type = XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR;
+	done->next = NULL;
+	done->session = oxr_session_to_openxr(sess);
+	done->actionId = actionId;
+	done->result = result;
+	// message[] was already zero-initialised by ALLOC.
+	if (message != NULL) {
+		size_t len = strnlen(message, XR_MAX_DESKTOP_MESSAGE_SIZE_DXR - 1);
+		memcpy(done->message, message, len);
+		done->message[len] = '\0';
+	}
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopCaptureStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->state = state;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureCompleted(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  uint64_t captureId,
+                                                  XrResult result,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  XrRect2Di sourceRect,
+                                                  XrTime frameTime,
+                                                  const char *message)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataDesktopCaptureCompletedDXR *done;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &done);
+
+	done->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR;
+	done->next = NULL;
+	done->session = oxr_session_to_openxr(sess);
+	done->captureId = captureId;
+	done->result = result;
+	done->width = width;
+	done->height = height;
+	done->sourceRect = sourceRect;
+	done->frameTime = frameTime;
+	// message[] was already zero-initialised by ALLOC.
+	if (message != NULL) {
+		size_t len = strnlen(message, XR_MAX_DESKTOP_MESSAGE_SIZE_DXR - 1);
+		memcpy(done->message, message, len);
+		done->message[len] = '\0';
+	}
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_desktop_control
+
+#ifdef OXR_HAVE_DXR_input_providers
+XrResult
+oxr_event_push_XrEventDataInputProvidersChanged(struct oxr_logger *log,
+                                                struct oxr_instance *inst,
+                                                XrInputRoleFamilyFlagsDXR changed_families)
+{
+	XrEventDataInputProvidersChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_INPUT_PROVIDERS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->changedFamilies = changed_families;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_input_providers
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+XrResult
+oxr_event_push_XrEventDataStereoCameraStateChanged(struct oxr_logger *log,
+                                                   struct oxr_instance *inst,
+                                                   uint64_t cameraId,
+                                                   XrStereoCameraStateDXR state)
+{
+	XrEventDataStereoCameraStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->cameraId = cameraId;
+	changed->state = state;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: Stereo camera %llu state -> %d", (unsigned long long)cameraId, (int)state);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  XrStereoCameraStreamEndReasonDXR reason)
+{
+	XrEventDataStereoCameraStreamEndedDXR *ended;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &ended);
+
+	ended->type = XR_TYPE_EVENT_DATA_STEREO_CAMERA_STREAM_ENDED_DXR;
+	ended->next = NULL;
+	ended->stream = stream;
+	ended->reason = reason;
+	event->result = XR_SUCCESS;
+
+	U_LOG_W("OXR EVENT: Stereo camera stream ended by the service (reason %d)", (int)reason);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst)
+{
+	XrEventDataStereoCamerasChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_STEREO_CAMERAS_CHANGED_DXR;
+	changed->next = NULL;
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_stereo_camera
+
+#ifdef OXR_HAVE_DXR_lift
+XrResult
+oxr_event_push_XrEventDataLiftTaskStateChangedDXR(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrLiftTaskDXR task,
+                                                  XrLiftTaskStateDXR state,
+                                                  XrLiftTaskStateDXR previousState,
+                                                  XrLiftFailureReasonDXR failureReason,
+                                                  float progress)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataLiftTaskStateChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_LIFT_TASK_STATE_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	changed->task = task;
+	changed->state = state;
+	changed->previousState = previousState;
+	changed->failureReason = failureReason;
+	changed->progress = progress;
+	event->result = XR_SUCCESS;
+
+	U_LOG_I("OXR EVENT: Lift task %d state %d -> %d (reason %d, progress %.2f)", (int)task, (int)previousState,
+	        (int)state, (int)failureReason, (double)progress);
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+
+XrResult
+oxr_event_push_XrEventDataLiftProvidersChangedDXR(struct oxr_logger *log, struct oxr_session *sess)
+{
+	struct oxr_instance *inst = sess->sys->inst;
+	XrEventDataLiftProvidersChangedDXR *changed;
+	struct oxr_event *event = NULL;
+
+	ALLOC(log, inst, &event, &changed);
+
+	changed->type = XR_TYPE_EVENT_DATA_LIFT_PROVIDERS_CHANGED_DXR;
+	changed->next = NULL;
+	changed->session = oxr_session_to_openxr(sess);
+	event->result = XR_SUCCESS;
+
+	lock(inst);
+	push(inst, event);
+	unlock(inst);
+
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_lift
+
 XrResult
 oxr_event_remove_session_events(struct oxr_logger *log, struct oxr_session *sess)
 {
@@ -900,6 +1236,25 @@ oxr_poll_event(struct oxr_logger *log, struct oxr_instance *inst, XrEventDataBuf
 		}
 	}
 	os_mutex_unlock(&inst->sessions_mutex);
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+	// ADR-043 R3: instance-level camera events (no session needed) ride the
+	// same queue; the service queued them per connection.
+	if (inst->extensions.DXR_stereo_camera) {
+		ret = oxr_stereo_camera_poll_events(log, inst);
+		if (ret != XR_SUCCESS) {
+			return ret;
+		}
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_lift
+	// Spec 4 (#2054): task / provider events of the sessions that opted in.
+	ret = oxr_conv_poll_events(log, inst);
+	if (ret != XR_SUCCESS) {
+		return ret;
+	}
+#endif
 
 	lock(inst);
 	struct oxr_event *event = pop(inst);

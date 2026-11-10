@@ -8,11 +8,14 @@
  * OpenXR. Handle class: the app creates and owns its toplevel window and hands
  * it to the runtime — the Phase 3 validation vehicle for app-provided windows
  * on desktop Linux (docs/roadmap/linux-support.md, #660). Adapted from
- * cube_hosted_legacy_vk_linux; the render path (fixed 2-view SBS, no mode
- * adaptation) is unchanged — the delta is the window + binding.
- * XR_DXR_display_info is enabled (when present) solely for the INV-1.3 panel
+ * cube_hosted_legacy_vk_linux; the delta is the window + binding.
+ * XR_DXR_display_info is enabled (when present) for the INV-1.3 panel
  * desktop-position query (#715), which also moves view sizing off the
- * legacy-compromise path.
+ * legacy-compromise path, and for the display rendering-mode keys every
+ * DisplayXR app has: V cycles to the next mode, 0-8 select mode N (0 = 2D),
+ * via xrRequestDisplayRenderingModeDXR. The app is stereo (at most 2 views
+ * rendered); tile size and grid follow the ACTIVE mode, so 2D renders one
+ * full-window view and the second located view aliases it (ADR-041).
  *
  * ONE BINARY, TWO WINDOW BACKENDS, chosen at runtime (`--platform=` /
  * DXR_WINDOW_BACKEND, default auto — a capability probe, never session env):
@@ -40,13 +43,22 @@
 #include "dxr_linux_window.h"
 #include "dxr_weave_snap.h"
 
+// XK_* keysyms: DxrWindowEvent carries the X11 keysym on both backends.
+#include <X11/keysym.h>
+
 #include <vulkan/vulkan.h>
+#include <vk_frame_ring.h>
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
+
+// dxr::CursorDepth - XR_DXR_cursor_depth bookkeeping (ADR-046). Scripted only
+// here (DISPLAYXR_CURSOR_DEPTH_UV), see InitializeOpenXR and the main loop.
+#include "cursor_depth.h"
 
 // displayxr-common: remap GL-convention clip-depth ([-1,1]) to Vulkan's [0,1].
 // mat4_from_xr_fov (== the Windows ProjectionFromXrFov) emits GL depth; without
@@ -58,6 +70,7 @@
 // xrLocateViews returned, so the views this fixed-SBS app does not render
 // alias view 0's subimage.
 #include "dxr_view_config.h"
+#include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
 
 #include <cmath>
 #include <csignal>
@@ -65,6 +78,7 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -80,6 +94,8 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 
+#include "color_policy.h"
+
 // ============================================================================
 // Logging
 // ============================================================================
@@ -87,6 +103,9 @@
 #define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+//! --lift / DISPLAYXR_LIFT_PROBE=1 (test_apps/common/lift_cpu_probe.h).
+static dxr_test::LiftCpuProbe g_liftProbe;
 
 #define XR_CHECK(call) \
     do { \
@@ -142,19 +161,47 @@ static uint64_t g_frameCounter = 0;
 //! plain bool*; copied back into g_running right after each pump.
 static bool g_windowRunning = true;
 
+// Rendering-mode key requests, set by OnWindowEvent and consumed by the frame
+// loop (the request is a session call, so it is issued from the loop, never
+// from inside the window pump). Same flags as displayxr-common's Windows
+// input_handler (cycleRenderingModeRequested / absoluteRenderingModeRequested).
+static bool g_cycleRenderingModeRequested = false;       // V
+static int32_t g_absoluteRenderingModeRequested = -1;    // 0-8; -1 = none
+
 /*!
- * Key handler. X11 keeps its historical behaviour to the letter — this app has
- * never bound a key there, and the window manager's close button plus SIGINT
- * are the exits. On Wayland a fullscreen surface has no close affordance at
- * all, so ESC / Q are wired up as the only way out short of a signal.
+ * Key handler, fed by pump_events() so it sees keysyms: DxrKey has no 0 or 4-8.
+ *
+ * Both backends: V cycles to the next display rendering mode, 0-8 select mode
+ * N (0 = 2D) when N is below the runtime's mode count (checked in the frame
+ * loop). Auto-repeat presses are ignored, so holding V does not spin modes.
+ *
+ * Wayland only: ESC / Q exit — a fullscreen surface has no close affordance,
+ * so they are the only way out short of a signal. X11 keeps its historical
+ * exits (the window manager's close button and SIGINT) and binds neither.
  */
-static void OnWindowKey(DxrKey key) {
-    if (g_window.backend() != DxrWindowBackend::Wayland) {
+static void OnWindowEvent(const DxrWindowEvent& ev) {
+    if (ev.type != DxrWindowEvent::Type::KeyDown || ev.repeat) {
         return;
     }
-    if (key == DxrKey::Escape || key == DxrKey::Q) {
-        LOG_INFO("Exit key — exiting");
-        g_windowRunning = false;
+    switch (ev.keysym) {
+    case XK_v:
+    case XK_V:
+        g_cycleRenderingModeRequested = true;
+        return;
+    case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
+    case XK_5: case XK_6: case XK_7: case XK_8:
+        g_absoluteRenderingModeRequested = (int32_t)(ev.keysym - XK_0);
+        return;
+    case XK_Escape:
+    case XK_q:
+    case XK_Q:
+        if (g_window.backend() == DxrWindowBackend::Wayland) {
+            LOG_INFO("Exit key — exiting");
+            g_windowRunning = false;
+        }
+        return;
+    default:
+        return;
     }
 }
 
@@ -403,16 +450,52 @@ static const uint32_t g_cubeVertSpv[] = {
     0x00000040,0x000100fd,0x00010038,
 };
 
-// Textured cube fragment shader: samples basecolor, normal, AO textures with directional lighting
-//   binding 0: basecolor sampler, binding 1: normal sampler, binding 2: AO sampler
-//   in: fragUV(0), fragWorldNormal(1), fragWorldTangent(2)
-//   Constructs TBN matrix, applies normal mapping, directional light with AO
+// Textured cube fragment shader.
+//
+// ADR-021 / INV-4.6: the `uLinearize` specialization constant (SpecId 0) adds
+// the standard sRGB EOTF to the emitted colour. The cube's basecolor/AO
+// textures are DISPLAY-REFERRED (VK_FORMAT_R8G8B8A8_UNORM, authored for a UNORM
+// pass-through swapchain). When the colour swapchain is `_SRGB` the attachment
+// encodes on write, so emitting those numbers raw would encode them twice
+// (washed out). Decoding here makes the round-trip an identity. Specialized at
+// pipeline-creation time from dxr::RenderSceneLinear(); see color_policy.h.
+//
+// GLSL source (regenerate via `glslangValidator -V cube.frag -o cube_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
+//   layout(set = 0, binding = 0) uniform sampler2D basecolorTex;
+//   layout(set = 0, binding = 1) uniform sampler2D normalTex;
+//   layout(set = 0, binding = 2) uniform sampler2D aoTex;
+//   layout(location = 0) in vec2 fragUV;
+//   layout(location = 1) in vec3 fragWorldNormal;
+//   layout(location = 2) in vec3 fragWorldTangent;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       vec3 basecolor = texture(basecolorTex, fragUV).xyz;
+//       vec3 normalMap = texture(normalTex, fragUV).xyz;
+//       float ao = texture(aoTex, fragUV).x;
+//       vec3 N = normalize(fragWorldNormal);
+//       vec3 T = normalize(fragWorldTangent);
+//       T = normalize(T - N * dot(T, N));
+//       vec3 B = cross(N, T);
+//       mat3 TBN = mat3(T, B, N);
+//       vec3 mappedNormal = normalize(TBN * (normalMap * 2.0 - 1.0));
+//       vec3 lightDir = normalize(vec3(0.3, 0.8, 0.5));
+//       float diffuse = max(dot(mappedNormal, lightDir), 0.0) * 0.7 + 0.3;
+//       vec3 col = basecolor * ao * diffuse;
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       outColor = vec4(col, 1.0);
+//   }
 static const uint32_t g_cubeFragSpv[] = {
-    0x07230203,0x00010000,0x0008000b,0x00000071,0x00000000,0x00020011,
+    0x07230203,0x00010000,0x0008000b,0x0000008b,0x00000000,0x00020011,
     0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
     0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,
     0x00000004,0x6e69616d,0x00000000,0x00000011,0x00000027,0x0000002b,
-    0x00000067,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
+    0x00000085,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
     0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
     0x00000009,0x65736162,0x6f6c6f63,0x00000072,0x00060005,0x0000000d,
     0x65736162,0x6f6c6f63,0x78655472,0x00000000,0x00040005,0x00000011,
@@ -425,14 +508,16 @@ static const uint32_t g_cubeFragSpv[] = {
     0x746e6567,0x00000000,0x00030005,0x00000036,0x00000042,0x00030005,
     0x0000003c,0x004e4254,0x00060005,0x0000004f,0x7070616d,0x6f4e6465,
     0x6c616d72,0x00000000,0x00050005,0x00000058,0x6867696c,0x72694474,
-    0x00000000,0x00040005,0x0000005d,0x66666964,0x00657375,0x00050005,
-    0x00000067,0x4374756f,0x726f6c6f,0x00000000,0x00040047,0x0000000d,
-    0x00000021,0x00000000,0x00040047,0x0000000d,0x00000022,0x00000000,
-    0x00040047,0x00000011,0x0000001e,0x00000000,0x00040047,0x00000017,
-    0x00000021,0x00000001,0x00040047,0x00000017,0x00000022,0x00000000,
-    0x00040047,0x0000001e,0x00000021,0x00000002,0x00040047,0x0000001e,
-    0x00000022,0x00000000,0x00040047,0x00000027,0x0000001e,0x00000001,
-    0x00040047,0x0000002b,0x0000001e,0x00000002,0x00040047,0x00000067,
+    0x00000000,0x00040005,0x0000005d,0x66666964,0x00657375,0x00030005,
+    0x00000066,0x006c6f63,0x00050005,0x0000006d,0x6e694c75,0x69726165,
+    0x0000657a,0x00050005,0x00000085,0x4374756f,0x726f6c6f,0x00000000,
+    0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x0000000d,
+    0x00000022,0x00000000,0x00040047,0x00000011,0x0000001e,0x00000000,
+    0x00040047,0x00000017,0x00000021,0x00000001,0x00040047,0x00000017,
+    0x00000022,0x00000000,0x00040047,0x0000001e,0x00000021,0x00000002,
+    0x00040047,0x0000001e,0x00000022,0x00000000,0x00040047,0x00000027,
+    0x0000001e,0x00000001,0x00040047,0x0000002b,0x0000001e,0x00000002,
+    0x00040047,0x0000006d,0x00000001,0x00000000,0x00040047,0x00000085,
     0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
     0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
     0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,0x00000007,
@@ -455,76 +540,97 @@ static const uint32_t g_cubeFragSpv[] = {
     0x0004002b,0x00000006,0x0000005b,0x3f014cae,0x0006002c,0x00000007,
     0x0000005c,0x00000059,0x0000005a,0x0000005b,0x0004002b,0x00000006,
     0x00000062,0x3f333333,0x0004002b,0x00000006,0x00000064,0x3e99999a,
-    0x00040020,0x00000066,0x00000003,0x00000013,0x0004003b,0x00000066,
-    0x00000067,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
-    0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,
-    0x00000007,0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,
-    0x0000001c,0x0000001d,0x00000007,0x0004003b,0x00000008,0x00000025,
-    0x00000007,0x0004003b,0x00000008,0x0000002a,0x00000007,0x0004003b,
-    0x00000008,0x00000036,0x00000007,0x0004003b,0x0000003b,0x0000003c,
-    0x00000007,0x0004003b,0x00000008,0x0000004f,0x00000007,0x0004003b,
-    0x00000008,0x00000058,0x00000007,0x0004003b,0x0000001c,0x0000005d,
-    0x00000007,0x0004003d,0x0000000b,0x0000000e,0x0000000d,0x0004003d,
-    0x0000000f,0x00000012,0x00000011,0x00050057,0x00000013,0x00000014,
-    0x0000000e,0x00000012,0x0008004f,0x00000007,0x00000015,0x00000014,
-    0x00000014,0x00000000,0x00000001,0x00000002,0x0003003e,0x00000009,
-    0x00000015,0x0004003d,0x0000000b,0x00000018,0x00000017,0x0004003d,
-    0x0000000f,0x00000019,0x00000011,0x00050057,0x00000013,0x0000001a,
-    0x00000018,0x00000019,0x0008004f,0x00000007,0x0000001b,0x0000001a,
-    0x0000001a,0x00000000,0x00000001,0x00000002,0x0003003e,0x00000016,
-    0x0000001b,0x0004003d,0x0000000b,0x0000001f,0x0000001e,0x0004003d,
-    0x0000000f,0x00000020,0x00000011,0x00050057,0x00000013,0x00000021,
-    0x0000001f,0x00000020,0x00050051,0x00000006,0x00000024,0x00000021,
-    0x00000000,0x0003003e,0x0000001d,0x00000024,0x0004003d,0x00000007,
-    0x00000028,0x00000027,0x0006000c,0x00000007,0x00000029,0x00000001,
-    0x00000045,0x00000028,0x0003003e,0x00000025,0x00000029,0x0004003d,
-    0x00000007,0x0000002c,0x0000002b,0x0006000c,0x00000007,0x0000002d,
-    0x00000001,0x00000045,0x0000002c,0x0003003e,0x0000002a,0x0000002d,
-    0x0004003d,0x00000007,0x0000002e,0x0000002a,0x0004003d,0x00000007,
-    0x0000002f,0x0000002a,0x0004003d,0x00000007,0x00000030,0x00000025,
-    0x00050094,0x00000006,0x00000031,0x0000002f,0x00000030,0x0004003d,
-    0x00000007,0x00000032,0x00000025,0x0005008e,0x00000007,0x00000033,
-    0x00000032,0x00000031,0x00050083,0x00000007,0x00000034,0x0000002e,
-    0x00000033,0x0006000c,0x00000007,0x00000035,0x00000001,0x00000045,
-    0x00000034,0x0003003e,0x0000002a,0x00000035,0x0004003d,0x00000007,
-    0x00000037,0x00000025,0x0004003d,0x00000007,0x00000038,0x0000002a,
-    0x0007000c,0x00000007,0x00000039,0x00000001,0x00000044,0x00000037,
-    0x00000038,0x0003003e,0x00000036,0x00000039,0x0004003d,0x00000007,
-    0x0000003d,0x0000002a,0x0004003d,0x00000007,0x0000003e,0x00000036,
-    0x0004003d,0x00000007,0x0000003f,0x00000025,0x00050051,0x00000006,
-    0x00000042,0x0000003d,0x00000000,0x00050051,0x00000006,0x00000043,
-    0x0000003d,0x00000001,0x00050051,0x00000006,0x00000044,0x0000003d,
-    0x00000002,0x00050051,0x00000006,0x00000045,0x0000003e,0x00000000,
-    0x00050051,0x00000006,0x00000046,0x0000003e,0x00000001,0x00050051,
-    0x00000006,0x00000047,0x0000003e,0x00000002,0x00050051,0x00000006,
-    0x00000048,0x0000003f,0x00000000,0x00050051,0x00000006,0x00000049,
-    0x0000003f,0x00000001,0x00050051,0x00000006,0x0000004a,0x0000003f,
-    0x00000002,0x00060050,0x00000007,0x0000004b,0x00000042,0x00000043,
-    0x00000044,0x00060050,0x00000007,0x0000004c,0x00000045,0x00000046,
-    0x00000047,0x00060050,0x00000007,0x0000004d,0x00000048,0x00000049,
-    0x0000004a,0x00060050,0x0000003a,0x0000004e,0x0000004b,0x0000004c,
-    0x0000004d,0x0003003e,0x0000003c,0x0000004e,0x0004003d,0x0000003a,
-    0x00000050,0x0000003c,0x0004003d,0x00000007,0x00000051,0x00000016,
-    0x0005008e,0x00000007,0x00000053,0x00000051,0x00000052,0x00060050,
-    0x00000007,0x00000054,0x00000040,0x00000040,0x00000040,0x00050083,
-    0x00000007,0x00000055,0x00000053,0x00000054,0x00050091,0x00000007,
-    0x00000056,0x00000050,0x00000055,0x0006000c,0x00000007,0x00000057,
-    0x00000001,0x00000045,0x00000056,0x0003003e,0x0000004f,0x00000057,
-    0x0003003e,0x00000058,0x0000005c,0x0004003d,0x00000007,0x0000005e,
-    0x0000004f,0x0004003d,0x00000007,0x0000005f,0x00000058,0x00050094,
-    0x00000006,0x00000060,0x0000005e,0x0000005f,0x0007000c,0x00000006,
-    0x00000061,0x00000001,0x00000028,0x00000060,0x00000041,0x00050085,
-    0x00000006,0x00000063,0x00000061,0x00000062,0x00050081,0x00000006,
-    0x00000065,0x00000063,0x00000064,0x0003003e,0x0000005d,0x00000065,
-    0x0004003d,0x00000007,0x00000068,0x00000009,0x0004003d,0x00000006,
-    0x00000069,0x0000001d,0x0005008e,0x00000007,0x0000006a,0x00000068,
-    0x00000069,0x0004003d,0x00000006,0x0000006b,0x0000005d,0x0005008e,
-    0x00000007,0x0000006c,0x0000006a,0x0000006b,0x00050051,0x00000006,
-    0x0000006d,0x0000006c,0x00000000,0x00050051,0x00000006,0x0000006e,
-    0x0000006c,0x00000001,0x00050051,0x00000006,0x0000006f,0x0000006c,
-    0x00000002,0x00070050,0x00000013,0x00000070,0x0000006d,0x0000006e,
-    0x0000006f,0x00000040,0x0003003e,0x00000067,0x00000070,0x000100fd,
-    0x00010038,
+    0x00020014,0x0000006c,0x00030031,0x0000006c,0x0000006d,0x0004002b,
+    0x00000006,0x00000071,0x3d6147ae,0x0004002b,0x00000006,0x00000074,
+    0x3f870a3d,0x0004002b,0x00000006,0x00000077,0x4019999a,0x0006002c,
+    0x00000007,0x00000078,0x00000077,0x00000077,0x00000077,0x0004002b,
+    0x00000006,0x0000007b,0x414eb852,0x0004002b,0x00000006,0x0000007f,
+    0x3d25aee6,0x0006002c,0x00000007,0x00000080,0x0000007f,0x0000007f,
+    0x0000007f,0x00040017,0x00000081,0x0000006c,0x00000003,0x00040020,
+    0x00000084,0x00000003,0x00000013,0x0004003b,0x00000084,0x00000085,
+    0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,
+    0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
+    0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,0x0000001c,
+    0x0000001d,0x00000007,0x0004003b,0x00000008,0x00000025,0x00000007,
+    0x0004003b,0x00000008,0x0000002a,0x00000007,0x0004003b,0x00000008,
+    0x00000036,0x00000007,0x0004003b,0x0000003b,0x0000003c,0x00000007,
+    0x0004003b,0x00000008,0x0000004f,0x00000007,0x0004003b,0x00000008,
+    0x00000058,0x00000007,0x0004003b,0x0000001c,0x0000005d,0x00000007,
+    0x0004003b,0x00000008,0x00000066,0x00000007,0x0004003d,0x0000000b,
+    0x0000000e,0x0000000d,0x0004003d,0x0000000f,0x00000012,0x00000011,
+    0x00050057,0x00000013,0x00000014,0x0000000e,0x00000012,0x0008004f,
+    0x00000007,0x00000015,0x00000014,0x00000014,0x00000000,0x00000001,
+    0x00000002,0x0003003e,0x00000009,0x00000015,0x0004003d,0x0000000b,
+    0x00000018,0x00000017,0x0004003d,0x0000000f,0x00000019,0x00000011,
+    0x00050057,0x00000013,0x0000001a,0x00000018,0x00000019,0x0008004f,
+    0x00000007,0x0000001b,0x0000001a,0x0000001a,0x00000000,0x00000001,
+    0x00000002,0x0003003e,0x00000016,0x0000001b,0x0004003d,0x0000000b,
+    0x0000001f,0x0000001e,0x0004003d,0x0000000f,0x00000020,0x00000011,
+    0x00050057,0x00000013,0x00000021,0x0000001f,0x00000020,0x00050051,
+    0x00000006,0x00000024,0x00000021,0x00000000,0x0003003e,0x0000001d,
+    0x00000024,0x0004003d,0x00000007,0x00000028,0x00000027,0x0006000c,
+    0x00000007,0x00000029,0x00000001,0x00000045,0x00000028,0x0003003e,
+    0x00000025,0x00000029,0x0004003d,0x00000007,0x0000002c,0x0000002b,
+    0x0006000c,0x00000007,0x0000002d,0x00000001,0x00000045,0x0000002c,
+    0x0003003e,0x0000002a,0x0000002d,0x0004003d,0x00000007,0x0000002e,
+    0x0000002a,0x0004003d,0x00000007,0x0000002f,0x00000025,0x0004003d,
+    0x00000007,0x00000030,0x0000002a,0x0004003d,0x00000007,0x00000031,
+    0x00000025,0x00050094,0x00000006,0x00000032,0x00000030,0x00000031,
+    0x0005008e,0x00000007,0x00000033,0x0000002f,0x00000032,0x00050083,
+    0x00000007,0x00000034,0x0000002e,0x00000033,0x0006000c,0x00000007,
+    0x00000035,0x00000001,0x00000045,0x00000034,0x0003003e,0x0000002a,
+    0x00000035,0x0004003d,0x00000007,0x00000037,0x00000025,0x0004003d,
+    0x00000007,0x00000038,0x0000002a,0x0007000c,0x00000007,0x00000039,
+    0x00000001,0x00000044,0x00000037,0x00000038,0x0003003e,0x00000036,
+    0x00000039,0x0004003d,0x00000007,0x0000003d,0x0000002a,0x0004003d,
+    0x00000007,0x0000003e,0x00000036,0x0004003d,0x00000007,0x0000003f,
+    0x00000025,0x00050051,0x00000006,0x00000042,0x0000003d,0x00000000,
+    0x00050051,0x00000006,0x00000043,0x0000003d,0x00000001,0x00050051,
+    0x00000006,0x00000044,0x0000003d,0x00000002,0x00050051,0x00000006,
+    0x00000045,0x0000003e,0x00000000,0x00050051,0x00000006,0x00000046,
+    0x0000003e,0x00000001,0x00050051,0x00000006,0x00000047,0x0000003e,
+    0x00000002,0x00050051,0x00000006,0x00000048,0x0000003f,0x00000000,
+    0x00050051,0x00000006,0x00000049,0x0000003f,0x00000001,0x00050051,
+    0x00000006,0x0000004a,0x0000003f,0x00000002,0x00060050,0x00000007,
+    0x0000004b,0x00000042,0x00000043,0x00000044,0x00060050,0x00000007,
+    0x0000004c,0x00000045,0x00000046,0x00000047,0x00060050,0x00000007,
+    0x0000004d,0x00000048,0x00000049,0x0000004a,0x00060050,0x0000003a,
+    0x0000004e,0x0000004b,0x0000004c,0x0000004d,0x0003003e,0x0000003c,
+    0x0000004e,0x0004003d,0x0000003a,0x00000050,0x0000003c,0x0004003d,
+    0x00000007,0x00000051,0x00000016,0x0005008e,0x00000007,0x00000053,
+    0x00000051,0x00000052,0x00060050,0x00000007,0x00000054,0x00000040,
+    0x00000040,0x00000040,0x00050083,0x00000007,0x00000055,0x00000053,
+    0x00000054,0x00050091,0x00000007,0x00000056,0x00000050,0x00000055,
+    0x0006000c,0x00000007,0x00000057,0x00000001,0x00000045,0x00000056,
+    0x0003003e,0x0000004f,0x00000057,0x0003003e,0x00000058,0x0000005c,
+    0x0004003d,0x00000007,0x0000005e,0x0000004f,0x0004003d,0x00000007,
+    0x0000005f,0x00000058,0x00050094,0x00000006,0x00000060,0x0000005e,
+    0x0000005f,0x0007000c,0x00000006,0x00000061,0x00000001,0x00000028,
+    0x00000060,0x00000041,0x00050085,0x00000006,0x00000063,0x00000061,
+    0x00000062,0x00050081,0x00000006,0x00000065,0x00000063,0x00000064,
+    0x0003003e,0x0000005d,0x00000065,0x0004003d,0x00000007,0x00000067,
+    0x00000009,0x0004003d,0x00000006,0x00000068,0x0000001d,0x0005008e,
+    0x00000007,0x00000069,0x00000067,0x00000068,0x0004003d,0x00000006,
+    0x0000006a,0x0000005d,0x0005008e,0x00000007,0x0000006b,0x00000069,
+    0x0000006a,0x0003003e,0x00000066,0x0000006b,0x000300f7,0x0000006f,
+    0x00000000,0x000400fa,0x0000006d,0x0000006e,0x0000006f,0x000200f8,
+    0x0000006e,0x0004003d,0x00000007,0x00000070,0x00000066,0x00060050,
+    0x00000007,0x00000072,0x00000071,0x00000071,0x00000071,0x00050081,
+    0x00000007,0x00000073,0x00000070,0x00000072,0x00060050,0x00000007,
+    0x00000075,0x00000074,0x00000074,0x00000074,0x00050088,0x00000007,
+    0x00000076,0x00000073,0x00000075,0x0007000c,0x00000007,0x00000079,
+    0x00000001,0x0000001a,0x00000076,0x00000078,0x0004003d,0x00000007,
+    0x0000007a,0x00000066,0x00060050,0x00000007,0x0000007c,0x0000007b,
+    0x0000007b,0x0000007b,0x00050088,0x00000007,0x0000007d,0x0000007a,
+    0x0000007c,0x0004003d,0x00000007,0x0000007e,0x00000066,0x000500bc,
+    0x00000081,0x00000082,0x0000007e,0x00000080,0x000600a9,0x00000007,
+    0x00000083,0x00000082,0x0000007d,0x00000079,0x0003003e,0x00000066,
+    0x00000083,0x000200f9,0x0000006f,0x000200f8,0x0000006f,0x0004003d,
+    0x00000007,0x00000086,0x00000066,0x00050051,0x00000006,0x00000087,
+    0x00000086,0x00000000,0x00050051,0x00000006,0x00000088,0x00000086,
+    0x00000001,0x00050051,0x00000006,0x00000089,0x00000086,0x00000002,
+    0x00070050,0x00000013,0x0000008a,0x00000087,0x00000088,0x00000089,
+    0x00000040,0x0003003e,0x00000085,0x0000008a,0x000100fd,0x00010038,
 };
 
 // Grid vertex shader:
@@ -592,49 +698,85 @@ static const uint32_t g_gridVertSpv[] = {
     0x00010038,
 };
 
-// Grid fragment shader:
+// Grid fragment shader. Same `uLinearize` rule as the cube FS: the grid colour
+// arrives display-referred through the push constant, so it must be decoded
+// when the attachment will encode on write -- otherwise the grid brightens on
+// an `_SRGB` swapchain while the textured cube stays put.
+//
+// GLSL source (regenerate via `glslangValidator -V grid.frag -o grid_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
 //   layout(push_constant) uniform PC { mat4 transform; vec4 color; } pc;
-//   layout(location=0) out vec4 FragColor;
-//   void main() { FragColor = pc.color; }
+//   layout(location = 0) out vec4 FragColor;
+//   void main() {
+//       vec3 col = pc.color.rgb;
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       FragColor = vec4(col, pc.color.a);
+//   }
 static const uint32_t g_gridFragSpv[] = {
-    0x07230203, 0x00010000, 0x000d000a, 0x00000013,
-    0x00000000, 0x00020011, 0x00000001, 0x0006000b,
-    0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e,
-    0x00000000, 0x0003000e, 0x00000000, 0x00000001,
-    0x0006000f, 0x00000004, 0x00000004, 0x6e69616d,
-    0x00000000, 0x00000009, 0x00030003, 0x00000002,
-    0x000001c2, 0x00040005, 0x00000004, 0x6e69616d,
-    0x00000000, 0x00050005, 0x00000009, 0x67617246,
-    0x6f6c6f43, 0x00000072, 0x00040005, 0x0000000b,
-    0x00006350, 0x00000000, 0x00060006, 0x0000000b,
-    0x00000000, 0x6e617274, 0x726f6673, 0x0000006d,
-    0x00050006, 0x0000000b, 0x00000001, 0x6f6c6f63,
-    0x00000072, 0x00030005, 0x0000000d, 0x00006370,
-    0x00040047, 0x00000009, 0x0000001e, 0x00000000,
-    0x00040048, 0x0000000b, 0x00000000, 0x00000005,
-    0x00050048, 0x0000000b, 0x00000000, 0x00000023,
-    0x00000000, 0x00050048, 0x0000000b, 0x00000000,
-    0x00000007, 0x00000010, 0x00050048, 0x0000000b,
-    0x00000001, 0x00000023, 0x00000040, 0x00030047,
-    0x0000000b, 0x00000002, 0x00020013, 0x00000002,
-    0x00030021, 0x00000003, 0x00000002, 0x00030016,
-    0x00000006, 0x00000020, 0x00040017, 0x00000007,
-    0x00000006, 0x00000004, 0x00040020, 0x00000008,
-    0x00000003, 0x00000007, 0x0004003b, 0x00000008,
-    0x00000009, 0x00000003, 0x00040018, 0x0000000a,
-    0x00000007, 0x00000004, 0x0004001e, 0x0000000b,
-    0x0000000a, 0x00000007, 0x00040020, 0x0000000c,
-    0x00000009, 0x0000000b, 0x0004003b, 0x0000000c,
-    0x0000000d, 0x00000009, 0x00040015, 0x0000000e,
-    0x00000020, 0x00000001, 0x0004002b, 0x0000000e,
-    0x0000000f, 0x00000001, 0x00040020, 0x00000010,
-    0x00000009, 0x00000007, 0x00050036, 0x00000002,
-    0x00000004, 0x00000000, 0x00000003, 0x000200f8,
-    0x00000005, 0x00050041, 0x00000010, 0x00000011,
-    0x0000000d, 0x0000000f, 0x0004003d, 0x00000007,
-    0x00000012, 0x00000011,
-    0x0003003e, 0x00000009, 0x00000012, 0x000100fd,
-    0x00010038,
+    0x07230203,0x00010000,0x0008000b,0x00000039,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x0006000f,0x00000004,
+    0x00000004,0x6e69616d,0x00000000,0x0000002e,0x00030010,0x00000004,
+    0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,
+    0x6e69616d,0x00000000,0x00030005,0x00000009,0x006c6f63,0x00030005,
+    0x0000000c,0x00004350,0x00060006,0x0000000c,0x00000000,0x6e617274,
+    0x726f6673,0x0000006d,0x00050006,0x0000000c,0x00000001,0x6f6c6f63,
+    0x00000072,0x00030005,0x0000000e,0x00006370,0x00050005,0x00000016,
+    0x6e694c75,0x69726165,0x0000657a,0x00050005,0x0000002e,0x67617246,
+    0x6f6c6f43,0x00000072,0x00030047,0x0000000c,0x00000002,0x00040048,
+    0x0000000c,0x00000000,0x00000005,0x00050048,0x0000000c,0x00000000,
+    0x00000007,0x00000010,0x00050048,0x0000000c,0x00000000,0x00000023,
+    0x00000000,0x00050048,0x0000000c,0x00000001,0x00000023,0x00000040,
+    0x00040047,0x00000016,0x00000001,0x00000000,0x00040047,0x0000002e,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
+    0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,0x00000007,
+    0x00040017,0x0000000a,0x00000006,0x00000004,0x00040018,0x0000000b,
+    0x0000000a,0x00000004,0x0004001e,0x0000000c,0x0000000b,0x0000000a,
+    0x00040020,0x0000000d,0x00000009,0x0000000c,0x0004003b,0x0000000d,
+    0x0000000e,0x00000009,0x00040015,0x0000000f,0x00000020,0x00000001,
+    0x0004002b,0x0000000f,0x00000010,0x00000001,0x00040020,0x00000011,
+    0x00000009,0x0000000a,0x00020014,0x00000015,0x00030031,0x00000015,
+    0x00000016,0x0004002b,0x00000006,0x0000001a,0x3d6147ae,0x0004002b,
+    0x00000006,0x0000001d,0x3f870a3d,0x0004002b,0x00000006,0x00000020,
+    0x4019999a,0x0006002c,0x00000007,0x00000021,0x00000020,0x00000020,
+    0x00000020,0x0004002b,0x00000006,0x00000024,0x414eb852,0x0004002b,
+    0x00000006,0x00000028,0x3d25aee6,0x0006002c,0x00000007,0x00000029,
+    0x00000028,0x00000028,0x00000028,0x00040017,0x0000002a,0x00000015,
+    0x00000003,0x00040020,0x0000002d,0x00000003,0x0000000a,0x0004003b,
+    0x0000002d,0x0000002e,0x00000003,0x00040015,0x00000030,0x00000020,
+    0x00000000,0x0004002b,0x00000030,0x00000031,0x00000003,0x00040020,
+    0x00000032,0x00000009,0x00000006,0x00050036,0x00000002,0x00000004,
+    0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,
+    0x00000009,0x00000007,0x00050041,0x00000011,0x00000012,0x0000000e,
+    0x00000010,0x0004003d,0x0000000a,0x00000013,0x00000012,0x0008004f,
+    0x00000007,0x00000014,0x00000013,0x00000013,0x00000000,0x00000001,
+    0x00000002,0x0003003e,0x00000009,0x00000014,0x000300f7,0x00000018,
+    0x00000000,0x000400fa,0x00000016,0x00000017,0x00000018,0x000200f8,
+    0x00000017,0x0004003d,0x00000007,0x00000019,0x00000009,0x00060050,
+    0x00000007,0x0000001b,0x0000001a,0x0000001a,0x0000001a,0x00050081,
+    0x00000007,0x0000001c,0x00000019,0x0000001b,0x00060050,0x00000007,
+    0x0000001e,0x0000001d,0x0000001d,0x0000001d,0x00050088,0x00000007,
+    0x0000001f,0x0000001c,0x0000001e,0x0007000c,0x00000007,0x00000022,
+    0x00000001,0x0000001a,0x0000001f,0x00000021,0x0004003d,0x00000007,
+    0x00000023,0x00000009,0x00060050,0x00000007,0x00000025,0x00000024,
+    0x00000024,0x00000024,0x00050088,0x00000007,0x00000026,0x00000023,
+    0x00000025,0x0004003d,0x00000007,0x00000027,0x00000009,0x000500bc,
+    0x0000002a,0x0000002b,0x00000027,0x00000029,0x000600a9,0x00000007,
+    0x0000002c,0x0000002b,0x00000026,0x00000022,0x0003003e,0x00000009,
+    0x0000002c,0x000200f9,0x00000018,0x000200f8,0x00000018,0x0004003d,
+    0x00000007,0x0000002f,0x00000009,0x00060041,0x00000032,0x00000033,
+    0x0000000e,0x00000010,0x00000031,0x0004003d,0x00000006,0x00000034,
+    0x00000033,0x00050051,0x00000006,0x00000035,0x0000002f,0x00000000,
+    0x00050051,0x00000006,0x00000036,0x0000002f,0x00000001,0x00050051,
+    0x00000006,0x00000037,0x0000002f,0x00000002,0x00070050,0x0000000a,
+    0x00000038,0x00000035,0x00000036,0x00000037,0x00000034,0x0003003e,
+    0x0000002e,0x00000038,0x000100fd,0x00010038,
 };
 
 // ============================================================================
@@ -881,11 +1023,19 @@ struct VkRenderer {
     uint32_t fbWidth = 0;
     uint32_t fbHeight = 0;
 
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;  // init-time texture uploads only
+    // INV-4.10 / #1917: N frames in flight, one submit per frame, never a wait
+    // on the frame just submitted (replaces the old single cmd + frameFence).
+    dxr::VkFrameRing ring;
 
     float cubeRotation = 0.0f;
+
+    // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
+    // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
+    // the matching `uLinearize` specialization constant, so the per-frame clear
+    // colour must follow the SAME latched decision rather than re-reading the
+    // environment and drifting out of step with the baked shaders.
+    bool sceneLinear = false;
 
     // Texture resources
     VkImage texImages[3] = {};          // basecolor, normal, AO
@@ -909,6 +1059,34 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     renderer.physicalDevice = physDevice;
     renderer.graphicsQueue = queue;
     renderer.queueFamilyIndex = queueFamilyIndex;
+
+    // ADR-021 / INV-4.6: decide ONCE, here, whether the fragment shaders emit
+    // scene-linear. This runs after CreateSwapchain() noted the colour format,
+    // so dxr::RenderSceneLinear() is authoritative: `_SRGB` swapchain => the
+    // attachment encodes on write => the shaders must hand it decoded (linear)
+    // values, or the authored display-referred colour gets encoded twice and
+    // washes out. DXR_TRUE_LINEAR overrides in both directions (see
+    // color_policy.h). Same shape as the Windows VK cube apps (#1650).
+    renderer.sceneLinear = dxr::RenderSceneLinear();
+    const VkBool32 specLinearize = renderer.sceneLinear ? VK_TRUE : VK_FALSE;
+    VkSpecializationMapEntry specEntry = {};
+    specEntry.constantID = 0;  // layout(constant_id = 0) const bool uLinearize
+    specEntry.offset = 0;
+    specEntry.size = sizeof(VkBool32);
+    VkSpecializationInfo fragSpec = {};
+    fragSpec.mapEntryCount = 1;
+    fragSpec.pMapEntries = &specEntry;
+    fragSpec.dataSize = sizeof(specLinearize);
+    fragSpec.pData = &specLinearize;
+
+    // One-off init line (never per frame) so a washed-out capture can be told
+    // apart from a mis-selected swapchain format without a rebuild.
+    LOG_WARN("[color] colorFormat=%d sceneLinear=%s (%s)",
+             (int)colorFormat,
+             renderer.sceneLinear ? "yes" : "no",
+             renderer.sceneLinear
+                 ? "fragment shaders decode authored colour; the attachment re-encodes"
+                 : "fragment shaders write authored display-referred bytes raw");
 
     // Render pass
     {
@@ -948,12 +1126,32 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         subpass.pColorAttachments = &colorRef;
         subpass.pDepthStencilAttachment = &depthRef;
 
+        // The single depth image is shared by every frame; with N frames in
+        // flight (INV-4.10) the next frame's depth clear must wait for the
+        // previous frame's depth writes (WAW), and the colour layout
+        // transition must wait for colour output.
+        VkSubpassDependency dep = {};
+        dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dep.dstSubpass = 0;
+        dep.srcStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dep.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
         VkRenderPassCreateInfo rpInfo = {};
         rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
         rpInfo.attachmentCount = 2;
         rpInfo.pAttachments = attachments;
         rpInfo.subpassCount = 1;
         rpInfo.pSubpasses = &subpass;
+        rpInfo.dependencyCount = 1;
+        rpInfo.pDependencies = &dep;
 
         if (vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass) != VK_SUCCESS) {
             LOG_ERROR("Failed to create render pass");
@@ -1040,6 +1238,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = cubeFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.binding = 0;
@@ -1134,6 +1333,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = gridFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.binding = 0;
@@ -1307,7 +1507,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     memcpy(data, gridVerts.data(), (size_t)gridBufSize);
     vkUnmapMemory(device, renderer.gridVertexMemory);
 
-    // Command pool + command buffer
+    // Command pool (init-time texture uploads)
     {
         VkCommandPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1318,27 +1518,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
             LOG_ERROR("Failed to create command pool");
             return false;
         }
-
-        VkCommandBufferAllocateInfo allocInfo = {};
-        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.commandPool = renderer.commandPool;
-        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandBufferCount = 1;
-
-        if (vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer) != VK_SUCCESS) {
-            LOG_ERROR("Failed to allocate command buffer");
-            return false;
-        }
     }
 
-    // Frame fence
+    // Frame ring (per-frame command buffers + fences)
     {
-        VkFenceCreateInfo fenceInfo = {};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-        if (vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence) != VK_SUCCESS) {
-            LOG_ERROR("Failed to create fence");
+        dxr::VkFrameRing::Config ringCfg;  // default 3 frames in flight; push constants, no UBO
+        if (!renderer.ring.init(device, physDevice, queue, queueFamilyIndex, ringCfg)) {
+            LOG_ERROR("Failed to create frame ring");
             return false;
         }
     }
@@ -1532,23 +1718,27 @@ static void RenderScene(
     VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
 {
-    VkDevice device = renderer.device;
-
-    // Wait for previous frame
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    // Begin command buffer
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    // Waits only the slot used N frames ago (INV-4.10), resets + begins its cmd
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) {
+        LOG_ERROR("Frame ring beginFrame failed");
+        return;
+    }
 
     // Begin render pass with full SBS framebuffer
     VkClearValue clearValues[2] = {};
     clearValues[0].color = {{0.05f, 0.05f, 0.25f, 1.0f}};
+    // ADR-021 / INV-4.6: VkClearColorValue is taken in the attachment's OWN
+    // space, so an `_SRGB` attachment encodes it -- the display-referred
+    // background above would come out visibly brighter than the cube drawn over
+    // it. Decode it off the SAME latched flag the pipelines were specialized
+    // with. Alpha is linear in both spaces and is never converted.
+    if (renderer.sceneLinear) {
+        for (int i = 0; i < 3; i++) {
+            clearValues[0].color.float32[i] =
+                dxr::DisplayReferredToSceneLinear(clearValues[0].color.float32[i]);
+        }
+    }
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
@@ -1639,23 +1829,20 @@ static void RenderScene(
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
 
-    // Submit
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
-
-    // Wait for completion before returning (runtime needs the image ready)
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
+    // ONE submit with the slot fence, no wait. The caller releases the
+    // swapchain image after this; the runtime composes on the same queue, so
+    // this work is ordered ahead of it.
+    VkResult submitResult = renderer.ring.endFrame();
+    if (submitResult != VK_SUCCESS) {
+        LOG_ERROR("Frame submit failed: %d", (int)submitResult);
+    }
 }
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (!renderer.device) return;
 
+    renderer.ring.waitAll();
     vkDeviceWaitIdle(renderer.device);
 
     for (auto fb : renderer.framebuffers)
@@ -1679,10 +1866,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
         renderer.depthMemory = VK_NULL_HANDLE;
     }
 
-    if (renderer.frameFence) {
-        vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
-        renderer.frameFence = VK_NULL_HANDLE;
-    }
+    renderer.ring.destroy();
     if (renderer.commandPool) {
         vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
         renderer.commandPool = VK_NULL_HANDLE;
@@ -1783,6 +1967,9 @@ struct AppXrSession {
 
     XrViewConfigurationType viewConfigType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
     std::vector<XrViewConfigurationView> configViews;
+    // PRIMARY_MULTIVIEW_DXR begun: render every ACTIVE view (activeViewCount),
+    // one view set per display when the window spans displays (multi-screen M3).
+    bool isMultiview = false;
 
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
@@ -1823,11 +2010,60 @@ struct AppXrSession {
     // window handle + display info + view poses), returning render-ready views.
     bool hasViewRig = false;
 
+    // XR_DXR_cursor_depth (ADR-046): enabled only for a scripted cursor
+    // (DISPLAYXR_CURSOR_DEPTH_UV), see InitializeOpenXR.
+    bool hasCursorDepthExt = false;
+    uint32_t cursorDepthSpecVersion = 0;
+
     // Which window backend (and therefore which binding extension) this run
     // resolved to. Set by InitializeOpenXR from --backend / DXR_WINDOW_BACKEND
     // + what the runtime advertises; consumed when the window is created.
     DxrWindowBackend windowBackend = DxrWindowBackend::Auto;
+
+    // ---- Display rendering modes (XR_DXR_display_info v8+/v10/v13) ----
+    // Resolved only when display_info is enabled; null = the mode keys are
+    // no-ops. The runtime owns the current mode: currentModeIndex is seeded
+    // from the enumerated isActive flag and then follows
+    // XrEventDataRenderingModeChangedDXR — the app never assumes its request
+    // landed.
+    PFN_xrRequestDisplayRenderingModeDXR pfnRequestDisplayRenderingMode = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModes = nullptr;
+    static constexpr uint32_t kMaxModes = 9; // keys 0-8
+    uint32_t renderingModeCount = 0;
+    uint32_t currentModeIndex = 0;
+    bool haveCurrentMode = false;
+    XrDisplayRenderingModeInfoDXR modes[kMaxModes] = {};
 };
+
+// XR_DXR_cursor_depth (ADR-046): the app owns the depth - "ray -> first cube
+// hit" - and dxr::CursorDepth does the rest (footprint rays from the previous
+// locate's outer views, the hint / draw-request structs on xrLocateViews).
+// Slab test against the cube as the renderer places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+// Same as cube_handle_vk_macos.
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
+{
+    const float size = kVirtualDisplayHeight / 4.0f; // the renderer's cubeSize
+    const float c = cosf(rot), s = sinf(rot), h = size * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
 
 static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend) {
     LOG_INFO("Initializing OpenXR...");
@@ -1844,7 +2080,11 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     bool hasDisplayInfo = false;
     bool hasViewRig = false;
     bool hasWeave = false;
+    bool hasLift = false;
     for (const auto& ext : extensions) {
+        if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) {
+            hasLift = true;
+        }
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0) {
             hasVulkan = true;
         }
@@ -1862,6 +2102,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         }
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
             hasWeave = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
         }
     }
 
@@ -1905,12 +2148,13 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                                     : XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
     if (hasDisplayInfo) {
         // Enabled for the INV-1.3 panel desktop-position query below (#715).
-        // NOTE: enabling XR_DXR_display_info also switches the runtime's view
-        // sizing off the legacy-app compromise path — the app still renders a
-        // fixed 2-view SBS at whatever dimensions xrEnumerateViewConfigurationViews
-        // reports at init, and does not adapt to later mode changes.
+        // Also the rendering-mode keys (V / 0-8): mode enumeration, the request
+        // entry point and XrEventDataRenderingModeChangedDXR all live here.
+        // Enabling it switches the runtime's view sizing off the legacy-app
+        // compromise path; the render loop sizes its tiles from the ACTIVE
+        // mode's scale/tile grid, so a mode change is followed per frame.
         enabledExtensions.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
-        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims)");
+        LOG_INFO("XR_DXR_display_info: AVAILABLE (enabled for panel position + dims + rendering modes)");
     }
     // XR_DXR_view_rig (#396 W7): the app chains XrDisplayRigDXR on every
     // xrLocateViews and the runtime does the window-relative Kooima (window
@@ -1938,6 +2182,31 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         LOG_INFO("XR_DXR_weave: NOT FOUND — window drags will not be phase-snapped");
     }
 
+    // XR_DXR_cursor_depth (ADR-046 Amendment 2 B): the runtime draws a
+    // depth-aware cursor. Linux has no live-pointer adapter in this app yet,
+    // so it is enabled only for a SCRIPTED cursor (DISPLAYXR_CURSOR_DEPTH_UV=u,v,
+    // headless capture of the runtime's cursor draw); DISPLAYXR_CURSOR_DEPTH=0
+    // opts out even then. Spec v5+ (the runtime draws).
+    {
+        const char *uv = getenv("DISPLAYXR_CURSOR_DEPTH_UV");
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (uv != nullptr && !(opt != nullptr && strcmp(opt, "0") == 0) && xr.cursorDepthSpecVersion >= 5) {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+            xr.hasCursorDepthExt = true;
+        }
+        LOG_INFO("XR_DXR_cursor_depth: %s (v%u)",
+                 xr.hasCursorDepthExt ? "ENABLED (scripted cursor, runtime draws)" : "off", xr.cursorDepthSpecVersion);
+    }
+
+    if (g_liftProbe.enabled) {
+        if (hasLift) {
+            enabledExtensions.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+        } else {
+            LOG_WARN("--lift: XR_DXR_lift not advertised by the runtime; probe off");
+            g_liftProbe.enabled = false;
+        }
+    }
+
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "CubeHandleVkLinux",
             sizeof(createInfo.applicationInfo.applicationName) - 1);
@@ -1951,6 +2220,16 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
 
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created");
+    g_liftProbe.OnInstance(xr.instance);
+
+    // Rendering-mode entry points (keys V / 0-8). Absent extension or function
+    // leaves them null and the keys become no-ops (logged once at session).
+    if (hasDisplayInfo) {
+        xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingMode);
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
+                              (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModes);
+    }
 
     XrSystemGetInfo systemInfo = {XR_TYPE_SYSTEM_GET_INFO};
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -1983,6 +2262,56 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
                      xr.displayPixelWidth, xr.displayPixelHeight,
                      xr.viewScaleX, xr.viewScaleY);
         }
+    }
+
+    // XR_DXR_display_info v22 (multi-screen M1): every display the runtime
+    // knows, one line each. Informational only — the app still renders to the
+    // system-default display reported above. Absent on runtimes older than
+    // v22 (the proc lookup then fails and nothing is logged).
+    if (hasDisplayInfo) {
+        PFN_xrEnumerateDisplaysDXR pfnEnumerateDisplays = nullptr;
+        if (XR_SUCCEEDED(xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplaysDXR",
+                                               (PFN_xrVoidFunction*)&pfnEnumerateDisplays)) &&
+            pfnEnumerateDisplays != nullptr) {
+            uint32_t displayCount = 0;
+            if (XR_SUCCEEDED(pfnEnumerateDisplays(xr.instance, xr.systemId, 0, &displayCount, nullptr))) {
+                std::vector<XrDisplayDXR> displays(displayCount, XrDisplayDXR{XR_TYPE_DISPLAY_DXR});
+                if (displayCount > 0 &&
+                    XR_SUCCEEDED(pfnEnumerateDisplays(xr.instance, xr.systemId, displayCount, &displayCount,
+                                                      displays.data()))) {
+                    for (uint32_t i = 0; i < displayCount; i++) {
+                        const XrDisplayDXR& d = displays[i];
+                        LOG_INFO("Display %u: id=0x%016llx '%s' plug-in='%s'%s%s%s %dx%d @ (%d,%d), "
+                                 "%.4f x %.4f m, %ux%u px, nominal z %.3f m, scale %.3fx%.3f, eye modes 0x%llx",
+                                 i, (unsigned long long)d.displayId, d.deviceName, d.vendorPluginId,
+                                 (d.flags & XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR) ? " [system default]" : "",
+                                 (d.flags & XR_DISPLAY_PRIMARY_BIT_DXR) ? " [primary]" : "",
+                                 (d.flags & XR_DISPLAY_TRACKED_BIT_DXR) ? " [tracked]" : "",
+                                 d.desktopRect.extent.width, d.desktopRect.extent.height,
+                                 d.desktopRect.offset.x, d.desktopRect.offset.y,
+                                 d.info.displaySizeMeters.width, d.info.displaySizeMeters.height,
+                                 d.info.displayPixelWidth, d.info.displayPixelHeight,
+                                 d.info.nominalViewerPositionInDisplaySpace.z,
+                                 d.info.recommendedViewScaleX, d.info.recommendedViewScaleY,
+                                 (unsigned long long)d.eyeTracking.supportedModes);
+                    }
+                }
+            }
+        }
+    }
+
+    // Multi-screen M3: begin PRIMARY_MULTIVIEW_DXR when the runtime offers it,
+    // so a window spanning two displays gets each display's own views
+    // (XrViewDisplayBindingsDXR). DXR_STEREO_FIXED_APP=1 keeps the legacy
+    // 2-view PRIMARY_STEREO session (the runtime then frames those two views
+    // from the display holding most of the window).
+    {
+        const char* fixedStereo = getenv("DXR_STEREO_FIXED_APP");
+        if (fixedStereo == nullptr || fixedStereo[0] != '1') {
+            xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+        }
+        xr.isMultiview = xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
+        LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
     }
 
     uint32_t viewCount = 0;
@@ -2159,6 +2488,87 @@ static bool CreateVulkanDevice(AppXrSession& xr, VkPhysicalDevice physDevice, ui
     return true;
 }
 
+//! (Re)read the runtime's rendering-mode table and the active mode. Called once
+//! after xrCreateSession; the active mode then follows the mode-changed event.
+static void EnumerateRenderingModes(AppXrSession& xr) {
+    if (xr.pfnEnumerateDisplayRenderingModes == nullptr || xr.session == XR_NULL_HANDLE) {
+        return;
+    }
+    uint32_t count = 0;
+    if (XR_FAILED(xr.pfnEnumerateDisplayRenderingModes(xr.session, 0, &count, nullptr)) || count == 0) {
+        return;
+    }
+    std::vector<XrDisplayRenderingModeInfoDXR> modes(count, {XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR});
+    if (XR_FAILED(xr.pfnEnumerateDisplayRenderingModes(xr.session, count, &count, modes.data()))) {
+        return;
+    }
+    xr.renderingModeCount = count > AppXrSession::kMaxModes ? AppXrSession::kMaxModes : count;
+    LOG_INFO("Display rendering modes (%u):", count);
+    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+        xr.modes[i] = modes[i];
+        xr.modes[i].next = nullptr;
+        if (modes[i].isActive) {
+            xr.currentModeIndex = modes[i].modeIndex;
+            xr.haveCurrentMode = true;
+        }
+        LOG_INFO("  [%u] %s (views=%u, tiles=%ux%u, scale=%.2fx%.2f, 3D=%s%s%s)", modes[i].modeIndex,
+                 modes[i].modeName, modes[i].viewCount, modes[i].tileColumns, modes[i].tileRows,
+                 modes[i].viewScaleX, modes[i].viewScaleY, modes[i].hardwareDisplay3D ? "yes" : "no",
+                 modes[i].isActive ? ", active" : "", modes[i].isRequestable ? "" : ", locked by workspace");
+    }
+}
+
+//! The table entry for the active mode, or null before the runtime reported one.
+static const XrDisplayRenderingModeInfoDXR* ActiveRenderingMode(const AppXrSession& xr) {
+    if (!xr.haveCurrentMode) {
+        return nullptr;
+    }
+    for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+        if (xr.modes[i].modeIndex == xr.currentModeIndex) {
+            return &xr.modes[i];
+        }
+    }
+    return nullptr;
+}
+
+/*!
+ * Turn the key flags into at most one xrRequestDisplayRenderingModeDXR, on the
+ * frame-loop thread. Mirrors displayxr-common's xr_session_common.cpp: V goes to
+ * (current + 1) % count, 0-8 only when N < count. The current mode is NOT
+ * updated here — XrEventDataRenderingModeChangedDXR does that.
+ */
+static void ProcessRenderingModeKeys(AppXrSession& xr) {
+    const bool cycle = g_cycleRenderingModeRequested;
+    const int32_t absolute = g_absoluteRenderingModeRequested;
+    g_cycleRenderingModeRequested = false;
+    g_absoluteRenderingModeRequested = -1;
+    if (!cycle && absolute < 0) {
+        return;
+    }
+    if (xr.pfnRequestDisplayRenderingMode == nullptr || xr.renderingModeCount == 0 ||
+        xr.session == XR_NULL_HANDLE) {
+        return; // no-op; said so once at session creation
+    }
+    int32_t target = -1;
+    if (cycle) {
+        target = (int32_t)((xr.currentModeIndex + 1) % xr.renderingModeCount);
+    }
+    if (absolute >= 0) {
+        if ((uint32_t)absolute < xr.renderingModeCount) {
+            target = absolute;
+        } else {
+            LOG_INFO("Mode key %d ignored: the runtime has %u rendering modes", absolute,
+                     xr.renderingModeCount);
+        }
+    }
+    if (target < 0) {
+        return;
+    }
+    const XrResult r = xr.pfnRequestDisplayRenderingMode(xr.session, (uint32_t)target);
+    LOG_INFO("Rendering mode request %u -> %d (%s): %s", xr.currentModeIndex, target,
+             cycle && absolute < 0 ? "V" : "digit", XR_SUCCEEDED(r) ? "ok" : "FAILED");
+}
+
 static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex)
 {
@@ -2220,6 +2630,14 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
              DxrLinuxWindow::backend_name(g_window.backend()),
              g_window.required_openxr_extension(), g_window.describe().c_str());
 
+    EnumerateRenderingModes(xr);
+    if (xr.pfnRequestDisplayRenderingMode == nullptr || xr.renderingModeCount == 0) {
+        LOG_INFO("Rendering-mode keys [V] / [0-8] are no-ops: %s",
+                 xr.pfnRequestDisplayRenderingMode == nullptr
+                     ? "xrRequestDisplayRenderingModeDXR unavailable (XR_DXR_display_info absent or too old)"
+                     : "the runtime enumerated no rendering modes");
+    }
+
     return true;
 }
 
@@ -2251,14 +2669,48 @@ static bool CreateSwapchain(AppXrSession& xr) {
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    int64_t selectedFormat = formats[0];
+    // ADR-021 / INV-4.6: request an honest `_SRGB` colour swapchain. The runtime
+    // lists B8G8R8A8_UNORM first, and since #1623 vk_native treats a UNORM
+    // swapchain as holding LINEAR values and encodes it on output, so this
+    // app's display-referred bytes would be encoded a second time (washed out).
+    // dxr::ChooseColorSwapchainFormat() takes the advertised `_SRGB` sibling of
+    // formats[0] (channel order kept); DXR_SWAPCHAIN_ENCODING=unorm restores the
+    // old choice for A/B. Noting it is what makes dxr::RenderSceneLinear() --
+    // and therefore the shaders' `uLinearize` -- follow the swapchain.
+    const dxr::ColorFormatChoice colorChoice =
+        dxr::ChooseColorSwapchainFormat(formats, dxr::ColorEncodingPreferenceFromEnvironment());
+    int64_t selectedFormat = colorChoice.format;
+    dxr::NoteColorSwapchainFormat(selectedFormat);
+    if (colorChoice.fellBack) {
+        LOG_WARN("[color] no `_SRGB` swapchain format satisfied the request; using %lld",
+                 (long long)selectedFormat);
+    }
     LOG_INFO("Selected swapchain format: %lld (0x%llX)", (long long)selectedFormat, (long long)selectedFormat);
 
     const auto& view = xr.configViews[0];
 
-    // Legacy: use recommendedImageRectWidth * 2 (stereo SBS) since no modes are enumerated
+    // Worst case across the enumerated rendering modes (ADR-010): each mode
+    // needs cols x (display x scaleX) by rows x (display x scaleY) — the 2-view
+    // SBS mode and 2D both fit a display-sized atlas, so a mode switch never
+    // needs a new swapchain. Without a mode table (no display_info), keep the
+    // historical 2-view SBS envelope.
     uint32_t scWidth = view.recommendedImageRectWidth * 2;
     uint32_t scHeight = view.recommendedImageRectHeight;
+    if (xr.renderingModeCount > 0 && xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+            const XrDisplayRenderingModeInfoDXR& m = xr.modes[i];
+            const uint32_t cols = m.tileColumns > 0 ? m.tileColumns : 1;
+            const uint32_t rows = m.tileRows > 0 ? m.tileRows : 1;
+            const float sx = m.viewScaleX > 0.0f ? m.viewScaleX : 1.0f;
+            const float sy = m.viewScaleY > 0.0f ? m.viewScaleY : 1.0f;
+            const uint32_t w = cols * (uint32_t)std::ceil(xr.displayPixelWidth * sx);
+            const uint32_t h = rows * (uint32_t)std::ceil(xr.displayPixelHeight * sy);
+            if (w > scWidth) scWidth = w;
+            if (h > scHeight) scHeight = h;
+        }
+    }
+    if (view.maxImageRectWidth > 0 && scWidth > view.maxImageRectWidth) scWidth = view.maxImageRectWidth;
+    if (view.maxImageRectHeight > 0 && scHeight > view.maxImageRectHeight) scHeight = view.maxImageRectHeight;
 
     XrSwapchainCreateInfo swapchainInfo = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
@@ -2323,8 +2775,20 @@ static bool PollEvents(AppXrSession& xr) {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
             xr.exitRequested = true;
             break;
-        // Legacy app: no rendering mode events (XR_DXR_display_info not enabled)
+        case XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            xr.haveCurrentMode = true;
+            const XrDisplayRenderingModeInfoDXR* m = ActiveRenderingMode(xr);
+            LOG_INFO("Rendering mode changed: %u -> %u (%s)", modeEvent->previousModeIndex,
+                     modeEvent->currentModeIndex, m ? m->modeName : "?");
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_DISPLAY_MODE_REQUEST_DENIED_DXR:
+            LOG_INFO("Rendering mode request denied by the runtime (workspace-locked or unsupported)");
+            break;
         default:
+            g_liftProbe.OnEvent(event);
             break;
         }
 
@@ -2393,6 +2857,7 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime, const XrCompositionLa
 }
 
 static void CleanupOpenXR(AppXrSession& xr) {
+    g_liftProbe.Shutdown();
     if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(xr.swapchain.swapchain);
         xr.swapchain.swapchain = XR_NULL_HANDLE;
@@ -2427,7 +2892,7 @@ static void SignalHandler(int sig) {
 
 static void PrintUsage(const char* argv0) {
     fprintf(stdout,
-        "Usage: %s [--platform=x11|wayland|auto] [--windowed] [--help]\n"
+        "Usage: %s [--platform=x11|wayland|auto] [--windowed] [--lift] [--help]\n"
         "\n"
         "  --platform=x11     app-owned X11 window, XR_DXR_xlib_window_binding\n"
         "  --platform=wayland app-owned Wayland surface, XR_DXR_wayland_surface_binding\n"
@@ -2444,6 +2909,9 @@ static void PrintUsage(const char* argv0) {
         "                     the window instead of resizing the window to the panel.\n"
         "                     The weave PHASE still needs the compositor geometry\n"
         "                     service (window-geometry@displayxr.org).\n"
+        "  --lift             XR_DXR_lift probe: a VIEWS_MONO stream over CPU images\n"
+        "                     from this in-process session; logs \"[lift-probe]\" lines\n"
+        "                     (DISPLAYXR_LIFT_PROBE_EVERY / _FRAMES tune it).\n"
         "\n"
         "Env: DXR_WINDOW_BACKEND=x11|wayland|auto (an explicit request; --platform wins)\n"
         "     DXR_CUBE_WINDOW=WxH+X+Y            windowed size/pos, panel-relative\n"
@@ -2467,6 +2935,8 @@ static void PrintUsage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+    g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
+    g_liftProbe.gpu = g_liftProbe.enabled && dxr_test::LiftCpuProbe::RequestedGpu(argc, argv);
     // Line-buffer stdout even when redirected: LOG_INFO writes are otherwise block-
     // buffered and vanish when `timeout` SIGTERMs the process (every INFO line of a
     // redirected run was lost; the runtime's stderr log survived, the app's did not).
@@ -2493,6 +2963,8 @@ int main(int argc, char** argv) {
             }
         } else if (strcmp(a, "--windowed") == 0) {
             waylandWindowed = true;
+        } else if (strcmp(a, "--lift") == 0) {
+            // XR_DXR_lift CPU probe (g_liftProbe, set above).
         } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
             PrintUsage(argv[0]);
             return 0;
@@ -2560,6 +3032,17 @@ int main(int argc, char** argv) {
     winDesc.title = "Cube Handle VK (DisplayXR)";
     winDesc.app_id = "com.displayxr.cube_handle_vk_linux";
     winDesc.fullscreen_on_wayland = true;
+    // TEST HOOK (DXR_CUBE_DRAG_BUTTON=N, off by default): drag the window from
+    // its content with mouse button N, as the demos do with the right button —
+    // lets a headless run exercise the content drag (runtime#1748).
+    if (const char* denv = getenv("DXR_CUBE_DRAG_BUTTON")) {
+        const int b = atoi(denv);
+        if (b >= 1 && b <= 3) {
+            winDesc.wayland_drag_button = (uint32_t)b;
+            winDesc.x11_drag_button = (uint32_t)b;
+            LOG_WARN("DXR_CUBE_DRAG_BUTTON=%d: content drag on button %d (test hook)", b, b);
+        }
+    }
 
     if (xr.windowBackend == DxrWindowBackend::Wayland) {
         // A Wayland client cannot POSITION itself, so DXR_CUBE_WINDOW's offset
@@ -2582,6 +3065,19 @@ int main(int argc, char** argv) {
         }
     } else if (waylandWindowed) {
         LOG_WARN("--windowed only affects the Wayland backend — ignored on X11 (use DXR_CUBE_WINDOW)");
+    }
+
+    // Launched into the workspace (the shell sets DISPLAYXR_WORKSPACE_SESSION=1):
+    // this app is an IPC client and the service composites its swapchain, so its
+    // own window is never a render target. Create it (it is still bound at
+    // xrCreateSession) but never map or fullscreen it, or it flashes up
+    // fullscreen on the 3D panel before the workspace tile appears. Same "1"
+    // gate as the runtime's own workspace-session window hide.
+    if (const char* ws = getenv("DISPLAYXR_WORKSPACE_SESSION")) {
+        if (strcmp(ws, "1") == 0) {
+            winDesc.start_hidden = true;
+            LOG_INFO("DISPLAYXR_WORKSPACE_SESSION=1: app window created hidden (the workspace composites it)");
+        }
     }
 
     if (!g_window.create(xr.windowBackend, winDesc)) {
@@ -2627,6 +3123,36 @@ int main(int argc, char** argv) {
     // Without this extension, negative viewport height is undefined in Vulkan 1.0.
     deviceExtensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
 
+    // --lift-gpu (ADR-053 P5 step E): the fd / dma-buf export + import
+    // extensions, each when the device offers it.
+    if (g_liftProbe.gpu) {
+        uint32_t availCount = 0;
+        vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, nullptr);
+        std::vector<VkExtensionProperties> avail(availCount);
+        vkEnumerateDeviceExtensionProperties(physDevice, nullptr, &availCount, avail.data());
+        auto has = [&](const char *name) {
+            for (const auto &e : avail) {
+                if (strcmp(e.extensionName, name) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        uint32_t n = 0;
+        const char *const *names = dxr_test::LiftCpuProbe::GpuDeviceExtensions(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            if (has(names[i])) {
+                deviceExtensions.push_back(names[i]);
+            }
+        }
+        g_liftProbe.dmabuf_ext = has("VK_EXT_external_memory_dma_buf") && has("VK_EXT_image_drm_format_modifier") &&
+                                 has("VK_KHR_image_format_list");
+        g_liftProbe.foreign_ext = has("VK_EXT_queue_family_foreign");
+        LOG_INFO("--lift-gpu: dma-buf input %s, queue family foreign %s",
+                 g_liftProbe.dmabuf_ext ? "available" : "not available (OPAQUE_FD input)",
+                 g_liftProbe.foreign_ext ? "yes" : "no");
+    }
+
     // Find graphics queue
     uint32_t queueFamilyIndex = 0;
     if (!FindGraphicsQueueFamily(physDevice, queueFamilyIndex)) {
@@ -2643,6 +3169,8 @@ int main(int argc, char** argv) {
         CleanupOpenXR(xr);
         return 1;
     }
+
+    g_liftProbe.SetVulkan(physDevice, vkDevice, graphicsQueue, queueFamilyIndex);
 
     // Create session
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
@@ -2681,6 +3209,7 @@ int main(int argc, char** argv) {
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         LOG_ERROR("Vulkan renderer initialization failed");
+        vkRenderer.ring.destroy();  // before vkDestroyDevice (dtor would run after)
         CleanupOpenXR(xr);
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
@@ -2705,12 +3234,64 @@ int main(int argc, char** argv) {
         }
     }
 
+    // XR_DXR_cursor_depth (ADR-046): a scripted cursor the runtime draws in
+    // its default look. enable(0) (extension off) leaves the helper inert: no
+    // structs on xrLocateViews. No platform adapter is set, so the OS cursor
+    // is never touched.
+    dxr::CursorDepth cursor;
+    cursor.enable(xr.hasCursorDepthExt ? xr.cursorDepthSpecVersion : 0);
+    cursor.setCursorHeight(0.04f); // fraction of canvas height, as the macOS cubes
+    cursor.setRayCast([&vkRenderer](const dxr::CursorRay &r) -> std::optional<float> {
+        float t;
+        return RayHitCube(r.origin, r.dir, vkRenderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+    });
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) {
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
+    }
+    // DISPLAYXR_CURSOR_DEPTH_SIZE_M=<metres>: the default look drawn at that
+    // height on the panel instead of the OS cursor's (a bigger arrow for
+    // measuring the draw in a capture).
+    if (const char *sz = getenv("DISPLAYXR_CURSOR_DEPTH_SIZE_M")) {
+        const float m = strtof(sz, nullptr);
+        if (m > 0.0f) cursor.setSprite(XR_NULL_HANDLE, {0.0f, 0.0f}, m);
+    }
+
     LOG_INFO("=== Entering main loop (Ctrl+C to exit) ===");
+    LOG_INFO("Keys: [V] Mode  [0-8] Mode N%s",
+             g_window.backend() == DxrWindowBackend::Wayland ? "  [Esc/Q] Quit" : "");
 
     // Frame timing
     auto lastTime = std::chrono::high_resolution_clock::now();
 
+    // DXR_TESTAPP_MAX_HZ — unconditional app-side frame cap, default off (same
+    // knob as the Windows test apps). Drives the app below the panel refresh
+    // so the runtime's repaint path can be measured against a slow producer.
+    int capHz = 0;
+    if (const char *capEnv = getenv("DXR_TESTAPP_MAX_HZ")) {
+        capHz = atoi(capEnv);
+        if (capHz < 0) capHz = 0;
+        if (capHz > 240) capHz = 240;
+    }
+    const std::chrono::nanoseconds capInterval(capHz > 0 ? 1000000000LL / capHz : 0);
+    std::chrono::steady_clock::time_point capNext = std::chrono::steady_clock::now();
+    if (capHz > 0) {
+        LOG_WARN("DXR_TESTAPP_MAX_HZ=%d — app frame cap active (min interval %.2f ms)", capHz,
+                 capInterval.count() / 1e6);
+    }
+
     while (g_running && !xr.exitRequested) {
+        // Frame cap (sleep only, like the Windows apps): hold the top of the
+        // loop until the minimum interval has elapsed; resync if behind.
+        if (capHz > 0) {
+            auto capNow = std::chrono::steady_clock::now();
+            if (capNext > capNow) {
+                std::this_thread::sleep_for(capNext - capNow);
+                capNow = std::chrono::steady_clock::now();
+            }
+            capNext = (capNext + capInterval > capNow) ? capNext + capInterval : capNow + capInterval;
+        }
+
         // Delta time
         auto now = std::chrono::high_resolution_clock::now();
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();
@@ -2725,10 +3306,12 @@ int main(int argc, char** argv) {
         // The runtime pumps neither window system, so the app must. On Wayland
         // this is also what answers xdg_wm_base.ping — miss it and the
         // compositor kills the client as unresponsive.
-        g_window.pump(OnWindowKey, &g_windowRunning);
+        g_window.pump_events(OnWindowEvent, &g_windowRunning);
         if (!g_windowRunning) {
             g_running = false; // one-way: never resurrect a SIGINT-cleared flag
         }
+        // V / 0-8 → xrRequestDisplayRenderingModeDXR, from the frame loop.
+        ProcessRenderingModeKeys(xr);
 
         // TEST HOOK (DXR_CUBE_TEST_RESIZE, off by default): declare a different
         // surface size once, so the runtime's Wayland resize-follow can be
@@ -2746,6 +3329,10 @@ int main(int argc, char** argv) {
         }
         PollEvents(xr);
 
+        if (xr.sessionRunning && g_liftProbe.Tick(xr.session)) {
+            xrRequestExitSession(xr.session); // DISPLAYXR_LIFT_PROBE_FRAMES reached
+        }
+
         if (xr.sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(xr, frameState)) {
@@ -2761,6 +3348,16 @@ int main(int argc, char** argv) {
                     locateInfo.space = xr.localSpace;
 
                     XrViewState viewState = {XR_TYPE_VIEW_STATE};
+                    // ADR-041 + multi-screen M3: how many located views are
+                    // live (the sum over displays when the window spans
+                    // displays), and which of them belong to which display.
+                    XrViewActivityStateDXR activity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                    XrViewDisplayBindingDXR bindingStorage[4] = {};
+                    XrViewDisplayBindingsDXR bindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                    bindings.bindingCapacityInput = 4;
+                    bindings.bindings = bindingStorage;
+                    activity.next = &bindings;
+                    viewState.next = &activity;
                     // Query view count
                     xrLocateViews(xr.session, &locateInfo, &viewState, 0, &viewCount, nullptr);
                     if (viewCount == 0) viewCount = 2; // fallback
@@ -2782,8 +3379,19 @@ int main(int argc, char** argv) {
                         locateInfo.next = &displayRig;
                     }
 
+                    // XR_DXR_cursor_depth: the hint / draw request on the
+                    // locate (inert when the extension is off).
+                    cursor.chain(locateInfo, viewState);
+
                     std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState, viewCount, &viewCount, views.data());
+                    if (cursor.enabled() && XR_SUCCEEDED(locResult)) {
+                        // Remembers the views for next frame's footprint rays.
+                        const uint32_t live = (activity.activeViewCount > 0 && activity.activeViewCount < viewCount)
+                                                  ? activity.activeViewCount
+                                                  : viewCount;
+                        cursor.afterLocate(views.data(), live);
+                    }
                     if (XR_SUCCEEDED(locResult) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
                         (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
@@ -2810,11 +3418,41 @@ int main(int argc, char** argv) {
                             // ADR-041: the layer carries the LOCATED count;
                             // only the active views are rendered, the tail
                             // aliases view 0 and the runtime drops it.
+                            //
+                            // Mode-following (V / 0-8): the ACTIVE rendering
+                            // mode supplies scale + tile grid. A 2D mode
+                            // (hardwareDisplay3D false) renders ONE view at
+                            // window x scale (1.0) and aliases the other; a
+                            // 3D mode renders up to 2 views (this app is
+                            // stereo) into the mode's grid. No mode table →
+                            // the init-time display_info scale, 2-view SBS.
                             const uint32_t locatedCount =
                                 (viewCount > 0) ? viewCount : 2;
-                            uint32_t eyeCount = 2;
-                            if (eyeCount > locatedCount)
-                              eyeCount = locatedCount;
+                            const XrDisplayRenderingModeInfoDXR* mode = ActiveRenderingMode(xr);
+                            float scaleX = xr.viewScaleX, scaleY = xr.viewScaleY;
+                            uint32_t tileCols = 2, tileRows = 1;
+                            // Views per view SET (one set per display the
+                            // window covers). A stereo session caps at 2 and
+                            // the tail aliases (ADR-041); a multiview session
+                            // renders every view of the active mode.
+                            uint32_t perSet = 2;
+                            if (mode != nullptr) {
+                                if (mode->viewScaleX > 0.0f) scaleX = mode->viewScaleX;
+                                if (mode->viewScaleY > 0.0f) scaleY = mode->viewScaleY;
+                                tileCols = mode->tileColumns > 0 ? mode->tileColumns : 1;
+                                tileRows = mode->tileRows > 0 ? mode->tileRows : 1;
+                                if (!(mode->hardwareDisplay3D && mode->viewCount > 1)) {
+                                    perSet = 1;
+                                } else {
+                                    perSet = xr.isMultiview ? mode->viewCount : 2;
+                                }
+                                if (perSet == 1) {
+                                    tileCols = 1;
+                                    tileRows = 1;
+                                }
+                            }
+                            if (perSet > tileCols * tileRows) perSet = tileCols * tileRows;
+
                             uint32_t winW = 0, winH = 0;
                             if (!g_window.current_size(&winW, &winH)) {
                                 winW = 0;
@@ -2822,54 +3460,135 @@ int main(int argc, char** argv) {
                             }
                             uint32_t eyeW, eyeH;
                             if (winW > 0 && winH > 0) {
-                                eyeW = (uint32_t)(winW * xr.viewScaleX);
-                                eyeH = (uint32_t)(winH * xr.viewScaleY);
+                                eyeW = (uint32_t)(winW * scaleX);
+                                eyeH = (uint32_t)(winH * scaleY);
                             } else {
                                 eyeW = xr.viewWidth;   // fallback: recommended (fullscreen envelope)
                                 eyeH = xr.viewHeight;
                             }
-                            // Clamp to the worst-case swapchain (SBS packs 2 tiles wide).
+                            // Clamp to one tile of the worst-case swapchain.
                             if (eyeW == 0) eyeW = 1;
                             if (eyeH == 0) eyeH = 1;
-                            if (eyeW > xr.swapchain.width / eyeCount) eyeW = xr.swapchain.width / eyeCount;
-                            if (eyeH > xr.swapchain.height) eyeH = xr.swapchain.height;
+                            if (eyeW > xr.swapchain.width / tileCols) eyeW = xr.swapchain.width / tileCols;
+                            if (eyeH > xr.swapchain.height / tileRows) eyeH = xr.swapchain.height / tileRows;
 
-                            EyeRenderParams eyeParams[2];
-                            projectionViews.resize(locatedCount, {});
-                            for (uint32_t i = 0; i < eyeCount; i++) {
-                                eyeParams[i].viewportX = i * eyeW;  // SBS: left eye at 0, right at eyeW
-                                eyeParams[i].viewportY = 0;
-                                eyeParams[i].width = eyeW;
-                                eyeParams[i].height = eyeH;
-                                mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
-                                // Clip policy stays app-side (fov is clip-independent).
-                                // Display rig: ZDP-anchored near/far so depth precision
-                                // brackets the convergence plane — near = ez - vH,
-                                // far = ez + 1000·vH, ez = rig-local eye Z (= pose Z at
-                                // identity rig). Matches cube_handle_vk_win.
-                                float nearZ = 0.01f, farZ = 100.0f;
-                                if (useDisplayRig) {
-                                    float ez = views[i].pose.position.z;
-                                    nearZ = (ez - kVirtualDisplayHeight > 0.001f)
-                                                ? (ez - kVirtualDisplayHeight) : 0.001f;
-                                    farZ = ez + 1000.0f * kVirtualDisplayHeight;
+                            /*
+                             * View sets. Without display bindings: one set,
+                             * the whole window, views [0, active). With them
+                             * (multi-screen M3, a window spanning displays):
+                             * one set per display, each rendered into ITS
+                             * segment's part of every tile — the same mosaic
+                             * the runtime composes, so each tile still holds
+                             * the whole window at view resolution.
+                             */
+                            struct ViewSet {
+                                uint32_t first, count;
+                                int32_t x, y;
+                                uint32_t w, h; // window px
+                            };
+                            ViewSet sets[4];
+                            uint32_t setCount = 0;
+                            const uint32_t nb = bindings.bindingCountOutput;
+                            if (xr.isMultiview && nb > 0 && nb <= 4 && winW > 0 && winH > 0) {
+                                for (uint32_t b = 0; b < nb; b++) {
+                                    const XrViewDisplayBindingDXR& vb = bindingStorage[b];
+                                    sets[setCount++] = {vb.firstView, vb.viewCount, vb.segmentRect.offset.x,
+                                                        vb.segmentRect.offset.y,
+                                                        (uint32_t)vb.segmentRect.extent.width,
+                                                        (uint32_t)vb.segmentRect.extent.height};
                                 }
-                                mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, nearZ, farZ);
-                                // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
-                                // clips [0,1], so remap or the cube is near-clipped
-                                // whenever the ZDP near sits close to the content
-                                // (invisible windowed). displayxr-common shared fn,
-                                // exactly like cube_handle_vk_win.
-                                convert_projection_gl_to_zero_to_one(eyeParams[i].projMat);
-
-                                projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-                                projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
-                                projectionViews[i].subImage.imageRect.offset = {(int32_t)(i * eyeW), 0};
-                                projectionViews[i].subImage.imageRect.extent = {(int32_t)eyeW, (int32_t)eyeH};
-                                projectionViews[i].subImage.imageArrayIndex = 0;
-                                projectionViews[i].pose = views[i].pose;
-                                projectionViews[i].fov = views[i].fov;
+                            } else {
+                                uint32_t active = perSet;
+                                // A multiview session takes the runtime's
+                                // count; a stereo-capped one keeps its cap.
+                                if (xr.isMultiview && activity.activeViewCount > 0 &&
+                                    activity.activeViewCount < active) {
+                                    active = activity.activeViewCount;
+                                }
+                                sets[setCount++] = {0, active, 0, 0, winW, winH};
                             }
+
+                            // Log the bindings when they change (one line, never per frame).
+                            {
+                                static std::string lastBindings;
+                                std::string now = "activeViewCount=" + std::to_string(activity.activeViewCount);
+                                for (uint32_t b = 0; b < nb && b < 4; b++) {
+                                    char line[192];
+                                    snprintf(line, sizeof(line),
+                                             "; display 0x%016llx views %u..%u segment %d,%d %dx%d",
+                                             (unsigned long long)bindingStorage[b].displayId,
+                                             bindingStorage[b].firstView,
+                                             bindingStorage[b].firstView + bindingStorage[b].viewCount - 1,
+                                             bindingStorage[b].segmentRect.offset.x,
+                                             bindingStorage[b].segmentRect.offset.y,
+                                             bindingStorage[b].segmentRect.extent.width,
+                                             bindingStorage[b].segmentRect.extent.height);
+                                    now += line;
+                                }
+                                if (nb == 0) now += "; no display bindings (one view set)";
+                                if (now != lastBindings) {
+                                    lastBindings = now;
+                                    LOG_INFO("Views: %s", now.c_str());
+                                }
+                            }
+
+                            const float fx = winW > 0 ? (float)eyeW / (float)winW : 1.0f;
+                            const float fy = winH > 0 ? (float)eyeH / (float)winH : 1.0f;
+                            EyeRenderParams eyeParams[8];
+                            uint32_t eyeCount = 0; // views rendered = [0, eyeCount)
+                            projectionViews.resize(locatedCount, {});
+                            for (uint32_t si = 0; si < setCount; si++) {
+                                const ViewSet& vs = sets[si];
+                                // Edges rounded independently: two segments
+                                // that share a seam share the tile column.
+                                const int32_t x0 = (int32_t)std::lround(vs.x * fx);
+                                const int32_t y0 = (int32_t)std::lround(vs.y * fy);
+                                const int32_t x1 = (int32_t)std::lround((vs.x + (int32_t)vs.w) * fx);
+                                const int32_t y1 = (int32_t)std::lround((vs.y + (int32_t)vs.h) * fy);
+                                const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                for (uint32_t j = 0; j < vs.count && j < tileCols * tileRows; j++) {
+                                    const uint32_t i = vs.first + j;
+                                    if (i >= locatedCount || i >= 8) break;
+                                    const uint32_t tileX = j % tileCols;
+                                    const uint32_t tileY = j / tileCols;
+                                    eyeParams[i].viewportX = tileX * eyeW + (uint32_t)x0;
+                                    eyeParams[i].viewportY = tileY * eyeH + (uint32_t)y0;
+                                    eyeParams[i].width = sw;
+                                    eyeParams[i].height = sh;
+                                    mat4_view_from_xr_pose(eyeParams[i].viewMat, views[i].pose);
+                                    // Clip policy stays app-side (fov is clip-independent).
+                                    // Display rig: ZDP-anchored near/far so depth precision
+                                    // brackets the convergence plane — near = ez - vH,
+                                    // far = ez + 1000·vH, ez = rig-local eye Z (= pose Z at
+                                    // identity rig). Matches cube_handle_vk_win.
+                                    float nearZ = 0.01f, farZ = 100.0f;
+                                    if (useDisplayRig) {
+                                        float ez = views[i].pose.position.z;
+                                        nearZ = (ez - kVirtualDisplayHeight > 0.001f)
+                                                    ? (ez - kVirtualDisplayHeight) : 0.001f;
+                                        farZ = ez + 1000.0f * kVirtualDisplayHeight;
+                                    }
+                                    mat4_from_xr_fov(eyeParams[i].projMat, views[i].fov, nearZ, farZ);
+                                    // mat4_from_xr_fov emits GL [-1,1] clip-depth; Vulkan
+                                    // clips [0,1], so remap or the cube is near-clipped
+                                    // whenever the ZDP near sits close to the content
+                                    // (invisible windowed). displayxr-common shared fn,
+                                    // exactly like cube_handle_vk_win.
+                                    convert_projection_gl_to_zero_to_one(eyeParams[i].projMat);
+
+                                    projectionViews[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+                                    projectionViews[i].subImage.swapchain = xr.swapchain.swapchain;
+                                    projectionViews[i].subImage.imageRect.offset = {
+                                        (int32_t)eyeParams[i].viewportX, (int32_t)eyeParams[i].viewportY};
+                                    projectionViews[i].subImage.imageRect.extent = {(int32_t)sw, (int32_t)sh};
+                                    projectionViews[i].subImage.imageArrayIndex = 0;
+                                    projectionViews[i].pose = views[i].pose;
+                                    projectionViews[i].fov = views[i].fov;
+                                    if (i + 1 > eyeCount) eyeCount = i + 1;
+                                }
+                            }
+                            if (eyeCount == 0) eyeCount = 1; // never leave view 0 unwritten
 
                             // ADR-041: fill the inactive tail — own located
                             // pose/fov, view 0's subimage.

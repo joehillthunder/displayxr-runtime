@@ -31,6 +31,11 @@
       "blurb": "How an app hands its native window to the runtime so the compositor can output into it."
     },
     {
+      "id": "input",
+      "title": "Input providers",
+      "blurb": "Which installed input provider drives an app's controllers, hands and gamepad, and how an app shows its user the choice and asks for one — while the user's own pins and defaults always win."
+    },
+    {
       "id": "workspace",
       "title": "Workspace controller surface",
       "blurb": "The contract that lets a workspace controller — the DisplayXR Shell, or any third-party / OEM / vertical / AI-agent equivalent — drive the spatial-desktop layer on top of the runtime. Activation is gated by orchestrator-PID match; the runtime trusts whatever binary it was configured to spawn."
@@ -55,7 +60,7 @@
     "XR_DXR_view_rig": {
       "group": "rendering",
       "title": "View Rig",
-      "summary": "App declares a display or camera rig descriptor and consumes render-ready XrView{pose, fov}; the runtime owns the projection math"
+      "summary": "App declares a display or camera rig descriptor and consumes render-ready XrView{pose, fov}; the runtime owns the projection math — and, chained on the hand-joint locate, returns the joints in that same rig frame"
     },
     "XR_DXR_display_zones": {
       "group": "rendering",
@@ -72,10 +77,25 @@
       "title": "Rear Depth Budget",
       "summary": "Advisory limit on how far behind the display plane a transparent app may render, chained on XrViewState at xrLocateViews"
     },
+    "XR_DXR_cursor_depth": {
+      "group": "rendering",
+      "title": "Depth-Aware Cursor",
+      "summary": "Opt-in: the app reports the nearest content under the cursor at xrLocateViews; the runtime places a cursor sprite just in front of it (and, since v5, draws it, with the app's own sprite or the OS cursor's look; since v8 also on any woven rect, so a web page's cursor is drawn by the runtime with the browser's real cursor), so the pointer never sits behind 3D content"
+    },
+    "XR_DXR_stereo_comfort": {
+      "group": "rendering",
+      "title": "Stereo Comfort Zone",
+      "summary": "Opt-in: xrLocateViews reports the comfort zone for the current viewer (diopter bounds in front of and behind the glass, and the matching on-glass disparity, at the tracked or nominal viewing distance, with the user's depth preference applied), so an app sizes its eye separation from the display instead of a hard-coded percentage"
+    },
     "XR_DXR_weave": {
       "group": "rendering",
       "title": "Window Weave Service",
-      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence"
+      "summary": "Window-bound synchronous weave for present-owners: hand the runtime a stereo texture and a window rect, get back a weaved shared texture and a fence (sync_file acquire/release fences on desktop Linux and Android, so the weave pipelines with the caller's GPU work); a window spanning two 3D screens is woven per screen, with each screen's eyes and each rect's per-screen parts handed back"
+    },
+    "XR_DXR_lift": {
+      "group": "rendering",
+      "title": "2D-to-3D Conversion",
+      "summary": "2D-to-3D conversion as a service: depth, video depth, stereo or N views, and photo-to-Gaussian-splats, served by whichever conversion provider the runtime selects per task (apps see tasks; they may list the candidate providers read-only and hint one per stream, never set the user's default); enumerate tasks with their readiness and pushed state events, and wait for READY rather than fall back to an in-app converter; submit 2D frames (any platform image kind, explicit sync), acquire the latest result with its depth units and view metadata, or flag a weave rect as 2D so the service lifts it before weaving; the runtime owns the viewpoint policy, can derive the viewpoints from the app's own view rig, and returns depth from the same inference aligned to display space"
     },
     "XR_DXR_win32_window_binding": {
       "group": "windowing",
@@ -85,7 +105,7 @@
     "XR_DXR_cocoa_window_binding": {
       "group": "windowing",
       "title": "Cocoa Window Binding",
-      "summary": "App-provided NSView, IOSurface sharing"
+      "summary": "App-provided NSView, IOSurface sharing, runtime-owned phase-snapped window drag/resize (opt-out)"
     },
     "XR_DXR_xlib_window_binding": {
       "group": "windowing",
@@ -100,17 +120,22 @@
     "XR_DXR_android_surface_binding": {
       "group": "windowing",
       "title": "Android Surface Binding",
-      "summary": "App-provided Android Surface / ANativeWindow, republished across background and resume, with the per-frame window rect"
+      "summary": "App-provided Android Surface / ANativeWindow, republished across background and resume, with the per-frame window rect and the surface's touch events for the runtime's touch input provider"
     },
     "XR_DXR_macos_gl_binding": {
       "group": "windowing",
       "title": "macOS OpenGL Binding",
       "summary": "macOS OpenGL graphics binding"
     },
+    "XR_DXR_input_providers": {
+      "group": "input",
+      "title": "Input Providers",
+      "summary": "An app lists the resident input providers (the provider's own name, families it supplies, presence, which one holds this app's controllers / hands / gamepad) and requests one per family, optionally as the user's per-app pin"
+    },
     "XR_DXR_spatial_workspace": {
       "group": "workspace",
       "title": "Spatial Workspace",
-      "summary": "Multi-app composition: window pose, hit-test, capture, overlay, modal input grab"
+      "summary": "Multi-app composition across every 3D screen: screen enumeration, per-screen window placement and overlays, capture, modal input grab"
     },
     "XR_DXR_workspace_file_dialog": {
       "group": "workspace",
@@ -122,10 +147,30 @@
       "title": "App MCP Tools",
       "summary": "An app registers its own MCP tools with the runtime's agent surface; calls arrive on the OpenXR event queue"
     },
+    "XR_DXR_desktop_control": {
+      "group": "agent",
+      "title": "Desktop Control",
+      "summary": "An app's agent observes and operates the desktop (windows, UI text, typing, clicks) and, as a separate consent scope, captures screen stills, through the OS's own consent, granted to the app, never to DisplayXR"
+    },
     "XR_DXR_atlas_capture": {
       "group": "capture",
       "title": "Atlas Capture",
       "summary": "Vendor-neutral PNG snapshot of the multi-view atlas at a caller-selected compositor stage, for any app class"
+    },
+    "XR_DXR_stereo_camera": {
+      "group": "capture",
+      "title": "Stereo Camera Source",
+      "summary": "A runtime-owned, privacy-gated stereo camera source: the display's own camera (usually the eye tracker's, supplied by the vendor plug-in without taking it from the tracker) or an opted-in plain UVC side-by-side webcam, fanned out by the service to clients as rectified newest-frame side-by-side pairs over shared memory"
+    },
+    "XR_DXR_app_share": {
+      "group": "capture",
+      "title": "3D App Share",
+      "summary": "3D screen share: a running DisplayXR app's pre-weave left/right views offered as one more XR_DXR_stereo_camera source, display-referred side-by-side frames with per-frame content metadata, behind a per-start runtime share prompt (ADR-061; not implemented yet)"
+    },
+    "XR_DXR_swapchain_color_encoding": {
+      "group": "rendering",
+      "title": "Swapchain Color Encoding",
+      "summary": "Declares that a UNORM swapchain holds display-encoded (sRGB) values, so the runtime reads it like an _SRGB one: lets a 10-bit back buffer be submitted without converting it"
     }
   }
 }

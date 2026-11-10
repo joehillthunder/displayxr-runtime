@@ -19,21 +19,38 @@
  * composite alpha-over in layer-list order — blits cannot blend. Zones
  * frames are all-or-none at the oxr layer, so normal frames never touch the
  * draw path.
+ *
+ * Exception 2 (#1935): a fast-path frame whose source is a truthful-sRGB
+ * swapchain (#1559) is drawn, not blitted — a blit reads in the image's
+ * format and would decode it, and the per-frame raw copy that used to dodge
+ * that was the whole frame on Adreno. See draw_raw_view_pass().
  */
 
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_deposit.h"
+#include "comp_vk_native_equirect2.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/comp_layer_view_camera.h"
+#include "util/u_color_encoding.h"
+#include "util/u_cursor_depth.h"
 
 #include "xrt/xrt_vulkan_includes.h"
 #include "vk/vk_helpers.h"
 
+// #1905: comp_vk_native_queue_submit_retry. XRT_OS_ANDROID is defined by now
+// (vk_helpers.h -> xrt_compositor.h -> xrt_config_os.h).
+#ifdef XRT_OS_ANDROID
+#include "comp_vk_native_target.h"
+#endif
+
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+
+#include "math/m_api.h"
 
 #include <string.h>
 #include <math.h>
@@ -42,6 +59,13 @@
 #include "shaders/zone_blit.vert.h"
 #include "shaders/zone_blit.frag.h"
 #include "shaders/zone_blit_array.frag.h"
+#include "shaders/zone_blit_soft.frag.h"
+#include "shaders/zone_blit_soft_array.frag.h"
+#include "shaders/equirect2.vert.h"
+#include "shaders/equirect2.frag.h"
+#include "shaders/equirect2_array.frag.h"
+#include "shaders/atlas_pq.vert.h"
+#include "shaders/atlas_pq.frag.h"
 
 //! Upper bound on zone draws (and so descriptor sets) per frame:
 //! zones (OXR_DISPLAY_ZONES_MAX_ZONES_3D = 32) × views (XRT_MAX_VIEWS = 8).
@@ -59,27 +83,108 @@
  * pass reproduces the blit byte-for-byte.
  */
 DEBUG_GET_ONCE_BOOL_OPTION(vk_force_compose_pass, "DXR_VK_FORCE_COMPOSE_PASS", false)
+DEBUG_GET_ONCE_OPTION(atlas_format, "DXR_ATLAS_FORMAT", NULL)
 
 /*!
- * How a draw composites onto what is already in the tile.
+ * The atlas format. B8G8R8A8_UNORM unless DXR_ATLAS_FORMAT asks for a deeper one
+ * (experimental, 10-bit path to the panel): `rgb10a2` -> A2B10G10R10_UNORM_PACK32,
+ * `rgba16f` -> R16G16B16A16_SFLOAT. Every consumer reads r->format, and the DP is
+ * told it, so a deeper atlas reaches the weaver intact.
+ */
+static VkFormat
+atlas_format_from_env(void)
+{
+	const char *v = debug_get_option_atlas_format();
+	if (v == NULL || v[0] == '\0') {
+		return VK_FORMAT_B8G8R8A8_UNORM;
+	}
+	VkFormat f = VK_FORMAT_B8G8R8A8_UNORM;
+	if (strcmp(v, "rgb10a2") == 0) {
+		f = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+	} else if (strcmp(v, "rgba16f") == 0) {
+		f = VK_FORMAT_R16G16B16A16_SFLOAT;
+	} else {
+		U_LOG_W("DXR_ATLAS_FORMAT='%s' not recognised (rgb10a2 | rgba16f) - keeping B8G8R8A8", v);
+		return f;
+	}
+	U_LOG_W("DXR_ATLAS_FORMAT=%s: vk_native atlas format %d (experimental)", v, (int)f);
+	return f;
+}
+
+/*!
+ * Blend STATES the pass needs — three, not four.
  *
- * LOCAL AND TEMPORARY. #1611 is landing the shared vocabulary in
- * comp_layer_view_camera.h (`comp_layer_blend_mode` + the painter's-order
- * first-layer gate, and an OPAQUE_COVER mode this does not have yet); when
- * that merges, this enum is deleted and the table below is re-indexed on it.
- * It exists only so this step does not have to wait, and deliberately does
- * NOT try to pre-empt the final spelling.
+ * #1611's `enum comp_layer_blend_mode` has four modes, but two of them share
+ * one pipeline: COMP_LAYER_BLEND_OPAQUE_COVER is the same blending-OFF state
+ * as COMP_LAYER_BLEND_REPLACE, and differs only in that the shader emits
+ * alpha = 1 — which comp_layer_blend_fold_opaque_cover() achieves by folding
+ * `scale.a = 0, bias.a = 1` into the colour scale/bias the fragment shader
+ * already applies. So the table is 3 states x 2 samplers = 6 pipelines, not
+ * 4 x 2 = 8, and there is no specialisation constant and no fourth shader.
+ *
+ * @ref vk_compose_blend_state maps the shared mode onto these.
  */
 enum vk_compose_blend
 {
-	//! Blending off: the source written verbatim, RGBA. What a blit did.
-	VK_COMPOSE_BLEND_REPLACE = 0,
+	//! Blending off. Serves both REPLACE and OPAQUE_COVER.
+	VK_COMPOSE_BLEND_OFF = 0,
 	//! out.rgb = src.rgb + dst.rgb * (1 - src.a)
 	VK_COMPOSE_BLEND_PREMULT = 1,
 	//! out.rgb = src.rgb * src.a + dst.rgb * (1 - src.a)
 	VK_COMPOSE_BLEND_UNPREMULT = 2,
 	VK_COMPOSE_BLEND_COUNT,
 };
+
+//! Shared policy mode -> the pipeline's blend state.
+static inline enum vk_compose_blend
+vk_compose_blend_state(enum comp_layer_blend_mode mode)
+{
+	switch (mode) {
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return VK_COMPOSE_BLEND_PREMULT;
+	case COMP_LAYER_BLEND_STRAIGHT: return VK_COMPOSE_BLEND_UNPREMULT;
+	case COMP_LAYER_BLEND_REPLACE:
+	case COMP_LAYER_BLEND_OPAQUE_COVER:
+	default: return VK_COMPOSE_BLEND_OFF;
+	}
+}
+
+/*!
+ * The push-constant block, byte-identical to the `ComposeParams` every shader
+ * in shaders/ declares. 128 bytes — the guaranteed minimum, see the range.
+ */
+struct vk_compose_push
+{
+	float mvp[16];         //!< Quad only; the fullscreen path ignores it.
+	float src_rect[4];     //!< xy = src origin (norm), zw = src size (norm).
+	float params[4];       //!< x = array slice, y = quad flag; zw reserved.
+	float color_scale[4];  //!< XR_KHR_composition_layer_color_scale_bias.
+	float color_bias[4];   //!< ditto.
+};
+
+/*!
+ * The format the private compose target is ATTACHED through — the single
+ * switch the escape hatch flips.
+ *
+ * `_SRGB` (default): the hardware decodes each source on sample, blends in
+ * linear and encodes once on write — the #1589/#1610 model.
+ *
+ * `UNORM` (`DXR_COLOR_LEGACY_UNORM_ENCODED=1`): no encode on write, so layers
+ * blend in encoded space exactly as they did before this work. Paired with
+ * sampling through the NON-decoding views, that is one switch and one
+ * behaviour, the same shape the Direct3D side uses.
+ *
+ * Vulkan keeps the private target even under the hatch, where the shared
+ * header describes the Direct3D side as not creating one. The target is not
+ * only a colour device here — it is the render pass that draws quads and
+ * blends zones, so dropping it would drop those too. Attaching it UNORM is
+ * byte-equivalent to the old behaviour and costs one extra image copy on a
+ * transitional path.
+ */
+static inline VkFormat
+zone_compose_view_format(void)
+{
+	return u_color_legacy_unorm_encoded() ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_B8G8R8A8_SRGB;
+}
 
 //! Which sampler the source view needs.
 enum vk_compose_sampler
@@ -99,6 +204,36 @@ struct comp_vk_native_renderer
 
 	//! Command pool for recording blit commands.
 	VkCommandPool cmd_pool;
+
+	/*!
+	 * The compose command buffer, allocated ONCE from cmd_pool and recycled
+	 * with vkResetCommandBuffer by renderer_draw and draw_zones_pass (#1935).
+	 * Allocating + freeing one per frame made the Adreno driver hand its
+	 * command memory back to the kernel on every vkFreeCommandBuffers and
+	 * allocate + zero fresh pages the next frame — ~80% of an sRGB app's
+	 * xrEndFrame CPU, growing as the kgsl pre-zeroed pool drained. A reset
+	 * without RELEASE_RESOURCES keeps that memory. Safe to reset at the top
+	 * of the next draw because both draw paths wait draw_fence (signalled by
+	 * this buffer's own submit) before returning, and a failed submit leaves
+	 * it not pending. Only touched on the thread that owns cmd_pool.
+	 */
+	VkCommandBuffer draw_cmd;
+
+	/*!
+	 * Signalled by the submit of draw_cmd, and the ONLY thing the per-frame
+	 * draw paths wait on (#1917). It used to be vkQueueWaitIdle on the main
+	 * queue — the APP's queue in-process — which waits for everything on it,
+	 * including work another thread (a fill, an app render/submit thread)
+	 * queued after ours, so a pipelining app could be held to one frame in
+	 * flight. Waiting on our own submit keeps exactly the guarantee callers
+	 * need — the atlas is complete when draw returns (the hand-off posts it
+	 * right after), and draw_cmd is idle for the next reset — and on an
+	 * in-order queue it also implies the app's earlier submits for the
+	 * source image are done, which is what the blit depended on anyway.
+	 * Created once (lazily), reset after each wait — never created or
+	 * destroyed per frame.
+	 */
+	VkFence draw_fence;
 
 	//! Number of tile columns in the atlas (default 2 for stereo).
 	uint32_t tile_columns;
@@ -165,10 +300,107 @@ struct comp_vk_native_renderer
 		 * so the pipeline must match the SOURCE, not the layer's flags.
 		 */
 		VkPipeline pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		/*!
+		 * XR_KHR_composition_layer_equirect2 (#1602): same table shape,
+		 * same layout and push-constant block, but equirect2.vert/.frag —
+		 * a per-pixel ray cast against the layer's sphere rather than a
+		 * textured rectangle.
+		 */
+		VkPipeline eq2_pipelines[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		/*!
+		 * ADR-046 Amendment 2 B.7: the runtime-drawn cursor softened
+		 * against crosstalk (zone_blit_soft{,_array}.frag), same table
+		 * shape, layout and push-constant block. Only the PREMULT and
+		 * UNPREMULT columns are used, the straight-alpha flag being a
+		 * specialization constant of the UNPREMULT one. Built LAZILY on
+		 * the first cursor frame that needs softening (ADR-046 §0), so a
+		 * session that never asks pays nothing.
+		 */
+		VkPipeline pipelines_soft[VK_COMPOSE_BLEND_COUNT][VK_COMPOSE_SAMPLER_COUNT];
+		//! The soft pipelines could not be built: crisp cursor from then on.
+		bool soft_failed;
 		VkDescriptorPool descriptor_pool;
+
+		/*!
+		 * @name The private compose target (#1589/#1610)
+		 *
+		 * The pass does NOT render into the atlas. It renders into a
+		 * runtime-private image of the SAME format, created
+		 * MUTABLE_FORMAT with a {UNORM, SRGB} format list, through its
+		 * **_SRGB** view — so the fixed-function blender decodes,
+		 * blends in LINEAR light and re-encodes on write, which is what
+		 * OpenXR specifies and what the CTS reference images are. The
+		 * result is then handed to the atlas with vkCmdCopyImage:
+		 * identical formats, so raw bytes, NO conversion.
+		 *
+		 * Deliberately a copy and never a blit — vkCmdBlitImage
+		 * CONVERTS between sRGB and UNORM, which would apply the encode
+		 * a second time.
+		 *
+		 * The atlas itself is untouched: same image, same UNORM format,
+		 * same ENCODED bytes, same `process_atlas` format argument. No
+		 * DP change, no plug-in ABI change.
+		 * @{
+		 */
+		VkImage compose_image;
+		VkDeviceMemory compose_memory;
+		VkImageView compose_view;   //!< _SRGB — the render-pass attachment.
+		/*!
+		 * UNORM view of the same memory, SAMPLED by the hand-off draw
+		 * (DXR_VK_ZONES_COPY_TO_DRAW, default on): the stored ENCODED
+		 * bytes with no decode, written to the UNORM atlas with no
+		 * encode — byte-for-byte what the copy moved. VK_NULL_HANDLE
+		 * when the knob is off or the view could not be made; the
+		 * hand-off then copies.
+		 */
+		VkImageView compose_unorm_view;
+		//! The zone render pass's finalLayout: SHADER_READ_ONLY when it
+		//! is built for the draw hand-off, TRANSFER_SRC for the copy.
+		VkImageLayout compose_final_layout;
+		uint32_t compose_w, compose_h;
+		//! @}
+
 		bool ready;
 		bool failed; //!< init failed once — stay on the blit fallback
 	} zone;
+
+	/*!
+	 * #1935: the fast path's draw for a truthful-sRGB source.
+	 *
+	 * The fast path is vkCmdBlitImage, and a blit reads its source in the
+	 * IMAGE's format — so an `_SRGB` app image (#1559) would be decoded on
+	 * the way into the UNORM/ENCODED atlas. #1559 avoided that with a raw
+	 * vkCmdCopyImage into a UNORM scratch every frame; on Adreno that copy
+	 * was the whole frame. This is the replacement: one REPLACE draw per view
+	 * straight into the atlas, sampling the swapchain's UNORM mutable-format
+	 * view (comp_vk_native_swapchain_get_image_view) — the stored bytes, no
+	 * decode, no encode, no scratch. Byte-for-byte what copy + blit wrote.
+	 *
+	 * Rides the compose pass's bundle (pipeline layout, set layout, sampler,
+	 * descriptor pool, shaders) and is built alongside it in
+	 * zone_draw_ensure. Its own render pass because the attachment is the
+	 * ATLAS (UNORM), not the private `_SRGB` compose target, and the
+	 * pipelines must be compatible with it. Framebuffers are per atlas view,
+	 * like the deposit ring alternates them (#1178), and dropped with the
+	 * atlas.
+	 */
+	struct
+	{
+		VkRenderPass render_pass;
+		//! Blending off, by @ref VK_COMPOSE_SAMPLER_2D / _2D_ARRAY.
+		VkPipeline pipelines[VK_COMPOSE_SAMPLER_COUNT];
+		VkFramebuffer fb[COMP_VK_DEPOSIT_RING];
+		VkImageView fb_view[COMP_VK_DEPOSIT_RING];
+		/*!
+		 * NEAREST, clamp: the zones hand-off draw samples the compose
+		 * target 1:1 (pixel centre to texel centre), and point sampling
+		 * makes that exact by construction rather than by the filter
+		 * weights happening to be 0/1.
+		 */
+		VkSampler nearest;
+		bool ready;
+		bool failed; //!< build failed once — keep the #1559 copy + blit
+	} raw;
 
 	/*!
 	 * VK-0 (#1178) — when non-NULL the atlas is NOT owned by this renderer:
@@ -179,7 +411,82 @@ struct comp_vk_native_renderer
 	 * reach. NULL (the default) restores the owned-atlas path verbatim.
 	 */
 	struct comp_vk_deposit *deposit;
+	/*!
+	 * #2317 P2a: wait-half storage for the deposit chain (deposit_chain_signal):
+	 * the deposit's own release and the hub's DIRECT release, both timelines.
+	 * Must outlive the vkQueueSubmit it is chained into; one submit is built
+	 * at a time, the same rule as the keyed-mutex chain storage.
+	 */
+	VkSemaphore deposit_wait_sems[2];
+	uint64_t deposit_wait_values[2];
+	VkPipelineStageFlags deposit_wait_stages[2];
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * XrCursorDepthDrawInfoDXR. The draw tests `req.active` once; the
+	 * default-look image and its staging buffer are created on the first
+	 * request that needs them. The pipelines are the compose pass's own.
+	 */
+	struct
+	{
+		//! One-frame request from the compositor, consumed by the next draw.
+		struct comp_vk_native_cursor_draw req;
+		//! The default look's sprite: R8G8B8A8 `_SRGB` (UNORM under the
+		//! legacy colour hatch, which samples every source undecoded),
+		//! steady-state SHADER_READ_ONLY_OPTIMAL once uploaded.
+		VkImage default_image;
+		VkDeviceMemory default_memory;
+		VkImageView default_view;
+		uint32_t default_w, default_h;
+		//! Host-visible staging for the next upload.
+		VkBuffer staging;
+		VkDeviceMemory staging_memory;
+		VkDeviceSize staging_size;
+		//! The staged pixels still have to be copied into default_image.
+		bool upload_pending;
+		//! default_image has been uploaded at least once.
+		bool default_ready;
+		bool warned_no_pass;
+		bool announced;
+		//! The softened pipelines failed once (ADR-046 B.7); logged.
+		bool warned_soft;
+	} cursor;
+
+	/*!
+	 * #2340 PQ re-encode pass (DXR_ATLAS_ENCODING=pq only; all null unless
+	 * ever requested). Two private images of the atlas's format and
+	 * allocation: the atlas is copied into @ref src, the pass draws
+	 * src -> dst, and dst is copied back. Owning both ends keeps the
+	 * framebuffer and the descriptor set fixed while the deposit ring
+	 * alternates the atlas view every frame; the price is two atlas copies,
+	 * paid only by the experimental path.
+	 */
+	struct
+	{
+		VkRenderPass render_pass;
+		VkDescriptorSetLayout set_layout;
+		VkPipelineLayout pipeline_layout;
+		VkPipeline pipeline;
+		VkDescriptorPool descriptor_pool;
+		VkDescriptorSet descriptor_set;
+		VkSampler sampler;
+		VkImage src, dst;
+		VkDeviceMemory src_memory, dst_memory;
+		VkImageView src_view, dst_view;
+		VkFramebuffer framebuffer;
+		uint32_t w, h;
+		//! The pipeline could not be built; never retried.
+		bool failed;
+	} pq;
 };
+
+static void
+raw_destroy_framebuffers(struct comp_vk_native_renderer *r);
+static void
+raw_destroy(struct comp_vk_native_renderer *r);
 
 /*!
  * Does this frame carry any XR_DXR_display_zones 3D zone layer?
@@ -207,16 +514,281 @@ layers_contain_zone_3d(const struct comp_layer_accum *layers)
 /*!
  * Does the compose pass draw this layer type?
  *
- * Projection-class and 3D zones. Quad / cylinder / equirect are accumulated
- * but not yet drawn on this backend (#1581) — they are skipped here exactly
- * as the blit path skipped them, so this change neither adds nor removes
- * content.
+ * Projection-class, 3D zones, QUADS (#1581 — the Vulkan backend accepted
+ * `comp_layer_accum_quad` and never drew it, so every Khronos CTS interactive
+ * composition prompt, label and reference image was invisible here) and
+ * EQUIRECT2 (#1602 — same defect, six blank CTS Equirect2 subtests).
+ * Cylinder / equirect1 / cube remain accumulated and undrawn.
+ *
+ * Also the fast-path census: every type listed here counts as a contributing
+ * layer, so a lone equirect2 frame is a compose case (it covers a sub-rect
+ * and owes a linear blend), never the blit.
  */
 static bool
 compose_pass_draws_layer(const struct comp_layer *layer)
 {
 	const enum xrt_layer_type t = layer->data.type;
-	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D;
+	return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH || t == XRT_LAYER_ZONE_3D ||
+	       t == XRT_LAYER_QUAD || t == XRT_LAYER_EQUIRECT2;
+}
+
+/*!
+ * Resolve the source a (layer, view) pair samples.
+ *
+ * Projection-class and zone layers carry a per-view swapchain and a per-view
+ * sub-image; a QUAD or an EQUIRECT2 carries ONE swapchain and one sub-image
+ * shown in every view it is visible in. Both shapes resolve here so the transition loop and
+ * the draw loop cannot disagree about which image a draw touches — they must
+ * agree, or an image is sampled in the wrong layout.
+ */
+static bool
+compose_layer_source(const struct comp_layer *layer,
+                     uint32_t view,
+                     struct xrt_swapchain **out_xsc,
+                     const struct xrt_sub_image **out_sub)
+{
+	if (layer->data.type == XRT_LAYER_QUAD) {
+		*out_xsc = layer->sc_array[0];
+		*out_sub = &layer->data.quad.sub;
+	} else if (layer->data.type == XRT_LAYER_EQUIRECT2) {
+		*out_xsc = layer->sc_array[0];
+		*out_sub = &layer->data.equirect2.sub;
+	} else {
+		*out_xsc = layer->sc_array[view];
+		*out_sub = &layer->data.proj.v[view].sub;
+	}
+	return *out_xsc != NULL;
+}
+
+/*!
+ * Multi-screen M3: does this layer's view set go through the per-segment
+ * routing (see comp_vk_native_eff_layout::route)? Projection-class layers
+ * carry one view set per segment; quads and equirect2 layers are drawn once per
+ * segment too, each with THAT segment's view camera, confined to its rect —
+ * one camera across the whole mosaic tile would mis-place them on every
+ * segment but the first. Zones are never routed.
+ */
+static bool
+layer_is_routed(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	const enum xrt_layer_type t = layer->data.type;
+	return layout->route_count > 0 && (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH ||
+	                                   t == XRT_LAYER_QUAD || t == XRT_LAYER_EQUIRECT2);
+}
+
+//! Views a routed layer contributes: the end of the last segment's range.
+static uint32_t
+routed_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > n) {
+			n = end;
+		}
+	}
+	// A projection layer is bounded by what it submitted; a quad / equirect2
+	// has one sub-image shown in every routed view.
+	const bool per_view =
+	    layer->data.type == XRT_LAYER_PROJECTION || layer->data.type == XRT_LAYER_PROJECTION_DEPTH;
+	if (per_view && n > layer->data.view_count) {
+		n = layer->data.view_count;
+	}
+	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
+}
+
+/*!
+ * Where a routed layer view goes: segment k's local view j lands in tile j, at
+ * the segment's rect inside that tile (the mosaic). False = the view belongs to
+ * no segment (the aliased tail) or to a tile the layout does not have.
+ */
+static bool
+route_eye(const struct comp_vk_native_eff_layout *layout,
+          uint32_t eye,
+          uint32_t *out_tile,
+          int32_t *x0,
+          int32_t *y0,
+          int32_t *x1,
+          int32_t *y1)
+{
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t first = layout->route[k].first_view;
+		if (eye < first || eye >= first + layout->route[k].view_count) {
+			continue;
+		}
+		const uint32_t j = eye - first;
+		if (j >= layout->views || layout->cols == 0) {
+			return false;
+		}
+		const int32_t bx = (int32_t)((j % layout->cols) * layout->tile_w);
+		const int32_t by = (int32_t)((j / layout->cols) * layout->tile_h);
+		*out_tile = j;
+		*x0 = bx + layout->route[k].x;
+		*y0 = by + layout->route[k].y;
+		*x1 = *x0 + (int32_t)layout->route[k].w;
+		*y1 = *y0 + (int32_t)layout->route[k].h;
+		return layout->route[k].w > 0 && layout->route[k].h > 0;
+	}
+	return false;
+}
+
+/*!
+ * How many views does this layer contribute to?
+ *
+ * A quad or an equirect2 is a single world-placed surface: it is a candidate
+ * in EVERY tile and `is_layer_view_visible_n` decides which ones. Everything
+ * else is per-view content bounded by its own view_count.
+ */
+static uint32_t
+compose_layer_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout)
+{
+	uint32_t n;
+	if (layer_is_routed(layer, layout)) {
+		// Multi-screen M3: one draw per routed view (per segment).
+		n = routed_view_count(layer, layout);
+	} else if (layer->data.type == XRT_LAYER_QUAD || layer->data.type == XRT_LAYER_EQUIRECT2) {
+		n = layout->views;
+	} else {
+		n = layer->data.view_count;
+		if (n > layout->views) {
+			n = layout->views;
+		}
+	}
+	// Clamped to XRT_MAX_VIEWS because the per-view camera and per-tile
+	// painter's-order arrays are sized by it: an effective layout claiming
+	// more views than that would otherwise index off the end of both.
+	if (n > XRT_MAX_VIEWS) {
+		n = XRT_MAX_VIEWS;
+	}
+	return n == 0 ? 1 : n;
+}
+
+/*!
+ * One view of one `XR_KHR_composition_layer_equirect2` layer (#1602): decide
+ * whether it draws, resolve its blend mode, and pack its shader constants.
+ *
+ * Ported from the D3D11 reference render_equirect2_layer(), its D3D12 port
+ * and GL's gl_render_equirect2_layer(), sharing every policy decision with
+ * them through comp_layer_view_camera.h:
+ *
+ *  - per-eye visibility from is_layer_view_visible_n(), view-count aware
+ *    (#1580). NO front-facing test: a sphere has no back face, #1590 is
+ *    normative for quads only, and culling here would drop a viewer standing
+ *    INSIDE the sphere — the ordinary 360-background case and CTS Equirect2
+ *    subtests 1-4. An invisible view marks nothing: it draws nothing;
+ *  - the blend mode through comp_layer_subrect_blend_mode(): a sphere
+ *    section paints part of the tile, so it can never be the tile's base
+ *    (#1598), but it MARKS the tile so a later projection layer blends over
+ *    it. The caller folds OPAQUE_COVER into the colour scale/bias with every
+ *    other layer's;
+ *  - the camera is this view's comp_layer_view_camera (#1580), the SAME one
+ *    the projection tile was framed by, and its FOV enters ONLY here, as the
+ *    frustum tangents.
+ *
+ * Like the other ports there is no forward MVP: the shader casts rays from
+ * the camera into the layer's MODEL space, so what is packed is the inverse
+ * model-view — with the frustum tangents folded into its 3x3, because the
+ * HLSL cbuffer's 160 bytes do not fit the pass's 128-byte push-constant block
+ * (comp_vk_native_equirect2.h; shaders/equirect2.vert reads it back).
+ *
+ * @param out_eq   16 floats for vk_compose_push::mvp.
+ * @param out_mode The shared blend mode for this draw.
+ * @return false when this view does not draw the layer.
+ */
+static bool
+compose_equirect2_view(const struct comp_layer *layer,
+                       uint32_t view,
+                       uint32_t view_count,
+                       const struct comp_layer_view_camera *cam,
+                       struct comp_layer_tile_state *tile,
+                       float out_eq[16],
+                       enum comp_layer_blend_mode *out_mode)
+{
+	const struct xrt_layer_data *data = &layer->data;
+	const struct xrt_layer_equirect2_data *eq = &data->equirect2;
+
+	if (!is_layer_view_visible_n(data, view, view_count)) {
+		return false;
+	}
+
+	// Inverse model-view: rays go FROM the camera INTO model space.
+	struct xrt_matrix_4x4 model, view_mat, mv, mv_inv;
+	const struct xrt_vec3 scale = {1.0f, 1.0f, 1.0f};
+	math_matrix_4x4_model(&eq->pose, &scale, &model);
+	math_matrix_4x4_view_from_pose(&cam->pose, &view_mat);
+	math_matrix_4x4_multiply(&view_mat, &model, &mv);
+	math_matrix_4x4_inverse(&mv, &mv_inv);
+
+	// The frustum's tangent extents, folded into the inverse model-view by
+	// the shared packer: THE ONLY place this view's FOV (angle_left,
+	// angle_down, ...) enters the draw.
+	comp_vk_native_equirect2_pack(&mv_inv, &cam->fov, eq->radius, eq->central_horizontal_angle,
+	                              eq->upper_vertical_angle, eq->lower_vertical_angle, out_eq);
+
+	// A sphere section is SUB-RECT: it marks the tile, never takes the base.
+	const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(tile, data->flags);
+	*out_mode = mode;
+	return true;
+}
+
+/*!
+ * Is every colour source this frame already an honest `_SRGB` swapchain?
+ *
+ * The blit fast path passes bytes through unchanged, which is only correct
+ * when the app already encoded them. A UNORM swapchain holds LINEAR values
+ * (ADR-021 §6, and OpenXR: "All other formats will be treated as linear
+ * values"), so passing those through to a display processor that is handed
+ * ENCODED bytes renders them far too dark. Such a frame has to take the
+ * render pass, where the _SRGB attachment applies the encode.
+ *
+ * Asks the app's REQUESTED format, never the image's.
+ */
+static bool
+compose_frame_source_is_srgb(const struct comp_layer_accum *layers)
+{
+	if (layers == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const struct comp_layer *layer = &layers->layers[i];
+		if (!compose_pass_draws_layer(layer)) {
+			continue;
+		}
+		for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+			struct xrt_swapchain *xsc = layer->sc_array[v];
+			if (xsc == NULL) {
+				continue;
+			}
+			if (!comp_vk_native_swapchain_is_srgb(xsc)) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+/*!
+ * Is the frame's single contributing layer a full-tile projection blit?
+ *
+ * An input to @ref u_color_compose_fast_path, not a policy: a quad, a zone or
+ * a Local2D layer covers a SUB-RECT and composites over the clear, so it is a
+ * compose case even when it is the only layer.
+ */
+static bool
+compose_frame_base_is_projection(const struct comp_layer_accum *layers)
+{
+	if (layers == NULL) {
+		return false;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		const struct comp_layer *layer = &layers->layers[i];
+		if (!compose_pass_draws_layer(layer)) {
+			continue;
+		}
+		const enum xrt_layer_type t = layer->data.type;
+		return t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH;
+	}
+	return false;
 }
 
 //! How many layers this frame would the compose pass actually draw?
@@ -250,17 +822,51 @@ zone_draw_destroy_framebuffer(struct comp_vk_native_renderer *r)
 	r->zone.framebuffer = VK_NULL_HANDLE;
 }
 
+//! Drop the private compose target (it is sized to the atlas allocation).
+static void
+zone_compose_target_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	if (r->zone.compose_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->zone.compose_view, NULL);
+		r->zone.compose_view = VK_NULL_HANDLE;
+	}
+	if (r->zone.compose_unorm_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->zone.compose_unorm_view, NULL);
+		r->zone.compose_unorm_view = VK_NULL_HANDLE;
+	}
+	if (r->zone.compose_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->zone.compose_image, NULL);
+		r->zone.compose_image = VK_NULL_HANDLE;
+	}
+	if (r->zone.compose_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->zone.compose_memory, NULL);
+		r->zone.compose_memory = VK_NULL_HANDLE;
+	}
+	r->zone.compose_w = 0;
+	r->zone.compose_h = 0;
+}
+
 static void
 zone_draw_destroy(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
 	zone_draw_destroy_framebuffer(r);
+	raw_destroy(r); // built on this bundle's layouts — goes with it
 	for (int b = 0; b < VK_COMPOSE_BLEND_COUNT; b++) {
 		for (int sm = 0; sm < VK_COMPOSE_SAMPLER_COUNT; sm++) {
 			if (r->zone.pipelines[b][sm] != VK_NULL_HANDLE) {
 				vk->vkDestroyPipeline(vk->device, r->zone.pipelines[b][sm], NULL);
 				r->zone.pipelines[b][sm] = VK_NULL_HANDLE;
+			}
+			if (r->zone.eq2_pipelines[b][sm] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, r->zone.eq2_pipelines[b][sm], NULL);
+				r->zone.eq2_pipelines[b][sm] = VK_NULL_HANDLE;
+			}
+			if (r->zone.pipelines_soft[b][sm] != VK_NULL_HANDLE) {
+				vk->vkDestroyPipeline(vk->device, r->zone.pipelines_soft[b][sm], NULL);
+				r->zone.pipelines_soft[b][sm] = VK_NULL_HANDLE;
 			}
 		}
 	}
@@ -285,6 +891,7 @@ zone_draw_destroy(struct comp_vk_native_renderer *r)
 		r->zone.render_pass = VK_NULL_HANDLE;
 	}
 	r->zone.ready = false;
+	r->zone.soft_failed = false; // the next build may retry them
 }
 
 static void
@@ -295,6 +902,7 @@ destroy_atlas_resources(struct comp_vk_native_renderer *r)
 	// The zone framebuffer wraps atlas_view — drop it with the atlas; the
 	// rest of the zone bundle is atlas-independent and survives resizes.
 	zone_draw_destroy_framebuffer(r);
+	raw_destroy_framebuffers(r); // #1935: these wrap the atlas view(s) too
 
 	// VK-0 (#1178): the deposit owns its ring, image, view and memory. Let
 	// go of the borrowed handles; comp_vk_deposit_resize / _destroy frees
@@ -463,8 +1071,12 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 		return XRT_ERROR_ALLOCATION;
 	}
 
+	// Colour provenance: one line per process saying which regime ran, so a
+	// capture's log proves what it was taken under.
+	u_color_log_state_once("vk_native");
+
 	r->vk = vk;
-	r->format = VK_FORMAT_B8G8R8A8_UNORM;
+	r->format = atlas_format_from_env();
 	r->tile_columns = 2;
 	r->tile_rows = 1;
 
@@ -509,6 +1121,12 @@ comp_vk_native_renderer_create(struct comp_vk_native_compositor *c,
 	return XRT_SUCCESS;
 }
 
+static void
+cursor_destroy(struct comp_vk_native_renderer *r);
+
+static void
+pq_destroy(struct comp_vk_native_renderer *r);
+
 void
 comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 {
@@ -523,12 +1141,27 @@ comp_vk_native_renderer_destroy(struct comp_vk_native_renderer **renderer_ptr)
 
 	destroy_atlas_resources(r);
 	zone_draw_destroy(r);
+	// The private compose target outlives zone_draw_destroy (it is sized to
+	// the atlas, not tied to the pipeline bundle) and nothing else frees it at
+	// teardown — validation reported its image, memory and view(s) leaked at
+	// vkDestroyDevice.
+	zone_compose_target_destroy(r);
+	cursor_destroy(r); // XR_DXR_cursor_depth v5 (all null unless ever requested)
+	pq_destroy(r);     // #2340 (likewise)
 	// After destroy_atlas_resources — that call drops the borrowed handles
 	// into the deposit's ring, this one frees the ring itself.
 	comp_vk_deposit_destroy(&r->deposit);
 
 	if (r->cmd_pool != VK_NULL_HANDLE) {
+		if (r->draw_cmd != VK_NULL_HANDLE) {
+			vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &r->draw_cmd);
+			r->draw_cmd = VK_NULL_HANDLE;
+		}
 		vk->vkDestroyCommandPool(vk->device, r->cmd_pool, NULL);
+	}
+	if (r->draw_fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, r->draw_fence, NULL);
+		r->draw_fence = VK_NULL_HANDLE;
 	}
 
 	free(r);
@@ -594,11 +1227,18 @@ cmd_image_barrier(struct vk_bundle *vk,
  *
  */
 
+/*!
+ * One compose-pass pipeline. @p frag_spec (NULL for every layer pipeline) is
+ * the fragment stage's specialization - only the softened cursor uses one
+ * (ADR-046 B.7, its straight-alpha flag).
+ */
 static bool
 zone_create_pipeline(struct comp_vk_native_renderer *r,
+                     VkRenderPass render_pass,
                      VkShaderModule vert,
                      VkShaderModule frag,
                      enum vk_compose_blend blend,
+                     const VkSpecializationInfo *frag_spec,
                      VkPipeline *out_pipeline)
 {
 	struct vk_bundle *vk = r->vk;
@@ -615,6 +1255,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 	        .module = frag,
 	        .pName = "main",
+	        .pSpecializationInfo = frag_spec,
 	    },
 	};
 
@@ -646,9 +1287,13 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 
-	// REPLACE is blending OFF — the source written verbatim, RGBA, which is
-	// exactly what vkCmdBlitImage did and is what a projection layer needs
-	// so its own alpha reaches the atlas for the #225 compose-under gate.
+	// Blending OFF serves two shared modes. REPLACE (the first layer into a
+	// tile) writes the source verbatim, RGBA — exactly what vkCmdBlitImage
+	// did, and what a transparent-background app's single projection layer
+	// needs so its own alpha reaches the atlas for the #225 compose-under
+	// gate. OPAQUE_COVER (a LATER unflagged layer) uses the same state and
+	// gets its spec-mandated alpha of one from the shader, via
+	// comp_layer_blend_fold_opaque_cover().
 	//
 	// Alpha-over: premultiplied (One/OneMinusSrcAlpha) by default, straight
 	// alpha only swaps the source color factor. Alpha factors are
@@ -656,7 +1301,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	// into the atlas (D3D11 blend_premul/blend_alpha parity).
 	const bool unpremultiplied = (blend == VK_COMPOSE_BLEND_UNPREMULT);
 	VkPipelineColorBlendAttachmentState blend_attachment = {
-	    .blendEnable = (blend == VK_COMPOSE_BLEND_REPLACE) ? VK_FALSE : VK_TRUE,
+	    .blendEnable = (blend == VK_COMPOSE_BLEND_OFF) ? VK_FALSE : VK_TRUE,
 	    .srcColorBlendFactor =
 	        unpremultiplied ? VK_BLEND_FACTOR_SRC_ALPHA : VK_BLEND_FACTOR_ONE,
 	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
@@ -693,7 +1338,7 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 	    .pColorBlendState = &blend_state,
 	    .pDynamicState = &dynamic_state,
 	    .layout = r->zone.pipeline_layout,
-	    .renderPass = r->zone.render_pass,
+	    .renderPass = render_pass,
 	    .subpass = 0,
 	};
 
@@ -704,6 +1349,141 @@ zone_create_pipeline(struct comp_vk_native_renderer *r,
 		return false;
 	}
 	return true;
+}
+
+static void
+raw_destroy_framebuffers(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (r->raw.fb[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, r->raw.fb[i], NULL);
+			r->raw.fb[i] = VK_NULL_HANDLE;
+		}
+		r->raw.fb_view[i] = VK_NULL_HANDLE;
+	}
+}
+
+static void
+raw_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	raw_destroy_framebuffers(r);
+	for (int sm = 0; sm < VK_COMPOSE_SAMPLER_COUNT; sm++) {
+		if (r->raw.pipelines[sm] != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, r->raw.pipelines[sm], NULL);
+			r->raw.pipelines[sm] = VK_NULL_HANDLE;
+		}
+	}
+	if (r->raw.render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, r->raw.render_pass, NULL);
+		r->raw.render_pass = VK_NULL_HANDLE;
+	}
+	if (r->raw.nearest != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, r->raw.nearest, NULL);
+		r->raw.nearest = VK_NULL_HANDLE;
+	}
+	r->raw.ready = false;
+}
+
+/*!
+ * Build the #1935 raw-read draw (see the `raw` field). Called from
+ * zone_draw_ensure while its shader modules are alive. A failure here is
+ * sticky and local: the compose pass is unaffected, and truthful-sRGB frames
+ * keep the #1559 scratch copy + blit.
+ */
+static void
+raw_create(struct comp_vk_native_renderer *r, VkShaderModule vert, VkShaderModule frag, VkShaderModule frag_array)
+{
+	struct vk_bundle *vk = r->vk;
+
+	/*
+	 * The attachment is the atlas itself, in its own (UNORM) format: what the
+	 * fragment shader writes is stored as-is, like a blit destination. CLEAR
+	 * stands in for the blit path's vkCmdClearColorImage over the whole atlas
+	 * (renderArea is the whole allocation). Ends in SHADER_READ_ONLY with
+	 * shader-read visibility — the same hand-off state the blit path leaves
+	 * for the display processor.
+	 */
+	VkAttachmentDescription attachment = {
+	    .format = r->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	    .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkAttachmentReference color_ref = {
+	    .attachment = 0,
+	    .layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &color_ref,
+	};
+	VkSubpassDependency dependencies[2] = {
+	    {
+	        // The previous frame's display-processor read of the atlas.
+	        .srcSubpass = VK_SUBPASS_EXTERNAL,
+	        .dstSubpass = 0,
+	        .srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	        .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	    },
+	    {
+	        .srcSubpass = 0,
+	        .dstSubpass = VK_SUBPASS_EXTERNAL,
+	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+	    },
+	};
+	VkRenderPassCreateInfo rp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &attachment,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	    .dependencyCount = 2,
+	    .pDependencies = dependencies,
+	};
+
+	VkSamplerCreateInfo nearest_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_NEAREST,
+	    .minFilter = VK_FILTER_NEAREST,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .maxLod = 0.25f,
+	};
+
+	r->raw.failed = true; // cleared on full success
+	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->raw.render_pass);
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateSampler(vk->device, &nearest_ci, NULL, &r->raw.nearest);
+	}
+	if (res != VK_SUCCESS ||
+	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag, VK_COMPOSE_BLEND_OFF, NULL,
+	                          &r->raw.pipelines[VK_COMPOSE_SAMPLER_2D]) ||
+	    !zone_create_pipeline(r, r->raw.render_pass, vert, frag_array, VK_COMPOSE_BLEND_OFF, NULL,
+	                          &r->raw.pipelines[VK_COMPOSE_SAMPLER_2D_ARRAY])) {
+		U_LOG_W(
+		    "#1935: could not build the sRGB raw-read draw (%d) — truthful-sRGB swapchains keep the "
+		    "#1559 scratch copy + blit",
+		    res);
+		raw_destroy(r);
+		r->raw.failed = true;
+		return;
+	}
+	r->raw.failed = false;
+	r->raw.ready = true;
 }
 
 //! Lazily create the atlas-independent zone draw bundle. Returns ready state;
@@ -723,15 +1503,26 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	// Render pass: clear the whole atlas (zones frames own the frame's 3D
 	// content), end in SHADER_READ_ONLY for the display processor.
+	/*
+	 * The attachment is the PRIVATE compose target's _SRGB view, not the
+	 * atlas — so the blender works in linear light (#1610) and the encode
+	 * happens on write. The pass is followed by the hand-off into the
+	 * (UNORM, ENCODED) atlas: a REPLACE draw sampling the target's UNORM view
+	 * (default) — so `finalLayout` is SHADER_READ_ONLY — or, under
+	 * DXR_VK_ZONES_COPY_TO_DRAW=0, a raw vkCmdCopyImage with TRANSFER_SRC.
+	 */
+	const bool draw_handoff = comp_vk_native_zones_copy_to_draw_enabled();
+	r->zone.compose_final_layout =
+	    draw_handoff ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 	VkAttachmentDescription attachment = {
-	    .format = r->format,
+	    .format = zone_compose_view_format(),
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	    .finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	    .finalLayout = r->zone.compose_final_layout,
 	};
 
 	VkAttachmentReference color_ref = {
@@ -755,12 +1546,17 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	    },
 	    {
+	        // To the hand-off: the draw's fragment-shader read, or the copy's
+	        // transfer read (both stages named, so the fallback copy after a
+	        // failed draw setup is covered by the same dependency).
 	        .srcSubpass = 0,
 	        .dstSubpass = VK_SUBPASS_EXTERNAL,
 	        .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	        .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	        .dstStageMask = draw_handoff ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
+	                                     : VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+	        .dstAccessMask = draw_handoff ? (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT)
+	                                      : VK_ACCESS_TRANSFER_READ_BIT,
 	    },
 	};
 
@@ -802,20 +1598,40 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	}
 
 	/*
-	 * 32 bytes, visible to BOTH stages: vec4 src_rect (vertex) + vec4 params
-	 * (fragment; x = array slice). The range was 16 bytes VERTEX-only, which
-	 * left the fragment stage with no per-draw channel at all — the array
-	 * variant needs one, and so will the per-layer colour flag. Well inside
-	 * the 128-byte guaranteed maxPushConstantsSize.
+	 * 128 bytes, visible to BOTH stages:
+	 *   mat4 mvp (64, vertex, quad only)
+	 *   vec4 src_rect (16, vertex)
+	 *   vec4 params (16; x = array slice [fragment], y = quad flag [vertex])
+	 *   vec4 color_scale + vec4 color_bias (32, fragment)
 	 *
-	 * Every shader in the bundle declares this block identically; Vulkan
+	 * That is EXACTLY the guaranteed minimum maxPushConstantsSize, which is
+	 * legal (the limit is inclusive) but leaves no headroom: anything added
+	 * later has to move into a descriptor, not into this block. Asserted
+	 * against the device limit below rather than assumed, because a silent
+	 * overflow here would be a validation error on the narrowest device and
+	 * nothing at all on this one.
+	 *
+	 * Every shader in the bundle declares the block identically; Vulkan
 	 * requires one layout across the stages of a pipeline.
 	 */
 	VkPushConstantRange push_range = {
 	    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 	    .offset = 0,
-	    .size = 8 * sizeof(float), // vec4 src_rect + vec4 params
+	    .size = sizeof(struct vk_compose_push),
 	};
+
+	{
+		VkPhysicalDeviceProperties props;
+		vk->vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+		if (props.limits.maxPushConstantsSize < push_range.size) {
+			U_LOG_E("VK compose: device maxPushConstantsSize %u < %u required — draw path "
+			        "disabled, falling back to blits",
+			        props.limits.maxPushConstantsSize, push_range.size);
+			zone_draw_destroy(r);
+			r->zone.failed = true;
+			return false;
+		}
+	}
 
 	VkPipelineLayoutCreateInfo pl_ci = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -852,14 +1668,17 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		return false;
 	}
 
+	// + 1: the runtime-drawn cursor's set (XR_DXR_cursor_depth v5), so a
+	// frame that exhausts the layer budget still has one for the cursor.
+	// + 1: the zones hand-off draw's set (compose target -> atlas).
 	VkDescriptorPoolSize pool_size = {
 	    .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-	    .descriptorCount = VK_ZONE_MAX_DRAWS,
+	    .descriptorCount = VK_ZONE_MAX_DRAWS + 2,
 	};
 
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-	    .maxSets = VK_ZONE_MAX_DRAWS,
+	    .maxSets = VK_ZONE_MAX_DRAWS + 2,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
 	};
@@ -875,6 +1694,9 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 	VkShaderModule vert = VK_NULL_HANDLE;
 	VkShaderModule frag = VK_NULL_HANDLE;
 	VkShaderModule frag_array = VK_NULL_HANDLE;
+	VkShaderModule eq2_vert = VK_NULL_HANDLE;
+	VkShaderModule eq2_frag = VK_NULL_HANDLE;
+	VkShaderModule eq2_frag_array = VK_NULL_HANDLE;
 	VkShaderModuleCreateInfo sm_ci = {
 	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 	    .codeSize = sizeof(shaders_zone_blit_vert),
@@ -891,13 +1713,28 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 		sm_ci.pCode = shaders_zone_blit_array_frag;
 		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag_array);
 	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_vert);
+		sm_ci.pCode = shaders_equirect2_vert;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_vert);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_frag);
+		sm_ci.pCode = shaders_equirect2_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_frag);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_equirect2_array_frag);
+		sm_ci.pCode = shaders_equirect2_array_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &eq2_frag_array);
+	}
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to create shader modules: %d", res);
-		if (vert != VK_NULL_HANDLE) {
-			vk->vkDestroyShaderModule(vk->device, vert, NULL);
-		}
-		if (frag != VK_NULL_HANDLE) {
-			vk->vkDestroyShaderModule(vk->device, frag, NULL);
+		VkShaderModule made[] = {vert, frag, frag_array, eq2_vert, eq2_frag, eq2_frag_array};
+		for (size_t k = 0; k < sizeof(made) / sizeof(made[0]); k++) {
+			if (made[k] != VK_NULL_HANDLE) {
+				vk->vkDestroyShaderModule(vk->device, made[k], NULL);
+			}
 		}
 		zone_draw_destroy(r);
 		r->zone.failed = true;
@@ -906,15 +1743,26 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	bool ok = true;
 	for (int b = 0; b < VK_COMPOSE_BLEND_COUNT && ok; b++) {
-		ok = zone_create_pipeline(r, vert, frag, (enum vk_compose_blend)b,
+		ok = zone_create_pipeline(r, r->zone.render_pass, vert, frag, (enum vk_compose_blend)b, NULL,
 		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
-		     zone_create_pipeline(r, vert, frag_array, (enum vk_compose_blend)b,
-		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+		     zone_create_pipeline(r, r->zone.render_pass, vert, frag_array, (enum vk_compose_blend)b, NULL,
+		                          &r->zone.pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]) &&
+		     zone_create_pipeline(r, r->zone.render_pass, eq2_vert, eq2_frag, (enum vk_compose_blend)b, NULL,
+		                          &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D]) &&
+		     zone_create_pipeline(r, r->zone.render_pass, eq2_vert, eq2_frag_array, (enum vk_compose_blend)b,
+		                          NULL, &r->zone.eq2_pipelines[b][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+	}
+	// #1935: the fast path's raw-read draw shares these shaders and layouts.
+	if (ok) {
+		raw_create(r, vert, frag, frag_array);
 	}
 
 	vk->vkDestroyShaderModule(vk->device, vert, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag, NULL);
 	vk->vkDestroyShaderModule(vk->device, frag_array, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_vert, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_frag, NULL);
+	vk->vkDestroyShaderModule(vk->device, eq2_frag_array, NULL);
 
 	if (!ok) {
 		zone_draw_destroy(r);
@@ -924,8 +1772,8 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
 
 	r->zone.failed = false;
 	r->zone.ready = true;
-	U_LOG_W("VK compose: draw path ready (%d blend modes x 2D/2D_ARRAY = %d pipelines)",
-        VK_COMPOSE_BLEND_COUNT, VK_COMPOSE_BLEND_COUNT * VK_COMPOSE_SAMPLER_COUNT);
+	U_LOG_W("VK compose: draw path ready (%d blend modes x 2D/2D_ARRAY x {blit, equirect2} = %d pipelines)",
+	        VK_COMPOSE_BLEND_COUNT, 2 * VK_COMPOSE_BLEND_COUNT * VK_COMPOSE_SAMPLER_COUNT);
 	return true;
 }
 
@@ -938,7 +1786,7 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  * entirely GPU-side: the consumer's `ID3D11DeviceContext4::Wait(fence, value)`
  * orders its reads behind this signal without any CPU blocking on Vulkan. In
  * particular the deposit does NOT lean on the pre-existing per-frame
- * `vkQueueWaitIdle` below (#837's to remove) — take that wait away and the
+ * wait below (#837; now a fence on this submit, #1917) — take that wait away and the
  * ordering guarantee here is unchanged.
  *
  * **VK-1 (#1178) — the same submit takes the ring's back-pressure WAIT.** The
@@ -953,7 +1801,9 @@ zone_draw_ensure(struct comp_vk_native_renderer *r)
  *
  * @param[out] sem_storage,value_storage Caller-owned storage that must outlive
  *        the vkQueueSubmit call — VkSubmitInfo only borrows pointers.
- * @param[out] wait_value_storage,wait_stage_storage Likewise, for the wait half.
+ * @param[out] wait_value_storage,wait_stage_storage Unused since #2317 P2a: the
+ *        wait half can carry TWO timelines now, so the renderer owns its storage
+ *        (`deposit_wait_*`). Kept so the three call sites stay unchanged.
  */
 static void
 deposit_chain_signal(struct comp_vk_native_renderer *r,
@@ -1001,75 +1851,199 @@ deposit_chain_signal(struct comp_vk_native_renderer *r,
 	 * attachment on the draw path and a transfer destination on the blit/clear
 	 * path — so earlier stages of this submit still overlap the wait.
 	 */
+	/*
+	 * #2317 P2a: and the hub's DIRECT-ingress release of the same slot, on the
+	 * hub's own consumer fence — a second timeline, because the hub read this
+	 * slot on ITS device and signals there (one signaller per timeline). At
+	 * most one of the two is normally owed; both may be across the one-time
+	 * move from DIRECT to xbridge.
+	 */
+	(void)wait_value_storage;
+	(void)wait_stage_storage;
+	const VkPipelineStageFlags stage =
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	uint32_t n = 0;
 	const uint64_t release = comp_vk_deposit_current_slot_wait(r->deposit);
 	if (release != 0) {
-		*wait_value_storage = release;
-		*wait_stage_storage =
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-		timeline_info->waitSemaphoreValueCount = 1;
-		timeline_info->pWaitSemaphoreValues = wait_value_storage;
-		submit_info->waitSemaphoreCount = 1;
-		submit_info->pWaitSemaphores = sem_storage;
-		submit_info->pWaitDstStageMask = wait_stage_storage;
+		r->deposit_wait_sems[n] = *sem_storage;
+		r->deposit_wait_values[n] = release;
+		r->deposit_wait_stages[n] = stage;
+		n++;
+	}
+	VkSemaphore hub_sem = VK_NULL_HANDLE;
+	uint64_t hub_release = 0;
+	comp_vk_deposit_current_slot_hub_wait(r->deposit, &hub_sem, &hub_release);
+	if (hub_sem != VK_NULL_HANDLE && hub_release != 0) {
+		r->deposit_wait_sems[n] = hub_sem;
+		r->deposit_wait_values[n] = hub_release;
+		r->deposit_wait_stages[n] = stage;
+		n++;
+	}
+	if (n != 0) {
+		timeline_info->waitSemaphoreValueCount = n;
+		timeline_info->pWaitSemaphoreValues = r->deposit_wait_values;
+		submit_info->waitSemaphoreCount = n;
+		submit_info->pWaitSemaphores = r->deposit_wait_sems;
+		submit_info->pWaitDstStageMask = r->deposit_wait_stages;
 	}
 }
 
-//! (Re)create the framebuffer over the current atlas view.
+/*!
+ * Create (or resize) the private compose target — see the struct comment.
+ *
+ * Same format as the atlas, MUTABLE_FORMAT with a {UNORM, SRGB} format list,
+ * viewed as _SRGB. A/B'd on MoltenVK against a natively-_SRGB image: both
+ * blend 50% linear white over linear black to byte 188 (linear blending), and
+ * the two routes are byte-identical, so the mutable-view route is sound on
+ * that driver. Re-run that check on a new GPU vendor or driver stack.
+ */
+static bool
+zone_compose_target_ensure(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	const uint32_t w = r->atlas_alloc_width;
+	const uint32_t h = r->atlas_alloc_height;
+	if (w == 0 || h == 0) {
+		return false;
+	}
+	if (r->zone.compose_image != VK_NULL_HANDLE && r->zone.compose_w == w && r->zone.compose_h == h) {
+		return true;
+	}
+	zone_compose_target_destroy(r);
+
+	VkFormat list[2] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+	VkImageFormatListCreateInfo fmt_list = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+	    .viewFormatCount = 2,
+	    .pViewFormats = list,
+	};
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .pNext = &fmt_list,
+	    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .extent = {w, h, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    // TRANSFER_DST: the window-space pass copies the published atlas back
+	    // in to blend over it in linear light (#1795). SAMPLED (added below
+	    // when the draw hand-off is on): the hand-off reads it through the
+	    // UNORM view instead of vkCmdCopyImage.
+	    .usage =
+	        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	const bool draw_handoff = comp_vk_native_zones_copy_to_draw_enabled();
+	if (draw_handoff) {
+		ici.usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+	}
+	VkResult res = vk->vkCreateImage(vk->device, &ici, NULL, &r->zone.compose_image);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to create the private compose target: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vk->vkGetImageMemoryRequirements(vk->device, r->zone.compose_image, &mr);
+	uint32_t type_id = 0;
+	if (!vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id)) {
+		U_LOG_E("VK compose: no device-local memory type for the compose target");
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mr.size,
+	    .memoryTypeIndex = type_id,
+	};
+	res = vk->vkAllocateMemory(vk->device, &mai, NULL, &r->zone.compose_memory);
+	if (res == VK_SUCCESS) {
+		res = vk->vkBindImageMemory(vk->device, r->zone.compose_image, r->zone.compose_memory, 0);
+	}
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to back the compose target: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	VkImageViewCreateInfo vci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = r->zone.compose_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = zone_compose_view_format(),
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	res = vk->vkCreateImageView(vk->device, &vci, NULL, &r->zone.compose_view);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("VK compose: failed to create the compose target's _SRGB view: %d", res);
+		zone_compose_target_destroy(r);
+		return false;
+	}
+	if (draw_handoff) {
+		// The NON-decoding view for the hand-off draw. Optional: without it
+		// the hand-off copies, exactly as before.
+		VkImageViewCreateInfo uci = vci;
+		uci.format = VK_FORMAT_B8G8R8A8_UNORM;
+		if (vk->vkCreateImageView(vk->device, &uci, NULL, &r->zone.compose_unorm_view) != VK_SUCCESS) {
+			r->zone.compose_unorm_view = VK_NULL_HANDLE;
+			U_LOG_W("VK compose: no UNORM view of the compose target — the zones hand-off keeps the copy");
+		}
+	}
+	r->zone.compose_w = w;
+	r->zone.compose_h = h;
+	U_LOG_W("VK compose: private linear-blend target %ux%u (UNORM+MUTABLE, _SRGB view) ready", w, h);
+	return true;
+}
+
 static bool
 zone_draw_ensure_framebuffer(struct comp_vk_native_renderer *r)
 {
 	struct vk_bundle *vk = r->vk;
 
-	if (r->atlas_view == VK_NULL_HANDLE) {
+	/*
+	 * The attachment is the PRIVATE compose target, not the atlas.
+	 *
+	 * That collapses what used to be a per-atlas-view framebuffer cache:
+	 * the atlas view alternates every frame on the VK-0 deposit ring
+	 * (#1178), so the old code kept one framebuffer per ring slot to avoid
+	 * rebuilding it on the render path. The compose target is owned by this
+	 * renderer and stable across the ring, so there is exactly one
+	 * framebuffer and it only changes when the atlas ALLOCATION changes.
+	 */
+	if (!zone_compose_target_ensure(r)) {
 		return false;
 	}
 
-	// Already have one for this view? (Always true after the first zones
-	// frame on the owned atlas; alternates between two entries on the
-	// VK-0 deposit ring.)
-	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
-		if (r->zone.fb[i] != VK_NULL_HANDLE && r->zone.fb_view[i] == r->atlas_view) {
-			r->zone.framebuffer = r->zone.fb[i];
-			return true;
-		}
+	if (r->zone.fb[0] != VK_NULL_HANDLE && r->zone.fb_view[0] == r->zone.compose_view) {
+		r->zone.framebuffer = r->zone.fb[0];
+		return true;
 	}
-
-	uint32_t slot = 0;
-	bool found_free = false;
-	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
-		if (r->zone.fb[i] == VK_NULL_HANDLE) {
-			slot = i;
-			found_free = true;
-			break;
-		}
-	}
-	if (!found_free) {
-		// Cache is sized to the ring, so this is unreachable in practice;
-		// evict rather than leak if the atlas view set ever grows.
+	if (r->zone.fb[0] != VK_NULL_HANDLE) {
 		vk->vkDestroyFramebuffer(vk->device, r->zone.fb[0], NULL);
 		r->zone.fb[0] = VK_NULL_HANDLE;
 		r->zone.fb_view[0] = VK_NULL_HANDLE;
-		slot = 0;
 	}
 
 	VkFramebufferCreateInfo fb_ci = {
 	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
 	    .renderPass = r->zone.render_pass,
 	    .attachmentCount = 1,
-	    .pAttachments = &r->atlas_view,
-	    .width = r->atlas_alloc_width,
-	    .height = r->atlas_alloc_height,
+	    .pAttachments = &r->zone.compose_view,
+	    .width = r->zone.compose_w,
+	    .height = r->zone.compose_h,
 	    .layers = 1,
 	};
 
-	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.fb[slot]);
+	VkResult res = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->zone.fb[0]);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to create framebuffer: %d", res);
-		r->zone.fb[slot] = VK_NULL_HANDLE;
+		U_LOG_E("VK compose: failed to create framebuffer: %d", res);
+		r->zone.fb[0] = VK_NULL_HANDLE;
 		return false;
 	}
-	r->zone.fb_view[slot] = r->atlas_view;
-	r->zone.framebuffer = r->zone.fb[slot];
+	r->zone.fb_view[0] = r->zone.compose_view;
+	r->zone.framebuffer = r->zone.fb[0];
 	return true;
 }
 
@@ -1089,16 +2063,11 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL) {
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
 			// A LAYERED (arraySize > 1) source used to bail the whole
@@ -1108,13 +2077,684 @@ zone_pass_usable(struct comp_vk_native_renderer *r,
 			// stereo (ADR-032) its alpha-over compositing, frame-wide,
 			// for one layered layer. zone_blit_array.frag handles it
 			// now and the draw below picks the matching pipeline.
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
-			if (comp_vk_native_swapchain_get_image_view(xsc, sc_index) == 0) {
+			if (comp_vk_native_swapchain_get_image_view(xsc, sub->image_index) == 0) {
 				return false;
 			}
 		}
 	}
 	return true;
+}
+
+/*!
+ * Hand out the renderer's persistent compose command buffer, reset and in the
+ * recording state. Allocated on first use, recycled every frame after — never
+ * freed until the pool is destroyed. See the draw_cmd field for why.
+ */
+static VkResult
+renderer_begin_draw_cmd(struct comp_vk_native_renderer *r, VkCommandBuffer *out_cmd)
+{
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	if (r->draw_cmd == VK_NULL_HANDLE) {
+		VkCommandBufferAllocateInfo alloc_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = r->cmd_pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &r->draw_cmd);
+		if (res != VK_SUCCESS) {
+			r->draw_cmd = VK_NULL_HANDLE;
+			return res;
+		}
+	} else {
+		// No RELEASE_RESOURCES: keeping the driver's command memory is the
+		// whole point. cmd_pool has RESET_COMMAND_BUFFER_BIT.
+		res = vk->vkResetCommandBuffer(r->draw_cmd, 0);
+		if (res != VK_SUCCESS) {
+			return res;
+		}
+	}
+
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	res = vk->vkBeginCommandBuffer(r->draw_cmd, &begin_info);
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+	*out_cmd = r->draw_cmd;
+	return VK_SUCCESS;
+}
+
+/*!
+ * Submit draw_cmd on the main queue with draw_fence, and wait for THAT submit
+ * only (see draw_fence). On a failed submit nothing is pending and the fence
+ * is unsignalled, so the next frame can reset both.
+ */
+static VkResult
+renderer_submit_draw_and_wait(struct comp_vk_native_renderer *r, VkSubmitInfo *submit_info, const char *label)
+{
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	if (r->draw_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		res = vk->vkCreateFence(vk->device, &fci, NULL, &r->draw_fence);
+		if (res != VK_SUCCESS) {
+			r->draw_fence = VK_NULL_HANDLE;
+			return res;
+		}
+	}
+
+#ifdef XRT_OS_ANDROID
+	// #1905: one retry on -3 (shared-GSL-context race; see the helper). A
+	// failed attempt consumed nothing and left the fence unsignalled.
+	res = comp_vk_native_queue_submit_retry(vk, vk->main_queue->queue, submit_info, r->draw_fence, label);
+#else
+	(void)label;
+	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, submit_info, r->draw_fence);
+#endif
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+
+	VkResult wres = vk->vkWaitForFences(vk->device, 1, &r->draw_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &r->draw_fence);
+	if (wres != VK_SUCCESS) {
+		// Device lost or similar. The submit DID happen, so report success
+		// (the caller must not abandon the deposit signal); just log.
+		U_LOG_E("VK compose: waiting the %s fence failed: %d", label, wres);
+	}
+	return VK_SUCCESS;
+}
+
+/*!
+ * The view the compose pass SAMPLES a swapchain image through - the ONE
+ * source-view choice (#1589), for every layer and the cursor sprite alike.
+ *
+ * The view in the format the app asked for, so the GPU DECODES an `_SRGB`
+ * source to linear and passes a UNORM one through as the linear values it
+ * holds; the pass composites in linear light and its attachment re-encodes on
+ * write, so this is the read half of a matched pair. Under the legacy hatch
+ * the pass blends in encoded space, so the non-decoding view.
+ */
+static uint64_t
+compose_source_view(struct xrt_swapchain *xsc, uint32_t image_index)
+{
+	return u_color_legacy_unorm_encoded() ? comp_vk_native_swapchain_get_image_view(xsc, image_index)
+	                                      : comp_vk_native_swapchain_get_true_image_view(xsc, image_index);
+}
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * The cursor rides the compose pass: one more alpha-blended quad per view tile
+ * after every layer the pass draws, through the pass's own pipelines (the QUAD
+ * vertex path with an affine MVP), into the private `_SRGB` compose target -
+ * so it blends in linear light, its source is sampled as its declared format,
+ * and the atlas receives ENCODED bytes by the pass's raw copy, exactly like
+ * every other layer. Never double-encoded, never a second colour rule.
+ *
+ */
+
+static void
+cursor_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	if (r->cursor.default_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, r->cursor.default_view, NULL);
+		r->cursor.default_view = VK_NULL_HANDLE;
+	}
+	if (r->cursor.default_image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, r->cursor.default_image, NULL);
+		r->cursor.default_image = VK_NULL_HANDLE;
+	}
+	if (r->cursor.default_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->cursor.default_memory, NULL);
+		r->cursor.default_memory = VK_NULL_HANDLE;
+	}
+	if (r->cursor.staging != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, r->cursor.staging, NULL);
+		r->cursor.staging = VK_NULL_HANDLE;
+	}
+	if (r->cursor.staging_memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, r->cursor.staging_memory, NULL);
+		r->cursor.staging_memory = VK_NULL_HANDLE;
+	}
+	r->cursor.staging_size = 0;
+	r->cursor.default_w = 0;
+	r->cursor.default_h = 0;
+	r->cursor.upload_pending = false;
+	r->cursor.default_ready = false;
+}
+
+void
+comp_vk_native_renderer_set_cursor(struct comp_vk_native_renderer *r, const struct comp_vk_native_cursor_draw *cursor)
+{
+	if (r == NULL || cursor == NULL) {
+		return;
+	}
+	r->cursor.req = *cursor;
+}
+
+bool
+comp_vk_native_renderer_set_cursor_default_image(struct comp_vk_native_renderer *r,
+                                                 const uint8_t *rgba,
+                                                 uint32_t width,
+                                                 uint32_t height)
+{
+	if (r == NULL || rgba == NULL || width == 0 || height == 0) {
+		return false;
+	}
+	struct vk_bundle *vk = r->vk;
+	VkResult res;
+
+	// A new size needs a new image. Only ever called between draws, and every
+	// draw waits its own fence, so nothing in flight references the old one.
+	if (r->cursor.default_image != VK_NULL_HANDLE &&
+	    (r->cursor.default_w != width || r->cursor.default_h != height)) {
+		vk->vkDestroyImageView(vk->device, r->cursor.default_view, NULL);
+		vk->vkDestroyImage(vk->device, r->cursor.default_image, NULL);
+		vk->vkFreeMemory(vk->device, r->cursor.default_memory, NULL);
+		r->cursor.default_view = VK_NULL_HANDLE;
+		r->cursor.default_image = VK_NULL_HANDLE;
+		r->cursor.default_memory = VK_NULL_HANDLE;
+		r->cursor.default_ready = false;
+	}
+	if (r->cursor.default_image == VK_NULL_HANDLE) {
+		// The bytes are sRGB-ENCODED. Sampled decoded (the `_SRGB` format)
+		// into the linear-blend pass; under the legacy hatch the pass blends
+		// in encoded space and every source is read undecoded, so UNORM.
+		const VkFormat fmt =
+		    u_color_legacy_unorm_encoded() ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SRGB;
+		res = vk_create_image_simple(vk, (VkExtent2D){width, height}, fmt,
+		                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		                             &r->cursor.default_memory, &r->cursor.default_image);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("cursor_draw: default-look image %ux%u failed: %d", width, height, res);
+			r->cursor.default_image = VK_NULL_HANDLE;
+			r->cursor.default_memory = VK_NULL_HANDLE;
+			return false;
+		}
+		const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		res = vk_create_view(vk, r->cursor.default_image, VK_IMAGE_VIEW_TYPE_2D, fmt, range,
+		                     &r->cursor.default_view);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("cursor_draw: default-look view failed: %d", res);
+			cursor_destroy(r);
+			return false;
+		}
+		r->cursor.default_w = width;
+		r->cursor.default_h = height;
+	}
+
+	const VkDeviceSize size = (VkDeviceSize)width * height * 4;
+	if (r->cursor.staging_size < size) {
+		if (r->cursor.staging != VK_NULL_HANDLE) {
+			vk->vkDestroyBuffer(vk->device, r->cursor.staging, NULL);
+			vk->vkFreeMemory(vk->device, r->cursor.staging_memory, NULL);
+			r->cursor.staging = VK_NULL_HANDLE;
+			r->cursor.staging_memory = VK_NULL_HANDLE;
+			r->cursor.staging_size = 0;
+		}
+		if (!vk_buffer_init(vk, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                    &r->cursor.staging, &r->cursor.staging_memory)) {
+			U_LOG_E("cursor_draw: default-look staging buffer failed");
+			r->cursor.staging = VK_NULL_HANDLE;
+			r->cursor.staging_memory = VK_NULL_HANDLE;
+			return false;
+		}
+		r->cursor.staging_size = size;
+	}
+	void *mapped = NULL;
+	res = vk->vkMapMemory(vk->device, r->cursor.staging_memory, 0, size, 0, &mapped);
+	if (res != VK_SUCCESS || mapped == NULL) {
+		return false;
+	}
+	memcpy(mapped, rgba, (size_t)size);
+	vk->vkUnmapMemory(vk->device, r->cursor.staging_memory);
+	r->cursor.upload_pending = true;
+	return true;
+}
+
+/*!
+ * Before the pass: copy staged default-look pixels into its image (only when
+ * they changed), and resolve the view + sampler kind the cursor samples.
+ *
+ * @param[out] out_app_image The app sprite's VkImage, to transition for
+ *             sampling with the layers' sources; VK_NULL_HANDLE otherwise.
+ * @return false if there is nothing to sample this frame.
+ */
+static bool
+cursor_prepare(struct comp_vk_native_renderer *r,
+               VkCommandBuffer cmd,
+               const struct comp_vk_native_cursor_draw *cur,
+               VkImageView *out_view,
+               enum vk_compose_sampler *out_sampler,
+               VkImage *out_app_image)
+{
+	struct vk_bundle *vk = r->vk;
+	*out_app_image = VK_NULL_HANDLE;
+	*out_sampler = VK_COMPOSE_SAMPLER_2D;
+
+	if (cur->xsc != NULL) {
+		VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(cur->xsc, cur->image_index);
+		// Same rule as every layer source (#1589): an `_SRGB` sprite
+		// decodes into the linear blend.
+		const uint64_t v = compose_source_view(cur->xsc, cur->image_index);
+		if (img == VK_NULL_HANDLE || v == 0) {
+			u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+			return false;
+		}
+		*out_view = (VkImageView)(uintptr_t)v;
+		*out_sampler = comp_vk_native_swapchain_get_array_size(cur->xsc) > 1 ? VK_COMPOSE_SAMPLER_2D_ARRAY
+		                                                                     : VK_COMPOSE_SAMPLER_2D;
+		*out_app_image = img;
+		return true;
+	}
+
+	if (r->cursor.default_image == VK_NULL_HANDLE) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+		return false;
+	}
+	if (r->cursor.upload_pending) {
+		cmd_image_barrier(
+		    vk, cmd, r->cursor.default_image,
+		    r->cursor.default_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+		    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		const VkBufferImageCopy region = {
+		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .imageExtent = {r->cursor.default_w, r->cursor.default_h, 1},
+		};
+		vk->vkCmdCopyBufferToImage(cmd, r->cursor.staging, r->cursor.default_image,
+		                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+		cmd_image_barrier(vk, cmd, r->cursor.default_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		r->cursor.upload_pending = false;
+		r->cursor.default_ready = true;
+	}
+	if (!r->cursor.default_ready) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+		return false;
+	}
+	*out_view = r->cursor.default_view;
+	return true;
+}
+
+/*!
+ * ADR-046 Amendment 2 B.7: build the softened-cursor pipelines on the first
+ * cursor frame that needs them (zero cost otherwise, ADR-046 §0). The PREMULT
+ * column samples a premultiplied sprite (the default look), the UNPREMULT one
+ * a straight-alpha sprite (the app's) - the shader's `straight`
+ * specialization constant. Failure logs once and the caller draws the crisp
+ * cursor instead (never refuses it).
+ */
+static bool
+cursor_ensure_soft_pipelines(struct comp_vk_native_renderer *r)
+{
+	if (r->zone.pipelines_soft[VK_COMPOSE_BLEND_PREMULT][VK_COMPOSE_SAMPLER_2D] != VK_NULL_HANDLE) {
+		return true;
+	}
+	if (r->zone.soft_failed) {
+		return false;
+	}
+	struct vk_bundle *vk = r->vk;
+	VkShaderModule vert = VK_NULL_HANDLE;
+	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModule frag_array = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo sm_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_zone_blit_vert),
+	    .pCode = shaders_zone_blit_vert,
+	};
+	VkResult res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &vert);
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_soft_frag);
+		sm_ci.pCode = shaders_zone_blit_soft_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_zone_blit_soft_array_frag);
+		sm_ci.pCode = shaders_zone_blit_soft_array_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag_array);
+	}
+	bool ok = res == VK_SUCCESS;
+	const VkSpecializationMapEntry entry = {.constantID = 0, .offset = 0, .size = sizeof(VkBool32)};
+	const enum vk_compose_blend cols[2] = {VK_COMPOSE_BLEND_PREMULT, VK_COMPOSE_BLEND_UNPREMULT};
+	for (int k = 0; k < 2 && ok; k++) {
+		const VkBool32 straight = cols[k] == VK_COMPOSE_BLEND_UNPREMULT ? VK_TRUE : VK_FALSE;
+		const VkSpecializationInfo spec = {
+		    .mapEntryCount = 1,
+		    .pMapEntries = &entry,
+		    .dataSize = sizeof(straight),
+		    .pData = &straight,
+		};
+		ok = zone_create_pipeline(r, r->zone.render_pass, vert, frag, cols[k], &spec,
+		                          &r->zone.pipelines_soft[cols[k]][VK_COMPOSE_SAMPLER_2D]) &&
+		     zone_create_pipeline(r, r->zone.render_pass, vert, frag_array, cols[k], &spec,
+		                          &r->zone.pipelines_soft[cols[k]][VK_COMPOSE_SAMPLER_2D_ARRAY]);
+	}
+	VkShaderModule made[] = {vert, frag, frag_array};
+	for (size_t k = 0; k < sizeof(made) / sizeof(made[0]); k++) {
+		if (made[k] != VK_NULL_HANDLE) {
+			vk->vkDestroyShaderModule(vk->device, made[k], NULL);
+		}
+	}
+	if (!ok) {
+		for (int b = 0; b < VK_COMPOSE_BLEND_COUNT; b++) {
+			for (int sm = 0; sm < VK_COMPOSE_SAMPLER_COUNT; sm++) {
+				if (r->zone.pipelines_soft[b][sm] != VK_NULL_HANDLE) {
+					vk->vkDestroyPipeline(vk->device, r->zone.pipelines_soft[b][sm], NULL);
+					r->zone.pipelines_soft[b][sm] = VK_NULL_HANDLE;
+				}
+			}
+		}
+		r->zone.soft_failed = true;
+		if (!r->cursor.warned_soft) {
+			r->cursor.warned_soft = true;
+			U_LOG_W(
+			    "cursor_draw: softened-cursor pipelines failed (%d) - drawing the crisp cursor (ADR-046 "
+			    "B.7, one-time warning)",
+			    res);
+		}
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Inside the pass, after every layer: one quad per view tile.
+ *
+ * The compose vertex shader's QUAD path maps the unit square's
+ * `pos = (u - 0.5, 0.5 - v)` through `mvp`; an affine mvp built from three of
+ * the sprite's tile-normalised corners puts texel (u, v) exactly where
+ * u_cursor_draw_corners() said, for any per-view map (Vulkan NDC +y runs down
+ * the viewport, the same direction as the tile's y).
+ */
+static void
+cursor_record_draws(struct comp_vk_native_renderer *r,
+                    VkCommandBuffer cmd,
+                    const struct comp_vk_native_cursor_draw *cur,
+                    VkImageView src_view,
+                    enum vk_compose_sampler sampler_kind,
+                    const struct comp_vk_native_eff_layout *layout)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->zone.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->zone.set_layout,
+	};
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
+		return;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->zone.sampler,
+	    .imageView = src_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	const enum vk_compose_blend blend = cur->premultiplied ? VK_COMPOSE_BLEND_PREMULT : VK_COMPOSE_BLEND_UNPREMULT;
+	// ADR-046 B.7: soften with lift against crosstalk. Blur and opacity are
+	// both exactly off on the glass, so an on-glass frame takes the crisp
+	// pipeline with the push constants it always had (bit-identical). The
+	// soft pipelines are built on the first frame that needs them; if they
+	// cannot be, the cursor is drawn crisp rather than not at all.
+	const bool soft =
+	    (cur->blur_px > 0.0f || cur->alpha < 1.0f) && !cur->report_only && cursor_ensure_soft_pipelines(r);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                      soft ? r->zone.pipelines_soft[blend][sampler_kind]
+	                           : r->zone.pipelines[blend][sampler_kind]);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
+
+	// Mono content fills the whole content region (one tile box); otherwise
+	// view i owns tile i of the effective grid (#542).
+	const bool mono = layout->views <= 1;
+	const uint32_t tiles = mono ? 1 : layout->cols * layout->rows;
+	const uint32_t n = cur->view_count < tiles ? cur->view_count : tiles;
+	uint32_t drawn = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		float bx, by, bw, bh;
+		if (mono) {
+			bx = 0.0f;
+			by = 0.0f;
+			bw = (float)(layout->cols * layout->tile_w);
+			bh = (float)(layout->rows * layout->tile_h);
+		} else {
+			bx = (float)((i % layout->cols) * layout->tile_w);
+			by = (float)((i / layout->cols) * layout->tile_h);
+			bw = (float)layout->tile_w;
+			bh = (float)layout->tile_h;
+		}
+		if (bw <= 0.0f || bh <= 0.0f || bx >= (float)r->atlas_alloc_width ||
+		    by >= (float)r->atlas_alloc_height) {
+			continue;
+		}
+		VkViewport vp = {.x = bx, .y = by, .width = bw, .height = bh, .minDepth = 0.0f, .maxDepth = 1.0f};
+		// The scissor is mandatory: a cursor at a tile edge must not spill
+		// into the neighbour view (the DP would weave it into the wrong eye),
+		// nor - in a zones frame - out of its zone (#1949).
+		const float cx0 = bx + cur->clip[0] * bw;
+		const float cy0 = by + cur->clip[1] * bh;
+		float sx1 = cx0 + cur->clip[2] * bw;
+		float sy1 = cy0 + cur->clip[3] * bh;
+		sx1 = sx1 > bx + bw ? bx + bw : sx1;
+		sy1 = sy1 > by + bh ? by + bh : sy1;
+		sx1 = sx1 > (float)r->atlas_alloc_width ? (float)r->atlas_alloc_width : sx1;
+		sy1 = sy1 > (float)r->atlas_alloc_height ? (float)r->atlas_alloc_height : sy1;
+		const int32_t sx0i = (int32_t)(cx0 + 0.5f);
+		const int32_t sy0i = (int32_t)(cy0 + 0.5f);
+		const int32_t sx1i = (int32_t)(sx1 + 0.5f);
+		const int32_t sy1i = (int32_t)(sy1 + 0.5f);
+		if (sx1i <= sx0i || sy1i <= sy0i) {
+			continue;
+		}
+		drawn++;
+		if (cur->report_only) {
+			continue; // #1952: the app shows its OS cursor this frame
+		}
+		VkRect2D scissor = {
+		    .offset = {sx0i, sy0i},
+		    .extent = {(uint32_t)(sx1i - sx0i), (uint32_t)(sy1i - sy0i)},
+		};
+
+		// Padded by the blur radius (a no-op at radius 0: the corners come
+		// back unchanged and the uv span is exactly 0..1), hotspot unmoved.
+		// (The cast below: C before C23 will not add const to a pointer to
+		// an array implicitly.)
+		struct u_cursor_soften_quad sq;
+		u_cursor_draw_soften_quad(cur->corners[i], cur->tile_px_w, cur->tile_px_h, soft ? cur->blur_px : 0.0f,
+		                          &sq);
+		const float (*c)[2] = (const float (*)[2])sq.corners;
+		const float ex[2] = {c[2][0] - c[0][0], c[2][1] - c[0][1]}; // u: (0,0) -> (1,0)
+		const float ey[2] = {c[1][0] - c[0][0], c[1][1] - c[0][1]}; // v: (0,0) -> (0,1)
+		const float mid[2] = {c[0][0] + 0.5f * (ex[0] + ey[0]), c[0][1] + 0.5f * (ex[1] + ey[1])};
+		// Column-major: NDC = 2 * (mid + pos.x * ex - pos.y * ey) - 1.
+		// The 128-byte block has no room to grow, so the softened draw
+		// packs its parameters into it (zone_blit_soft.frag): the radius
+		// in the reserved params.zw, the opacity in color_scale (all four
+		// for a premultiplied sprite, alpha only for a straight one).
+		const float a = soft ? cur->alpha : 1.0f;
+		struct vk_compose_push push = {
+		    .mvp = {2.0f * ex[0], 2.0f * ex[1], 0.0f, 0.0f,   //
+		            -2.0f * ey[0], -2.0f * ey[1], 0.0f, 0.0f, //
+		            0.0f, 0.0f, 1.0f, 0.0f,                   //
+		            2.0f * mid[0] - 1.0f, 2.0f * mid[1] - 1.0f, 0.0f, 1.0f},
+		    // The quad's uv span: 0..1, or -r..1+r when padded.
+		    .src_rect = {sq.uv[0][0], sq.uv[0][1], sq.uv[3][0] - sq.uv[0][0], sq.uv[3][1] - sq.uv[0][1]},
+		    // array slice 0, QUAD path; zw = blur radius in sprite uv
+		    .params = {0.0f, 1.0f, sq.radius_uv[0], sq.radius_uv[1]},
+		    .color_scale = {cur->premultiplied ? a : 1.0f, cur->premultiplied ? a : 1.0f,
+		                    cur->premultiplied ? a : 1.0f, a},
+		    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
+		};
+		vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+		vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+		vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
+		                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+		                       &push);
+		vk->vkCmdDraw(cmd, 6, 1, 0, 0);
+	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(cur->req);
+	} else {
+		u_cursor_draw_report_refused(cur->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+	}
+
+	if (!r->cursor.announced && !cur->report_only && drawn > 0) {
+		r->cursor.announced = true;
+		U_LOG_W(
+		    "cursor_draw: Vulkan compositor drawing the cursor (%s, %u view(s); ADR-046 Amendment 2 B, "
+		    "one-time notice)",
+		    cur->xsc != NULL ? "app sprite" : "default look", n);
+	}
+}
+
+static VkFramebuffer
+raw_framebuffer(struct comp_vk_native_renderer *r);
+
+/*!
+ * Hand the composed zones frame to the atlas with a DRAW, not a copy.
+ *
+ * On Adreno a per-frame vkCmdCopyImage allocates and zeroes driver memory
+ * inside the call (and vkResetCommandBuffer frees it again): the avatar demo
+ * — the only shipped zones + Local2D app — spent ~6 ms of a ~32 ms frame in
+ * this one copy (#1935 / #1959 found the same trap on the sRGB fast path).
+ *
+ * One REPLACE draw over the whole atlas through the #1935 raw-read render
+ * pass (attachment = the UNORM atlas, CLEAR + STORE, ends SHADER_READ_ONLY
+ * exactly as the copy path's barrier leaves it), sampling the compose
+ * target's UNORM view 1:1 with a NEAREST sampler. The UNORM view reads the
+ * stored bytes with no decode and the UNORM atlas stores the shader output
+ * with no encode, and both images are B8G8R8A8: the atlas gets exactly the
+ * bytes the copy moved (memory: the vk_native atlas is ENCODED by
+ * construction — never decode on this hop).
+ *
+ * Returns false WITHOUT recording anything when the draw is unavailable, so
+ * the caller can still copy.
+ */
+static bool
+zones_handoff_draw(struct comp_vk_native_renderer *r, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->zone.compose_final_layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
+	    r->zone.compose_unorm_view == VK_NULL_HANDLE || !r->raw.ready || r->raw.nearest == VK_NULL_HANDLE ||
+	    r->zone.compose_w != r->atlas_alloc_width || r->zone.compose_h != r->atlas_alloc_height) {
+		return false;
+	}
+	VkFramebuffer fb = raw_framebuffer(r);
+	if (fb == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->zone.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->zone.set_layout,
+	};
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+		return false;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->raw.nearest,
+	    .imageView = r->zone.compose_unorm_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+	// The clear is fully overdrawn (compose target == atlas allocation).
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, 0.0f}}};
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->raw.render_pass,
+	    .framebuffer = fb,
+	    .renderArea = {{0, 0}, {r->atlas_alloc_width, r->atlas_alloc_height}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear_value,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	VkViewport vp = {
+	    .x = 0.0f,
+	    .y = 0.0f,
+	    .width = (float)r->zone.compose_w,
+	    .height = (float)r->zone.compose_h,
+	    .minDepth = 0.0f,
+	    .maxDepth = 1.0f,
+	};
+	VkRect2D scissor = {{0, 0}, {r->zone.compose_w, r->zone.compose_h}};
+	// Identity: whole source, slice 0, fullscreen path, no scale/bias.
+	struct vk_compose_push push = {
+	    .src_rect = {0.0f, 0.0f, 1.0f, 1.0f},
+	    .params = {0.0f, 0.0f, 0.0f, 0.0f},
+	    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+	    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
+	};
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->raw.pipelines[VK_COMPOSE_SAMPLER_2D]);
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
+	vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+	                       0, sizeof(push), &push);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+	return true;
+}
+
+/*!
+ * Publish the zone composite into a DEEPER atlas (DXR_ATLAS_FORMAT, experimental).
+ *
+ * The compose target stays B8G8R8A8_UNORM storage, so a raw vkCmdCopyImage
+ * into an A2B10G10R10 / R16G16B16A16F atlas would reinterpret its bits. This
+ * blit reads the target through its UNORM storage format and writes the
+ * atlas's UNORM / float format: a value conversion with no sRGB step on either
+ * side, so the encode the _SRGB view applied on write is carried, not repeated.
+ * The 8-bit atlas never comes here — it keeps the raw copy.
+ */
+static void
+publish_compose_to_deep_atlas(struct comp_vk_native_renderer *r, VkCommandBuffer cmd)
+{
+	struct vk_bundle *vk = r->vk;
+	VkImageBlit blit = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffsets = {{0, 0, 0}, {(int32_t)r->zone.compose_w, (int32_t)r->zone.compose_h, 1}},
+	};
+	vk->vkCmdBlitImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
 }
 
 //! Draw-based projection pass for zones frames: clear via loadOp, draw each
@@ -1125,56 +2765,39 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
                 struct comp_layer_accum *layers,
                 uint32_t target_width,
                 uint32_t target_height,
-                const struct comp_vk_native_eff_layout *layout)
+                const struct comp_vk_native_eff_layout *layout,
+                const struct comp_vk_native_cursor_draw *cursor)
 {
 	struct vk_bundle *vk = r->vk;
 
-	VkCommandBufferAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = r->cmd_pool,
-	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	    .commandBufferCount = 1,
-	};
-
-	VkCommandBuffer cmd;
-	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkResult res = renderer_begin_draw_cmd(r, &cmd);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("VK zones: failed to allocate command buffer: %d", res);
+		U_LOG_E("VK zones: failed to begin command buffer: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-
-	VkCommandBufferBeginInfo begin_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
 	vk->vkResetDescriptorPool(vk->device, r->zone.descriptor_pool, 0);
 
 	// Transition each unique source image for sampling. A zone's view tiles
 	// share one swapchain image, so dedupe — re-transitioning would declare
 	// a wrong oldLayout.
-	VkImage transitioned[VK_ZONE_MAX_DRAWS];
+	VkImage transitioned[VK_ZONE_MAX_DRAWS + 1];
 	uint32_t transitioned_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
 		if (!compose_pass_draws_layer(layer)) {
 			continue;
 		}
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
-			if (xsc == NULL) {
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
-			VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sc_index);
+			VkImage img =
+			    (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sub->image_index);
 			if (img == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1216,6 +2839,34 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	}
 
 	/*
+	 * XR_DXR_cursor_depth v5: the cursor's source, resolved (and the default
+	 * look uploaded) outside the pass. An app sprite is transitioned with the
+	 * layers' sources - and handed back with them below - unless a layer
+	 * already samples the same image.
+	 */
+	VkImageView cursor_view = VK_NULL_HANDLE;
+	enum vk_compose_sampler cursor_sampler = VK_COMPOSE_SAMPLER_2D;
+	bool cursor_ok = false;
+	if (cursor != NULL && cursor->active) {
+		VkImage cursor_img = VK_NULL_HANDLE;
+		cursor_ok = cursor_prepare(r, cmd, cursor, &cursor_view, &cursor_sampler, &cursor_img);
+		if (cursor_ok && cursor_img != VK_NULL_HANDLE) {
+			bool seen = false;
+			for (uint32_t t = 0; t < transitioned_count; t++) {
+				seen = seen || transitioned[t] == cursor_img;
+			}
+			if (!seen) {
+				transitioned[transitioned_count++] = cursor_img;
+				cmd_image_barrier(vk, cmd, cursor_img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+				                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			}
+		}
+	}
+
+	/*
 	 * Clear alpha must follow the SAME rule as the blit path, not a
 	 * hardcoded 0.
 	 *
@@ -1244,6 +2895,52 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
+	/*
+	 * ONE camera per view per frame (#1580), hoisted out of the layer loop.
+	 *
+	 * Only quads consume it, but it is resolved for every view up front so
+	 * two quads in the same view cannot end up on two different cameras.
+	 *
+	 * THE RETURN VALUE IS A DIAGNOSTIC, NOT "SKIP". `cam` is fully
+	 * populated on every branch, including the legacy placeholder, which
+	 * returns false and logs once inside the helper. Dropping the layer on
+	 * false would make a fallback frame silently quad-less — the header
+	 * carries a @warning about this and main has a structural test
+	 * asserting no backend gates on it. Hence the explicit (void).
+	 *
+	 * Canvas metres are 0 (unknown) on purpose: every frame carrying a quad
+	 * also carries a projection layer, so leg (a) of the helper fires and
+	 * the display3d synthesis is never reached. Same call shape as Metal
+	 * and GL.
+	 */
+	struct comp_layer_view_camera cams[XRT_MAX_VIEWS];
+	const uint32_t tile_count = layout->views > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : layout->views;
+	// Multi-screen M3: under routing a quad is drawn per routed view, with
+	// that view's camera — so resolve every routed view's camera.
+	uint32_t cam_count = tile_count;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > cam_count) {
+			cam_count = end > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : end;
+		}
+	}
+	for (uint32_t v = 0; v < cam_count; v++) {
+		(void)comp_layer_view_camera_select(layers, v, NULL, 0.0f, 0.0f, &cams[v]);
+	}
+
+	/*
+	 * Painter's-order state, one per tile, zeroed for this frame (#1598).
+	 *
+	 * The FIRST FULL-TILE projection layer into a tile is a REPLACE whatever
+	 * its flags say — a transparent-background app sets SOURCE_ALPHA on its
+	 * single projection layer, and that blit has to write alpha verbatim or
+	 * the DP's alpha gate dies (#225). Later layers blend by their flags, and
+	 * an unflagged one is OPAQUE_COVER, not REPLACE. Sub-rect layers (quads,
+	 * zones) never take the base slot; see the per-draw split below. The
+	 * shared helpers own the rule; this backend just carries the state.
+	 */
+	struct comp_layer_tile_state tiles[XRT_MAX_VIEWS] = {0};
+
 	uint32_t draw_count = 0;
 	for (uint32_t i = 0; i < layers->layer_count; i++) {
 		struct comp_layer *layer = &layers->layers[i];
@@ -1251,20 +2948,21 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			continue;
 		}
 		const bool is_zone = layer->data.type == XRT_LAYER_ZONE_3D;
+		const bool is_quad = layer->data.type == XRT_LAYER_QUAD;
+		const bool is_eq2 = layer->data.type == XRT_LAYER_EQUIRECT2;
+		const bool routed = layer_is_routed(layer, layout);
+		// Multi-screen M3: a routed layer draws one view per SEGMENT into
+		// each tile. The segments are disjoint, so every one of them is the
+		// layer's first write into its part of the tile: the blend mode is
+		// decided once per tile and shared by the layer's segments.
+		bool route_mode_set[XRT_MAX_VIEWS] = {false};
+		enum comp_layer_blend_mode route_mode[XRT_MAX_VIEWS];
 
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) {
-			view_count = layout->views;
-		}
-		if (view_count == 0) {
-			view_count = 1;
-		}
-
-		const bool unpremul =
-		    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
+		const uint32_t view_count = compose_layer_view_count(layer, layout);
 
 		for (uint32_t eye = 0; eye < view_count; eye++) {
-			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			struct xrt_swapchain *xsc = NULL;
+			const struct xrt_sub_image *sub = NULL;
 			if (draw_count >= VK_ZONE_MAX_DRAWS) {
 				// Same silent-drop hazard as the transition loop above:
 				// warn once rather than quietly losing a zone.
@@ -1279,12 +2977,105 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 				}
 				continue;
 			}
-			if (xsc == NULL) {
+			if (!compose_layer_source(layer, eye, &xsc, &sub)) {
 				continue;
 			}
-			uint32_t sc_index = layer->data.proj.v[eye].sub.image_index;
-			VkImageView src_view =
-			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc, sc_index);
+			uint32_t route_tile = 0;
+			int32_t rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+			if (routed && !route_eye(layout, eye, &route_tile, &rx0, &ry0, &rx1, &ry1)) {
+				continue; // the aliased tail: no segment owns it
+			}
+			if (is_quad) {
+				// Eye visibility, N-view aware: the parity rule
+				// is right for 2 views and meaningless for a 2x2
+				// quad mode, where the halves overlap by one.
+				if (!is_layer_view_visible_n(&layer->data, routed ? route_tile : eye, tile_count)) {
+					continue;
+				}
+				/*
+				 * Back-face cull (#1590). The spec: "Only front
+				 * face of the quad surface is visible; the back
+				 * face is not visible and must not be drawn by
+				 * the runtime", with the front normal at +Z.
+				 *
+				 * Against THIS VIEW's camera, not a display-space
+				 * eye — a quad can face one eye and not the
+				 * other, and the shared predicate is documented
+				 * to take comp_layer_view_camera::pose.position.
+				 * A skipped quad must NOT mark the tile
+				 * composited: it drew nothing, so the next layer
+				 * is still the first one in.
+				 */
+				if (!comp_layer_quad_is_front_facing(&layer->data.quad.pose,
+				                                     &cams[eye].pose.position)) {
+					continue;
+				}
+			}
+			/*
+			 * THE PAINTER'S RULE (#1598), split three ways exactly as
+			 * D3D11 / D3D12 / GL / Metal split it (comp_layer_view_camera.h):
+			 *
+			 *  - a FULL-TILE projection-class layer asks the first-in-tile
+			 *    gate: the first one into the tile is REPLACE (verbatim
+			 *    RGBA, #225), later ones blend by their flags;
+			 *  - a SUB-RECT Khronos layer (quad) takes its flags via
+			 *    comp_layer_subrect_blend_mode() and can never reach
+			 *    REPLACE — it cannot establish the tile's alpha — but it
+			 *    marks the tile, so a later projection layer blends over it;
+			 *  - a 3D ZONE takes NEITHER helper: ADR-027 keeps it alpha-over
+			 *    in list order, PREMULTIPLIED unless flagged unpremultiplied,
+			 *    so an unflagged zone's texture alpha survives. It marks the
+			 *    tile too.
+			 *
+			 * Resolved HERE, before any per-draw early-out below, so the
+			 * mark is eager (D3D11/GL parity): which layer holds the base
+			 * slot stays a function of the layer LIST, not of a transient
+			 * view/descriptor failure. A back-face-culled quad (above)
+			 * never gets here, so it marks nothing — it drew nothing.
+			 */
+			enum comp_layer_blend_mode mode;
+			float eq2_constants[16];
+			if (is_eq2) {
+				// Visibility, sub-rect blend mode and the packed
+				// ray constants, all per view (#1602).
+				if (!compose_equirect2_view(layer, routed ? route_tile : eye, tile_count, &cams[eye],
+				                            &tiles[routed ? route_tile : eye], eq2_constants, &mode)) {
+					continue;
+				}
+			} else if (is_zone) {
+				comp_layer_tile_mark_composited(&tiles[eye]);
+				mode = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
+				           ? COMP_LAYER_BLEND_STRAIGHT
+				           : COMP_LAYER_BLEND_PREMULTIPLIED;
+			} else if (is_quad) {
+				mode =
+				    comp_layer_subrect_blend_mode(&tiles[routed ? route_tile : eye], layer->data.flags);
+			} else if (routed) {
+				if (!route_mode_set[route_tile]) {
+					route_mode[route_tile] =
+					    comp_layer_tile_blend_mode(&tiles[route_tile], layer->data.flags);
+					route_mode_set[route_tile] = true;
+				}
+				mode = route_mode[route_tile];
+			} else {
+				mode = comp_layer_tile_blend_mode(&tiles[eye], layer->data.flags);
+			}
+
+			/*
+			 * Sample through the view in the format the APP ASKED
+			 * FOR, so the GPU DECODES an `_SRGB` source to linear
+			 * and passes a UNORM one through as the linear values
+			 * it holds (#1589). The pass composites in linear light
+			 * and the attachment re-encodes on write, so this is the
+			 * read half of a matched pair — never a lone decode.
+			 *
+			 * The fast path keeps the non-decoding read (the #1935
+			 * raw-view draw, or #1572's UNORM scratch under
+			 * DXR_VK_SRGB_MUTABLE_VIEW=0); neither is wired in here,
+			 * and wiring them in would double-encode.
+			 */
+			const uint64_t src_view_u64 = compose_source_view(xsc, sub->image_index);
+			VkImageView src_view = (VkImageView)(uintptr_t)src_view_u64;
 			if (src_view == VK_NULL_HANDLE) {
 				continue;
 			}
@@ -1294,7 +3085,14 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			// Tile-place by the effective grid (#542); mono content
 			// spans the full content region.
 			float dx0, dy0, dx1, dy1;
-			if (layout->views == 1 || view_count == 1) {
+			if (routed) {
+				// Multi-screen M3: the segment's rect inside its tile. The
+				// scissor below clamps to this same box.
+				dx0 = (float)rx0;
+				dy0 = (float)ry0;
+				dx1 = (float)rx1;
+				dy1 = (float)ry1;
+			} else if (layout->views == 1 || view_count == 1) {
 				dx0 = 0.0f;
 				dy0 = 0.0f;
 				dx1 = (float)(layout->cols * layout->tile_w);
@@ -1322,6 +3120,13 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			    .minDepth = 0.0f,
 			    .maxDepth = 1.0f,
 			};
+			// A QUAD is placed by its MVP (and an EQUIRECT2 by its
+			// rays), so its viewport is the whole tile box — and the SCISSOR below is then
+			// load-bearing rather than belt-and-braces: a projected
+			// quad's geometry can extend past the viewport rect and
+			// Vulkan viewports do not clip, so the spill would land
+			// in the NEIGHBOUR view's tile and the DP would weave it
+			// as ghosting in the wrong eye.
 			if (is_zone) {
 				const struct xrt_rect *zr = &layer->data.zone_3d.rect;
 				const float zsx = (dx1 - dx0) / (float)target_width;
@@ -1397,20 +3202,62 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			if (sc_w == 0 || sc_h == 0) {
 				continue;
 			}
-			const struct xrt_rect *sr = &layer->data.proj.v[eye].sub.rect;
-			// vec4 src_rect + vec4 params (params.x = array slice).
-			// Layout must match the block every shader in the bundle
-			// declares; the range is VERTEX | FRAGMENT.
-			float push[8] = {
-			    (float)sr->offset.w / (float)sc_w,
-			    (float)sr->offset.h / (float)sc_h,
-			    (float)sr->extent.w / (float)sc_w,
-			    (float)sr->extent.h / (float)sc_h,
-			    (float)layer->data.proj.v[eye].sub.array_index,
-			    0.0f,
-			    0.0f,
-			    0.0f,
+			const struct xrt_rect *sr = &sub->rect;
+			struct vk_compose_push push = {
+			    .src_rect =
+			        {
+			            (float)sr->offset.w / (float)sc_w,
+			            (float)sr->offset.h / (float)sc_h,
+			            (float)sr->extent.w / (float)sc_w,
+			            (float)sr->extent.h / (float)sc_h,
+			        },
+			    .params = {(float)sub->array_index, is_quad ? 1.0f : 0.0f, 0.0f, 0.0f},
+			    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+			    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
 			};
+
+			/*
+			 * XR_KHR_composition_layer_color_scale_bias, when the
+			 * layer carries it (identity otherwise). Filled BEFORE the
+			 * OPAQUE_COVER fold below, which overrides alpha.
+			 */
+			if ((layer->data.flags & XRT_LAYER_COMPOSITION_COLOR_BIAS_SCALE) != 0) {
+				push.color_scale[0] = layer->data.color_scale.r;
+				push.color_scale[1] = layer->data.color_scale.g;
+				push.color_scale[2] = layer->data.color_scale.b;
+				push.color_scale[3] = layer->data.color_scale.a;
+				push.color_bias[0] = layer->data.color_bias.r;
+				push.color_bias[1] = layer->data.color_bias.g;
+				push.color_bias[2] = layer->data.color_bias.b;
+				push.color_bias[3] = layer->data.color_bias.a;
+			}
+
+			// OPAQUE_COVER's alpha-of-one is emitted by the SHADER,
+			// folded into the scale/bias it already applies: fixed-
+			// function blending cannot make a constant 1 out of an
+			// arbitrary src.a. No-op for every other mode.
+			comp_layer_blend_fold_opaque_cover(mode, push.color_scale, push.color_bias);
+
+			if (is_quad) {
+				// model = pose * scale(size.x, size.y, 1); view
+				// from the camera pose; VULKAN infinite-reverse
+				// projection from the camera fov at near 0.1.
+				// The vulkan helper pairs with NO clip-Y flip in
+				// the vertex shader — see the shader comment;
+				// change both together or neither.
+				struct xrt_matrix_4x4 view_mat, proj_mat, model, mv, mvp;
+				const struct xrt_layer_quad_data *q = &layer->data.quad;
+				struct xrt_vec3 qscale = {q->size.x, q->size.y, 1.0f};
+				math_matrix_4x4_view_from_pose(&cams[eye].pose, &view_mat);
+				math_matrix_4x4_projection_vulkan_infinite_reverse(&cams[eye].fov, 0.1f,
+				                                                    &proj_mat);
+				math_matrix_4x4_model(&q->pose, &qscale, &model);
+				math_matrix_4x4_multiply(&view_mat, &model, &mv);
+				math_matrix_4x4_multiply(&proj_mat, &mv, &mvp);
+				memcpy(push.mvp, mvp.v, sizeof(push.mvp));
+			} else if (is_eq2) {
+				memcpy(push.mvp, eq2_constants, sizeof(push.mvp));
+			}
 
 			// The view the swapchain handed us is a 2D_ARRAY view iff
 			// the swapchain is layered, and a `sampler2D` cannot bind
@@ -1420,40 +3267,109 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 			    comp_vk_native_swapchain_get_array_size(xsc) > 1 ? VK_COMPOSE_SAMPLER_2D_ARRAY
 			                                                     : VK_COMPOSE_SAMPLER_2D;
 
-			/*
-			 * Blend mode. ZONES keep alpha-over in layer-list order,
-			 * bit-for-bit what they did before this pass grew a
-			 * second caller. A PROJECTION layer takes REPLACE, which
-			 * is what its vkCmdBlitImage did: overwrite, alpha
-			 * verbatim.
-			 *
-			 * This is NOT yet the OpenXR painter's-order rule
-			 * (#1598: first-into-tile replaces, later layers blend
-			 * by their flags). That rule arrives with #1611's shared
-			 * helper; deciding it here would mean inventing a second
-			 * copy of a policy that is still being finalised, and
-			 * would change what two overlapping projection layers do
-			 * inside a step whose whole job is to change nothing.
-			 */
-			const enum vk_compose_blend blend =
-			    !is_zone ? VK_COMPOSE_BLEND_REPLACE
-			             : (unpremul ? VK_COMPOSE_BLEND_UNPREMULT : VK_COMPOSE_BLEND_PREMULT);
+			// OPAQUE_COVER shares REPLACE's blending-off state; the
+			// difference is entirely in the folded scale/bias above.
+			const enum vk_compose_blend blend = vk_compose_blend_state(mode);
 
 			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-			                       r->zone.pipelines[blend][sampler_kind]);
+			                      is_eq2 ? r->zone.eq2_pipelines[blend][sampler_kind]
+			                             : r->zone.pipelines[blend][sampler_kind]);
 			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
 			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
 			                             r->zone.pipeline_layout, 0, 1, &set, 0, NULL);
 			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
 			                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-			                        sizeof(push), push);
-			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+			                        sizeof(push), &push);
+			// 3 = fullscreen triangle (projection, zone, and the
+			// equirect2 ray-cast strip); 6 = the quad's two triangles.
+			vk->vkCmdDraw(cmd, is_quad ? 6 : 3, 1, 0, 0);
 			draw_count++;
+
+			if (is_eq2) {
+				// One line per process at the first equirect2 draw —
+				// the discriminator between "the port is live" and
+				// "the frame carried no equirect2". NEVER per frame.
+				static bool first_eq2_logged = false;
+				if (!first_eq2_logged) {
+					first_eq2_logged = true;
+					U_LOG_W("#1602: vk_native drew its first equirect2 layer");
+				}
+			}
 		}
 	}
 
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
+	// cursor, LAST in the pass - over every layer it composed, never
+	// occluded - and before the atlas is published to the DP. In a zones
+	// frame it is clipped to the hinted zone (#1949; resolved upstream).
+	if (cursor_ok) {
+		cursor_record_draws(r, cmd, cursor, cursor_view, cursor_sampler, layout);
+	}
+
 	vk->vkCmdEndRenderPass(cmd);
+
+	/*
+	 * Hand the composed frame to the atlas. Default: a REPLACE draw through
+	 * the compose target's UNORM view (zones_handoff_draw) — no per-frame
+	 * copy. DXR_VK_ZONES_COPY_TO_DRAW=0, or a draw that could not be set up,
+	 * keeps the raw copy below.
+	 */
+	const bool handoff_drawn = zones_handoff_draw(r, cmd);
+	{
+		static bool handoff_logged = false;
+		if (!handoff_logged) {
+			handoff_logged = true;
+			U_LOG_W("VK zones: compose target -> atlas hand-off = %s",
+			        handoff_drawn ? "draw through the UNORM view (no vkCmdCopyImage)"
+			                      : "vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW=0 or draw unavailable)");
+		}
+	}
+	if (!handoff_drawn) {
+		if (r->zone.compose_final_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+			// The pass was built for the draw; the render pass's external
+			// dependency already made the writes visible to TRANSFER.
+			cmd_image_barrier(vk, cmd, r->zone.compose_image, r->zone.compose_final_layout,
+			                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, VK_ACCESS_TRANSFER_READ_BIT,
+			                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		}
+		/*
+		 * Hand the composed frame to the atlas: a RAW COPY, never a blit.
+		 *
+		 * Both images are VK_FORMAT_B8G8R8A8_UNORM, so vkCmdCopyImage moves
+		 * bytes with no conversion of any kind — which is the whole point. The
+		 * private target's _SRGB VIEW already did the encode on write, so the
+		 * atlas receives display-referred bytes exactly as it always has.
+		 * vkCmdBlitImage here would CONVERT between the sRGB and UNORM
+		 * interpretations and apply the encode a second time.
+		 *
+		 * The atlas is unchanged in every respect a consumer can observe:
+		 * same image, same UNORM format, same ENCODED contents, same value
+		 * reported to the display processor. No DP change, no ABI change.
+		 */
+		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_UNDEFINED,
+		                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+		VkImageCopy copy = {
+		    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .srcOffset = {0, 0, 0},
+		    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+		    .dstOffset = {0, 0, 0},
+		    .extent = {r->zone.compose_w, r->zone.compose_h, 1},
+		};
+		if (r->format == VK_FORMAT_B8G8R8A8_UNORM) {
+			vk->vkCmdCopyImage(cmd, r->zone.compose_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+			                   r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+		} else {
+			publish_compose_to_deep_atlas(r, cmd);
+		}
+
+		cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	}
 
 	// Hand the source images back to the apps' steady-state layout.
 	for (uint32_t t = 0; t < transitioned_count; t++) {
@@ -1482,18 +3398,20 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_zones");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("VK zones: failed to submit draw commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);
-		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		// A failed submit leaves the command buffer not pending; the next
+		// draw resets and reuses it (never freed per frame — see draw_cmd).
 		return XRT_ERROR_VULKAN;
 	}
 
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	static bool zones_draw_logged = false;
 	if (!zones_draw_logged) {
@@ -1502,6 +3420,383 @@ draw_zones_pass(struct comp_vk_native_renderer *r,
 	}
 
 	return XRT_SUCCESS;
+}
+
+/*!
+ * Where the fast path puts one view of a full-tile projection layer in the
+ * atlas: the routed segment rect (multi-screen M3), the whole content region
+ * for mono content, else the view's effective tile (#542). Shared by the blit
+ * and the #1935 raw-read draw so the two cannot place a view differently.
+ */
+static void
+fast_path_dst_rect(const struct comp_vk_native_eff_layout *layout,
+                   bool routed,
+                   uint32_t view_count,
+                   uint32_t eye,
+                   int32_t rx0,
+                   int32_t ry0,
+                   int32_t rx1,
+                   int32_t ry1,
+                   int32_t *out_x0,
+                   int32_t *out_y0,
+                   int32_t *out_x1,
+                   int32_t *out_y1)
+{
+	if (routed) {
+		*out_x0 = rx0;
+		*out_y0 = ry0;
+		*out_x1 = rx1;
+		*out_y1 = ry1;
+	} else if (layout->views == 1 || view_count == 1) {
+		// Mono content: stretch across the full content region
+		*out_x0 = 0;
+		*out_y0 = 0;
+		*out_x1 = (int32_t)(layout->cols * layout->tile_w);
+		*out_y1 = (int32_t)(layout->rows * layout->tile_h);
+	} else {
+		// Tiled layout: place each eye in its effective tile (#542)
+		const uint32_t tile_x = eye % layout->cols;
+		const uint32_t tile_y = eye / layout->cols;
+		*out_x0 = (int32_t)(tile_x * layout->tile_w);
+		*out_y0 = (int32_t)(tile_y * layout->tile_h);
+		*out_x1 = *out_x0 + (int32_t)layout->tile_w;
+		*out_y1 = *out_y0 + (int32_t)layout->tile_h;
+	}
+}
+
+//! The fast path's view count for a projection layer (the blit loop's rule).
+static uint32_t
+fast_path_view_count(const struct comp_layer *layer, const struct comp_vk_native_eff_layout *layout, bool routed)
+{
+	uint32_t view_count = layer->data.view_count;
+	if (view_count > layout->views) {
+		view_count = layout->views;
+	}
+	if (view_count == 0) {
+		view_count = 1;
+	}
+	if (routed) {
+		view_count = routed_view_count(layer, layout);
+	}
+	return view_count;
+}
+
+/*!
+ * #1935: should this fast-path frame be drawn through the swapchains' UNORM
+ * views rather than blitted? Only when a source is a truthful-sRGB swapchain
+ * — the one case where the blit would need the #1559 scratch copy — the knob
+ * is on, the draw was built, and every source has a view to sample. Anything
+ * else blits exactly as before, so non-sRGB apps are byte-for-byte unchanged.
+ */
+static bool
+raw_view_frame_wanted(struct comp_vk_native_renderer *r,
+                      struct comp_layer_accum *layers,
+                      const struct comp_vk_native_eff_layout *layout)
+{
+	bool any_true_srgb = false;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_PROJECTION && layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+			continue;
+		}
+		const bool routed = layer_is_routed(layer, layout);
+		const uint32_t view_count = fast_path_view_count(layer, layout, routed);
+		for (uint32_t eye = 0; eye < view_count && eye < XRT_MAX_VIEWS; eye++) {
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL) {
+				continue;
+			}
+			if (comp_vk_native_swapchain_is_true_srgb(xsc)) {
+				any_true_srgb = true;
+			}
+			if (comp_vk_native_swapchain_get_image_view(xsc, layer->data.proj.v[eye].sub.image_index) ==
+			    0) {
+				return false;
+			}
+		}
+	}
+	if (!any_true_srgb || !comp_vk_native_srgb_mutable_view_enabled()) {
+		return false;
+	}
+	return zone_draw_ensure(r) && r->raw.ready;
+}
+
+//! The raw-read draw's framebuffer over the CURRENT atlas view (one per
+//! deposit-ring slot; a single one for the renderer's own atlas).
+static VkFramebuffer
+raw_framebuffer(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	uint32_t slot = COMP_VK_DEPOSIT_RING;
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		if (r->raw.fb[i] != VK_NULL_HANDLE && r->raw.fb_view[i] == r->atlas_view) {
+			return r->raw.fb[i];
+		}
+		if (slot == COMP_VK_DEPOSIT_RING && r->raw.fb[i] == VK_NULL_HANDLE) {
+			slot = i;
+		}
+	}
+	if (slot == COMP_VK_DEPOSIT_RING) {
+		// More distinct atlas views than ring slots: cannot happen without a
+		// resize, which drops the cache — start over rather than leak.
+		raw_destroy_framebuffers(r);
+		slot = 0;
+	}
+	VkFramebufferCreateInfo fb_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = r->raw.render_pass,
+	    .attachmentCount = 1,
+	    .pAttachments = &r->atlas_view,
+	    .width = r->atlas_alloc_width,
+	    .height = r->atlas_alloc_height,
+	    .layers = 1,
+	};
+	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->raw.fb[slot]) != VK_SUCCESS) {
+		r->raw.fb[slot] = VK_NULL_HANDLE;
+		return VK_NULL_HANDLE;
+	}
+	r->raw.fb_view[slot] = r->atlas_view;
+	return r->raw.fb[slot];
+}
+
+/*!
+ * #1935: the fast path for a frame whose source is a truthful-sRGB swapchain.
+ *
+ * Same frames, same placement and same result as the blit loop in
+ * comp_vk_native_renderer_draw — one full-tile projection layer, each view
+ * into its tile — but each view is a REPLACE draw sampling the swapchain's
+ * UNORM view instead of a vkCmdCopyImage into a scratch plus a blit. The
+ * UNORM view reads the app's stored (ENCODED) bytes with no decode and the
+ * UNORM atlas stores what the shader writes with no encode, so the atlas
+ * holds exactly the bytes the copy + blit put there: no colour conversion
+ * anywhere (memory: the vk_native atlas is ENCODED by construction).
+ *
+ * Returns false WITHOUT recording anything when the framebuffer cannot be
+ * made, so the caller can still blit the frame.
+ */
+static bool
+draw_raw_view_pass(struct comp_vk_native_renderer *r,
+                   struct comp_layer_accum *layers,
+                   const struct comp_vk_native_eff_layout *layout,
+                   xrt_result_t *out_result)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkFramebuffer fb = raw_framebuffer(r);
+	if (fb == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkResult res = renderer_begin_draw_cmd(r, &cmd);
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to begin command buffer: %d", res);
+		*out_result = XRT_ERROR_VULKAN;
+		return true;
+	}
+
+	vk->vkResetDescriptorPool(vk->device, r->zone.descriptor_pool, 0);
+
+	// Sources to SHADER_READ_ONLY, once per image (two views of one
+	// swapchain share an image; a second transition would lie about
+	// oldLayout). Handed back to COLOR_ATTACHMENT below, as the blit does.
+	VkImage transitioned[XRT_MAX_VIEWS * 2];
+	uint32_t transitioned_count = 0;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_PROJECTION && layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+			continue;
+		}
+		const bool routed = layer_is_routed(layer, layout);
+		const uint32_t view_count = fast_path_view_count(layer, layout, routed);
+		for (uint32_t eye = 0; eye < view_count && eye < XRT_MAX_VIEWS; eye++) {
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL) {
+				continue;
+			}
+			VkImage img = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(
+			    xsc, layer->data.proj.v[eye].sub.image_index);
+			bool seen = img == VK_NULL_HANDLE;
+			for (uint32_t t = 0; t < transitioned_count && !seen; t++) {
+				seen = transitioned[t] == img;
+			}
+			if (seen || transitioned_count >= ARRAY_SIZE(transitioned)) {
+				continue;
+			}
+			transitioned[transitioned_count++] = img;
+			cmd_image_barrier(vk, cmd, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+			                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		}
+	}
+
+	// The blit path's clear, as the pass's loadOp (no zones reach here).
+	const float clear_alpha = r->transparent_background ? 0.0f : 1.0f;
+	VkClearValue clear_value = {.color = {{0.0f, 0.0f, 0.0f, clear_alpha}}};
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->raw.render_pass,
+	    .framebuffer = fb,
+	    .renderArea = {{0, 0}, {r->atlas_alloc_width, r->atlas_alloc_height}},
+	    .clearValueCount = 1,
+	    .pClearValues = &clear_value,
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+
+	uint32_t draw_count = 0;
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		if (layer->data.type != XRT_LAYER_PROJECTION && layer->data.type != XRT_LAYER_PROJECTION_DEPTH) {
+			continue;
+		}
+		const bool routed = layer_is_routed(layer, layout);
+		const uint32_t view_count = fast_path_view_count(layer, layout, routed);
+		for (uint32_t eye = 0; eye < view_count && eye < XRT_MAX_VIEWS; eye++) {
+			int32_t rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+			uint32_t route_tile = 0;
+			if (routed && !route_eye(layout, eye, &route_tile, &rx0, &ry0, &rx1, &ry1)) {
+				continue; // the aliased tail: no segment owns it
+			}
+			struct xrt_swapchain *xsc = layer->sc_array[eye];
+			if (xsc == NULL) {
+				continue;
+			}
+			const struct xrt_sub_image *sub = &layer->data.proj.v[eye].sub;
+			// The NON-decoding view: UNORM over the `_SRGB` image's memory.
+			VkImageView src_view =
+			    (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(xsc, sub->image_index);
+			uint32_t sc_w = 0, sc_h = 0;
+			comp_vk_native_swapchain_get_dimensions(xsc, &sc_w, &sc_h);
+			if (src_view == VK_NULL_HANDLE || sc_w == 0 || sc_h == 0) {
+				continue;
+			}
+
+			int32_t dx0, dy0, dx1, dy1;
+			fast_path_dst_rect(layout, routed, view_count, eye, rx0, ry0, rx1, ry1, &dx0, &dy0, &dx1, &dy1);
+			// Scissor = the destination clamped to the atlas (a blit
+			// region outside the image would be invalid usage; a
+			// viewport does not clip, so clamp the scissor instead).
+			int32_t sx0 = dx0 < 0 ? 0 : dx0;
+			int32_t sy0 = dy0 < 0 ? 0 : dy0;
+			int32_t sx1 = dx1 > (int32_t)r->atlas_alloc_width ? (int32_t)r->atlas_alloc_width : dx1;
+			int32_t sy1 = dy1 > (int32_t)r->atlas_alloc_height ? (int32_t)r->atlas_alloc_height : dy1;
+			if (dx1 <= dx0 || dy1 <= dy0 || sx1 <= sx0 || sy1 <= sy0) {
+				continue;
+			}
+
+			VkDescriptorSetAllocateInfo ds_ai = {
+			    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+			    .descriptorPool = r->zone.descriptor_pool,
+			    .descriptorSetCount = 1,
+			    .pSetLayouts = &r->zone.set_layout,
+			};
+			VkDescriptorSet set = VK_NULL_HANDLE;
+			if (vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &set) != VK_SUCCESS) {
+				continue;
+			}
+			VkDescriptorImageInfo image_info = {
+			    .sampler = r->zone.sampler, // LINEAR + clamp: the blit's VK_FILTER_LINEAR
+			    .imageView = src_view,
+			    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			};
+			VkWriteDescriptorSet write = {
+			    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			    .dstSet = set,
+			    .dstBinding = 0,
+			    .descriptorCount = 1,
+			    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+			    .pImageInfo = &image_info,
+			};
+			vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+
+			// Identity scale/bias: the blit applies none either.
+			const struct xrt_rect *sr = &sub->rect;
+			struct vk_compose_push push = {
+			    .src_rect =
+			        {
+			            (float)sr->offset.w / (float)sc_w,
+			            (float)sr->offset.h / (float)sc_h,
+			            (float)sr->extent.w / (float)sc_w,
+			            (float)sr->extent.h / (float)sc_h,
+			        },
+			    .params = {(float)sub->array_index, 0.0f, 0.0f, 0.0f},
+			    .color_scale = {1.0f, 1.0f, 1.0f, 1.0f},
+			    .color_bias = {0.0f, 0.0f, 0.0f, 0.0f},
+			};
+			VkViewport vp = {
+			    .x = (float)dx0,
+			    .y = (float)dy0,
+			    .width = (float)(dx1 - dx0),
+			    .height = (float)(dy1 - dy0),
+			    .minDepth = 0.0f,
+			    .maxDepth = 1.0f,
+			};
+			VkRect2D scissor = {
+			    .offset = {sx0, sy0},
+			    .extent = {(uint32_t)(sx1 - sx0), (uint32_t)(sy1 - sy0)},
+			};
+			const enum vk_compose_sampler sampler_kind = comp_vk_native_swapchain_get_array_size(xsc) > 1
+			                                                 ? VK_COMPOSE_SAMPLER_2D_ARRAY
+			                                                 : VK_COMPOSE_SAMPLER_2D;
+
+			vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->raw.pipelines[sampler_kind]);
+			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+			vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->zone.pipeline_layout, 0, 1,
+			                            &set, 0, NULL);
+			vk->vkCmdPushConstants(cmd, r->zone.pipeline_layout,
+			                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+			                       sizeof(push), &push);
+			vk->vkCmdDraw(cmd, 3, 1, 0, 0); // fullscreen triangle over the viewport
+			draw_count++;
+		}
+	}
+
+	vk->vkCmdEndRenderPass(cmd);
+
+	for (uint32_t t = 0; t < transitioned_count; t++) {
+		cmd_image_barrier(vk, cmd, transitioned[t], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+		                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	}
+
+	vk->vkEndCommandBuffer(cmd);
+
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	VkTimelineSemaphoreSubmitInfo deposit_timeline = {0};
+	VkSemaphore deposit_sem = VK_NULL_HANDLE;
+	uint64_t deposit_value = 0;
+	uint64_t deposit_wait_value = 0;
+	VkPipelineStageFlags deposit_wait_stage = 0;
+	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
+	                     &deposit_wait_stage);
+
+	// #1905 retry on Android; waits THIS submit's fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw_raw_view");
+	if (res != VK_SUCCESS) {
+		U_LOG_E("Failed to submit renderer commands: %d", res);
+		comp_vk_deposit_abandon_signal(r->deposit);
+		*out_result = XRT_ERROR_VULKAN;
+		return true;
+	}
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W(
+		    "#1935: sRGB fast path drawn through the UNORM mutable-format view (%u draw(s), no scratch "
+		    "copy)",
+		    draw_count);
+	}
+	*out_result = XRT_SUCCESS;
+	return true;
 }
 
 xrt_result_t
@@ -1547,11 +3842,13 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * erases whatever the blits already put down. All-or-nothing per frame
 	 * is a property of the pass, not a simplification.
 	 *
-	 *  - FAST PATH — one drawable layer and no zones: the blit, verbatim.
+	 *  - FAST PATH — one drawable PROJECTION layer and no zones: the blit,
+	 *    verbatim.
 	 *    This is every shipping app, it is the perf path, and because the
 	 *    commands are literally unchanged it is also the no-regression
 	 *    proof: the atlas is byte-identical to before this change.
-	 *  - PASS — zones (which must blend), or more than one drawable layer.
+	 *  - PASS — zones (which must blend), a quad, or more than one drawable
+	 *    layer.
 	 *  - FALLBACK — the pass cannot be built (sticky `zone.failed`): the
 	 *    blit runs instead and content degrades exactly to main's behaviour
 	 *    (overlaps overwrite), which is a degradation, never a corruption.
@@ -1561,17 +3858,83 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	 * how "the pass reproduces the blit" is checked at all, since every
 	 * other frame takes one path or the other and never both.
 	 *
-	 * NOT gated on colour yet. #1589/#1610 will add "…and the source is
-	 * already _SRGB" to the fast path, because a UNORM source will then
-	 * need the pass to encode it. Today both paths produce identical bytes,
-	 * so adding that clause now would push single-layer UNORM frames — i.e.
-	 * most of the app population — onto the new path for no benefit.
+	 * GATED ON COLOUR (#1589). A single UNORM layer can no longer take the
+	 * blit: the blit passes bytes through, and a UNORM swapchain holds
+	 * LINEAR values that the display processor — which is handed ENCODED
+	 * bytes — would render far too dark. Only a source that is already
+	 * `_SRGB` is safe to pass through, and that is exactly the app
+	 * population the migration is moving everything to. The cost is honest:
+	 * a legacy UNORM app loses the fast path until it asks for the `_SRGB`
+	 * sibling, which is one more reason to migrate rather than to sit on
+	 * the old behaviour.
 	 */
 	const uint32_t drawable = compose_pass_layer_count(layers);
-	const bool want_pass = zones_frame || drawable > 1 || debug_get_bool_option_vk_force_compose_pass();
+
+	/*
+	 * The COLOUR half of the decision comes from the shared predicate, so
+	 * this backend cannot drift from Direct3D on when the encode is owed.
+	 * The three inputs are gathered locally (they need VkFormat knowledge,
+	 * which the backend-neutral header deliberately has none of) but the
+	 * RULE is not restated here — that restating is exactly how the
+	 * inverted-alpha divergence (#1621) happened.
+	 */
+	const bool colour_allows_raw = u_color_compose_fast_path(u_color_legacy_unorm_encoded(), drawable,
+	                                                          compose_frame_base_is_projection(layers),
+	                                                          compose_frame_source_is_srgb(layers));
+
+	/*
+	 * The STRUCTURAL half is this backend's own and must be ANDed with it,
+	 * not replaced by it. On Vulkan the "fast path" is literally
+	 * vkCmdBlitImage, which cannot blend and cannot draw a quad — so zones,
+	 * multi-layer frames and quad frames need the render pass whatever the
+	 * colour answer is. Note the hatch makes the shared predicate return
+	 * true unconditionally; without this AND, turning the hatch on would
+	 * silently take alpha-over compositing and quads away with it — and a
+	 * lone QUAD is exactly that case: one drawable layer, but a blit would
+	 * stretch it over the whole tile. So the single layer must also be a
+	 * full-tile projection blit (or the frame empty) for the blit to be a
+	 * faithful rendering of it.
+	 */
+	const bool structure_allows_raw =
+	    !zones_frame && (drawable == 0 || (drawable == 1 && compose_frame_base_is_projection(layers)));
+
+	/*
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): consumed by THIS draw
+	 * only. A frame carrying the runtime-drawn cursor composes through the
+	 * pass - the blit cannot blend - so the cursor is drawn after the layers
+	 * it composes. ZERO COST UNLESS REQUESTED: one field test.
+	 */
+	struct comp_vk_native_cursor_draw cursor = {0};
+	if (r->cursor.req.active) {
+		cursor = r->cursor.req;
+		r->cursor.req.active = false;
+	}
+
+	const bool want_pass = !(colour_allows_raw && structure_allows_raw) ||
+	                       debug_get_bool_option_vk_force_compose_pass() || cursor.active;
 
 	if (want_pass && zone_pass_usable(r, layers, layout)) {
-		return draw_zones_pass(r, layers, target_width, target_height, layout);
+		return draw_zones_pass(r, layers, target_width, target_height, layout, cursor.active ? &cursor : NULL);
+	}
+	if (cursor.active) {
+		u_cursor_draw_report_refused(cursor.req, U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS);
+	}
+	if (cursor.active && !r->cursor.warned_no_pass) {
+		r->cursor.warned_no_pass = true;
+		U_LOG_W("cursor_draw: the Vulkan compose pass is unavailable - cursor not drawn (one-time warning)");
+	}
+	/*
+	 * #1935: a truthful-sRGB source on the fast path is DRAWN through its
+	 * UNORM view rather than copied into a scratch and blitted. Only when the
+	 * frame is a fast-path frame (!want_pass) — the pass has its own
+	 * (decoding) read, and the blit fallback after a failed pass keeps the
+	 * copy.
+	 */
+	if (!want_pass && raw_view_frame_wanted(r, layers, layout)) {
+		xrt_result_t raw_result = XRT_SUCCESS;
+		if (draw_raw_view_pass(r, layers, layout, &raw_result)) {
+			return raw_result;
+		}
 	}
 	if (want_pass) {
 		static bool fallback_warned = false;
@@ -1582,25 +3945,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 	}
 
-	VkCommandBufferAllocateInfo alloc_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-	    .commandPool = r->cmd_pool,
-	    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-	    .commandBufferCount = 1,
-	};
-
-	VkCommandBuffer cmd;
-	VkResult res = vk->vkAllocateCommandBuffers(vk->device, &alloc_info, &cmd);
+	VkCommandBuffer cmd = VK_NULL_HANDLE;
+	VkResult res = renderer_begin_draw_cmd(r, &cmd);
 	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to allocate command buffer: %d", res);
+		U_LOG_E("Failed to begin command buffer: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
-
-	VkCommandBufferBeginInfo begin_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-	};
-	vk->vkBeginCommandBuffer(cmd, &begin_info);
 
 	// Transition atlas image to transfer dst
 	cmd_image_barrier(vk, cmd, r->atlas_image,
@@ -1637,9 +3987,10 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 
 		// CONTENT tile count from the SUBMISSION-derived effective layout
 		// (#542) — no longer clamped by the hardware weave-state.
-		uint32_t view_count = layer->data.view_count;
-		if (view_count > layout->views) view_count = layout->views;
-		if (view_count == 0) view_count = 1;
+		// Multi-screen M3: one view set per segment, each into its rect of
+		// every tile (the mosaic, comp_vk_native_eff_layout::route).
+		const bool routed = !is_zone && layer_is_routed(layer, layout);
+		const uint32_t view_count = fast_path_view_count(layer, layout, routed);
 
 		static bool blit_logged = false;
 		if (!blit_logged) {
@@ -1652,6 +4003,11 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 		}
 
 		for (uint32_t eye = 0; eye < view_count; eye++) {
+			uint32_t route_tile = 0;
+			int32_t rx0 = 0, ry0 = 0, rx1 = 0, ry1 = 0;
+			if (routed && !route_eye(layout, eye, &route_tile, &rx0, &ry0, &rx1, &ry1)) {
+				continue; // the aliased tail: no segment owns it
+			}
 			struct xrt_swapchain *xsc = layer->sc_array[eye];
 			if (xsc == NULL) {
 				if (!blit_logged) U_LOG_W("Atlas blit: eye %u swapchain NULL", eye);
@@ -1680,21 +4036,7 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			int32_t sy1 = sy0 + (int32_t)src_rect->extent.h;
 
 			int32_t dx0, dy0, dx1, dy1;
-			if (layout->views == 1 || view_count == 1) {
-				// Mono content: stretch across the full content region
-				dx0 = 0;
-				dy0 = 0;
-				dx1 = (int32_t)(layout->cols * layout->tile_w);
-				dy1 = (int32_t)(layout->rows * layout->tile_h);
-			} else {
-				// Tiled layout: place each eye in its effective tile (#542)
-				uint32_t tile_x = eye % layout->cols;
-				uint32_t tile_y = eye / layout->cols;
-				dx0 = (int32_t)(tile_x * layout->tile_w);
-				dy0 = (int32_t)(tile_y * layout->tile_h);
-				dx1 = dx0 + (int32_t)layout->tile_w;
-				dy1 = dy0 + (int32_t)layout->tile_h;
-			}
+			fast_path_dst_rect(layout, routed, view_count, eye, rx0, ry0, rx1, ry1, &dx0, &dy0, &dx1, &dy1);
 
 			// XR_DXR_display_zones: scale the zone rect (client-window
 			// px) into the tile box — in zones frames the tile spans
@@ -1768,6 +4110,12 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 			 * scratch and blit from there. Returns 0 — and costs
 			 * nothing — for every other swapchain, which is all of them
 			 * when DXR_VK_SWAPCHAIN_TRUE_FORMAT=0.
+			 *
+			 * #1935: a fast-path frame with such a source no longer gets
+			 * here by default — draw_raw_view_pass() samples the UNORM
+			 * view instead, no copy. This staging remains for
+			 * DXR_VK_SRGB_MUTABLE_VIEW=0 and for the blit FALLBACK after
+			 * a failed compose pass.
 			 */
 			VkImage blit_src = src_image;
 			uint32_t blit_layer = layer->data.proj.v[eye].sub.array_index;
@@ -1837,18 +4185,30 @@ comp_vk_native_renderer_draw(struct comp_vk_native_renderer *r,
 	deposit_chain_signal(r, &submit_info, &deposit_timeline, &deposit_sem, &deposit_value, &deposit_wait_value,
 	                     &deposit_wait_stage);
 
-	res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+	/*
+	 * #1905: one retry on -3. This is the submit that loses the shared-GSL
+	 * race on model viewer: the app's unlocked submit on the app queue
+	 * collides with a fill's on the repaint queue, and the NEXT submit on the
+	 * app queue — this one — returns -3, dropping the app frame ("Failed to
+	 * render layers"). The failed submit consumed nothing (the deposit
+	 * timeline value is still unsignalled), so resubmitting it is safe.
+	 */
+
+	// That retry lives in the helper (Android only); it waits THIS submit's
+	// fence, not the queue (#1917).
+	res = renderer_submit_draw_and_wait(r, &submit_info, "renderer_draw");
 	if (res != VK_SUCCESS) {
 		U_LOG_E("Failed to submit renderer commands: %d", res);
 		// The claimed value will never be signalled — give it back, or a
 		// consumer waiting on it waits forever.
 		comp_vk_deposit_abandon_signal(r->deposit);
-		vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+		// A failed submit leaves the command buffer not pending; the next
+		// draw resets and reuses it (never freed per frame — see draw_cmd).
 		return XRT_ERROR_VULKAN;
 	}
 
-	vk->vkQueueWaitIdle(vk->main_queue->queue);
-	vk->vkFreeCommandBuffers(vk->device, r->cmd_pool, 1, &cmd);
+	// renderer_submit_draw_and_wait() waited draw_fence: the atlas is
+	// complete and draw_cmd is idle for the next reset.
 
 	return XRT_SUCCESS;
 }
@@ -1893,6 +4253,494 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *r)
 {
 	return (int32_t)r->format;
+}
+
+bool
+comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer *r,
+                                                  uint64_t *out_image,
+                                                  uint64_t *out_view,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height)
+{
+	if (u_color_legacy_unorm_encoded() || !zone_compose_target_ensure(r)) {
+		return false;
+	}
+	*out_image = (uint64_t)(uintptr_t)r->zone.compose_image;
+	*out_view = (uint64_t)(uintptr_t)r->zone.compose_view;
+	*out_width = r->zone.compose_w;
+	*out_height = r->zone.compose_h;
+	return true;
+}
+
+/*
+ *
+ * #2340 PQ re-encode pass.
+ *
+ */
+
+static void
+pq_destroy_targets(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->pq.framebuffer != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, r->pq.framebuffer, NULL);
+		r->pq.framebuffer = VK_NULL_HANDLE;
+	}
+	VkImageView *views[2] = {&r->pq.src_view, &r->pq.dst_view};
+	VkImage *images[2] = {&r->pq.src, &r->pq.dst};
+	VkDeviceMemory *memories[2] = {&r->pq.src_memory, &r->pq.dst_memory};
+	for (int i = 0; i < 2; i++) {
+		if (*views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, *views[i], NULL);
+			*views[i] = VK_NULL_HANDLE;
+		}
+		if (*images[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImage(vk->device, *images[i], NULL);
+			*images[i] = VK_NULL_HANDLE;
+		}
+		if (*memories[i] != VK_NULL_HANDLE) {
+			vk->vkFreeMemory(vk->device, *memories[i], NULL);
+			*memories[i] = VK_NULL_HANDLE;
+		}
+	}
+	r->pq.w = 0;
+	r->pq.h = 0;
+}
+
+static void
+pq_destroy(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	pq_destroy_targets(r);
+	if (r->pq.pipeline != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, r->pq.pipeline, NULL);
+		r->pq.pipeline = VK_NULL_HANDLE;
+	}
+	if (r->pq.pipeline_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyPipelineLayout(vk->device, r->pq.pipeline_layout, NULL);
+		r->pq.pipeline_layout = VK_NULL_HANDLE;
+	}
+	if (r->pq.descriptor_pool != VK_NULL_HANDLE) {
+		// Frees descriptor_set with it.
+		vk->vkDestroyDescriptorPool(vk->device, r->pq.descriptor_pool, NULL);
+		r->pq.descriptor_pool = VK_NULL_HANDLE;
+		r->pq.descriptor_set = VK_NULL_HANDLE;
+	}
+	if (r->pq.set_layout != VK_NULL_HANDLE) {
+		vk->vkDestroyDescriptorSetLayout(vk->device, r->pq.set_layout, NULL);
+		r->pq.set_layout = VK_NULL_HANDLE;
+	}
+	if (r->pq.sampler != VK_NULL_HANDLE) {
+		vk->vkDestroySampler(vk->device, r->pq.sampler, NULL);
+		r->pq.sampler = VK_NULL_HANDLE;
+	}
+	if (r->pq.render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, r->pq.render_pass, NULL);
+		r->pq.render_pass = VK_NULL_HANDLE;
+	}
+}
+
+//! The render pass, descriptor set and pipeline: independent of the atlas size.
+static bool
+pq_ensure_pipeline(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+
+	if (r->pq.pipeline != VK_NULL_HANDLE) {
+		return true;
+	}
+	if (r->pq.failed) {
+		return false;
+	}
+
+	// The caller barriers dst into and out of COLOR_ATTACHMENT_OPTIMAL, so the
+	// pass neither transitions nor loads: every texel is overwritten.
+	VkAttachmentDescription att = {
+	    .format = r->format,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	    .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	    .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	    .initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	    .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkSubpassDescription subpass = {
+	    .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	    .colorAttachmentCount = 1,
+	    .pColorAttachments = &ref,
+	};
+	VkRenderPassCreateInfo rp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	    .attachmentCount = 1,
+	    .pAttachments = &att,
+	    .subpassCount = 1,
+	    .pSubpasses = &subpass,
+	};
+	VkResult res = vk->vkCreateRenderPass(vk->device, &rp_ci, NULL, &r->pq.render_pass);
+
+	// texelFetch ignores filtering; a combined sampler is simply the binding.
+	VkSamplerCreateInfo smp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+	    .magFilter = VK_FILTER_NEAREST,
+	    .minFilter = VK_FILTER_NEAREST,
+	    .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+	    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+	    .maxLod = 0.0f,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateSampler(vk->device, &smp_ci, NULL, &r->pq.sampler);
+	}
+
+	VkDescriptorSetLayoutBinding binding = {
+	    .binding = 0,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .descriptorCount = 1,
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	};
+	VkDescriptorSetLayoutCreateInfo dsl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+	    .bindingCount = 1,
+	    .pBindings = &binding,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateDescriptorSetLayout(vk->device, &dsl_ci, NULL, &r->pq.set_layout);
+	}
+	VkPipelineLayoutCreateInfo pl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &r->pq.set_layout,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreatePipelineLayout(vk->device, &pl_ci, NULL, &r->pq.pipeline_layout);
+	}
+	VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+	VkDescriptorPoolCreateInfo dp_ci = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    .maxSets = 1,
+	    .poolSizeCount = 1,
+	    .pPoolSizes = &pool_size,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateDescriptorPool(vk->device, &dp_ci, NULL, &r->pq.descriptor_pool);
+	}
+	VkDescriptorSetAllocateInfo ds_ai = {
+	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+	    .descriptorPool = r->pq.descriptor_pool,
+	    .descriptorSetCount = 1,
+	    .pSetLayouts = &r->pq.set_layout,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkAllocateDescriptorSets(vk->device, &ds_ai, &r->pq.descriptor_set);
+	}
+
+	VkShaderModule vert = VK_NULL_HANDLE;
+	VkShaderModule frag = VK_NULL_HANDLE;
+	VkShaderModuleCreateInfo sm_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+	    .codeSize = sizeof(shaders_atlas_pq_vert),
+	    .pCode = shaders_atlas_pq_vert,
+	};
+	if (res == VK_SUCCESS) {
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &vert);
+	}
+	if (res == VK_SUCCESS) {
+		sm_ci.codeSize = sizeof(shaders_atlas_pq_frag);
+		sm_ci.pCode = shaders_atlas_pq_frag;
+		res = vk->vkCreateShaderModule(vk->device, &sm_ci, NULL, &frag);
+	}
+
+	if (res == VK_SUCCESS) {
+		VkPipelineShaderStageCreateInfo stages[2] = {
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+		        .module = vert,
+		        .pName = "main",
+		    },
+		    {
+		        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+		        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+		        .module = frag,
+		        .pName = "main",
+		    },
+		};
+		VkPipelineVertexInputStateCreateInfo vertex_input = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		};
+		VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		    .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		};
+		VkPipelineViewportStateCreateInfo viewport_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		    .viewportCount = 1,
+		    .scissorCount = 1,
+		};
+		VkPipelineRasterizationStateCreateInfo rasterization = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		    .polygonMode = VK_POLYGON_MODE_FILL,
+		    .cullMode = VK_CULL_MODE_NONE,
+		    .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+		    .lineWidth = 1.0f,
+		};
+		VkPipelineMultisampleStateCreateInfo multisample = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+		};
+		// Blending off: the pass replaces every texel, alpha included.
+		VkPipelineColorBlendAttachmentState blend_attachment = {
+		    .blendEnable = VK_FALSE,
+		    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+		                      VK_COLOR_COMPONENT_A_BIT,
+		};
+		VkPipelineColorBlendStateCreateInfo blend_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		    .attachmentCount = 1,
+		    .pAttachments = &blend_attachment,
+		};
+		VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+		VkPipelineDynamicStateCreateInfo dynamic_state = {
+		    .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		    .dynamicStateCount = 2,
+		    .pDynamicStates = dynamic_states,
+		};
+		VkGraphicsPipelineCreateInfo pipeline_ci = {
+		    .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		    .stageCount = 2,
+		    .pStages = stages,
+		    .pVertexInputState = &vertex_input,
+		    .pInputAssemblyState = &input_assembly,
+		    .pViewportState = &viewport_state,
+		    .pRasterizationState = &rasterization,
+		    .pMultisampleState = &multisample,
+		    .pColorBlendState = &blend_state,
+		    .pDynamicState = &dynamic_state,
+		    .layout = r->pq.pipeline_layout,
+		    .renderPass = r->pq.render_pass,
+		    .subpass = 0,
+		};
+		res = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &r->pq.pipeline);
+	}
+	if (vert != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, vert, NULL);
+	}
+	if (frag != VK_NULL_HANDLE) {
+		vk->vkDestroyShaderModule(vk->device, frag, NULL);
+	}
+
+	if (res != VK_SUCCESS) {
+		U_LOG_E("encode_atlas_pq: pipeline creation failed: %d", res);
+		pq_destroy(r); // frees whatever was made before the failure
+		r->pq.failed = true;
+		return false;
+	}
+	return true;
+}
+
+static bool
+pq_create_image(struct comp_vk_native_renderer *r,
+                VkImageUsageFlags usage,
+                VkImage *out_image,
+                VkDeviceMemory *out_memory,
+                VkImageView *out_view)
+{
+	struct vk_bundle *vk = r->vk;
+
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = r->format,
+	    .extent = {r->atlas_alloc_width, r->atlas_alloc_height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = usage,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	if (vk->vkCreateImage(vk->device, &ici, NULL, out_image) != VK_SUCCESS) {
+		*out_image = VK_NULL_HANDLE;
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vk->vkGetImageMemoryRequirements(vk->device, *out_image, &mr);
+	uint32_t type_id = 0;
+	if (!vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id)) {
+		return false;
+	}
+	VkMemoryAllocateInfo mai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mr.size,
+	    .memoryTypeIndex = type_id,
+	};
+	if (vk->vkAllocateMemory(vk->device, &mai, NULL, out_memory) != VK_SUCCESS) {
+		*out_memory = VK_NULL_HANDLE;
+		return false;
+	}
+	if (vk->vkBindImageMemory(vk->device, *out_image, *out_memory, 0) != VK_SUCCESS) {
+		return false;
+	}
+	VkImageViewCreateInfo vci = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+	    .image = *out_image,
+	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+	    .format = r->format,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	if (vk->vkCreateImageView(vk->device, &vci, NULL, out_view) != VK_SUCCESS) {
+		*out_view = VK_NULL_HANDLE;
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * The two private images and the framebuffer, sized to the atlas ALLOCATION.
+ * They follow it through a grow, which only happens behind the resize path's
+ * vkDeviceWaitIdle, so nothing still reads the old ones when they go.
+ */
+static bool
+pq_ensure_targets(struct comp_vk_native_renderer *r)
+{
+	struct vk_bundle *vk = r->vk;
+	const uint32_t w = r->atlas_alloc_width;
+	const uint32_t h = r->atlas_alloc_height;
+
+	if (r->pq.framebuffer != VK_NULL_HANDLE && r->pq.w == w && r->pq.h == h) {
+		return true;
+	}
+	pq_destroy_targets(r);
+
+	if (!pq_create_image(r, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, &r->pq.src,
+	                     &r->pq.src_memory, &r->pq.src_view) ||
+	    !pq_create_image(r, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, &r->pq.dst,
+	                     &r->pq.dst_memory, &r->pq.dst_view)) {
+		U_LOG_E("encode_atlas_pq: could not allocate the %ux%u working images", w, h);
+		pq_destroy_targets(r);
+		return false;
+	}
+	VkFramebufferCreateInfo fb_ci = {
+	    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+	    .renderPass = r->pq.render_pass,
+	    .attachmentCount = 1,
+	    .pAttachments = &r->pq.dst_view,
+	    .width = w,
+	    .height = h,
+	    .layers = 1,
+	};
+	if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &r->pq.framebuffer) != VK_SUCCESS) {
+		r->pq.framebuffer = VK_NULL_HANDLE;
+		U_LOG_E("encode_atlas_pq: framebuffer creation failed (%ux%u)", w, h);
+		pq_destroy_targets(r);
+		return false;
+	}
+	VkDescriptorImageInfo image_info = {
+	    .sampler = r->pq.sampler,
+	    .imageView = r->pq.src_view,
+	    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	};
+	VkWriteDescriptorSet write = {
+	    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+	    .dstSet = r->pq.descriptor_set,
+	    .dstBinding = 0,
+	    .descriptorCount = 1,
+	    .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+	    .pImageInfo = &image_info,
+	};
+	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
+	r->pq.w = w;
+	r->pq.h = h;
+	return true;
+}
+
+bool
+comp_vk_native_renderer_encode_atlas_pq(struct comp_vk_native_renderer *r, void *cmd_ptr)
+{
+	if (r == NULL || cmd_ptr == NULL || r->atlas_image == VK_NULL_HANDLE) {
+		return false;
+	}
+	if (r->format != VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+		// PQ code values need the 10-bit atlas; an 8-bit one would band.
+		return false;
+	}
+	if (!pq_ensure_pipeline(r) || !pq_ensure_targets(r)) {
+		return false;
+	}
+
+	struct vk_bundle *vk = r->vk;
+	VkCommandBuffer cmd = (VkCommandBuffer)cmd_ptr;
+	const uint32_t w = r->pq.w;
+	const uint32_t h = r->pq.h;
+	const VkImageCopy copy = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .extent = {w, h, 1},
+	};
+
+	/*
+	 * 1. atlas -> src. The source stages also order this pass after the
+	 * previous frame's use of the same private images: a barrier's first scope
+	 * covers everything earlier on the queue, and on the split path the
+	 * previous frame's pass may still be executing.
+	 */
+	cmd_image_barrier(
+	    vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+	        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	    VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, r->pq.src, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->pq.src,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	cmd_image_barrier(vk, cmd, r->pq.src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+	// 2. src -> dst through the encode shader.
+	cmd_image_barrier(vk, cmd, r->pq.dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
+	                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	VkRenderPassBeginInfo rp_begin = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = r->pq.render_pass,
+	    .framebuffer = r->pq.framebuffer,
+	    .renderArea = {{0, 0}, {w, h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
+	VkViewport vp = {0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f};
+	VkRect2D scissor = {{0, 0}, {w, h}};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pq.pipeline);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, r->pq.pipeline_layout, 0, 1,
+	                            &r->pq.descriptor_set, 0, NULL);
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+
+	// 3. dst -> atlas, which goes back to the layout every reader expects.
+	cmd_image_barrier(vk, cmd, r->pq.dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, r->pq.dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, r->atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+	cmd_image_barrier(vk, cmd, r->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+	return true;
 }
 
 xrt_result_t

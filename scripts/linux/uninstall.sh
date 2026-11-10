@@ -18,7 +18,8 @@ if [ "$SYSTEM" = 1 ]; then
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
     EXT_ROOT=/usr/local/share/gnome-shell/extensions
-    UNIT=""
+    UNIT_DIR=/usr/local/lib/systemd/user
+    SHARE_ROOT=/usr/local/share
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -26,14 +27,22 @@ else
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
     EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
-    UNIT="$CONFIG_ROOT/systemd/user/displayxr.service"
+    UNIT_DIR="$CONFIG_ROOT/systemd/user"
+    SHARE_ROOT="$DATA_ROOT"
 fi
 
-if [ -n "$UNIT" ] && [ -f "$UNIT" ]; then
-    systemctl --user disable --now displayxr.service >/dev/null 2>&1 || true
-    rm -f "$UNIT"
-    systemctl --user daemon-reload 2>/dev/null || true
-    echo "==> Removed systemd --user unit"
+# displayxr-service units (#1744): the socket-activated pair, and v1's plain
+# displayxr.service if an older install left it.
+if [ -f "$UNIT_DIR/displayxr.socket" ] || [ -f "$UNIT_DIR/displayxr.service" ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        systemctl --global disable displayxr.socket >/dev/null 2>&1 || true
+    else
+        systemctl --user disable --now displayxr.socket displayxr.service >/dev/null 2>&1 || true
+        rm -f "$UNIT_DIR/default.target.wants/displayxr.service" "$UNIT_DIR/sockets.target.wants/displayxr.socket"
+    fi
+    rm -f "$UNIT_DIR/displayxr.socket" "$UNIT_DIR/displayxr.service"
+    [ "$SYSTEM" = 1 ] || systemctl --user daemon-reload 2>/dev/null || true
+    echo "==> Removed displayxr-service systemd user units"
 fi
 
 # Only unset the ActiveRuntime if it is ours; restore a backup if present.
@@ -45,6 +54,7 @@ if [ -f "$ACTIVE" ] && grep -q "openxr_displayxr.so" "$ACTIVE"; then
 fi
 
 rm -f "$DP_ROOT/200-sim-display.json"
+rm -f "$DP_ROOT/200-sim-input-input-provider.json" "$DP_ROOT/250-sim-conversion-conversion-provider.json"
 # Leave other vendors' manifests + the shared root in place; prune if empty.
 rmdir "$DP_ROOT" 2>/dev/null || true
 
@@ -74,11 +84,21 @@ if [ "$SYSTEM" = 1 ]; then
     fi
 fi
 
+# VK_LAYER_DXR_queue_lock manifest (#2036); prune the dirs only if empty.
+rm -f "$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+rm -f "$SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"  # #886
+rmdir "$SHARE_ROOT/vulkan/explicit_layer.d" "$SHARE_ROOT/vulkan/implicit_layer.d" "$SHARE_ROOT/vulkan" 2>/dev/null || true
+
+# DisplayXR Dashboard menu entry + icon.
+rm -f "$SHARE_ROOT/applications/displayxr-dashboard.desktop" \
+    "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+
 if [ "$SYSTEM" = 1 ]; then
     # /usr/local is shared — remove only what install.sh placed.
-    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" \
+    rm -f "$PREFIX/bin/displayxr-cli" "$PREFIX/bin/displayxr-service" "$PREFIX/bin/displayxr-conversion-host" "$PREFIX/bin/displayxr-tracking-host" "$PREFIX/bin/displayxr-dashboard" \
         "$PREFIX/bin/displayxr-gnome-extension-enable" \
-        "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+        "$PREFIX/lib/openxr_displayxr.so" "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" \
+        "$PREFIX/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
     rmdir -p "$PREFIX/lib/displayxr/plugins" 2>/dev/null || true
 else
     rm -rf "$PREFIX"

@@ -39,6 +39,7 @@ Build apps for 3D displays using the OpenXR standard.
 - [XR_DXR_depth_budget](specs/extensions/XR_DXR_depth_budget.md) — rear depth budget: how far behind the display plane a transparent app may render (ADR-040)
 - [XR_EXT_view_configuration_views_change](specs/extensions/XR_EXT_view_configuration_views_change.md) — **Khronos** extension: adoption note for the live-`recommendedImageRect*` doorbell (move `subImage.imageRect`, never reallocate; kill switches; the two bespoke zone events it soft-deprecates)
 - [Kooima Projection](architecture/kooima-projection.md) — N-view Kooima math and projection pipelines
+- [Window Segments](architecture/comp-segments.md) — a window spanning screens, woven per screen by each screen's own DP (multi-screen M2)
 
 ---
 
@@ -60,6 +61,7 @@ Contribute to the DisplayXR runtime — compositors, state tracker, auxiliary co
 - **[comp_multi One Pipeline (macOS/Linux/Android)](architecture/comp-multi-one-pipeline.md)** — #967 design note: bounded waits, shared-surface port to Android, issue split
 - **[In-Process vs Service](architecture/in-process-vs-service.md)** — compositor deployment modes
 - **[Implementing an Extension](guides/implementing-extension.md)** — how to add OpenXR extensions
+- **[Stereo camera consent](guides/stereo-camera-consent.md)** — what gates `XR_DXR_stereo_camera` frames (consent prompt, delegating browsers, foreground rule, kill switches) and how an app or browser declares itself
 
 ### Internal Specs (`specs/runtime/`)
 
@@ -78,6 +80,7 @@ Integrate your 3D display hardware into DisplayXR.
 - **[Vendor Plug-in Onboarding](guides/vendor-plugin-onboarding.md)** — zero-to-shipping guide for a new vendor's external plug-in repo (post-#263 model)
 - **[`xrt_plugin_iface` reference](reference/xrt_plugin_iface.md)** — per-method contract for the plug-in vtable
 - **[Plug-in discovery spec](specs/runtime/plugin-discovery.md)** — registry / JSON manifest formats, env-var overrides
+- **[Conversion-provider discovery spec](specs/runtime/conversion-provider-discovery.md)** — the third plug-in type (2D→3D models: depth, view synthesis, splats): C ABI summary, registry / manifest formats, selection, readiness, hosting rules, model packs (draft, ADR-053)
 - **[ADR-019: Vendor Plug-in / Aux Boundary](adr/ADR-019-vendor-plugin-aux-boundary.md)** — why the runtime DLL holds zero vendor identifiers
 - **[ADR-022: Per-Mode Capability Flags + Frozen Enumerated App Structs](adr/ADR-022-per-mode-capability-flags-frozen-enum-structs.md)** — `mode_flags` bits (no more rendering-mode ABI breaks) + `XrDisplayRenderingModeInfoDXR` frozen at v13 (all future per-mode fields chain)
 - **[Display Processor Interface](specs/vendor/display-processor-interface.md)** — the DP vtable you'll implement
@@ -92,6 +95,7 @@ Integrate your 3D display hardware into DisplayXR.
 - [Writing a Driver](guides/writing-driver.md) — driver framework basics
 - **[ADR-034: Input-Provider Plug-ins](adr/ADR-034-input-provider-plugins.md)** — the second plug-in type: tracked motion controllers from an external DLL ([discovery contract](specs/runtime/input-provider-discovery.md) · [iface reference](reference/xrt_input_plugin_iface.md))
 - [OpenVR titles via OpenComposite](guides/openvr-titles-via-opencomposite.md) — how SteamVR-era titles reach the runtime + its motion controllers
+- [Porting a native Android game to the weave extension](guides/android-game-stereo-port.md) — real two-eye rendering for a game with no source: twins, replay, camera classification, the frame boundary, what is reusable
 
 ### Integrated vendors (`vendors/`)
 
@@ -147,6 +151,26 @@ Integrate your 3D display hardware into DisplayXR.
 - [ADR-039](adr/ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](adr/ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 - [ADR-041](adr/ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
+- [ADR-042](adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md) — A vendor 2D→3D conversion module supersedes the open default — the runtime exposes it, weaving stays the DP's
+- [ADR-043](adr/ADR-043-stereo-camera-source.md) — A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime
+- [ADR-044](adr/ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
+- [ADR-045](adr/ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
+- [ADR-046](adr/ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
+- [ADR-047](adr/ADR-047-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
+- [ADR-048](adr/ADR-048-lift-viewpoint-policy.md) — Lift viewpoint policy — window-relative viewpoints, rig gains, axis mode and ease-back are runtime policy
+- [ADR-049](adr/ADR-049-in-process-lift-rides-the-service.md) — In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
+- [ADR-050](adr/ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
+- [ADR-051](adr/ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
+- [ADR-052](adr/ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
+- [ADR-053](adr/ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
+- [ADR-054](adr/ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
+- [ADR-055](adr/ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
+- [ADR-056](adr/ADR-056-desktop-control-runs-in-the-app.md) — Desktop control is a first-class capability that runs in the app — the OS's consent belongs to the app, never to DisplayXR
+- [ADR-057](adr/ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
+- [ADR-058](adr/ADR-058-late-view-synthesis-and-depth-reprojection.md) — Late view synthesis and depth reprojection — converted content is placed at the eyes of the frame it is shown in, not the frame it was converted for
+- [ADR-059](adr/ADR-059-d3d11-hub-compositor-windows.md) — One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
+- [ADR-060](adr/ADR-060-texture-target-reference-window-binding.md) — A texture target is named by a reference window and a rect; its display processor is windowless
+- [ADR-061](adr/ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app
 <!-- END ADR INDEX -->
 
 ---
@@ -167,6 +191,8 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - **[Roadmap Overview](roadmap/overview.md)** — milestone status and project trajectory
 - [Spatial Desktop PRD](roadmap/spatial-desktop-prd.md) — product vision
 - [PR FAQ](roadmap/prfaq.md) — press-release-style framing
+- [Stereo Camera Source](roadmap/stereo-camera-source.md) — a display's (eye-tracking) stereo camera as a plug-in-provided, privacy-gated source for web calls: browser `getUserMedia` integration, Android, phased plan (design, ADR-043)
+- [Conversion Providers](roadmap/conversion-providers.md) — plan for 2D→3D models as a third plug-in type: service-composed pipelines, satellite hosting, transport matrix, lift spec 4/5, consumer migration, phases P0–P6 (ADR-053) · [header drafts](roadmap/conversion-providers-headers-draft.md)
 - [Spatial Workspace Extensions Plan](roadmap/spatial-workspace-extensions-plan.md) — three-phase plan to decouple the shell from the runtime: boundary rename (Phase 1, done), policy migration behind extensions (Phase 2), repo severance (Phase 3)
 - [Workspace Extensions Header Sketch](roadmap/spatial-workspace-extensions-headers-draft.md) — `XR_DXR_spatial_workspace.h` C-level API draft (historical: the separate app-launcher extension sketched there was dropped; launcher tiles ship as `*.displayxr.json` manifests)
 - [Workspace Controller Detection](roadmap/spatial-workspace-controller-detection.md) — Phase 2.0 prep: orchestrator detects installed controller via sidecar `.controller.json` manifest
@@ -177,6 +203,7 @@ Design docs, status trackers, and plans — some shipped, some in progress. Afte
 - [Display Zones](roadmap/display-zones.md) — N 3D zones + 2D zones + wish mask: avatar migration + phased plan (ADR-027)
 - [Android Transparency — Compose-Under-Background](roadmap/android-transparency-compose-under.md) — why Android weaves-then-gates instead of compositing a captured background under the views, the Android capture landscape, and the T0/T1/T2 plan (#1031)
 - [Display Spatial Model](roadmap/display-spatial-model.md) — displays in the spatial graph (#46)
+- [Multi-screen plan](roadmap/multi-screen.md) — N screens, one DP each, segments + per-screen views; joint runtime × LeiaSR milestones (#69)
 - [Multi-Display Single Machine](roadmap/multi-display-single-machine.md) — multiple displays, one machine (#69)
 - [Multi-Display Networked](roadmap/multi-display-networked.md) — displays across the network (#70)
 - [XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW](roadmap/XR_VIEW_CONFIGURATION_PRIMARY_MULTIVIEW.md) — Khronos multiview proposal (#80)
@@ -197,9 +224,11 @@ Cross-cutting references that don't belong to a single audience.
 - [CTS interactive procedure](reference/cts-interactive-procedure.md) — operator runbook for the three human-evaluated CTS categories (`[composition]` / `[scenario]` / `[actions]` × `[interactive]`): which display processor a submission should use and why, the qwerty key map that stands in for controllers, a per-test judgement table, and stated verdict rules for the 3D-display ambiguities (#1523 § 4)
 - [Motion-to-Photon Levers](reference/motion-to-photon-levers.md) — every latency knob (late weave, repaint, queue tiers, deferred present, late latching) with its default, and the defaults per GPU topology (dGPU / iGPU / hybrid)
 - [Weave Cadence vs. Eye Prediction](reference/weave-cadence-vs-eye-prediction.md) — how late weave / repaint / slot partition / adapter split relate to vendor-side late latching and the eye predictor, which of them exist on Android, and the CNSDK prediction measurement plan
+- [Vulkan Conversion Glue](reference/vulkan-conversion-glue.md) — the conversion core's Vulkan GPU glue on macOS / desktop Linux: what attaches where, which memory kinds are real (OPAQUE_FD / DMABUF on Linux, IOSurface on macOS), the CPU lane, sync, and the S5 parity test
 - [Adapter Selection](reference/adapter-selection.md) — `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` supported contract (hybrid iGPU/dGPU machines, in-process `getenv` caveat)
 - [DPI Awareness](reference/dpi-awareness.md) — the DLL rule: Win32 geometry read inside the runtime answers in the HOST app's DPI space, so publish-worthy rects must pin a per-monitor-v2 thread context
-- [Control Panel performance settings](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
+- [Performance settings (Control Panel → Dashboard)](roadmap/control-panel-performance-settings.md) — census of all 71 `DXR_*` levers (read site, mechanism, default, tier) + the design for a persisted settings store the runtime reads inside the app process (design only)
+- [Display dashboard](roadmap/display-dashboard.md) — multi-screen status for the CLI (`status --watch`), the DisplayXR Dashboard (Displays + Windows pages) and agents: snapshot schema, warnings as data, the DIAG RPCs, the `get_screen_status` plug-in slot, phasing (design, ADR-051)
 - [Workspace Stability](reference/workspace-stability.md) — the wedge family (lock starvation, fence jams, blocking presents, vendor-DP and MCP write wedges), the no-unbounded-work principle (#925), and the diagnostic toolkit ([RENDER] tell, PDBs, wedge captures, close gauntlet)
 
 Vendor-specific reference docs now live in [`vendors/<vendor>/`](vendors/).

@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -47,6 +48,18 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
                               uint32_t height,
                               bool transparent_background,
                               struct comp_vk_native_target **out_target);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Whether the compositor's (the app's) VkInstance can create an XCB surface.
+ * False when VK_KHR_xcb_surface is not enabled on it — the target then falls
+ * back to an Xlib surface over the same X11 window (#2322).
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_instance_has_xcb_surface(struct comp_vk_native_compositor *c);
+#endif
 
 /*!
  * Create a target from an already-built VkSurfaceKHR (direct-scanout path,
@@ -121,6 +134,54 @@ xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint);
 
 /*!
+ * #2095 / ADR-055: @ref comp_vk_native_target_acquire for a caller that joins
+ * the acquire to a GPU semaphore chain instead of a host wait.
+ *
+ * With @p acquire_sem == VK_NULL_HANDLE this is exactly
+ * comp_vk_native_target_acquire: the target's own semaphore is signalled and
+ * CONSUMED here by a dummy submit + vkQueueWaitIdle, so the image is usable
+ * on return. With a caller-owned @p acquire_sem, vkAcquireNextImageKHR
+ * signals THAT semaphore and nothing here waits it — the caller's first batch
+ * that touches the image must wait it on the GPU, and the caller owns the
+ * semaphore's reuse rule (binary: one signal, one wait, then a fence proves
+ * the wait retired). @p out_acquire_sem_signalled (may be NULL) reports
+ * whether the call actually enqueued a signal on @p acquire_sem: false when
+ * a held, never-presented image was handed out instead (no acquire ran) or
+ * on failure, so the caller never waits a semaphore nothing will signal.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
+                                 uint32_t *out_index,
+                                 VkQueue queue,
+                                 bool is_repaint,
+                                 VkSemaphore acquire_sem,
+                                 bool *out_acquire_sem_signalled);
+
+/*!
+ * #2095: consume a pending signal on a caller-owned acquire semaphore that
+ * nothing will wait on the GPU (the caller left its chain before the batch
+ * that waited it was submitted), the way the host-wait acquire always
+ * consumed the target's own: a dummy submit that waits it, then
+ * vkQueueWaitIdle(@p queue). After it the semaphore is unsignalled with no
+ * pending operations and the image is usable from the host's point of view.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_target_consume_acquire_signal(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore sem);
+
+/*!
+ * Number of images in the current target image set (0 before the first
+ * create). #2095: bounds the in-process weave-sync ring.
+ *
+ * @ingroup comp_vk_native
+ */
+uint32_t
+comp_vk_native_target_get_image_count(struct comp_vk_native_target *target);
+
+/*!
  * Present the rendered image.
  *
  * @param target  The target.
@@ -143,6 +204,24 @@ xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted);
 
 /*!
+ * #2095 / ADR-055: @ref comp_vk_native_target_present with a GPU wait.
+ *
+ * @p wait_sem != VK_NULL_HANDLE makes vkQueuePresentKHR wait that semaphore
+ * (the caller's final batch signals it after the COLOR→PRESENT transition),
+ * which is what lets the caller present WITHOUT a host wait for its own GPU
+ * work. VK_NULL_HANDLE is the pre-existing behaviour: no wait, the caller has
+ * already drained. On the Windows DComp bridge the semaphore is ignored (that
+ * path never reaches WSI); callers only chain on WSI presents.
+ *
+ * @ingroup comp_vk_native
+ */
+xrt_result_t
+comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
+                                 VkQueue queue,
+                                 bool counted,
+                                 VkSemaphore wait_sem);
+
+/*!
  * Weave-latency harness (DXR_WEAVE_LATENCY_CSV): timestamp the moment the
  * weave is recorded for the current frame. No-op when the harness is off.
  */
@@ -160,6 +239,30 @@ comp_vk_native_target_weave_mark(struct comp_vk_native_target *target, bool mode
  */
 void
 comp_vk_native_target_weave_mark_repaint(struct comp_vk_native_target *target, bool mode_3d);
+
+/*!
+ * Keep an ACQUIRED swapchain image that will not be presented, and hand it out
+ * again on the next @ref comp_vk_native_target_acquire.
+ *
+ * Vulkan returns an acquired image to the presentation engine only through a
+ * present. A frame that acquires and then decides not to present (a fill whose
+ * fence-park lost the race to a fresher app frame, #1748) would otherwise leak
+ * that image for the life of the swapchain; enough leaks and every later
+ * acquire blocks forever — the app hangs in vkAcquireNextImageKHR with the
+ * compositor lock held. Holding it instead costs nothing: the next frame
+ * renders into it. Dropped automatically when the image set is recreated.
+ */
+void
+comp_vk_native_target_hold_unpresented(struct comp_vk_native_target *target, uint32_t index);
+
+/*!
+ * Make @p index the image the next @ref comp_vk_native_target_present presents.
+ * For a caller that released the compositor lock between its acquire and its
+ * present (the fill fence-park), during which another frame may have acquired
+ * and presented its own image.
+ */
+void
+comp_vk_native_target_set_current_index(struct comp_vk_native_target *target, uint32_t index);
 
 /*!
  * #868: pace a repaint to the panel. Runs WITHOUT the compositor lock.
@@ -241,6 +344,18 @@ VkFormat
 comp_vk_native_target_get_format(struct comp_vk_native_target *target);
 
 /*!
+ * True when the current target images (and their views) can be SAMPLED: the
+ * WSI swapchain was created with VK_IMAGE_USAGE_SAMPLED_BIT (only when
+ * DXR_VK_ZONES_COPY_TO_DRAW is on and the surface supports it), or the
+ * images are the DComp bridge's imported ring (always sampled). The Local2D
+ * composite then snapshots the weave target with a draw instead of a copy.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_target_images_sampled(struct comp_vk_native_target *target);
+
+/*!
  * Get the target's image-set generation (#602). Bumped each time the target
  * image set is (re)created — the compositor forwards it to the display
  * processor so caches keyed by the target VkImage handle can be invalidated
@@ -296,6 +411,33 @@ enum comp_vk_native_target_surface_state
  */
 enum comp_vk_native_target_surface_state
 comp_vk_native_target_sync_surface(struct comp_vk_native_target *target);
+
+#ifdef XRT_OS_ANDROID
+struct vk_bundle;
+
+/*!
+ * #1905 (Android only): vkQueueSubmit, retried ONCE after 1 ms if it returns
+ * VK_ERROR_INITIALIZATION_FAILED (-3). Any other result — and a second -3 — is
+ * returned unchanged, so the caller's existing failure path still runs.
+ *
+ * MITIGATION, not the fix. On Adreno every submit in the process lands on one
+ * GSL context; the app's own vkQueueSubmit (which the runtime cannot
+ * serialise) racing a runtime submit on another queue corrupts the context
+ * timestamp (`gsl_context_base_next_timestamp: next client ts N must be
+ * greater than current ts N`), and the NEXT submit returns -3 even though
+ * nothing about it is wrong. A failed submit leaves its command buffers,
+ * semaphores and fence untouched (Vulkan spec, vkQueueSubmit), so the SAME
+ * submit info is safe to resubmit. The structural fix is to serialise every
+ * submit in the process (a queue-lock layer, or a second VkDevice for the
+ * runtime) — tracked on #1905.
+ *
+ * Logs the first retry and every 100th after it (WARN, with @p site), never
+ * per frame.
+ */
+VkResult
+comp_vk_native_queue_submit_retry(
+    struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *submit, VkFence fence, const char *site);
+#endif
 
 #ifdef __cplusplus
 }

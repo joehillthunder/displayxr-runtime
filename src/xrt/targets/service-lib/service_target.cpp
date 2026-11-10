@@ -15,6 +15,9 @@
 #include "server/ipc_server.h"
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_mainloop_android.h"
+#include "server/ipc_server_stereo_camera.h"
+#include "util/u_camera_consent.h"
+#include "util/u_camera_consent_android.h"
 #include "util/u_logging.h"
 
 #include <android/native_window.h>
@@ -26,11 +29,443 @@
 #include "android/android_main_thread.h"
 
 #include <chrono>
+#include <string>
 #include <memory>
 #include <thread>
 
 using wrap::android::view::Surface;
 using namespace std::chrono_literals;
+
+namespace {
+
+/*!
+ * #1006 (ADR-036 D4): the Java half of the Android workspace overlay mode,
+ * org.freedesktop.monado.ipc.WorkspaceControllerPolicy. Resolved ONCE on the
+ * service main thread (nativeStartServer): FindClass on an IPC pthread would
+ * use the system class loader and miss the runtime's own classes.
+ */
+struct WorkspacePolicyJni
+{
+	JavaVM *vm = nullptr;
+	jclass cls = nullptr;            //!< global ref
+	jmethodID is_verified = nullptr; //!< static boolean isVerifiedController(Context, int)
+	jmethodID on_overlay = nullptr;  //!< static void onOverlayChanged(boolean, int)
+	jobject context = nullptr;       //!< global ref to the service context
+} g_ws_policy;
+
+//! Attach the calling thread if needed; *attached says whether to detach after.
+JNIEnv *
+ws_policy_env(bool *attached)
+{
+	*attached = false;
+	if (g_ws_policy.vm == nullptr) {
+		return nullptr;
+	}
+	JNIEnv *env = nullptr;
+	if (g_ws_policy.vm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_OK) {
+		return env;
+	}
+	if (g_ws_policy.vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+		return nullptr;
+	}
+	*attached = true;
+	return env;
+}
+
+bool
+ws_policy_verify_controller(long peer_uid)
+{
+	if (g_ws_policy.cls == nullptr || g_ws_policy.is_verified == nullptr) {
+		return false;
+	}
+	bool attached = false;
+	JNIEnv *env = ws_policy_env(&attached);
+	if (env == nullptr) {
+		return false;
+	}
+	jboolean ok = env->CallStaticBooleanMethod(g_ws_policy.cls, g_ws_policy.is_verified, g_ws_policy.context,
+	                                           (jint)peer_uid);
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+		ok = JNI_FALSE;
+	}
+	if (attached) {
+		g_ws_policy.vm->DetachCurrentThread();
+	}
+	return ok == JNI_TRUE;
+}
+
+void
+ws_policy_overlay_changed(bool active, long controller_uid)
+{
+	if (g_ws_policy.cls == nullptr || g_ws_policy.on_overlay == nullptr) {
+		return;
+	}
+	bool attached = false;
+	JNIEnv *env = ws_policy_env(&attached);
+	if (env == nullptr) {
+		return;
+	}
+	env->CallStaticVoidMethod(g_ws_policy.cls, g_ws_policy.on_overlay, (jboolean)(active ? JNI_TRUE : JNI_FALSE),
+	                          (jint)controller_uid);
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+	}
+	if (attached) {
+		g_ws_policy.vm->DetachCurrentThread();
+	}
+}
+
+void
+ws_policy_init(JNIEnv *env, JavaVM *vm, jobject context)
+{
+	if (g_ws_policy.cls != nullptr) {
+		return;
+	}
+	jclass local = env->FindClass("org/freedesktop/monado/ipc/WorkspaceControllerPolicy");
+	if (local == nullptr || env->ExceptionCheck()) {
+		env->ExceptionClear();
+		U_LOG_E("service: WorkspaceControllerPolicy not found - Android workspace controllers cannot verify");
+		return;
+	}
+	g_ws_policy.vm = vm;
+	g_ws_policy.cls = (jclass)env->NewGlobalRef(local);
+	env->DeleteLocalRef(local);
+	g_ws_policy.is_verified =
+	    env->GetStaticMethodID(g_ws_policy.cls, "isVerifiedController", "(Landroid/content/Context;I)Z");
+	g_ws_policy.on_overlay = env->GetStaticMethodID(g_ws_policy.cls, "onOverlayChanged", "(ZI)V");
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		U_LOG_E("service: WorkspaceControllerPolicy methods not found");
+		g_ws_policy.is_verified = nullptr;
+		g_ws_policy.on_overlay = nullptr;
+		return;
+	}
+	g_ws_policy.context = env->NewGlobalRef(context);
+	ipc_server_set_android_controller_verify_provider(ws_policy_verify_controller);
+	ipc_server_set_android_overlay_hook(ws_policy_overlay_changed);
+	U_LOG_I("service: Android workspace-controller policy registered (#1006)");
+}
+
+/*
+ *
+ * XR_DXR_stereo_camera A2 (stereo-camera-android §4): the Android consent
+ * platform — identity (package + signing certificate of the peer uid), the
+ * peer's and the runtime's CAMERA permission, the consent dialog, the in-use
+ * notification with Stop, and the screen-lock watch. The Java half is
+ * org.freedesktop.monado.ipc.StereoCameraConsent; resolved once on the main
+ * thread like the workspace policy above.
+ *
+ */
+struct CameraConsentJni
+{
+	JavaVM *vm = nullptr;
+	jclass cls = nullptr;
+	jobject context = nullptr;
+	jmethodID peer_identity = nullptr;  //!< String peerIdentity(Context, int)
+	jmethodID peer_camera = nullptr;    //!< boolean peerCameraAllowed(Context, String)
+	jmethodID ensure_runtime = nullptr; //!< boolean ensureRuntimeCamera(Context, int)
+	jmethodID prompt = nullptr;         //!< int prompt(Context, String, String, int)
+	jmethodID in_use = nullptr;         //!< void inUseChanged(Context, int, String)
+	jmethodID has_cert = nullptr;       //!< boolean hasSigningCertificate(Context, String, String)
+	jmethodID foreground = nullptr;     //!< static boolean consumerInForeground()
+} g_cam;
+
+JNIEnv *
+cam_env(bool *attached)
+{
+	*attached = false;
+	if (g_cam.vm == nullptr) {
+		return nullptr;
+	}
+	JNIEnv *env = nullptr;
+	if (g_cam.vm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_OK) {
+		return env;
+	}
+	if (g_cam.vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+		return nullptr;
+	}
+	*attached = true;
+	return env;
+}
+
+void
+cam_env_done(JNIEnv *env, bool attached)
+{
+	if (env->ExceptionCheck()) {
+		env->ExceptionDescribe();
+		env->ExceptionClear();
+	}
+	if (attached) {
+		g_cam.vm->DetachCurrentThread();
+	}
+}
+
+bool
+cam_peer_subject(void * /*ctx*/, long pid, long uid, char *out, size_t cap)
+{
+	out[0] = '\0';
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.peer_identity == nullptr) {
+		return false;
+	}
+	jstring js = (jstring)env->CallStaticObjectMethod(g_cam.cls, g_cam.peer_identity, g_cam.context, (jint)uid);
+	std::string id;
+	if (!env->ExceptionCheck() && js != nullptr) {
+		const char *c = env->GetStringUTFChars(js, nullptr);
+		if (c != nullptr) {
+			id = c;
+			env->ReleaseStringUTFChars(js, c);
+		}
+		env->DeleteLocalRef(js);
+	}
+	cam_env_done(env, attached);
+
+	std::string pkg, digest;
+	size_t tab = id.find('\t');
+	if (tab != std::string::npos) {
+		pkg = id.substr(0, tab);
+		digest = id.substr(tab + 1);
+	}
+	uint32_t n = 0;
+	const struct u_camera_consent_android_trusted *list = u_camera_consent_android_builtin_trusted(&n);
+	// A trusted package whose CURRENT certificate is not the listed one may have
+	// rotated its key (APK v3 lineage): it keeps its trust iff the listed
+	// certificate is in its signing history; the subject then names the listed one.
+	if (!pkg.empty() && !digest.empty() && g_cam.has_cert != nullptr &&
+	    u_camera_consent_android_trust_lookup(list, n, pkg.c_str(), digest.c_str(), nullptr) ==
+	        U_CAMERA_CONSENT_ANDROID_PACKAGE_ONLY) {
+		bool att = false;
+		JNIEnv *e2 = cam_env(&att);
+		for (uint32_t i = 0; e2 != nullptr && i < n; i++) {
+			if (pkg != list[i].package) {
+				continue;
+			}
+			char want[U_CAMERA_CONSENT_ANDROID_DIGEST_SIZE];
+			if (!u_camera_consent_android_digest_normalize(list[i].cert_sha256, want)) {
+				continue;
+			}
+			jstring jp = e2->NewStringUTF(pkg.c_str());
+			jstring jw = e2->NewStringUTF(want);
+			jboolean has = e2->CallStaticBooleanMethod(g_cam.cls, g_cam.has_cert, g_cam.context, jp, jw);
+			if (e2->ExceptionCheck()) {
+				e2->ExceptionClear();
+				has = JNI_FALSE;
+			}
+			e2->DeleteLocalRef(jp);
+			e2->DeleteLocalRef(jw);
+			if (has == JNI_TRUE) {
+				U_LOG_W(
+				    "stereo camera consent: %s rotated its signing key; the listed certificate is in "
+				    "its "
+				    "lineage — trusted",
+				    pkg.c_str());
+				digest = want;
+				break;
+			}
+		}
+		if (e2 != nullptr) {
+			cam_env_done(e2, att);
+		}
+	}
+	enum u_camera_consent_android_identity_result r =
+	    u_camera_consent_android_identity(list, n, pkg.c_str(), digest.c_str(), out, cap);
+	if (r != U_CAMERA_CONSENT_ANDROID_ID_OK) {
+		U_LOG_W("stereo camera consent: pid %ld uid %ld (%s) has no verifiable identity — %s", pid, uid,
+		        pkg.empty() ? "?" : pkg.c_str(), u_camera_consent_android_identity_str(r));
+		return false;
+	}
+	return true;
+}
+
+bool
+cam_os_camera_allowed(void * /*ctx*/, const char *subject)
+{
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.peer_camera == nullptr) {
+		return false;
+	}
+	jstring js = env->NewStringUTF(subject);
+	jboolean ok = env->CallStaticBooleanMethod(g_cam.cls, g_cam.peer_camera, g_cam.context, js);
+	if (env->ExceptionCheck()) {
+		ok = JNI_FALSE;
+	}
+	env->DeleteLocalRef(js);
+	cam_env_done(env, attached);
+	return ok == JNI_TRUE;
+}
+
+bool
+cam_ensure_service_camera(void * /*ctx*/, uint32_t timeout_ms)
+{
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.ensure_runtime == nullptr) {
+		return false;
+	}
+	jboolean ok = env->CallStaticBooleanMethod(g_cam.cls, g_cam.ensure_runtime, g_cam.context, (jint)timeout_ms);
+	if (env->ExceptionCheck()) {
+		ok = JNI_FALSE;
+	}
+	cam_env_done(env, attached);
+	return ok == JNI_TRUE;
+}
+
+bool
+cam_consumer_foreground(void * /*ctx*/)
+{
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.foreground == nullptr) {
+		return false;
+	}
+	jboolean ok = env->CallStaticBooleanMethod(g_cam.cls, g_cam.foreground);
+	if (env->ExceptionCheck()) {
+		env->ExceptionClear();
+		ok = JNI_FALSE;
+	}
+	cam_env_done(env, attached);
+	return ok == JNI_TRUE;
+}
+
+enum u_camera_consent_prompt_answer
+cam_prompt(void * /*ctx*/, const char *subject, const char *app_name, long /*pid*/, uint32_t timeout_ms)
+{
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.prompt == nullptr) {
+		return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	jstring js = env->NewStringUTF(subject);
+	jstring jn = env->NewStringUTF(app_name != nullptr ? app_name : "");
+	jint r = env->CallStaticIntMethod(g_cam.cls, g_cam.prompt, g_cam.context, js, jn, (jint)timeout_ms);
+	if (env->ExceptionCheck()) {
+		r = U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+	env->DeleteLocalRef(js);
+	env->DeleteLocalRef(jn);
+	cam_env_done(env, attached);
+	switch (r) {
+	case U_CAMERA_CONSENT_PROMPT_ALLOW: return U_CAMERA_CONSENT_PROMPT_ALLOW;
+	case U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE: return U_CAMERA_CONSENT_PROMPT_ALLOW_ONCE;
+	case U_CAMERA_CONSENT_PROMPT_DENY: return U_CAMERA_CONSENT_PROMPT_DENY;
+	case U_CAMERA_CONSENT_PROMPT_TIMEOUT: return U_CAMERA_CONSENT_PROMPT_TIMEOUT;
+	default: return U_CAMERA_CONSENT_PROMPT_UNAVAILABLE;
+	}
+}
+
+//! The in-use state may have changed: refresh the notification (no manager lock held).
+void
+cam_indicator(void * /*ctx*/)
+{
+	struct ipc_server_stereo_camera_status st;
+	if (!ipc_server_stereo_camera_get_status(&st)) {
+		return;
+	}
+	bool attached = false;
+	JNIEnv *env = cam_env(&attached);
+	if (env == nullptr || g_cam.in_use == nullptr) {
+		return;
+	}
+	jstring jc = env->NewStringUTF(st.consumers);
+	env->CallStaticVoidMethod(g_cam.cls, g_cam.in_use, g_cam.context, (jint)st.started_streams, jc);
+	env->DeleteLocalRef(jc);
+	cam_env_done(env, attached);
+}
+
+void
+cam_consent_init(JNIEnv *env, JavaVM *vm, jobject context)
+{
+	if (g_cam.cls != nullptr) {
+		return;
+	}
+	jclass local = env->FindClass("org/freedesktop/monado/ipc/StereoCameraConsent");
+	if (local == nullptr || env->ExceptionCheck()) {
+		env->ExceptionClear();
+		U_LOG_E("service: StereoCameraConsent not found — every stereo camera consumer will be refused");
+		return;
+	}
+	g_cam.vm = vm;
+	g_cam.cls = (jclass)env->NewGlobalRef(local);
+	env->DeleteLocalRef(local);
+	jmethodID store_dir =
+	    env->GetStaticMethodID(g_cam.cls, "storeDir", "(Landroid/content/Context;)Ljava/lang/String;");
+	g_cam.peer_identity =
+	    env->GetStaticMethodID(g_cam.cls, "peerIdentity", "(Landroid/content/Context;I)Ljava/lang/String;");
+	g_cam.peer_camera =
+	    env->GetStaticMethodID(g_cam.cls, "peerCameraAllowed", "(Landroid/content/Context;Ljava/lang/String;)Z");
+	g_cam.ensure_runtime =
+	    env->GetStaticMethodID(g_cam.cls, "ensureRuntimeCamera", "(Landroid/content/Context;I)Z");
+	g_cam.prompt = env->GetStaticMethodID(g_cam.cls, "prompt",
+	                                      "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;I)I");
+	g_cam.in_use =
+	    env->GetStaticMethodID(g_cam.cls, "inUseChanged", "(Landroid/content/Context;ILjava/lang/String;)V");
+	g_cam.has_cert = env->GetStaticMethodID(g_cam.cls, "hasSigningCertificate",
+	                                        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z");
+	jmethodID start_watching = env->GetStaticMethodID(g_cam.cls, "startWatching", "(Landroid/content/Context;)V");
+	g_cam.foreground = env->GetStaticMethodID(g_cam.cls, "consumerInForeground", "()Z");
+	if (env->ExceptionCheck() || store_dir == nullptr || start_watching == nullptr) {
+		env->ExceptionClear();
+		U_LOG_E(
+		    "service: StereoCameraConsent methods not found — every stereo camera consumer will be refused");
+		g_cam.peer_identity = g_cam.peer_camera = g_cam.ensure_runtime = g_cam.prompt = g_cam.in_use = nullptr;
+		return;
+	}
+	g_cam.context = env->NewGlobalRef(context);
+
+	// The JSON store lives in the runtime's private files dir (no $HOME here).
+	jstring jd = (jstring)env->CallStaticObjectMethod(g_cam.cls, store_dir, g_cam.context);
+	if (!env->ExceptionCheck() && jd != nullptr) {
+		const char *d = env->GetStringUTFChars(jd, nullptr);
+		if (d != nullptr) {
+			u_camera_consent_store_set_user_dir(d);
+			env->ReleaseStringUTFChars(jd, d);
+		}
+		env->DeleteLocalRef(jd);
+	}
+	env->ExceptionClear();
+
+	struct ipc_server_stereo_camera_platform p = {};
+	p.peer_subject = cam_peer_subject;
+	p.os_camera_allowed = cam_os_camera_allowed;
+	p.prompt = cam_prompt;
+	p.ensure_service_camera = cam_ensure_service_camera;
+	p.user_facing_requires_presenting = true; // option R (stereo-camera-android §1.2)
+	p.consumer_foreground = cam_consumer_foreground;
+	p.gave_up_is_suspended = true;            // the OS takes the camera in the background
+	ipc_server_stereo_camera_set_platform(&p);
+	ipc_server_stereo_camera_set_indicator_provider(cam_indicator, nullptr);
+
+	env->CallStaticVoidMethod(g_cam.cls, start_watching, g_cam.context);
+	env->ExceptionClear();
+	U_LOG_I("service: Android stereo camera consent platform registered (A2)");
+}
+
+} // namespace
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_StereoCameraConsent_nativeSetLocked(JNIEnv *env, jclass, jboolean locked, jstring why)
+{
+	const char *w = why != nullptr ? env->GetStringUTFChars(why, nullptr) : nullptr;
+	ipc_server_stereo_camera_set_session_locked(locked == JNI_TRUE, w != nullptr ? w : "android");
+	if (w != nullptr) {
+		env->ReleaseStringUTFChars(why, w);
+	}
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_org_freedesktop_monado_ipc_StereoCameraConsent_nativeStopAll(JNIEnv *env, jclass, jstring why)
+{
+	const char *w = why != nullptr ? env->GetStringUTFChars(why, nullptr) : nullptr;
+	(void)ipc_server_stereo_camera_stop_all(w != nullptr ? w : "android");
+	if (w != nullptr) {
+		env->ReleaseStringUTFChars(why, w);
+	}
+}
 
 namespace {
 struct IpcServerHelper
@@ -156,6 +591,12 @@ Java_org_freedesktop_monado_ipc_MonadoImpl_nativeStartServer(JNIEnv *env, jobjec
 	// Leia CNSDK) can be marshaled onto it from the comp_multi render worker — that
 	// init must be kicked off from a Looper-bearing thread or it hangs (#510 M2).
 	android_main_thread_dispatch_init();
+
+	// #1006: workspace-controller verification + overlay hook, resolved here on
+	// the main thread (the runtime's class loader is the current one).
+	ws_policy_init(env, jvm, context);
+	// A2: stereo camera consent platform (before the server creates its camera manager).
+	cam_consent_init(env, jvm, context);
 
 	IpcServerHelper::instance().startServer();
 }

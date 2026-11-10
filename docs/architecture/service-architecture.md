@@ -123,14 +123,17 @@ Windows only.
    ┌─────────────────────────────────┴───────────────────────────────────────────────────┐
    │ displayxr-service.exe  (ONE process, ONE heap)                                       │
    │  main thread ─ ipc_server_main → main_loop (20 Hz)            ipc_server_process.c:537│
-   │  tray thread ─ message pump + WH_KEYBOARD_LL Ctrl+Space hook   service_tray_win.c:514 │
+   │  tray thread ─ message pump + WH_KEYBOARD_LL hotkey hook       service_tray_win.c:514 │
    │  watchdog thread ─ WaitForSingleObject(child, INFINITE)         service_orchestrator.c:418│
    │  per-client IPC threads ×N (≤ IPC_MAX_CLIENTS 8)               ipc_server_process.c:1029│
    │  D3D11 window thread (service-owned HWND)                      comp_d3d11_window.cpp:1650│
    │  capture/render thread (workspace mode only)                   comp_d3d11_service.cpp:6186│
    │  window-op worker (detached, never joined)                     comp_d3d11_service.cpp:1398│
    │  WinRT capture pool threads (2D window capture)               d3d11_capture.cpp:285   │
-   │  IN-PROCESS DLLs: vendor DP (leaked HMODULE), input providers (leaked), LeapC.dll     │
+   │  viewer-tracking host supervisor (100 ms tick, §4a)            target_viewer_host.c  │
+   │  IN-PROCESS DLLs: vendor DP (leaked HMODULE), input providers (leaked), LeapC.dll,    │
+   │    viewer-tracking provider ONLY without displayxr-tracking-host (fallback, §4a)     │
+   │  SHARED MEMORY: the viewer pose page (owner; host writes, in-process apps read)      │
    └──┬──────────────────────┬────────────────────────────────────────────────────────────┘
       │ CreateProcessA
       ▼
@@ -149,10 +152,14 @@ Windows only.
 | Logon → service | `HKLM\...\Run` value, `--autostart`; exits immediately if `start_on_login=false` | `installer/DisplayXRInstaller.nsi:873`; `main.c:125-128` (`ExitProcess(0)`) |
 | Any IPC client → service | pipe missing ⇒ `CreateProcessA(displayxr-service.exe)` → `service\` sibling → `ShellExecuteExA` (works from AppContainer). **No arguments** — workspace mode is entered later by `workspace_activate`, never by launch | `ipc_client_connection.c:195-262` |
 | Singleton | the named pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE`; the pidfile path is a libbsd-only no-op on Windows | `ipc_server_mainloop_windows.cpp:153-155,184-198`; `u_process.c:86-91` |
-| Service → shell | `WH_KEYBOARD_LL` hook on the **tray** thread → `PostMessage(WM_ORCHESTRATOR_SPAWN_WORKSPACE)` → `spawn_workspace()` → `CreateProcessA("<binary> --service-managed", CREATE_NO_WINDOW, inherited env)`. Hook is **uninstalled while the shell runs** (#344) and re-armed by the watchdog on exit | `service_orchestrator.c:700-779, 388, 267, 409-412, 358-362` |
+| Service → shell | `WH_KEYBOARD_LL` hook on the **tray** thread, matching the **configured** launch combo exactly (`service.json` `controllers.<id>.hotkey`, Ctrl+Shift+Space by default — Ctrl+Space before 2026-10-26; none → no hook) → `PostMessage(WM_ORCHESTRATOR_SPAWN_WORKSPACE)` → `spawn_workspace()` → `CreateProcessA("<binary> --service-managed", CREATE_NO_WINDOW, inherited env + DISPLAYXR_WORKSPACE_HOTKEY)`. DIAG `system_workspace_launch` posts the same message. Hook is **uninstalled while the shell runs** (#344) and re-armed by the watchdog on exit. Config changes — tray menu or DIAG `system_reload_service_config` — all run on the tray thread through `service_orchestrator_apply_config`; DIAG `system_workspace_hotkey_suspend` takes the hook out for ≤ 60 s (launch settings: `workspace-controller-registration.md`) | `service_orchestrator.c:700-779, 388, 267, 409-412, 358-362` |
 | Shell → apps | `CreateProcessA` with `DISPLAYXR_WORKSPACE_SESSION=1`, `CREATE_NEW_CONSOLE`, **no job object**; the shell reaps them only on its own orderly exit (`request_client_exit` → 1 s → `TerminateProcess`) | `displayxr-shell-pvt/src/main.c:3519-3599, 7106-7145` |
 | Shell → voice | `CreateProcessA(displayxr-voice.exe)`, MCP client only, never touches the service | `displayxr-shell-pvt/src/shell_voice.c:652-767` |
-| Tray → control panel | `ShellExecuteW`, untracked | `service_tray_win.c:227` |
+| Tray → DisplayXR Dashboard | `ShellExecuteW`, untracked | `service_tray_win.c` (`launch_dashboard`) |
+| Linux: login → socket; client → service | **systemd user socket activation** (#1744). The `.deb` enables `displayxr.socket` for every user (`systemctl --global enable`; `postinst` also starts it in running user managers); it listens on `%t/displayxr_comp_ipc`, and the first client that dials it starts `displayxr.service`, which exits 30 s after its last client leaves (`IPC_EXIT_WHEN_IDLE`). The service reads the `LISTEN_FDS` hand-off itself (no libsystemd). Which clients dial is the hybrid router's decision: `XR_DXR_weave` present-owners (weave enabled and no window/surface binding extension) when the socket exists (else in-process), workspace controllers, `XRT_FORCE_MODE=ipc`; everything else stays in-process | `scripts/linux/systemd/`; `ipc_server_mainloop_linux.c` (`listen_fds_from_env`); `targets/openxr/target.c` |
+| Linux: service → controller | same POSIX orchestrator as macOS (`posix_spawn("<binary> --service-managed")`, `DISPLAYXR_WORKSPACE_SESSION=1` + `DISPLAYXR_WORKSPACE_HOTKEY`, `waitpid` watcher, respawn only in `enable`). The launch chord is held by the **GNOME Shell extension** (v13 `org.displayxr.WorkspaceHotkey1`), which outlives the idle-exiting service: a press with the service up → `Activated` → spawn; with it down → `StartUnit(displayxr.service)` and the press is handed over as `Configure`'s `pending`. X11 without the extension: `xcb_grab_key` on the root window while the service runs | `service_orchestrator.c` (macOS/Linux block), `service_hotkey_linux.c`; `workspace-controller-registration.md` § Linux |
+| Service → conversion host (ADR-053 D5, P2) | the conversion core's satellite proxy (`conv_host_proxy.c`), **lazily**: at the first describe it has no answer for, or the first warm / create that needs the provider. `"<service dir>\displayxr-conversion-host[.exe]" --provider <id> --binary <path> --channel <name> --parent <pid> --adapter-luid <hex>`, one process per provider binary, through the shared spawn helpers (`service_spawn.c`, the same mechanics as the workspace controller's). Windows: started suspended, put in the supervisor's job object (`KILL_ON_JOB_CLOSE`), then resumed; POSIX: `PR_SET_PDEATHSIG` / kqueue `NOTE_EXIT`. Inherits the service token (medium IL, never elevated). Which providers get one: `service_conversion.c` `resolve_hosting` — `DXR_CONV_<ID>_HOSTING` from the **service's** environment, then the provider's `Hosting` value; `auto` = satellite for every loader-registered provider; the built-in `dp-lift` adapter is in-service, always. With no host binary beside the service, a satellite provider is hosted in the service (WARN). Hosts are **not** workspace controllers: the orchestrator's watchdog never sees them | `service_conversion.c` (`add_entry`, `satellite_host_create`); `service_spawn.c`; `conv_host_proxy.c`; roadmap `conversion-providers.md` §3.4 |
+| Service → tracking host (tracking-provider-discovery §4a, ADR-054 N8) | `target_viewer_host.c`: once at system creation `displayxr-tracking-host --probe` (the host scans the tracking class — provenance + ABI gates, `probe()` — and names the rank-0 provider; ≤ 5 s, the service loads no provider binary), then **on demand** (the first viewer request of an IPC client, or an in-process app's `demand_ns` on the pose page) `--serve --provider <id> --page <name> --generation <n> --channel <token> --parent <pid> --geometry …`, through `os_process_spawn` (Windows job object `KILL_ON_JOB_CLOSE`; POSIX `PR_SET_PDEATHSIG` / kqueue `NOTE_EXIT`) + an `os_channel` (stop byte). Medium IL, refuses to run elevated. One host per service; the binary sits beside the service (`DXR_TRACKING_HOST_EXE` overrides, `none` = provider in the service) | `target_viewer_host.c`; `targets/tracking_host/main.c`; `target_viewer_tracking.c` (`resolve_hosting`) |
 | MCP adapter | **not spawned by anyone here and not in the service** — the MCP server runs inside every *app* at `xrCreateInstance`; the shell hosts the workspace endpoint; the service hosts none | `oxr_instance.c:651-654`; `main.c:159-162, 228-231` |
 
 ### 1.2 Supervision — what happens when each process dies
@@ -161,9 +168,11 @@ Windows only.
 |---|---|---|---|
 | **service** | nobody supervises it. Children keep running (no job object anywhere: `grep JobObject src/` = 0) | shell: `xrPollEvent` → `XR_ERROR_INSTANCE_LOST` → exits cleanly (`shell-pvt src/shell_openxr.cpp:519-528`, `main.c:6541`). Apps: `XR_ERROR_INSTANCE_LOST` on the next call, no `XrEventDataInstanceLossPending` (`oxr_xret.h:22-32`); no reconnect exists anywhere in `ipc_client_*` | n/a |
 | shell (ENABLE) | `workspace_watch_thread_func` | immediate relaunch, recursive watchdog | **none** — a crash-on-launch shell spins (`service_orchestrator.c:365-372`) |
-| shell (AUTO, default) | same | re-install the Ctrl+Space hook; service clears `workspace_mode`/`workspace_controller_pid` and calls `deactivate_workspace` on the dying client's IPC thread | `service_orchestrator.c:358-362`; `ipc_server_per_client_thread.c:186-200` |
+| shell (AUTO, default) | same | re-install the launch-hotkey hook (unless none is configured or it is suspended); service clears `workspace_mode`/`workspace_controller_pid` and calls `deactivate_workspace` on the dying client's IPC thread | `service_orchestrator.c:358-362`; `ipc_server_per_client_thread.c:186-200` |
 | a client app | its IPC thread's `ReadFile` breaks → `common_shutdown` | see §2.4 | n/a |
 | macOS shell | `posix_spawn` + waitpid respawn | 1 s settle | `service_orchestrator.c:1385-1395` |
+| tracking host (§4a) | the supervisor thread (`os_process_wait` every 100 ms; a 3 s heartbeat silence on the pose page = killed) | one WARN; the page's producer goes stale, so every reader answers "last known, `is_tracking` false" until the respawn's first sample; readers' cursors survive (the count continues) | 0.5 s doubling to 30 s, reset after 60 s running; **5 abnormal exits in 2 min** → FAILED, retried after 10 min; exit 10 (no provider) / 2 / 13 → FAILED at once. `target_viewer_host.c` (`target_vhost_sup_*`) |
+| conversion host (ADR-053 P2) | the proxy's supervisor (process wait + broken control channel), never the orchestrator | the host's epoch bumps, every in-flight command completes `failed`, then `CONV_HOST_EV_LOST(exit code)` to the core: the provider's rows go WARMING(`restarting`, n), stream handles stay valid, producers keep submitting latest-wins, output rings keep their last result. After the backoff a fresh host is spawned (`CONV_HOST_EV_RESTORED`): the core re-describes and re-warms; each stream's dispatcher sees the new epoch, re-opens its provider stream (`FRAME_RESET`, result flagged `discontinuity`) and re-registers its images in place. Exit 0 (idle) and 20 (update) are not crashes: READY rows go EVICTED. A watchdog-stuck call kills the host (exit 30), which then takes the crash path instead of FAILED(`hung`) | 0.5 s doubling to 30 s, reset after 10 min healthy; **crash loop = 5 abnormal exits in 10 min** (supervisor `CONV_HOST_EV_CRASH_LOOP`, and the readiness machine counts on its own) → FAILED(`crash_loop`) → the §2.4 rebind rule, or the stream stays alive in FAILED. `conv_core.c` (`host_event_locked`), `conv_stream.c` (`convert_one`) |
 
 Windows service defaults: `workspace=auto`, `start_on_login=true`
 (`service_config.c:36-38`); `workspace_binary` containing a path separator is a dev
@@ -174,7 +183,8 @@ override that bypasses the registry (`service_orchestrator.c:146-186`).
 | # | Way the service ends | Logs first? | Anchor |
 |---|---|---|---|
 | 1 | `--autostart` with `start_on_login=false` → `ExitProcess(0)` (the only `ExitProcess`) | yes | `main.c:125-128` |
-| 2 | Tray **Exit** → `g_service_shutdown_requested` → mainloop returns → `WinMain` returns | yes | `service_tray_win.c:406-411`; `ipc_server_mainloop_windows.cpp:273-277` |
+| 2 | Tray **Exit** → `g_service_shutdown_requested` → mainloop returns → `WinMain` returns | yes | `service_tray_win.c` (`request_service_exit`); `ipc_server_mainloop_windows.cpp:273-277` |
+| 2a | **Restart Manager / logoff / `taskkill` without `/F`** → `WM_QUERYENDSESSION` with `ENDSESSION_CLOSEAPP`, `WM_ENDSESSION` or `WM_CLOSE` on the hidden session-end window → the same path as #2, plus a 20 s backstop that `TerminateProcess`es if teardown has not finished (§1.5) | yes | `service_tray_win.c` (`session_wnd_proc`) |
 | 3 | `IPC_EXIT_ON_DISCONNECT` / `IPC_EXIT_WHEN_IDLE` (both default off) | yes | `ipc_server_per_client_thread.c:166-176` |
 | 4 | pipe-layer failure → `ipc_server_handle_failure` → `running=false` | yes | `ipc_server_process.c:933-937` |
 | 5 | `init_all` failure (e.g. no DP found) | yes | `ipc_server_process.c:1075-1084` |
@@ -191,7 +201,7 @@ fire for the window thread — `git show cc7df1676`):
 |---|---|---|
 | `wnd_proc` (trampoline `try{wnd_proc_inner}` **inside** the callback — the only placement that works across the x64 kernel-callback boundary) | `comp_d3d11_window.cpp:1377-1391` | message dropped, window lives |
 | `window_thread_func` | `comp_d3d11_window.cpp:1575-1591` | thread stops, `window_release` vote |
-| `capture_render_thread_func` | `comp_d3d11_service.cpp:6041, 6139-6164` | thread stops, `capture_render_running=false` — restartable but **nothing polls it**; recovery needs a new client or a Ctrl+Space cycle |
+| `capture_render_thread_func` | `comp_d3d11_service.cpp:6041, 6139-6164` | thread stops, `capture_render_running=false` — restartable but **nothing polls it**; recovery needs a new client or a launch-hotkey cycle |
 | `window_op_worker_func` (detached) | `comp_d3d11_service.cpp:1333-1375` | worker gone for the process lifetime; queued 2D restores silently stop |
 | capture `frame_pool.Recreate` only | `d3d11_capture.cpp:166` | — |
 
@@ -213,12 +223,104 @@ for input providers):
 
 | Aspect | Vendor DP | Input provider |
 |---|---|---|
-| Discovery (Win) | `HKLM\Software\DisplayXR\DisplayProcessors\*` (`Binary`, `ProbeOrder` default 100, cap 16, `PreferredPlugin` override) | `HKLM\Software\DisplayXR\InputProviders\*` (+ `Enabled`, cap 16, `Input\ForceQwerty` kill-switch) |
+| Discovery (Win) | `HKLM\Software\DisplayXR\DisplayProcessors\*` (`Binary`, `ProbeOrder` default 100, cap 16, `PreferredPlugin` override) | `HKLM\Software\DisplayXR\InputProviders\*` (+ `Enabled`, cap 16, `Input\ForceQwerty` kill-switch, `InputProviders\Policy\EmulatedControllers` qwerty-pair gate — N7) |
 | Load | `LoadLibraryExW(path, LOAD_WITH_ALTERED_SEARCH_PATH)`, ABI-major gate before any dispatch, **handle leaked for the process lifetime by design** | same (`target_input_plugin_loader.c:291, 323, 746`) |
 | When / thread | first `target_plugin_get_active()` — inside `xrt_instance_create_system` on the **main thread** at `init_all` (`ipc_server_process.c:506`); **plus** `target_plugin_refresh_active()` at **every per-client compositor create on that client's IPC thread**, under the process-wide `g_refresh_mutex` (`target_plugin_loader.c:1960-2008`; fired from `comp_d3d11_service.cpp:14196-14199`) | once per process at system build; no refresh, no unload, `iface->destroy` **never called** |
 | Where else | the same builder is linked into the runtime DLL and `displayxr-cli`, so an **in-process app hosts its own DP and its own providers** — two LeapC clients on one box (`targets/openxr/CMakeLists.txt:64`) | same |
 | Dev-path guard (#943 hardening 2a) | **none** — any absolute path in the registry loads verbatim; only a registry↔DLL version-skew WARN exists (`:315-352`) | **none** |
 | Vtable lifecycle | create / process_atlas / request_display_mode / destroy … all synchronous, unguarded | `probe`, `create_devices`, `destroy` (unused), `get_presence` — **no start/stop/health**; providers own their threads (`xrt_input_plugin.h:241-355`) |
+
+### 1.5 Restart Manager — the contract for third-party installers (Windows)
+
+Because plug-in handles are kept for the process lifetime (§1.4), every DLL a vendor
+plug-in pulls in — including **a vendor plug-in's dependency** installed by some other
+product — stays mapped in `displayxr-service.exe` until the process exits. An installer
+that must replace such a file therefore has to close the service first. The service is a
+well-behaved [Restart Manager](https://learn.microsoft.com/en-us/windows/win32/rstmgr/guidelines-for-applications)
+application so an installer can do that with the standard API and no DisplayXR-specific code.
+
+**What the service guarantees**
+
+- **Detectable.** `RmGetList` reports `displayxr-service.exe` as holding the file, as
+  a GUI application (`RmOtherWindow`: its top-level windows are hidden) with
+  `bRestartable = TRUE`.
+- **Closes cleanly.** A hidden top-level window on the tray thread answers
+  `WM_QUERYENDSESSION` with TRUE (no UI, no waits) and takes the normal tray-**Exit** path
+  (§1.3 #2a) on a Restart Manager close request — **already on the query** when it carries
+  `ENDSESSION_CLOSEAPP` — and on `WM_ENDSESSION` (`wParam` TRUE) or `WM_CLOSE`. The tray
+  window itself is message-only (`HWND_MESSAGE`), which never receives these messages.
+- **Why the query, not `WM_ENDSESSION`.** RM walks *every* top-level window of the process,
+  and a library a vendor plug-in loads can own one on a thread that never pumps messages
+  (measured: a 2D-to-3D conversion module's worker thread owns a hidden GL window). RM then
+  never completes the query round, so `WM_ENDSESSION` is never sent; with `RmForceShutdown`
+  it waits out its timeouts (~70 s), terminates the process, reports `ERROR_FAIL_SHUTDOWN`
+  and does **not** restart it. The `ENDSESSION_CLOSEAPP` query is the one signal that always
+  arrives. Exiting on it is safe here: the service has no unsaved state, and if another
+  application vetoes the shutdown the next OpenXR app starts the service again (§1.1). A
+  logoff/shutdown query (no `CLOSEAPP`) still waits for `WM_ENDSESSION`.
+- **Bounded.** If teardown has not finished 20 s after the request, the process terminates
+  itself, so the files are released inside Restart Manager's 30 s force window either way.
+- **Restartable, non-elevated.** At start the service calls `RegisterApplicationRestart("--rm-restart",
+  RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT)` (plus `--workspace` when it was
+  started with it) — installer restarts only: crash/hang behaviour is unchanged, and a
+  reboot is left to the `HKLM\…\Run` entry. `--autostart` is deliberately not
+  registered, so the "Start on login" preference cannot turn a restart into an exit. An
+  instance started with `--rm-restart` that finds itself **elevated** (an elevated installer
+  may relaunch it in its own context) hands the launch to the desktop shell
+  (`explorer.exe "<exe>"`, non-elevated) and exits: clients at medium/low integrity must be
+  able to reach the service.
+- Logged: one WARN on registration, one on the close request, one on a `--rm-restart` start
+  (with its integrity level).
+
+**The installer's sequence**
+
+```
+RmStartSession
+RmRegisterResources(<the files to replace>)
+RmGetList                       -> displayxr-service.exe, RmOtherWindow, restartable
+RmShutdown(RmForceShutdown)     -> service exits cleanly
+<replace the files>
+RmRestart                       -> service relaunched with --rm-restart
+RmEndSession
+```
+
+**Pass `RmForceShutdown`.** Measured on hardware, RM driven from an elevated process, the
+service at medium integrity:
+
+| State of the service | `RmShutdown(0)` | `RmShutdown(RmForceShutdown)` |
+|---|---|---|
+| no vendor window in the process | success in ~0.5 s, restarted | same |
+| a vendor library's non-pumping window present | `ERROR_FAIL_SHUTDOWN` after ~0.25 s — RM gives up at once and will not restart, although the service has seen the query and exits a moment later | success in 6–11 s (RM first waits ~5 s per unresponsive window), files released, restarted |
+
+Force costs nothing when the service is responsive: it exits on the query long before RM's
+30 s kill. In both columns `RmRestart` brought the service back at **medium integrity** with
+`--rm-restart`, from an elevated caller, with no minimum uptime. An installer that has
+already called `RmShutdown(0)` and got `ERROR_FAIL_SHUTDOWN` can simply call it again with
+`RmForceShutdown`.
+
+What a close costs: every connected OpenXR app loses its session
+(`XR_ERROR_INSTANCE_LOST`, no reconnect — §1.2), and the workspace controller is
+terminated exactly as on a normal service exit (`service_orchestrator_shutdown`); after the
+restart the orchestrator applies `service.json` again (a controller in **Enable** mode is
+respawned; **Auto** waits for the hotkey). In-process OpenXR apps load the plug-in — and its
+dependencies — themselves, so `RmGetList` lists them too and they are closed by their own
+window handling.
+
+**Conversion providers hosted in the satellite** (ADR-053) are not in the service at all:
+`RmGetList` on their files lists `displayxr-conversion-host.exe` instead, which exits 20 on the
+close request while the service keeps every session (the provider's tasks report
+WARMING(`updating`) until the host respawns). The service is listed for a vendor's conversion
+module only while the display plug-in's legacy lift slots (`dp-lift`) have it loaded — then the
+sequence above applies. Contract: `conversion-provider-discovery.md` §3.8.
+
+**Installers that do not use Restart Manager** terminate `displayxr-service.exe`
+(`taskkill /F /IM displayxr-service.exe`; without `/F` it closes cleanly only while no vendor
+window sits above the session-end window, so it is not reliable), replace the
+files, then start it again **non-elevated** — e.g. from an elevated installer,
+`explorer.exe "<InstallPath>\displayxr-service.exe"`, with `InstallPath` read from
+`HKLM\Software\DisplayXR\Runtime`. Starting it directly from an elevated process leaves an
+elevated service that normal-integrity clients cannot use. If nobody restarts it, the next
+OpenXR app that needs the service launches it (§1.1), and the next logon does too.
 
 ---
 
@@ -253,6 +355,7 @@ per call site from three client-controlled signals (§4.1). This table is what t
 | **MCP adapter / voice** | not OpenXR clients | per-app / shell pipes | — | 0 | — | unaffected |
 | **Input providers, vendor DP** | in-process DLLs | — | — | 0 | roles via the arbiter (`target_input_arbiter.c`) | **they are the service** |
 | **Unity/Unreal under the shell** | env → IPC | ordinary slot | tile | 1 | — | `INSTANCE_LOST` |
+| **In-process session's service link** (ADR-049 + Amendment 1, ADR-061 arm 2) | in-process app, a second **sessionless** `APP` connection `<exe> (in-process)` (`ipc_client_service_link.c`): on the first lift call, or at `xrBeginSession` while sharing is on (`DXR_APP_SHARE`, default on) | `service_link_register {caps lift/share, …}` (share links only); listed by the camera manager as `SOURCE_APP_LINK` | none of its own: lift calls; when shared, a 3-texture NT ring + fence published once, then one `service_link_share_frame_ready` per frame | 1 per in-process session that lifts **or** shares (never 2) | none | the app's session is unaffected; lift streams / the share are lost, the link reconnects |
 
 ### 2.3 Slot arithmetic against the target scenario
 
@@ -284,6 +387,42 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 | Client-side loss | any RPC failure → `XRT_ERROR_IPC_FAILURE` → `has_lost` → `XR_ERROR_INSTANCE_LOST` at 43 sites; **no reconnect, no `InstanceLossPending`** | `oxr_xret.h:22-32` |
 | Per-client RPC serialisation | every `ipc_call_*` takes `ipc_c->mutex` for the whole round trip — a client's render and main threads share one pipe and one lock (why #924's app main thread sat in `NtWriteFile`) | `shared/proto.py:68-131` |
 
+**Display status snapshot (ADR-051 D3, dashboard phase 2).** The service owns one
+`xrt_status_snapshot` and two generation counters, `topology` (screens + plug-ins) and
+`status` (everything else), in `ipc_server_status.c`. Event sites bump them directly —
+client connect / disconnect (`status`) and the world-event display re-probe (`topology`; fed
+by the tray's `WM_DISPLAYCHANGE` / `WM_DEVICECHANGE` on Windows and by the service's DRM
+hotplug feeder on desktop Linux, `service_drm_hotplug_linux.c`: kernel `drm` change uevents
+over raw netlink, else a 2 s poll of the connectors' `status`) —
+under a leaf lock, so they are safe from any context. Every other input is compared on the
+reading consumer's own IPC thread: each status read re-gathers the cheap live facts (slot
+table + session flags, presenter, lease, window, segment-table generation, window-handle
+owner, each bound DP's backend state and `is_tracking`, the mode) and the screen list +
+plug-in state, bumps the counter whose inputs moved, and once per 2 s rebuilds the snapshot
+and bumps `status` only if its content changed. The snapshot is rebuilt lazily, on the first
+piece read after a counter moved; with no DIAG consumer nothing runs, and nothing on the
+20 Hz main loop or the render thread changed. The identity rows (runtime, plug-ins,
+screens) come from the service target's registered `ipc_server_status_provider`
+(`target_status_snapshot_build_service`, targets/common); the live facts come from
+`ipc_server_get_health`, `comp_d3d11_service_get_render_diag` and
+`comp_d3d11_service_get_client_status` (which validates the compositor against the
+live-client registry under `render_mutex` → `clients_mutex` before reading it); on the
+desktop-Linux null + comp_multi service from `multi_compositor_status_get_client` /
+`multi_compositor_status_get_shared_dp` (the client matched against `msc->clients[]` under
+`list_and_timing_lock` only; presenter `SERVICE_WINDOW` for a shared-surface client, `SELF`
+for an `XR_DXR_weave` present-owner; one segment per window; no integrity triple, because
+comp_multi keeps no paint / present / skip counters). Three
+session-free RPCs, **DIAG class only** (`XRT_ERROR_NOT_AUTHORIZED` otherwise):
+`system_get_status_generation` → `{topology, status}`; `system_get_status_snapshot(screen_index)`
+→ the `xrt_status_head` (everything but the rows, plus client ids) and one screen row;
+`system_get_client_segments(client_id)` → one client row + its raw `xrt_segment_metrics`.
+Each reply is a fixed-size struct by value (the `system_enumerate_displays` mechanism) and
+carries the generation it belongs to, so a reader that straddles a rebuild refetches.
+`compositor_get_segment_metrics` stays own-session. Consumers: `displayxr-cli status`
+(`--watch` holds one DIAG slot and polls the counters), the Dashboard through it, MCP
+(Writes go the other way round: the Dashboard never talks to the service or the registry itself — a component's Enabled / Preferred change is one `displayxr-cli dp|input|conv …` invocation, which writes the policy store and pokes the service's component watch, ADR-054 N3d/N3e.)
+`get_status_snapshot` through the CLI.
+
 ---
 
 ## 3. Threads and locks
@@ -301,6 +440,12 @@ closed with **no message to the client**. An evicted-but-alive client (#925 S4) 
 | window-op worker | `comp_d3d11_service.cpp:1398` | `SetWindowPlacement`-family restores off the render path (#925 rank 7) | try/catch, no restart |
 | WinRT capture pool | `d3d11_capture.cpp:285-300` | `on_frame_arrived` → `CopyResource` on the **shared immediate context, outside `render_mutex`** (relies on `SetMultithreadProtected(TRUE)`, `comp_d3d11_service.cpp:14697-14705`) | partial |
 | provider threads | provider-owned (`ultraleap_provider.cpp:568` poll thread; net_input hub) | LeapC polling, #941 idle watchdog (a branch of the poll thread) | none |
+| conversion core (ADR-053) | `conv_core.c` `conv_core_create` (control thread), `conv_stream_lane_start` / `conv_job_lane_start` per provider (one stream dispatcher + one job worker), plus each in-service host's exec threads (`conv_host_inproc.c`) | control: readiness ticks, the stall watchdog, re-describes, and the satellite lifecycle queue (`host_events_locked`, fed from host threads under the leaf `evq_mtx`); dispatchers: one conversion at a time per provider, provider calls with no conversion lock held | provider code in-service runs on the exec threads; in a satellite it runs in **another process** |
+| conversion host proxy (ADR-053 P2) | `conv_host_proxy.c`, one set per satellite provider | supervisor (spawn, wait for exit, backoff, crash-loop cutoff), the completion-ring reader (`on_complete` per record, after the CPU has observed the record's fence value: the **fence rule** — the service never queues a GPU wait on a host-signalled fence on any context), the control-channel reader (describe / state / heartbeat / logs) | the host's crash, hang or update never reaches a compositor thread |
+| viewer-tracking host supervisor (§4a) | `target_viewer_host_create`, at system creation when a provider is usable | 100 ms tick under its own lock: page demand check, reap, hello, heartbeat watchdog, the ONE supervisor action (spawn / kill); writes the page's owner block on change. Takes the viewer-tracking lock never; the IPC view paths take only that lock to drain the page (copy ≤ 16 samples) | none (provider code is in another process) |
+| viewer-tracking page thread (fallback only) | `target_viewer_tracking.c` `resolve_hosting`, when no host binary is beside the service | 100 ms: the page heartbeat and readers' demand for the in-service provider | none |
+| lift (ADR-042) | `d3d11_lift.cpp` `d3d11_lift_create`, lazily on the first `XR_DXR_lift` call | the ONLY thread that touches the vendor's lift display processor: brings up a dedicated **lift device** on the service adapter (ID3D11Multithread-protected) + the plug-in's lift-only DP, then loops: priority-scheduled round (`u_lift_sched`) → take a stream's newest pending input → `lift_convert` / `lift_convert_blob` (ms to s) → copy into the output ring. Never takes `render_mutex` or `immediate_ctx_mutex`; calls back for tracked eyes with no lift lock held. Joined first in `system_destroy` | `DXR_LIFT=0` kill switch |
+| component-policy watch (ADR-054 N3d, #2051) | `service_component_watch.c`, `register_component_watch()` in `main.c` after `service_conversion_start` | idles in `WaitForMultipleObjects` over a stop event, a poke event and six `RegNotifyChangeKeyValue` events — HKLM + HKCU × `DisplayProcessors` / `InputProviders` / `ConversionProviders` (a missing root is watched through `Software\DisplayXR`); a registry wake is debounced 500 ms, a poke (the DIAG `system_request_component_reselect`, a conversion provider's `notify_changed`) is immediate. Dispatches ONE callback per class on this thread: display → `ipc_server_request_display_reprobe` (the re-probe worker, §4.2 no-live-swap); input → `target_input_plugin_reread_policy` → `t_input_arbiter_rerank` (roles + `generation_id` move at once); conversion → policy re-read → `conv_core_set_policy` + rescan with the HKCU `Enabled` overlay. Replaced the tray's HKLM-only `DisplayProcessors` waiter and the conversion core's private waiter. POSIX: the same thread runs a 2 s mtime poll of the per-user manifest dir instead (`preferred`, `input-preferred`, manifests) | none; a callback that throws is unguarded like the IPC threads |
 
 ### 3.2 Lock order (as of #964–#966)
 
@@ -347,8 +492,23 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
   resume path to maintain: `multi_compositor_register_client` restarts the thread
   and the presenter re-bind builds a DP on the first frame. The grace window is
   what keeps an app restart or a shell relaunch from recreating the vendor weaver.
+- **Lift (ADR-042) adds one leaf and no edge into the panel lock.** `d3d11_lift::mtx`
+  guards the stream table and every lift mailbox and is never held across a GPU
+  wait, a keyed-mutex acquire or a vendor call. Where both are taken the order is
+  `immediate_ctx_mutex → lift mtx` (a lift-flagged weave rect's snapshot, inside
+  `weave_submit`); the lift thread never takes `immediate_ctx_mutex` (it owns a
+  device of its own), and the IPC-side lift calls take `immediate_ctx_mutex` alone,
+  for one blit or one copy. Frames cross between the service device and the lift
+  device only as keyed-mutex shared textures (two input slots, two output-ring
+  slots per stream), so neither thread ever waits on the other's GPU queue.
 - Never join the render thread under `render_mutex`; never hold
   `global_state.lock` across a compositor call.
+- **comp_multi (macOS / Linux / Android) has its own, separate order** (#1005):
+  `msc->render_lock -> msc->list_and_timing_lock -> mc->slot_lock`. `render_lock` covers one
+  whole frame (transfer, render, DP, present) and is what client destroy, end_session, the
+  session-DP detach and the display-mode request take first; the list lock is held only for
+  bookkeeping and never across GPU work or a DP call. Full statement:
+  `@page comp_multi_locking` in `multi/comp_multi_interface.h`.
 
 ### 3.3 Locks
 
@@ -363,6 +523,7 @@ c->mutex  →  render_mutex  →  { ws_snapshot_mutex, active_compositor_mutex,
 | `hub->mutex` | Ultraleap provider | joint sets | poll thread + every consumer's `get_hand_tracking` |
 | `ipc_c->mutex` | per client process | the whole pipe round trip | every RPC |
 | `usys->sessions.mutex` | per system | session list; event push (unbounded malloc'd per-session list, `u_session.c:34-42`) | broadcasts |
+| `d3d11_lift::mtx` | per service (`d3d11_lift.cpp`), leaf | lift stream table, every stream's `u_lift_mailbox` (input slots, output ring, pins, stats), caps | lift thread between conversions; IPC threads for submit / acquire / stats (ns-µs, never across GPU or vendor work); `weave_submit` for lift-flagged rects (under `immediate_ctx_mutex`) |
 
 **Nesting observed:** `global_state.lock → render_mutex` at ≥ 11 handler sites
 (`ipc_server_handler.c:3735, 4079, 4110, 4204, 4370, 4429, 4475, 4696, 4792, 4968, 5106`
@@ -486,7 +647,7 @@ connect-after ⇒ always joins (relay — no claimant since #1180 — and contro
 **Transitions** (evidence in the standalone review): a client that was standalone when the
 shell activates is **never** flagged for reverse hot-switch (only slot members are, `:17836-17844`) —
 its commits take the workspace early-return (`:12431`) before `process_atlas`/`Present`, so it
-**goes dark with a live orphan DP** (INFERRED reachable: forced-IPC cube then Ctrl+Space). On
+**goes dark with a live orphan DP** (INFERRED reachable: forced-IPC cube then the launch hotkey). On
 deactivate, slot members lazily rebuild per-client resources on their own IPC threads
 (`:12440-12513`, DP factory on the IPC thread) — but a client with **no `app_hwnd`** (Chrome/hosted
 that joined under the shell) fails the `IsWindow` test and logs `swap_chain=NULL` forever
@@ -495,6 +656,8 @@ that joined under the shell) fails the `IsWindow` test and logs `swap_chain=NULL
 (`comp_d3d11_window.cpp:545-548`), and the #814 survivor scan (`:12929-12953`) sees `survivors==0`
 (standalone clients are never in `mc->clients[]`) so the first to leave flattens the panel
 for the other (INFERRED).
+
+**Multi-screen segments (ADR-047 Amendment 3).** A window spanning monitors is woven per screen only on the direct path: when the focused presenter is an `APP_HWND` client that opted in (`compositor_segments_enable`, sent by its oxr session on a box with two DP-backed screens), `pipeline_segments_weave` replaces that frame's single `process_atlas` with the client's own segment manager (the in-process `comp_d3d11_segments`, on `svc_out_device`): the panel DP weaves the primary screen's segment, windowless per-screen DPs the others. The service owns the screen registry, so only the session's display pin crosses IPC; the segment table and the per-segment view routing then cross by value (`compositor_get_segment_metrics`, `compositor_set_view_routing`) and the commit paints the routed atlas mosaic. Render thread under `render_mutex`; the client's `seg_mutex` is a leaf guarding the table it reads at `xrLocateViews`. The workspace path (`multi_compositor_render`) is ADR-052's: the controller sees every screen (`XR_DXR_spatial_workspace` v25 — `xrEnumerateWorkspaceScreensDXR`, SCREENS_CHANGED, placement in any screen's space, mapped into the primary's space at enqueue so every existing reader of a slot's pose is unchanged; the set lives in `ws_screens`, rebuilt on activation and on every display re-probe), and the service presents on every claimed 3D screen (D1): the service window on the panel plus one full-screen secondary presenter per other 3D screen (`svc_ws_presenter`: its own window, swap chain, atlas and screen-bound DP, all on the render device), rebuilt when the set's generation moves. The render thread runs one compose pass per presenter (`multi_compositor_compose_pass`; a secondary's pass installs a thread-local `svc_ws_pass` frame that maps the primary's display space into its pixels), weaves each with its own DP and presents it behind a non-blocking frame-latency claim, then composes and presents the primary exactly as before. Secondary windows feed the same input queue (cursor moved into workspace pixels) and mirror the focused client's input-forward rect and the reserved keys. A placed tile's views are framed from the screen it is on (ADR-052 Amendment 1): wholly on a secondary presenter, `ipc_try_get_sr_view_poses` takes that presenter DP's eyes and the window in that screen's display space (`comp_d3d11_service_get_client_workspace_view_frame`); straddling, `compositor_get_segment_metrics` hands out a per-part table built from the placement, so a multiview client's per-segment views and mosaic routing reach every presenter's compose unchanged. `DXR_SEGMENTS=0` / `DXR_WORKSPACE_SCREENS=single` keep the single presenter. Detail: `docs/architecture/comp-segments.md` § *Service / IPC path*.
 
 ### 4.4 #925 status (correcting the reference doc)
 
@@ -519,12 +682,15 @@ HRESULT.
 |---|---|---|---|---|
 | **Vendor DP** | in `probe`/`DllMain` during per-client `refresh_display_processors` → **every** client's `xrCreateSession` blocks behind `g_refresh_mutex`; in `process_atlas` on the render thread → workspace stops, controller RPCs park; on an IPC thread (standalone) → that client + shared-context contention | whole service (banner, no chatter) | caught only in `wnd_proc`/render thread; IPC threads → silent death | whole process |
 | **Input providers** | `get_presence` under `g_arb_mutex` → **every** client's `xrSyncActions` blocks (and each client's frame loop behind `ipc_c->mutex`); provider `hub->mutex` stall → all consumers of that provider | whole service (#943 signature — but see below) | crosses the C ABI ⇒ terminate, no banner, no WER | whole process |
-| tray thread | tray + Ctrl+Space dead; IPC survives | — | terminate | — |
+| tray thread | tray + launch hotkey dead; IPC survives | — | terminate | — |
 | window thread | frozen window; cross-thread window calls behind it | — | contained | — |
 | render thread | workspace stops compositing; clients keep sessions | — | contained, not self-healing | — |
 | per-client IPC thread | that client — unless inside `global_state.lock`/`g_arb_mutex`/`g_refresh_mutex`/`render_mutex` | whole service | terminate | — |
 | main thread | no new clients; existing keep running; mode-index push stops | whole service | terminate | — |
-| shell (separate process) | nothing blocks in the service; a hung shell keeps the Ctrl+Space hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
+| **conversion provider, in-service** (`dp-lift` always; any provider with `Hosting=in-service`) | its dispatcher waits; the stall watchdog marks the rows FAILED(`hung`) and abandons the exec thread until the service restarts; compositor unaffected | whole service | whole service | whole process |
+| **conversion host** (separate process, ADR-053 P2) | the stall watchdog kills the host (exit 30) → crash path | the host only: streams survive, WARMING(`restarting`) → re-open after the backoff | same | **isolated** (also DLL conflicts between model runtimes). A host that dies before signalling a fence is invisible to the compositor (the fence rule) |
+| **viewer-tracking host** (separate process, §4a) | its heartbeat stops → killed after 3 s → crash path; the view paths never wait on it (they read the page) | the host only: views hold the last known viewer, `is_tracking` false, restart after the backoff | same | **isolated**; a scribbling host can only corrupt its own samples (the reader bounds every index) |
+| shell (separate process) | nothing blocks in the service; a hung shell keeps the launch-hotkey hook uninstalled | watchdog respawn/re-arm, no backoff | same (exit code never read) | **isolated — the only real boundary in the design** |
 
 **On #943's mechanism.** The filed chain (last-client teardown → `xrt_system_devices_feature_dec`
 → refcount 0 → provider `end_feature` → `exit()`) is **not live at this commit**: `feature_inc`
@@ -561,14 +727,14 @@ the #930 signature (no banner) rather than #943's (banner present). See the #943
 
 | | Windows | macOS | Linux desktop | Android |
 |---|---|---|---|---|
-| service | `displayxr-service.exe` | `displayxr-service` + orchestrator (posix_spawn, respawn) | `displayxr-service`, **no orchestrator**; systemd socket activation optional | `libservice_target.so` in a bound **foreground** `Service` (`START_STICKY`), `ipc_server_main_android` on a `std::thread`; **one satellite process per client** (`MonadoServiceSlot0..3`, `android:process=":dxrN"`) brokered by the main process — see §7a |
+| service | `displayxr-service.exe` | `displayxr-service` + orchestrator (posix_spawn, respawn) | `displayxr-service`, **no orchestrator**; shipped in the `.deb`/tarball and **socket-activated** by a systemd user unit, exits when idle (#1744); runs detached (stdin not required), SIGTERM = clean stop | `libservice_target.so` in a bound **foreground** `Service` (`START_STICKY`), `ipc_server_main_android` on a `std::thread`; **one satellite process per client** (`MonadoServiceSlot0..3`, `android:process=":dxrN"`) brokered by the main process — see §7a |
 | transport | named pipe | AF_UNIX | AF_UNIX | binder for bootstrap only (`IMonado.aidl` 4 methods); per-frame traffic on a socketpair; **connect blocks a binder thread on a condvar until the 50 ms mainloop accepts** (`ipc_server_mainloop_android.c:170-222`); a process that **already holds a connected socket** skips the Java/binder bootstrap entirely — `ipc_client_connection_adopt_fd()` or `DXR_IPC_FD` (#1056, for an embedder like Chromium whose rendering process is not the process that owns its Java world) |
-| system compositor | `comp_d3d11_service` | **null + `comp_multi`** (shared-surface workspace path exists) | null + `comp_multi`, **headless only** (no present arm) | null + `comp_multi`, per-session `comp_window_android` |
-| DP | in-process; 1 or N | in-process; **one shared** | in-process | in-process (`dlopen`); **one per client**, `process_atlas` per client per frame |
-| clients on screen | N | N | 0 | **N, one per satellite process** (4 slots by default; §7a). Within *one* process it is still 1 — the app surface is a process-global singleton (`android_globals.cpp:21-44`) — which is exactly why each client gets its own process |
+| system compositor | `comp_d3d11_service` | **null + `comp_multi`** (shared-surface workspace path exists) | null + `comp_multi`, **shared spatial surface** (#710): one service-owned window (`comp_window_linux`: native Wayland 1:1 by default, X11 / XWayland fallback), workspace handler arms + surface input routing as on macOS; headless-verified, panel run pending | null + `comp_multi`, per-session `comp_window_android` by default; **workspace overlay mode** (shared surface in the controller's own surface) while a verified controller is active — §7b |
+| DP | in-process; 1 or N | in-process; **one shared** | in-process; **one shared** (plus one per `XR_DXR_weave` present-owner) | in-process (`dlopen`); **one per client**, `process_atlas` per client per frame; **one shared** in the overlay mode (§7b) |
+| clients on screen | N | N | N (shared surface) | **N, one per satellite process** (4 slots by default; §7a). Within *one* process it is still 1 — the app surface is a process-global singleton (`android_globals.cpp:21-44`) — which is exactly why each client gets its own process |
 | arbitration | inside `comp_d3d11_service.cpp` | Monado active-client fallthrough only | — | none needed for the on-screen part: the OS is the window manager and each client owns a process. What *is* shared — the panel's 3D lens — is a per-window preference resolved by refcount in the vendor services (#1039), not a display command |
-| #925 S1–S5 | ✔ | ✘ (`list_and_timing_lock` holds the whole per-client render + present; `vkWaitForFences(UINT64_MAX)`; unbounded `process_atlas`) | ✘ | ✘ |
-| supervision | orchestrator for children; nothing for the service | orchestrator | none | the OS (`START_STICKY`, but restart arrives with a null Intent → not re-foregrounded, `MonadoService.kt:63-71`); no client reconnect |
+| #925 S1–S5 | ✔ | partly (#1005/#1007: waits bounded with a per-client stall deadline, GPU work + present under `render_lock` not `list_and_timing_lock`; `process_atlas` itself is still a vendor call without a timeout) | as macOS | as macOS |
+| supervision | orchestrator for children; nothing for the service | orchestrator | systemd user manager (`Restart=on-failure`; the socket re-starts it on the next connect) | the OS (`START_STICKY`, but restart arrives with a null Intent → not re-foregrounded, `MonadoService.kt:63-71`); no client reconnect |
 
 **ADR-025 clarification.** "Out-of-process" there means the *app* is isolated from the vendor
 SDK by the app↔service split; the DP still lives in the service. There is no DP proxy/host in
@@ -625,6 +791,37 @@ CI builds the one merged runtime APK (#1031), which carries this path — but do
 CI-validated; there is no eviction policy beyond "first come, and the fifth app degrades to the
 legacy single-window path"; and nothing yet reports slot occupancy through `displayxr-cli` or the
 diag dashboard.
+
+### 7b. Android workspace overlay mode (ADR-036 D4, #1006)
+
+The per-window shape above is the Android default. The **workspace overlay mode** is the
+opt-in alternative a verified workspace controller turns on, exactly as a controller turns
+on the shared surface on Windows / macOS / Linux: one surface, one atlas, **one DP**, every
+participating client composited at controller-supplied poses.
+
+| Piece | What it does |
+|---|---|
+| Controller verification | A CONTROLLER claim on Android is checked by the peer **UID** (`SO_PEERCRED`): the package must declare `<meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>` **and** be signed with the runtime's certificate (`PackageManager.checkSignatures`). `ipc_server_set_android_controller_verify_provider` → `WorkspaceControllerPolicy.isVerifiedController`. Dev override: `debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER=1`. |
+| Routing | `SlotBroker` returns **-1** (main-process service) for a verified controller package and, while the overlay is on, for every new IPC client. Clients that already hold a satellite keep it. |
+| Output surface | The controller's own fullscreen Activity surface, published by its IPC client as any client's is. While the overlay is on, `MonadoImpl` honours `passAppSurface` / `clearAppSurface` only from the controller's UID; other surfaces are remembered and the most recent one is republished when the overlay ends. |
+| Mode switch | `workspace_activate` / `deactivate` / controller loss set `workspace_active`; the render thread applies it at the top of a frame (`msc->shared_mode_active`, read through `multi_shared_surface_active()`). On: the shared target + shared DP are built lazily, every per-session DP releases its lens vote. Off: the shared target is released (the window is process-global), the shared DP is **paused, never destroyed** (leia-plugin#39), per-session rendering resumes. |
+| Members | A client admitted into an active overlay is a *workspace-overlay member*: an Activity pause does not stop its session (it is on screen through the controller's surface), and its instance counts as a workspace session so the controller can enumerate and place it. |
+| 2D/3D | The controller is the display-mode authority; its `xrRequestDisplayRenderingModeDXR` reaches the shared DP through `workspace_request_display_mode` and every composited client hears the hardware state (#967 D-5). |
+
+Known limits: **member apps behind the fullscreen controller get frozen by Android's
+cached-app freezer** (measured on an NP02J: the older member within seconds of losing the
+foreground, the previous app later) — a frozen member shows its last frame, stretched into its
+current rect if the controller re-places it; the runtime cannot raise a client's importance
+from the service side, so members must stay visible (split-screen / freeform) or hold a
+foreground service of their own. Also: only clients that join *after* activation are composited (a satellite client
+stays per-window); nothing feeds pointer input to the workspace input queues on Android yet
+(#1996 — the touch input provider of #132 drains a *per-process* pointer queue that the
+hosted `SurfaceView` and `xrSubmitAndroidInputEventDXR` push into, so it serves in-process
+sessions; under the overlay the controller owns the surface and the queue it would need is
+the service's, which nothing fills);
+a content app that stops rendering when it loses its own window shows a frozen last frame;
+the vendor stack's "one core per process" behaviour (R2) is measured for creation only —
+the shared DP is held back while any per-session DP is alive in the main process.
 
 ---
 

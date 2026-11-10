@@ -55,9 +55,34 @@
 
 #ifdef XRT_OS_ANDROID
 #include "android/ipc_client_android.h"
+#include "android/android_globals.h"
 #endif // XRT_OS_ANDROID
 
 DEBUG_GET_ONCE_BOOL_OPTION(ipc_ignore_version, "IPC_IGNORE_VERSION", false)
+
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "os/os_time.h"
+#include "util/u_time.h"
+#include <sys/time.h> // struct timeval (SO_RCVTIMEO / SO_SNDTIMEO)
+
+/*
+ * #2515: an opt-in bound on connect + handshake (ipc_client_connection_set_
+ * handshake_timeout_ms). 0 = block forever, the default for every client.
+ */
+static volatile uint32_t g_handshake_timeout_ms = 0;
+static volatile bool g_handshake_timed_out = false;
+
+//! Apply (ms > 0) or clear (ms == 0) the per-call send/receive timeouts on @p fd.
+static void
+ipc_client_set_socket_timeouts(int fd, uint32_t ms)
+{
+	struct timeval tv;
+	tv.tv_sec = (time_t)(ms / 1000u);
+	tv.tv_usec = (suseconds_t)((ms % 1000u) * 1000u);
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+#endif
 
 #ifdef XRT_OS_ANDROID
 
@@ -598,6 +623,9 @@ ipc_open_pipe_busy_retry(struct ipc_connection *ipc_c, const char *pipe_name)
 	}
 }
 
+//! Set by ipc_client_connection_disable_service_launch() (#1966).
+static volatile bool g_service_launch_disabled = false;
+
 #if defined(NO_XRT_SERVICE_LAUNCH) || !defined(XRT_SERVICE_EXECUTABLE)
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -610,6 +638,25 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	return pipe_inst;
 }
 #else
+/*!
+ * Start the service OUTSIDE the caller's job object (#1966). The service is a
+ * long-lived daemon; a launcher that lives in a kill-on-close job (the
+ * dashboard's CLI children, a test harness) would otherwise take the service
+ * down with it when that job closes. A job that forbids breakaway refuses the
+ * flag with ERROR_ACCESS_DENIED, and then the plain launch is the best we can do.
+ */
+static BOOL
+ipc_launch_service_process(char *path, STARTUPINFOA *si, PROCESS_INFORMATION *pi)
+{
+	if (CreateProcessA(NULL, path, NULL, NULL, false, CREATE_BREAKAWAY_FROM_JOB, NULL, NULL, si, pi)) {
+		return TRUE;
+	}
+	if (GetLastError() != ERROR_ACCESS_DENIED) {
+		return FALSE;
+	}
+	return CreateProcessA(NULL, path, NULL, NULL, false, 0, NULL, NULL, si, pi);
+}
+
 // N.B. quality of life fallback to try launch the XRT_SERVICE_EXECUTABLE if pipe is not found
 static HANDLE
 ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
@@ -622,6 +669,10 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	IPC_ERROR(ipc_c, "Connect to %s failed: %d %s", pipe_name, err, ipc_winerror(err));
 	if (err != ERROR_FILE_NOT_FOUND) {
 		return INVALID_HANDLE_VALUE;
+	}
+	if (g_service_launch_disabled) {
+		SetLastError(err);
+		return INVALID_HANDLE_VALUE; // #1966: this process never starts the service
 	}
 	IPC_INFO(ipc_c, "Trying to launch " XRT_SERVICE_EXECUTABLE "...");
 	HMODULE hmod;
@@ -643,7 +694,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 	strcpy(p + 1, XRT_SERVICE_EXECUTABLE);
 	STARTUPINFOA si = {.cb = sizeof(si)};
 	PROCESS_INFORMATION pi;
-	if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
+	if (!ipc_launch_service_process(service_path, &si, &pi)) {
 		char first_path[MAX_PATH];
 		strcpy(first_path, service_path);
 		*p = 0;
@@ -655,7 +706,7 @@ ipc_connect_pipe(struct ipc_connection *ipc_c, const char *pipe_name)
 			return INVALID_HANDLE_VALUE;
 		}
 		strcpy(p + 1, "service\\" XRT_SERVICE_EXECUTABLE);
-		if (!CreateProcessA(NULL, service_path, NULL, NULL, false, 0, NULL, NULL, &si, &pi)) {
+		if (!ipc_launch_service_process(service_path, &si, &pi)) {
 			err = GetLastError();
 			IPC_INFO(ipc_c,
 			         "CreateProcessA failed for both %s and %s: %d %s. "
@@ -810,6 +861,14 @@ ipc_client_posix_dial(struct ipc_connection *ipc_c)
 
 	int socket = ret;
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: SO_SNDTIMEO also bounds connect() on a unix stream socket (a
+	// full backlog of a service that no longer accepts).
+	if (g_handshake_timeout_ms > 0) {
+		ipc_client_set_socket_timeouts(socket, g_handshake_timeout_ms);
+	}
+#endif
+
 	char sock_file[PATH_MAX];
 
 	ssize_t size = u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, sock_file, PATH_MAX);
@@ -821,7 +880,14 @@ ipc_client_posix_dial(struct ipc_connection *ipc_c)
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strcpy(addr.sun_path, sock_file);
+	if (!u_file_copy_unix_socket_path(addr.sun_path, sizeof(addr.sun_path), sock_file)) {
+		IPC_ERROR(ipc_c,
+		          "IPC socket path is %zu bytes, longer than a unix socket address holds (%zu with the "
+		          "terminator) — shorten XDG_RUNTIME_DIR: %s",
+		          strlen(sock_file), sizeof(addr.sun_path), sock_file);
+		close(socket);
+		return -1;
+	}
 
 	ret = connect(socket, (struct sockaddr *)&addr, sizeof(addr));
 	if (ret < 0) {
@@ -981,6 +1047,15 @@ ipc_client_describe_client(struct ipc_connection *ipc_c, const struct xrt_applic
 	struct ipc_client_description desc = {0};
 	desc.info = *a_info;
 	desc.pid = pid; // Extra info.
+#ifdef XRT_OS_ANDROID
+	// #1006: Android has no DISPLAYXR_WORKSPACE_SESSION env from a launching
+	// shell; a client the slot broker admitted into an active workspace overlay
+	// (known only after the connect above) IS a workspace session, so the
+	// controller can enumerate, place and compose it.
+	if (android_globals_get_workspace_overlay_member()) {
+		desc.info.workspace_session = true;
+	}
+#endif
 
 	xrt_result_t xret = ipc_call_instance_describe_client(ipc_c, &desc);
 	if (xret != XRT_SUCCESS) {
@@ -1061,6 +1136,34 @@ ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *o
 #endif
 }
 
+void
+ipc_client_connection_disable_service_launch(void)
+{
+#ifdef XRT_OS_WINDOWS
+	g_service_launch_disabled = true;
+#endif
+}
+
+void
+ipc_client_connection_set_handshake_timeout_ms(uint32_t timeout_ms)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	g_handshake_timeout_ms = timeout_ms;
+#else
+	(void)timeout_ms;
+#endif
+}
+
+bool
+ipc_client_connection_handshake_timed_out(void)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	return g_handshake_timed_out;
+#else
+	return false;
+#endif
+}
+
 xrt_result_t
 ipc_client_connection_init(struct ipc_connection *ipc_c,
                            enum u_logging_level log_level,
@@ -1072,6 +1175,12 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 	ipc_c->imc.ipc_handle = XRT_IPC_HANDLE_INVALID;
 	ipc_c->imc.log_level = log_level;
 	ipc_c->ism_handle = XRT_SHMEM_HANDLE_INVALID;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	const uint32_t hs_timeout_ms = g_handshake_timeout_ms;
+	const uint64_t hs_start_ns = os_monotonic_get_ns();
+	g_handshake_timed_out = false;
+#endif
 
 	// Must be done first.
 	int ret = os_mutex_init(&ipc_c->mutex);
@@ -1130,9 +1239,25 @@ ipc_client_connection_init(struct ipc_connection *ipc_c,
 		goto err_fini; // Already logged.
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the bound covers the handshake only; later calls (a consent
+	// prompt, a long-poll) may legitimately wait longer.
+	if (hs_timeout_ms > 0) {
+		ipc_client_set_socket_timeouts(ipc_c->imc.ipc_handle, 0);
+	}
+#endif
+
 	return XRT_SUCCESS;
 
 err_fini:
+#ifdef XRT_OS_LINUX_DESKTOP
+	// A failure that took the whole bound is the service not answering, not
+	// one of the immediate failures (refused, version skew).
+	if (hs_timeout_ms > 0 &&
+	    os_monotonic_get_ns() - hs_start_ns >= (uint64_t)hs_timeout_ms * U_TIME_1MS_IN_NS * 9u / 10u) {
+		g_handshake_timed_out = true;
+	}
+#endif
 	ipc_client_connection_fini(ipc_c);
 
 	return xret;

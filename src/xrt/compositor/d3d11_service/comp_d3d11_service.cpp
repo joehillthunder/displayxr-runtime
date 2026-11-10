@@ -9,6 +9,8 @@
 
 #include "comp_d3d11_service.h"
 #include "comp_eye_dp_policy.h"
+#include "comp_failsafe_2d_policy.h"
+#include "comp_d3d11_service_formats.h"
 #include "d3d11_service_shaders.h"
 #include "d3d11_bitmap_font.h"
 #include "d3d11_capture.h"
@@ -22,21 +24,35 @@
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_display_status.h"
 
 // #1589/#1610: the shared format-honesty policy (hatch + fast-path predicate).
 #include "util/u_color_encoding.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 #include "util/u_weave_scope.h"
+#include "util/u_tracking_any.h"
+#include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: an element's screen
 #include "util/u_misc.h"
 #include "util/u_system.h"
 #include "util/u_time.h"
 #include "util/u_crash_guard.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_time.h"
 
 #include "util/comp_layer_accum.h"
 // #1580: the ONE per-view camera every layer type is projected through.
 #include "util/comp_layer_view_camera.h"
 #include "util/comp_dp_factory.h"
+// Multi-screen M6/M3 on the service path: the in-process segment manager and
+// the shared routing / publish helpers.
+#include "util/comp_segments_route.h"
+#include "comp_d3d11_outcomp.h"
+#include "comp_d3d11_segments.h"
+#include "xrt/xrt_screen.h"
+#include "xrt/xrt_plugin.h"
+#include "xrt/xrt_stereo_camera.h"
+#include "util/comp_workspace_screens_ipc.h" // ADR-052: the workspace on N screens
 
 #include "comp_d3d11_window.h"
 
@@ -58,9 +74,15 @@
 // compositor (PR 1/6 made it a standalone static lib for exactly this).
 #include "comp_xbridge.h"
 #include "comp_split_gate.h"
+#include "d3d11_lift.h" // XR_DXR_lift (ADR-042)
+#include "comp_d3d11_service_conv.h" // ADR-053 P1a (#2003): the conversion core's D3D11 side
 
 #include "util/u_hud.h"
 #include "util/u_tiling.h"
+#include "util/u_lift_cursor.h"
+#include "util/u_cursor_depth.h"           // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
+#include "util/comp_cursor_look.h"         // the default look, shared with every compositor
+#include "d3d_shared/comp_cursor_shaders.h" // B.7 softening kernel (DXR_SOFTEN)
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -87,6 +109,7 @@
 #include "stb_image_write.h"
 
 #include <atomic>
+#include <memory>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
@@ -172,6 +195,10 @@ static weave_latency_log g_weave_latency_standalone;
 // path honors the knob only (its pacing is the device queue cap inside a
 // synchronous RPC — no per-frame pacer to govern).
 static late_weave_governor g_lw_gov_workspace;
+//! #2564: the workspace chain's frame-latency token ledger (see
+//! comp_weave_latency_win.h): every governor decrease used to strand its
+//! surplus tokens in the waitable for the life of the chain.
+static late_weave_token_ledger g_lw_ledger_workspace;
 
 /*
  * Late-weave phase 1 (DXR_LATE_WEAVE=1). Flattens the present queue
@@ -188,8 +215,12 @@ dxr_late_weave_enabled()
 	if (enabled < 0) {
 		// Default ON: late-weave is the product behavior on every path
 		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage. Read
+		// through u_setting so the Dashboard's Developer settings can set
+		// it for apps it never launched (perf-settings Phase 2B); the
+		// environment still wins. Same parse as before.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;
@@ -335,8 +366,26 @@ struct d3d11_service_image
 	//! The imported texture
 	wil::com_ptr<ID3D11Texture2D> texture;
 
-	//! Shader resource view for compositing
+	//! Shader resource view for compositing. Created in the texture's OWN
+	//! format, so for an `_SRGB` image it DECODES on sample (storage is
+	//! strongly typed — no UNORM view of it can be made). Right for a draw
+	//! into the `_SRGB`-view compose target, which re-encodes on write; wrong
+	//! for a passthrough draw into the UNORM atlas — see @ref raw_copy_srv.
 	wil::com_ptr<ID3D11ShaderResourceView> srv;
+
+	/*!
+	 * #1769: a NON-DECODING copy of an `_SRGB` @ref texture — TYPELESS storage
+	 * of the same family viewed as UNORM — for the passthrough shader draws
+	 * (a zones / Local-2D commit that is not composing, a scaled fast-path
+	 * projection view). Lazily built by service_raw_sample_srv() on first
+	 * use and refreshed by a same-family CopyResource per draw; never built
+	 * for a UNORM image, whose @ref srv is already raw.
+	 */
+	wil::com_ptr<ID3D11Texture2D> raw_copy_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> raw_copy_srv;
+	//! The draw pass that last refreshed @ref raw_copy_tex, so the views of a
+	//! tiled source (every view reads ONE image) cost one copy, not one each.
+	uint64_t raw_copy_pass;
 
 	//! KeyedMutex for cross-process synchronization
 	wil::com_ptr<IDXGIKeyedMutex> keyed_mutex;
@@ -395,6 +444,49 @@ struct d3d11_service_swapchain
  * and display processors, and allows the IPC service to start without creating a
  * window until a client actually connects.
  */
+/*!
+ * ADR-046 Amendment 1: one in-flight depth-patch readback of a lifted rect's
+ * depth map, with how to decode it (the map and its mapping can change per
+ * conversion, so each copy carries the ones it was taken with).
+ */
+struct svc_lift_cursor_rb
+{
+	wil::com_ptr<ID3D11Texture2D> staging; //!< SVC_LIFT_CURSOR_PATCH_MAX square, STAGING, CPU read
+	uint32_t format = 0;                   //!< DXGI_FORMAT of @c staging (R32_FLOAT / R16_FLOAT)
+	bool pending = false;                  //!< a copy is in flight
+	uint64_t seq = 0;                      //!< issue order
+	uint32_t w = 0, h = 0;                 //!< texels copied
+	bool inverse = false;
+	float value_scale = 1.0f, value_offset = 0.0f;
+	float relief_scale = 0.0f, relief_offset = 0.0f;
+};
+
+//! Readbacks in flight per rect: a copy is read 1-2 frames after it is issued.
+#define SVC_LIFT_CURSOR_RB 3
+//! Largest depth patch copied per frame (ADR-046 §6's cap).
+#define SVC_LIFT_CURSOR_PATCH_MAX 64
+
+/*!
+ * ADR-046 Amendment 1: the depth cursor of one lifted stream on a weave client:
+ * its time filter and its patch readbacks. Keyed by lift stream.
+ */
+struct svc_lift_cursor
+{
+	uint64_t stream_id = 0; //!< 0 = free
+	uint64_t last_used_ns = 0;
+	struct u_cursor_depth_filter filter = {};
+	struct svc_lift_cursor_rb rb[SVC_LIFT_CURSOR_RB];
+	uint64_t next_seq = 1;
+	//! The newest readback that completed: content z in front of the screen
+	//! (metres), or no content under the footprint.
+	bool have_sample = false;
+	bool sample_has_content = false;
+	float sample_z = 0.0f;
+	uint64_t sample_seq = 0;
+	uint64_t sample_ns = 0;
+	bool logged = false;
+};
+
 struct d3d11_client_render_resources
 {
 	//! Dedicated-thread window (NULL if using external HWND)
@@ -514,6 +606,10 @@ struct d3d11_client_render_resources
 	 */
 	bool compose_mirrors_atlas;
 
+	//! #1795: last pure-zones compose decision logged for this client
+	//! (0 = none yet, 1 = passthrough, 2 = composing) — on-change WARN only.
+	uint8_t zones_compose_logged;
+
 	//! Standalone atlas-clear bookkeeping. The per-commit clear-to-black is
 	//! only safe when every slot is guaranteed to be re-blitted this frame —
 	//! and it is NOT: the fence / KeyedMutex paths deliberately skip a view's
@@ -602,6 +698,44 @@ struct d3d11_client_render_resources
 
 	//! #1172: last encoding pushed to @ref weave_dp; -1 = unknown (#1016 rule).
 	int weave_dp_encoding;
+
+	/*!
+	 * ADR-060 R2: @ref weave_dp was made WINDOWLESS for its screen
+	 * (`create_dp_d3d11_for_screen`, window NULL) and declared
+	 * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN. It then holds no window
+	 * (the vendor never touches another process's HWND), and every weave of
+	 * this client feeds it `set_present_origin` from the service's own read of
+	 * @ref weave_dp_hwnd, relative to @ref weave_dp_screen_x / _y — the screen
+	 * the DP was bound to. False = the window-bound DP (the pre-R2 path).
+	 */
+	bool weave_dp_windowless;
+
+	//! ADR-060 R2: desktop origin of the screen the windowless @ref weave_dp is bound to.
+	int32_t weave_dp_screen_x;
+	int32_t weave_dp_screen_y;
+
+	//! ADR-060 R2: last origin pushed (WARN on the first only; INFO on change).
+	bool weave_dp_origin_valid;
+	int32_t weave_dp_origin_x;
+	int32_t weave_dp_origin_y;
+
+	/*!
+	 * ADR-060 R3 (XR_DXR_weave v12 §5e on Windows): the window origin THIS
+	 * submit fed the windowless DP's phase, desktop-absolute device px —
+	 * pending until the submit is accepted, then latched with a serial. Only a
+	 * windowless DP reports one: a window-bound vendor weaver reads the window
+	 * itself, so a value the service read would be a different, earlier read.
+	 * Written and read on the client's own thread (weave_submit, then its IPC
+	 * reply).
+	 */
+	bool weave_origin_pending;
+	int32_t weave_origin_pending_x;
+	int32_t weave_origin_pending_y;
+	bool weave_woven_valid;
+	int32_t weave_woven_x;
+	int32_t weave_woven_y;
+	uint64_t weave_woven_serial; //!< of the last latched origin; 0 = none yet
+	uint64_t weave_woven_next;   //!< monotonic counter behind weave_woven_serial
 
 	//! HUD overlay (runtime-owned windows only)
 	struct u_hud *hud;
@@ -718,6 +852,11 @@ struct d3d11_client_render_resources
 	//! Unused when the atlas already fills the mode exactly (zero-copy).
 	wil::com_ptr<ID3D11Texture2D>          weave_crop_tex;
 	wil::com_ptr<ID3D11ShaderResourceView> weave_crop_srv;
+	//! #2289: the client's executable basename, the tag of its per-client
+	//! capture trigger (`%TEMP%\displayxr_atlas_trigger.<tag>`); "" = the
+	//! global trigger only. Set per submit from the IPC handler, like the
+	//! POSIX weave engines' #2207 tag.
+	char                                   weave_capture_tag[64];
 	uint32_t                               weave_crop_w;
 	uint32_t                               weave_crop_h;
 
@@ -759,6 +898,62 @@ struct d3d11_client_render_resources
 	//! One-shot: this client has been reported as using the legacy path (#1058).
 	bool                                   weave_legacy_warned;
 
+	//! XR_DXR_lift (ADR-042): the lift-flagged rects of this client's NEXT
+	//! weave submit (comp_d3d11_service_lift_set_weave_rects), consumed and
+	//! cleared by that submit. Same IPC thread as the submit — no lock.
+	uint32_t                               lift_rect_count;
+	uint64_t                               lift_owner;
+	struct xrt_lift_weave_rect      lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	//! v6 path: RTV on weave_crop_tex, so lifted views can be written into
+	//! the crop before the weave (a lift frame never takes the zero-copy path).
+	wil::com_ptr<ID3D11RenderTargetView>   weave_crop_rtv;
+	//! XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): which lift bindings of the
+	//! last weave submit got the depth cursor (bit = binding index), and each
+	//! lifted stream's cursor state.
+	uint32_t                               lift_cursor_mask;
+	//! Why the last lifted-rect cursor was / was not drawn (logged on change).
+	int                                    lift_cursor_reason;
+	struct svc_lift_cursor                 lift_cursor[XRT_LIFT_WEAVE_RECTS_MAX];
+
+	/*!
+	 * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the weave-rect cursor.
+	 * Same IPC thread as the submit (one connection), so no lock. Nothing here
+	 * is touched by a client that never chains XrCursorDepthWeaveRequestDXR.
+	 * @{
+	 */
+	//! The request staged for the NEXT submit (comp_d3d11_service_weave_set_cursor_request).
+	struct xrt_weave_cursor_request        wc_req_next = {};
+	bool                                   wc_req_next_valid = false;
+	//! What the last submit drew (comp_d3d11_service_weave_get_cursor_state).
+	struct xrt_weave_cursor_state          wc_out = {};
+	//! One filter + HYBRID anchor per client (one pointer per window).
+	struct u_cursor_weave_state            wc_state = {};
+	//! The callers' last depth per rect index (500 ms, u_cursor_weave_memo).
+	struct u_cursor_weave_memo             wc_memo[XRT_WEAVE_CURSOR_MAX_RECTS] = {};
+	uint64_t                               wc_last_req_ns = 0;
+	//! Why the last weave-rect cursor was / was not drawn (logged on change).
+	int                                    wc_reason = 0;
+	//! The held sprite: its generation (0 = none) and kind (XrCursorDepthWeaveSpriteKindDXR).
+	uint64_t                               wc_sprite_gen = 0;
+	uint32_t                               wc_sprite_kind = 0;
+	uint64_t                               wc_sprite_os_cursor = 0;
+	//! OS_CURSOR carrier: the caller's HCURSOR rasterised (comp_cursor_look).
+	struct comp_cursor_look                wc_look = {};
+	uint64_t                               wc_look_uploaded = 0; //!< wc_look.generation in wc_sprite_tex
+	//! The held sprite's pixels (OS_CURSOR raster or TEXTURE copy), TYPELESS
+	//! with a non-decoding and a decoding view.
+	wil::com_ptr<ID3D11Texture2D>          wc_sprite_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> wc_sprite_srv;
+	wil::com_ptr<ID3D11ShaderResourceView> wc_sprite_srv_srgb;
+	uint32_t                               wc_sprite_w = 0, wc_sprite_h = 0;
+	float                                  wc_sprite_hot_x = 0.0f, wc_sprite_hot_y = 0.0f; //!< px
+	float                                  wc_sprite_size_m = 0.0f;
+	//! TEXTURE carrier staged by comp_d3d11_service_weave_set_cursor_sprite_texture (owned).
+	HANDLE                                 wc_tex_handle = nullptr;
+	bool                                   wc_tex_is_dxgi = false;
+	struct xrt_weave_cursor_sprite_texture wc_tex_info = {};
+	//! @}
+
 	//! Cached import of the caller's v4 overlay atlas (browser#18), keyed by the
 	//! shared-handle value exactly like weave_input_* above. A window-sized
 	//! premultiplied-alpha RGBA atlas the runtime composites OVER the woven
@@ -770,6 +965,49 @@ struct d3d11_client_render_resources
 	wil::com_ptr<ID3D11Texture2D>          weave_overlay_tex;
 	wil::com_ptr<ID3D11ShaderResourceView> weave_overlay_srv;
 	wil::com_ptr<IDXGIKeyedMutex>          weave_overlay_km;
+	//! Last overlay route logged (ADR-027 Amendment): true = the DP took it
+	//! into the weave via set_overlay_2d, false = the runtime's post-weave blit.
+	bool                                   weave_overlay_in_dp;
+	bool                                   weave_overlay_route_logged;
+	//! XR_DXR_weave v14: the next submit's overlay is unchanged (set by
+	//! comp_d3d11_service_weave_set_overlay_unchanged, consumed by the submit).
+	bool                                   weave_overlay_unchanged_next;
+	//! XR_DXR_weave v15: the next submit's overlay lens-filter strength [0,1];
+	//! negative = the DP's default. Consumed (reset to -1) by the submit.
+	float                                  weave_overlay_filter_strength_next;
+
+	//! DXR_WEAVE_GPU_TIMING=1 diagnostic (ADR-027 Amendment perf A/B; "2D under
+	//! the lens" P0 instrumentation). Per weave_submit: a disjoint + kWeaveTs
+	//! timestamp queries bracketing each GPU stage (WEAVE_TS_*), read back
+	//! non-blocking frames late (a slot still in flight when the ring wraps is
+	//! dropped, never waited on), plus CPU wall times of the lock / keyed-mutex
+	//! waits and of the whole synchronous submit. Aggregated and logged once
+	//! every 5 s. Queries are created lazily, only when the env var is set; the
+	//! all-zero state is the valid initial state.
+	static constexpr uint32_t kWeaveGpuRing = 8;
+	static constexpr uint32_t kWeaveTs = 6;
+	struct weave_timing_stat
+	{
+		double sum;
+		double max;
+		uint32_t n;
+	};
+	wil::com_ptr<ID3D11Query>              weave_gpu_disjoint[kWeaveGpuRing];
+	wil::com_ptr<ID3D11Query>              weave_gpu_ts[kWeaveGpuRing][kWeaveTs];
+	bool                                   weave_gpu_pending[kWeaveGpuRing];
+	uint8_t                                weave_gpu_path[kWeaveGpuRing];  //!< WEAVE_PATH_*
+	uint8_t                                weave_gpu_route[kWeaveGpuRing]; //!< WEAVE_OV_*
+	uint32_t                               weave_gpu_head;
+	weave_timing_stat                      weave_gpu_stage[7];   //!< ms, by WEAVE_GPU_*
+	uint32_t                               weave_gpu_n;          //!< frames read back
+	uint32_t                               weave_gpu_n_disjoint; //!< frames discarded (disjoint)
+	weave_timing_stat                      weave_cpu_stage[5];   //!< ms, by WEAVE_CPU_*
+	uint32_t                               weave_cpu_n;          //!< accepted submits
+	uint32_t                               weave_cpu_refused;    //!< refused after render_mutex
+	uint32_t                               weave_cpu_path_n[4];  //!< accepted submits by WEAVE_PATH_*
+	uint32_t                               weave_cpu_route_n[3]; //!< accepted submits by WEAVE_OV_*
+	uint32_t                               weave_cpu_ov_unchanged; //!< overlay declared unchanged (v14)
+	int64_t                                weave_gpu_last_log_ns;
 
 	//! Deferred auto-3D for no-zones standalone clients (#140 / no-zones-2D).
 	//! A non-workspace IPC handle app with no zone mask never triggers a 3D
@@ -787,6 +1025,94 @@ struct d3d11_client_render_resources
 /*!
  * D3D11 service native compositor.
  */
+/*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): one client's runtime-drawn
+ * cursor requests. Zero-initialised and never touched for a client that never
+ * asks (§0: no request, no state).
+ *
+ * A request arrives (`compositor_set_cursor_draw_request`) right before the
+ * commit it belongs to; that commit moves it from @ref pending to @ref frame (a
+ * commit without one clears @ref frame - a request covers one frame). A direct
+ * client's cursor is drawn into its atlas there and then; under the shell the
+ * render thread reads @ref frame to lift the workspace cursor onto the window.
+ * The outcome (#1952) is answered with the NEXT request.
+ */
+struct svc_client_cursor_draw
+{
+	//! Guards everything below except @ref pending / @ref pending_valid, which
+	//! only this client's IPC thread touches. Written by that thread (request +
+	//! commit), read by the render thread (the shell lift). A LEAF.
+	std::mutex mutex;
+
+	bool pending_valid = false;
+	uint64_t pending_seq = 0;
+	struct ipc_cursor_draw_request pending = {};
+
+	//! The request the LAST commit carried (false: it carried none).
+	bool frame_valid = false;
+	uint64_t frame_seq = 0;
+	struct ipc_cursor_draw_request frame = {};
+	uint64_t next_seq = 0;
+
+	//! The latest decision about a request of this client (seq 0 = none yet).
+	uint64_t outcome_seq = 0;
+	bool outcome_drew = false;
+	uint32_t outcome_reason = 0;
+
+	//! One-time notices (never per frame).
+	bool announced = false;
+	bool warned_zone = false;
+	bool warned_lag = false;
+};
+
+/*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): one client's
+ * measured-disparity state - the in-process D3D11 compositor's, moved into the
+ * service. Zero-initialised and never touched for a client that never asks.
+ *
+ * A request arrives (`compositor_set_cursor_measure_request`) right before the
+ * commit it belongs to. That commit copies a cursor-sized patch of the two
+ * outermost views of its first projection layer into a staging slot (while it
+ * still holds the views), and later commits read the slot back without waiting
+ * and block-match it. The reply to each request is the newest result.
+ * Everything here is touched only on this client's IPC thread, except the
+ * result, which the reply reads under @ref result_mutex.
+ */
+struct svc_client_cursor_measure
+{
+	bool pending_valid = false;
+	struct u_cursor_measure_request pending = {};
+
+	struct
+	{
+		//! Both views' copies, stacked (view A rows 0..h-1, view B h..2h-1).
+		wil::com_ptr<ID3D11Texture2D> staging;
+		UINT w = 0, h = 0;
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		bool in_flight = false;
+		struct u_cursor_measure_request req = {};
+		struct u_cursor_measure_plan plan = {};
+		enum u_cursor_measure_format mformat = U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	} slot[3];
+	uint32_t next_slot = 0;
+	uint32_t in_flight = 0;
+	struct u_cursor_measure_cache cache = {};
+
+	//! Newest finished measurement; a LEAF.
+	std::mutex result_mutex;
+	struct u_cursor_measure_result result = {};
+
+	bool announced = false;
+	bool warned_format = false;
+	uint32_t stat_n = 0, stat_reused = 0;
+	uint64_t stat_cpu_ns = 0, stat_cpu_max_ns = 0;
+};
+
+//! Phase 4: requests the render thread may leave unanswered before the reply
+//! reports the frame as not drawn (under the shell the lift decision is the
+//! render tick's, which runs at its own rate).
+#define SVC_CURSOR_OUTCOME_MAX_LAG 3u
+
 struct d3d11_service_compositor
 {
 	//! Base native compositor - must be first!
@@ -814,6 +1140,11 @@ struct d3d11_service_compositor
 
 	//! App's HWND from XR_DXR_win32_window_binding (for lazy standalone init)
 	HWND app_hwnd;
+
+	//! G7 / roadmap §5.2: the conversion eyes key of the DP that last answered
+	//! this client's eye query (its address; 0 = none yet). Written under
+	//! render_mutex by the eye query, read lock-free by the lift submit paths.
+	std::atomic<uint64_t> conv_eyes_key{0};
 
 	//! #1018: serialises this client's ATLAS WRITE SET against readers.
 	//!
@@ -843,6 +1174,15 @@ struct d3d11_service_compositor
 	//! than added to it — a "sleep the remainder" schedule drifts past one
 	//! period and lands the presenter at half rate.
 	int64_t pace_deadline_ns;
+
+	//! #2245 (ADR-047 Amendment 9): the refresh rate this client is paced at —
+	//! its window's majority screen's (svc_client_update_screen_hz, its IPC
+	//! thread, once per commit); 0 = not evaluated yet = `sys->refresh_rate`.
+	//! Read by the render thread and predict / wait frame (svc_client_hz).
+	std::atomic<float> screen_hz{0.0f};
+	//! #2245 gate: the monitor last held at the primary's rate because another
+	//! adapter scans it out (0 = none) — change-only logging, the IPC thread.
+	uint64_t screen_gated_monitor;
 
 	//! #1018: the client process's OS-DERIVED pid (#954 identity — never the
 	//! client's own claim). Set by the IPC server right after session create.
@@ -875,6 +1215,109 @@ struct d3d11_service_compositor
 	uint32_t pipe_tile_columns;
 	uint32_t pipe_tile_rows;
 	bool pipe_frame_ready;
+
+	/*!
+	 * Multi-screen M6/M3 on the service path (ADR-047 Amendment 3): this
+	 * client's window, when it spans monitors, is woven per screen by the
+	 * direct pipeline — the in-process compositor's segment manager, made on
+	 * the OUTPUT device. Opt-in: nothing here exists until the client sends
+	 * `compositor_segments_enable` (its oxr session does that only on a box
+	 * with two DP-backed screens), so a single-screen client is untouched.
+	 *
+	 * Threads. `segments`, `seg_outcomp` and `seg_device` are the render
+	 * thread's (it creates, updates and records them holding render_mutex);
+	 * compositor_destroy frees them under render_mutex too. `seg_mutex`
+	 * guards the hand-offs: the screen list (written by the IPC thread), the
+	 * published table (read by the IPC thread at xrLocateViews) and every
+	 * swap of `segments` (the IPC thread reads segment eyes through it).
+	 * Leaf lock: nothing is waited on while holding it.
+	 *
+	 * `seg_route` is the routing the client's last splitting locate handed
+	 * back; it is written and read only on this client's own IPC thread
+	 * (set_view_routing, then layer_commit — one connection, in order).
+	 */
+	std::mutex seg_mutex;
+	struct xrt_screen_list *seg_screens;             //!< heap copy; NULL = segmentation not enabled
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	uint64_t seg_pinned_display_id;
+	/*!
+	 * ADR-060 R2: the screen list the IPC server OFFERED at weave_bind_window
+	 * (heap copy, under @ref seg_mutex). Inert until this client's weave DP
+	 * turns out windowless: then it becomes @ref seg_screens (pin 0), so the
+	 * split rule holds — a windowless vendor weaver interlaces everything it is
+	 * handed, so a window reaching a 2D monitor must be cut per screen by the
+	 * runtime. A client whose DP stayed window-bound never uses it.
+	 */
+	struct xrt_screen_list *weave_offered_screens;
+	bool seg_rebuild; //!< a new list arrived: rebuild the manager on the next weave
+	struct comp_d3d11_segments *segments;
+	struct comp_d3d11_outcomp *seg_outcomp; //!< flat-2D fill, on @ref seg_device
+	ID3D11Device *seg_device;               //!< the device the two above were made on
+	struct xrt_segment_metrics seg_pub;     //!< the table the last direct weave took
+	//! When a direct weave of this client last published @ref seg_pub
+	//! (monotonic ns). A table older than SVC_SEG_PUB_FRESH_NS is not handed
+	//! out: the client is no longer the direct presenter (focus moved, the
+	//! workspace took over, its frames stalled), so it locates one view set.
+	int64_t seg_pub_ns;
+	struct xrt_segment_view_routing seg_route;
+	/*!
+	 * #1883: the per-segment partition this client's atlas is painted with.
+	 * `seg_route_painting` is set by this commit's projection pass when it
+	 * placed views routed (IPC thread); `seg_content_painted` is held with
+	 * the #1140 `painted_*` recipe (it changes only when the atlas does); and
+	 * `pipe_seg_content` is its copy published with `pipe_content_*` under
+	 * @ref seg_mutex, which the render thread's segment crop reads — so each
+	 * segment DP weaves the views painted for it, never a sliver of its
+	 * neighbour's cut at the live window's seam during a drag.
+	 */
+	bool seg_route_painting;
+	struct comp_segments_content seg_content_painted;
+	struct comp_segments_content pipe_seg_content;
+
+	/*!
+	 * Multi-screen M6 for a present-owner (#1884, ADR-047 Amendment 4): an
+	 * XR_DXR_weave caller's bound window, when it spans monitors, is woven per
+	 * screen by weave_submit — a segment manager of its own, separate from the
+	 * direct pipeline's above, because the woven handback lives on the RENDER
+	 * device (`sys->device`, where the #1172 ingest DP is), not the output
+	 * device, and because the two paths run on different threads. Built from
+	 * the same opt-in screen list (`seg_screens`), so a client that never sent
+	 * `compositor_segments_enable` is never segmented here either.
+	 *
+	 * Threads. `weave_segs`, `weave_seg_outcomp` and `weave_seg_device` belong
+	 * to weave_submit / the weave snap, which both hold render_mutex;
+	 * compositor_destroy frees them under it too. `weave_seg_rebuild` and
+	 * `weave_seg_pub` / `weave_seg_out` are guarded by `seg_mutex` (the list is
+	 * written by any IPC thread; the table is read by `weave_get_segments`).
+	 */
+	bool weave_seg_rebuild; //!< a new list arrived: rebuild the weave manager on the next submit
+	struct comp_d3d11_segments *weave_segs;
+	struct comp_d3d11_outcomp *weave_seg_outcomp; //!< flat-2D fill, on @ref weave_seg_device
+	ID3D11Device *weave_seg_device;
+	//! The last accepted submit's table, eyes zeroed: the change-only generation source.
+	struct xrt_segment_metrics weave_seg_pub;
+	//! The same table with every segment's eyes, as the submit predicted them.
+	struct xrt_segment_metrics weave_seg_out;
+	//! When @ref weave_seg_out was last published (monotonic ns). A zone-scoped
+	//! locate frames an element from it only while it is fresh
+	//! (SVC_SEG_PUB_FRESH_NS): a window whose weaves stopped keeps its session's
+	//! own framing (comp_d3d11_service_get_zone_weave_screen).
+	int64_t weave_seg_out_ns;
+
+	/*!
+	 * ADR-052 D2 — per-screen views of a WORKSPACE tile (a placed slot of the
+	 * compose path). Nothing is published by a render thread: the framing is
+	 * built on demand at the client's xrLocateViews from the slot's placement
+	 * and the workspace screen set (svc_ws_client_framing).
+	 *
+	 * `ws_seg_pub` (guarded by `seg_mutex`) is the last per-segment table
+	 * handed to the client, eyes zeroed — the change-only generation source.
+	 * `ws_frame_logged` / `ws_table_logged` are change-only lifecycle-log keys
+	 * touched only on this client's own IPC thread (both readers run there).
+	 */
+	struct xrt_segment_metrics ws_seg_pub;
+	uint64_t ws_frame_logged;
+	uint64_t ws_table_logged;
 
 	//! #1140: the recipe the per-client atlas ACTUALLY HOLDS — the per-view
 	//! content dims and the view count of the last commit that PAINTED it.
@@ -923,6 +1366,23 @@ struct d3d11_service_compositor
 	//! than fall back to the shared panel DP. Once, not per frame: the condition
 	//! is sticky (`weave_dp_refused`) and the frames are 60+/s.
 	std::atomic<bool> weave_dp_missing_logged{false};
+
+	//! Weave-idle release: monotonic ns of this present-owner's last
+	//! xrWeaveSubmitDXR (0 = never). Written by the submit (IPC thread), read by
+	//! the render thread — see pipeline_weave_idle_release_if_due.
+	std::atomic<int64_t> weave_last_submit_ns{0};
+	//! Weave-idle release: the DPs were released because this present-owner
+	//! stopped weaving. Render thread only, under render_mutex.
+	bool weave_idle_released = false;
+	//! Weave-idle release: the release also retired a panel DP that lived on
+	//! the service window (the #1172/#939 ingest-DP case), so the resume must
+	//! put one back there. Render thread only, under render_mutex.
+	bool weave_idle_rebind_panel = false;
+	//! Weave-idle release: guards `render.weave_dp` between its lazy create in
+	//! svc_ensure_client_weave_dp (IPC thread, deliberately OUTSIDE render_mutex)
+	//! and the idle release (render thread). The render thread only ever
+	//! try_locks it, so it can never wait on a vendor DP create (#925).
+	std::mutex weave_dp_mutex;
 
 	//! #964: pacing state for this client's presenter when it is an APP_HWND —
 	//! a foreign, frequently occluded window the render thread must never
@@ -1052,6 +1512,17 @@ struct d3d11_service_compositor
 	//! apples per-app frame-rate comparison.
 	int64_t last_commit_ns;
 
+	//! ADR-061: the attached share tap. Linkage guarded by g_svc_share_mutex;
+	//! @ref share_tap_active is the lock-free per-commit test.
+	std::shared_ptr<struct svc_share_tap> share_tap;
+	std::atomic<bool> share_tap_active{false};
+	//! ADR-061: what the last commit packed, for the enumeration (a stale read
+	//! only mislabels one listing).
+	std::atomic<int64_t> share_last_commit_ns{0};
+	std::atomic<uint32_t> share_active_views{0};
+	//! ADR-061: the unset-view-count fallback has been logged for this client.
+	bool share_views_fallback_logged = false;
+
 	//! App-initiated rendering-mode request (#575). The client's
 	//! xrRequestDisplayRenderingModeDXR crosses IPC into the
 	//! request_rendering_mode / request_display_mode vtable methods, which run
@@ -1167,6 +1638,15 @@ struct d3d11_service_compositor
 	uint64_t read_done_value;      //!< last value queued on the signal (commit thread only)
 	int64_t read_done_drop_log_ns; //!< 1/s throttle for the drop-not-defer log
 
+	//! #2320 -- commit-semaphore wait for clients NOT on the workspace_sync_fence
+	//! path (the D3D12 IPC client). All on the client's IPC thread.
+	bool commit_sem_stale = false;              //!< this commit's semaphore timed out: views stale
+	bool commit_sem_wait_logged = false;        //!< WARN-once oracle
+	int64_t commit_sem_window_start_ns = 0;     //!< [FENCE] commit_sem 10 s window
+	uint32_t commit_sem_complete_in_window = 0; //!< already complete, no wait
+	uint32_t commit_sem_reached_in_window = 0;  //!< reached within the bounded wait
+	uint32_t commit_sem_timeout_in_window = 0;  //!< timed out -> views stale, tile reused
+
 	//! XR_DXR_display_zones (#551) — standalone wish-over-IPC publish state.
 	//! Mirrors the in-process auto-wish raster (comp_d3d11_compositor's
 	//! d3d11_update_zone_wish_mask): an R8_UNORM union-of-zone-rects mask,
@@ -1250,6 +1730,12 @@ struct d3d11_service_compositor
 	uint32_t wish_watchdog_submits;
 	bool wish_watchdog_armed;
 	bool wish_watchdog_done;
+
+	//! XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4).
+	struct svc_client_cursor_draw cursor_draw;
+
+	//! XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6).
+	struct svc_client_cursor_measure cursor_measure;
 };
 
 /*!
@@ -1289,6 +1775,9 @@ struct compose_copy_cache
 	wil::com_ptr<ID3D11ShaderResourceView> srv;
 	uint32_t w{0};
 	uint32_t h{0};
+	//! #1765: the SOURCE format the cache was built for. A change re-creates
+	//! it — a CopyResource across typeless families is silently dropped.
+	DXGI_FORMAT fmt{DXGI_FORMAT_UNKNOWN};
 	//! True once at least one acquire+copy succeeded (until then there is
 	//! nothing valid to sample — the caller skips the draw, matching the
 	//! HUD cache's first-frame-before-acquire behavior).
@@ -1308,6 +1797,10 @@ struct overlay_slot
 	float size_w_m;            //!< Physical overlay width in meters
 	float size_h_m;            //!< Physical overlay height in meters
 	bool  stereo_sbs;          //!< spec_version 19: image is side-by-side stereo
+	//! spec_version 26 (ADR-052 Amendment 2): the screen it lives on; 0 = the
+	//! primary. Resolved per frame (comp_ws_overlay_screen): a screen that is
+	//! not a live secondary presenter draws it on the primary.
+	uint64_t screen_id;
 	struct compose_copy_cache copy_cache; //!< #925 S5 service-owned copy
 };
 
@@ -1360,10 +1853,14 @@ struct ws_command
 	struct d3d11_service_compositor *xc;
 	//! Target for *_SLOT / SET_FOCUS / EXIT_SLOT commands.
 	int slot;
-	//! SET_POSE payload.
+	//! SET_POSE payload. `pose` / `width_m` / `height_m` are always in the
+	//! PRIMARY screen's display space (a placement on another screen is mapped
+	//! at enqueue); `screen_id` is the anchor the controller placed it on
+	//! (0 = the primary — every pre-spec_version-25 set_pose).
 	struct xrt_pose pose;
 	float width_m;
 	float height_m;
+	uint64_t screen_id;
 	//! SET_VIS / INPUT_GRAB payload.
 	bool flag;
 	//! SET_CAP payload.
@@ -1406,6 +1903,13 @@ struct d3d11_service_system
 	//! Base system compositor - must be first!
 	struct xrt_system_compositor base;
 
+	//! The head panel's origin as the plug-in reported it at create time
+	//! (see @ref comp_d3d11_service_create_system). `base.info`'s origin is
+	//! still zero while create_system runs, so the create-time adapter and
+	//! split decisions read the panel's monitor from here.
+	int32_t create_panel_left = 0;
+	int32_t create_panel_top = 0;
+
 	//! spec_version 13: controller-pushed cursor sprite source. The controller
 	//! creates a session-global swapchain (xrCreateWorkspaceCursorSwapchainDXR),
 	//! renders its sprite into it, and points the runtime at it via
@@ -1435,6 +1939,10 @@ struct d3d11_service_system
 	//! #925 S5: service-owned copy of the controller's cursor swapchain
 	//! (DXR_COMPOSE_FROM_COPY).
 	struct compose_copy_cache cursor_copy_cache;
+	//! ADR-046 Amendment 1: the system-arrow sprite the service draws on lifted
+	//! content (created on first use; @c lift_cursor_sprite_failed stops retries).
+	wil::com_ptr<ID3D11ShaderResourceView> lift_cursor_sprite_srv;
+	bool lift_cursor_sprite_failed;
 
 	//! #308 (spec_version 18): controller input grab is active (modal UI like the
 	//! launcher band is up). While set, the cursor renders at z = 0 (zero
@@ -1537,6 +2045,15 @@ struct d3d11_service_system
 	//! every blit output to emit scene-linear (so content + chrome all reach the
 	//! DP linear). Bound once per frame; left at 0 for Model A.
 	wil::com_ptr<ID3D11Buffer> color_linearize_cb;
+	//! The IPC-thread twin: an immutable all-zero b1. Every blit a client's
+	//! commit thread issues on the shared context binds THIS, so a client's
+	//! own tile blits never see the render thread's linearize flag (b1 is
+	//! sticky across threads — with it at 1 under Model B, a zones app's
+	//! ordinary `blit_ps` decoded its content on the way INTO its atlas, and
+	//! the combine pass decoded it again: too dark whenever a second client
+	//! put the compose on Model B). The combine pass re-binds
+	//! `color_linearize_cb` inside every lock hold for the same reason.
+	wil::com_ptr<ID3D11Buffer> color_passthrough_cb;
 
 	//! Constant buffer for layer rendering
 	wil::com_ptr<ID3D11Buffer> layer_constant_buffer;
@@ -1674,6 +2191,12 @@ struct d3d11_service_system
 	//! render_mutex / c->mutex / atlas_submit_mutex → this.
 	std::mutex immediate_ctx_mutex;
 
+	//! XR_DXR_lift (ADR-042): the lift module — its own thread, device and
+	//! display processor (d3d11_lift.h). Created lazily on the first lift call
+	//! under @ref lift_create_mutex; destroyed first in system_destroy.
+	struct d3d11_lift *lift = nullptr;
+	std::mutex lift_create_mutex;
+
 	//! Count of threads currently blocked acquiring render_mutex through
 	//! render_mutex_fair_lock (every acquirer EXCEPT the capture render
 	//! thread). std::recursive_mutex has no waiter fairness, and with SR v2
@@ -1724,6 +2247,10 @@ struct d3d11_service_system
 	 * @{
 	 */
 	std::atomic<int64_t> render_diag_window_start_ns{0};
+	//! ADR-051: the last completed [RENDER] window as data (the log formats it);
+	//! guarded by @ref render_diag_last_mutex, read by comp_d3d11_service_get_render_diag.
+	std::mutex render_diag_last_mutex;
+	struct comp_d3d11_render_diag render_diag_last = {};
 	std::atomic<uint32_t> render_diag_capture_renders{0};
 	std::atomic<int64_t> render_diag_capture_render_total_ns{0};
 	std::atomic<uint32_t> render_diag_client_renders{0};
@@ -1823,6 +2350,30 @@ struct d3d11_service_system
 	void *workspace_wakeup_event; // HANDLE on Win32, opaque void* in header
 
 	/*!
+	 * @name The workspace's screens (ADR-052, XR_DXR_spatial_workspace v25)
+	 *
+	 * The set every controller-facing screen answer is built from: the
+	 * service's screen registry projected through `comp_ws_screens_build`.
+	 * Rebuilt by the IPC server on workspace activation, on every display
+	 * re-probe (a monitor added / removed / moved, a claim changed) and on
+	 * `workspace_enumerate_screens`; @ref ws_screens_generation moves only
+	 * when the set really changed. `ws_screens_mutex` is a LEAF guarding all
+	 * four fields (IPC threads write, the drain and the pose setters read).
+	 * @{
+	 */
+	std::mutex ws_screens_mutex;
+	struct comp_ws_screen_set ws_screens;
+	uint32_t ws_screens_generation;
+	//! The controller has enumerated at least once: it gets SCREENS_CHANGED.
+	bool ws_screens_optin;
+	//! The generation the controller last saw (enumerated or was told).
+	uint32_t ws_screens_gen_emitted;
+	//! The registry list @ref ws_screens was built from — what a secondary
+	//! presenter's screen binding is filled from (ADR-052 D1).
+	struct xrt_screen_list ws_screen_list;
+	/*! @} */
+
+	/*!
 	 * #918 OUTPUT-DEVICE SPLIT. Stood up by Stage A in
 	 * `comp_d3d11_service_create_system` when `DXR_WEAVE_ON_SCANOUT=1` resolves
 	 * a scanout adapter that is not the app's; NULL/false otherwise, and then
@@ -1918,6 +2469,13 @@ struct d3d11_service_system
 	uint32_t split_layout_rows{1};
 	//! Monotonic app-frame counter — the one sequence every bridge fence uses.
 	uint64_t split_seq{0};
+	/*!
+	 * #1883: the multi-screen content partition each submitted frame's atlas
+	 * was painted with, keyed by @ref split_seq — the slot the direct segment
+	 * weave consumes can be a tick older than the frame it submitted.
+	 * Render thread only.
+	 */
+	struct comp_segments_content_ring split_seg_content_ring = {};
 
 	/*!
 	 * #918 PR 4 — the OUTPUT-DEVICE crop, and the one thing on the output half
@@ -1978,6 +2536,41 @@ struct d3d11_service_system
 	//! an in-process or imported-swapchain client, which have no keyed mutex to
 	//! acquire in the first place.
 	std::atomic<uint32_t> render_diag_ui_acq_skip{0};
+
+	/*!
+	 * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): what the service's
+	 * runtime-drawn cursor needs, built on the FIRST request and never before
+	 * (§0: a service whose clients never ask pays nothing).
+	 * @{
+	 */
+	//! Guards the default look and its texture. Taken by the commit of any
+	//! direct client (several IPC threads); a LEAF - never held across a draw.
+	std::mutex cursor_look_mutex;
+	//! The default look (A.6): the mirrored OS cursor, else the classic arrow
+	//! (comp_cursor_look, shared with every in-process compositor).
+	struct comp_cursor_look cursor_look = {};
+	//! The look's pixels, TYPELESS, with a non-decoding and a decoding view (a
+	//! composing commit samples the latter into its `_SRGB` target).
+	wil::com_ptr<ID3D11Texture2D> cursor_look_tex;
+	wil::com_ptr<ID3D11ShaderResourceView> cursor_look_srv;
+	wil::com_ptr<ID3D11ShaderResourceView> cursor_look_srv_srgb;
+	uint64_t cursor_look_generation = 0;
+	//! The shared cursor shaders (d3d_shared/comp_cursor_shaders.h, the ones
+	//! every in-process D3D compositor draws its cursor with): the plain pixel
+	//! shader, the B.7 `DXR_SOFTEN` one, and the latter under the compose pass's
+	//! colour model (`DXR_SVC_LINEARIZE`), plus their two constant buffers.
+	//! Built on the first draw that needs them; `cursor_shaders_tried` keeps a
+	//! failure from retrying every frame.
+	std::mutex cursor_shaders_mutex;
+	bool cursor_shaders_tried = false;
+	bool cursor_shaders_ok = false;
+	wil::com_ptr<ID3D11VertexShader> cursor_vs;
+	wil::com_ptr<ID3D11PixelShader> cursor_ps;          //!< as stored (no colour arithmetic)
+	wil::com_ptr<ID3D11PixelShader> cursor_ps_soft;     //!< B.7 kernel
+	wil::com_ptr<ID3D11PixelShader> cursor_ps_soft_lin; //!< B.7 kernel + the pass's linearize flag (b2)
+	wil::com_ptr<ID3D11Buffer> cursor_cb_quad;          //!< b0: CursorQuadConstants
+	wil::com_ptr<ID3D11Buffer> cursor_cb_soften;        //!< b1: CursorSoftenConstants
+	/*! @} */
 };
 
 /*!
@@ -2231,18 +2824,19 @@ service_split_stage_a(struct d3d11_service_system *sys,
 
 	/*
 	 * The panel's screen ORIGIN. At this point in create_system
-	 * `sys->base.info.display_screen_left/top` are still the pre-DP zeros — the
-	 * real values arrive with the first display processor, which needs a window,
-	 * which needs a client. That is not the problem it looks like: the service's
-	 * display processor is created for COMP_DP_PRIMARY_MONITOR (see every
-	 * `comp_dp_factory_for_window` call in this file), and a 0,0 origin plus
-	 * `MONITOR_DEFAULTTONEAREST` resolves to exactly that monitor. If the
-	 * service ever drives a non-primary panel this has to move to the first
-	 * DP-backed frame; today it would be resolving a monitor the service never
-	 * presents to.
+	 * `sys->base.info.display_screen_left/top` are still zero: the instance
+	 * fills them only after the system compositor exists. The service's display
+	 * processor is created for COMP_DP_PRIMARY_MONITOR, which is the ACTIVE
+	 * PLUG-IN's panel (`xrt_dp_registry_primary_entry`), not the Windows
+	 * primary monitor; a zero origin + `MONITOR_DEFAULTTONEAREST` resolved the
+	 * Windows primary instead, so on a rig whose head panel is not the monitor
+	 * at the desktop origin the split chose its output adapter for a monitor
+	 * the service never presents to. The instance now hands in the origin the
+	 * plug-in reported (#2577 follow-up); (0, 0), unknown or the panel really
+	 * at the origin, resolves exactly as before.
 	 */
-	const int32_t panel_left = sys->base.info.display_screen_left;
-	const int32_t panel_top = sys->base.info.display_screen_top;
+	const int32_t panel_left = sys->create_panel_left;
+	const int32_t panel_top = sys->create_panel_top;
 
 	if (comp_split_gate_env_requested()) {
 		const uint64_t stage_a_start_ns = os_monotonic_get_ns();
@@ -2536,6 +3130,136 @@ struct combine_ctx_lock
 
 /*
  *
+ * ADR-052: a SECONDARY presenter's compose pass.
+ *
+ * The workspace composes once per presenter with the same code (the compose
+ * pass below). For the primary nothing is overridden and every reader sees
+ * exactly what it always saw. For a secondary presenter the render thread
+ * installs a `svc_ws_pass` for the duration of its pass: window geometry stays
+ * in the PRIMARY's display space (that is where every slot's pose lives), and
+ * the pass says where that space lands in the presenter's pixels — the
+ * primary's centre in the presenter's pixels and the primary's pixel pitch.
+ * Through desktop pixels that is ADR-052 D2's mapping exactly (footprint-
+ * continuous at the seam). The override is thread-local, so no other thread
+ * ever reads a secondary presenter's geometry.
+ *
+ */
+
+struct svc_ws_presenter; // defined with the presenter machinery (after the compose pass)
+
+struct svc_ws_pass
+{
+	uint32_t px_w; //!< The presenter's panel / atlas size.
+	uint32_t px_h;
+	float w_m; //!< Its physical size.
+	float h_m;
+	float cx_px; //!< The primary display's centre, in the presenter's pixels.
+	float cy_px;
+	float ppm_x; //!< Primary-space metres -> pixels (1 / the primary's pixel pitch).
+	float ppm_y;
+	int32_t origin_dx; //!< Presenter desktop origin minus the primary's (workspace px).
+	int32_t origin_dy;
+	uint32_t primary_px_w; //!< The primary's panel size (view-dims scaling).
+	uint32_t primary_px_h;
+	uint64_t screen_id; //!< The presenter's screen (ADR-052 Amendment 2: its overlays).
+};
+
+//! Installed by the render thread around a secondary presenter's pass; NULL otherwise.
+static thread_local const struct svc_ws_pass *t_ws_pass = nullptr;
+
+struct d3d11_multi_compositor;
+//! The live secondary presenters' screen ids (render thread; defined with the presenters).
+static uint32_t
+svc_ws_presenter_ids(const struct d3d11_multi_compositor *mc, uint64_t *out_ids, uint32_t cap);
+
+//! Display geometry as the compose pass sees it: the primary's, or the presenter's in a pass.
+static inline uint32_t
+svc_geom_px_w(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->px_w : sys->base.info.display_pixel_width;
+}
+
+static inline uint32_t
+svc_geom_px_h(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->px_h : sys->base.info.display_pixel_height;
+}
+
+static inline float
+svc_geom_w_m(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->w_m : sys->base.info.display_width_m;
+}
+
+static inline float
+svc_geom_h_m(const struct d3d11_service_system *sys)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->h_m : sys->base.info.display_height_m;
+}
+
+/*!
+ * Primary-space metres -> the pass's pixels: in a pass, the frame's centre
+ * becomes the primary's centre in the presenter's pixels and the scale the
+ * primary's pitch. No-op outside a pass (the caller's values stand).
+ */
+static inline void
+svc_ws_pass_frame(float *half_px_x, float *half_px_y, float *px_per_m_x, float *px_per_m_y)
+{
+	if (t_ws_pass == nullptr) {
+		return;
+	}
+	*half_px_x = t_ws_pass->cx_px;
+	*half_px_y = t_ws_pass->cy_px;
+	*px_per_m_x = t_ws_pass->ppm_x;
+	*px_per_m_y = t_ws_pass->ppm_y;
+}
+
+//! The cursor's workspace-pixel offset of the pass (0 outside one).
+static inline int32_t
+svc_ws_pass_origin_dx(void)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->origin_dx : 0;
+}
+
+static inline int32_t
+svc_ws_pass_origin_dy(void)
+{
+	return t_ws_pass != nullptr ? t_ws_pass->origin_dy : 0;
+}
+
+/*!
+ * Where one compose pass draws: the service window's combined atlas for the
+ * primary, a presenter's own atlas for a secondary.
+ */
+struct svc_compose_target
+{
+	ID3D11RenderTargetView *rtv;      //!< `R8G8B8A8_UNORM`, byte-exact (clear + Model A).
+	ID3D11RenderTargetView *rtv_srgb; //!< `_SRGB` encode-on-write view (Model B), may be NULL.
+	ID3D11DepthStencilView *dsv;      //!< Depth sibling (window occlusion).
+	bool encodes_on_write;            //!< This pass's combine-target choice (#1764).
+};
+
+//! The pass's combine RTV — `multi_combine_rtv` for a target.
+static inline ID3D11RenderTargetView *
+svc_compose_rtv(const struct svc_compose_target *t)
+{
+	if (t->encodes_on_write && t->rtv_srgb != nullptr) {
+		return t->rtv_srgb;
+	}
+	return t->rtv;
+}
+
+//! What the compose pass decided that the weave needs.
+struct svc_compose_out
+{
+	bool compose_linear;
+	uint32_t dp_view_w;
+	uint32_t dp_view_h;
+};
+
+
+/*
+ *
  * #925 S3 — command queue plumbing (definitions live with the handlers,
  * after the multi-comp helpers they apply through)
  *
@@ -2587,6 +3311,8 @@ service_ws_cmd_push(struct d3d11_service_system *sys, const struct ws_command *c
 //! instead of re-entering the drain.
 static void
 service_ws_cmd_drain(struct d3d11_service_system *sys);
+static void
+svc_ws_synth_press_settle(struct d3d11_multi_compositor *mc);
 
 //! Enqueue-or-inline helper shared by every converted handler: push, and on
 //! ring exhaustion take the fair lock and apply the same code inline.
@@ -2671,6 +3397,8 @@ service_ws_cmd_drain(struct d3d11_service_system *sys)
 	for (uint32_t i = 0; i < n; i++) {
 		service_ws_cmd_apply(sys, &local[i]);
 	}
+	// A synthetic one-click-drag DOWN is always paired with an UP.
+	svc_ws_synth_press_settle(sys->multi_comp);
 }
 
 
@@ -2679,6 +3407,254 @@ service_ws_cmd_drain(struct d3d11_service_system *sys)
  * #925 S5 — compose-from-copy refresh
  *
  */
+
+/*!
+ * #1765: create a service-owned copy target for a combine-pass source of
+ * format @p src_fmt, plus the SRV the combine pass samples it through — a
+ * NON-DECODING one.
+ *
+ * The combine pass has exactly one colour decode: the blit shader's b1
+ * `srgb_to_linear` under ADR-021 Model B (none under Model A). A source whose
+ * texture is an honest `_SRGB` format (the shell's chrome swapchains are
+ * `R8G8B8A8_UNORM_SRGB`) sampled through an `_SRGB`-typed SRV is decoded a
+ * SECOND time in hardware: title bars / HUD too dark under B, and decoded once
+ * where the passthrough contract wants none under A. So for the 8-bit sRGB
+ * families the copy is TYPELESS storage (a CopyResource from the `_SRGB` source
+ * is legal — same typeless family, a pure byte move) viewed as plain UNORM.
+ * Every other format keeps its own format and default view, exactly as before.
+ */
+static HRESULT
+svc_create_decode_free_copy(struct d3d11_service_system *sys,
+                            uint32_t w,
+                            uint32_t h,
+                            DXGI_FORMAT src_fmt,
+                            wil::com_ptr<ID3D11Texture2D> &tex_out,
+                            wil::com_ptr<ID3D11ShaderResourceView> &srv_out,
+                            // #1769: a LAYERED source (ADR-032) gets a copy
+                            // with the same slice count, viewed as a whole-
+                            // array Texture2DArray like the swapchain's own
+                            // per-image SRV. 1 keeps every #1765 caller as is.
+                            uint32_t array_size = 1)
+{
+	tex_out.reset();
+	srv_out.reset();
+	if (array_size == 0) {
+		array_size = 1;
+	}
+	const DXGI_FORMAT fmt = (src_fmt == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : src_fmt;
+	const DXGI_FORMAT sample_fmt = d3d_dxgi_format_srgb_to_unorm(fmt);
+	const bool decoding_source = (sample_fmt != fmt);
+
+	D3D11_TEXTURE2D_DESC cache_desc = {};
+	cache_desc.Width = w;
+	cache_desc.Height = h;
+	cache_desc.MipLevels = 1;
+	cache_desc.ArraySize = array_size;
+	cache_desc.Format = decoding_source ? d3d_dxgi_format_to_typeless_dxgi(fmt) : fmt;
+	cache_desc.SampleDesc.Count = 1;
+	cache_desc.Usage = D3D11_USAGE_DEFAULT;
+	cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	HRESULT hr = sys->device->CreateTexture2D(&cache_desc, nullptr, tex_out.put());
+	if (FAILED(hr)) {
+		tex_out.reset();
+		return hr;
+	}
+	if (decoding_source) {
+		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+		srv_desc.Format = sample_fmt;
+		if (array_size > 1) {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+			srv_desc.Texture2DArray.MostDetailedMip = 0;
+			srv_desc.Texture2DArray.MipLevels = 1;
+			srv_desc.Texture2DArray.FirstArraySlice = 0;
+			srv_desc.Texture2DArray.ArraySize = array_size;
+		} else {
+			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			srv_desc.Texture2D.MostDetailedMip = 0;
+			srv_desc.Texture2D.MipLevels = 1;
+		}
+		hr = sys->device->CreateShaderResourceView(tex_out.get(), &srv_desc, srv_out.put());
+	} else {
+		hr = sys->device->CreateShaderResourceView(tex_out.get(), nullptr, srv_out.put());
+	}
+	if (FAILED(hr)) {
+		srv_out.reset();
+		tex_out.reset();
+		return hr;
+	}
+	if (decoding_source) {
+		// One-off per (re)allocation — a lifecycle event, never per frame.
+		U_LOG_W(
+		    "Color (#1765) [d3d11_service]: decode-free copy %ux%u src=0x%X storage=0x%X srv=0x%X "
+		    "(same typeless family=%d)",
+		    w, h, (unsigned)fmt, (unsigned)cache_desc.Format, (unsigned)sample_fmt,
+		    (int)d3d_dxgi_format_same_typeless_family(fmt, cache_desc.Format));
+	}
+	return S_OK;
+}
+
+//! #1765: (re)create @p cache for a source described by @p src_desc — on a
+//! dimension OR format change (a CopyResource across typeless families is
+//! silently dropped). False when it could not be created.
+static bool
+compose_copy_cache_ensure(struct d3d11_service_system *sys,
+                          const D3D11_TEXTURE2D_DESC *src_desc,
+                          struct compose_copy_cache *cache)
+{
+	if (cache->tex && cache->srv && cache->w == src_desc->Width && cache->h == src_desc->Height &&
+	    cache->fmt == src_desc->Format) {
+		return true;
+	}
+	cache->valid = false;
+	cache->w = 0;
+	cache->h = 0;
+	cache->fmt = DXGI_FORMAT_UNKNOWN;
+	if (FAILED(svc_create_decode_free_copy(sys, src_desc->Width, src_desc->Height, src_desc->Format, cache->tex,
+	                                       cache->srv))) {
+		return false;
+	}
+	cache->w = src_desc->Width;
+	cache->h = src_desc->Height;
+	cache->fmt = src_desc->Format;
+	return true;
+}
+
+/*!
+ * #1765: the SRV the combine pass samples a controller swapchain image through
+ * on the LIVE path (DXR_COMPOSE_FROM_COPY off — the default).
+ *
+ * @p live_srv is the image's own per-image SRV, created with the swapchain's
+ * format. For an `_SRGB` swapchain that view decodes in hardware, and a
+ * service-created swapchain's storage is strongly typed (the NT-shared
+ * texture every client process opens and hands to its app), so no UNORM view
+ * of it can be created. Instead the image is copied — a byte move, same
+ * typeless family — into @p cache, whose SRV is UNORM, and that is sampled.
+ * The caller has already taken (or failed to take) the image's keyed mutex
+ * exactly as before, so the copy sees what the live sample would have.
+ *
+ * Non-sRGB sources (and array / mipped images the single-slice cache cannot
+ * mirror) return @p live_srv unchanged — the pre-#1765 path, byte for byte.
+ */
+static ID3D11ShaderResourceView *
+compose_decode_free_srv(struct d3d11_service_system *sys,
+                        struct d3d11_service_swapchain *sc,
+                        uint32_t img_idx,
+                        struct compose_copy_cache *cache,
+                        ID3D11ShaderResourceView *live_srv)
+{
+	if (live_srv == nullptr || sc == nullptr || img_idx >= sc->image_count || !sc->images[img_idx].texture) {
+		return live_srv;
+	}
+	D3D11_TEXTURE2D_DESC src_desc = {};
+	sc->images[img_idx].texture->GetDesc(&src_desc);
+	if (d3d_dxgi_format_srgb_to_unorm(src_desc.Format) == src_desc.Format) {
+		return live_srv; // already a non-decoding view
+	}
+	if (src_desc.ArraySize != 1 || src_desc.MipLevels != 1 || src_desc.SampleDesc.Count != 1 ||
+	    !compose_copy_cache_ensure(sys, &src_desc, cache)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			U_LOG_W(
+			    "Color (#1765) [d3d11_service]: _SRGB source 0x%X (%ux%u array=%u mips=%u) has no "
+			    "decode-free copy — sampling its decoding view",
+			    (unsigned)src_desc.Format, src_desc.Width, src_desc.Height, src_desc.ArraySize,
+			    src_desc.MipLevels);
+		}
+		return live_srv;
+	}
+	sys->context->CopyResource(cache->tex.get(), sc->images[img_idx].texture.get());
+	cache->valid = true;
+	return cache->srv.get();
+}
+
+/*!
+ * #1769: the SRV a PASSTHROUGH shader draw samples swapchain image @p img_idx
+ * through — one whose sample returns the stored bytes unchanged.
+ *
+ * A passthrough draw is one into the client's UNORM atlas RTV with b1 zero: it
+ * owes no encode and applies none, so the atlas holds encoded bytes exactly
+ * when it is handed encoded bytes. The image's own @ref d3d11_service_image::srv
+ * cannot give it that for an `_SRGB` swapchain: it is typed in the swapchain's
+ * format and DECODES on sample, and the strongly typed storage refuses a UNORM
+ * view (E_INVALIDARG). So the image is copied into @ref
+ * d3d11_service_image::raw_copy_tex — TYPELESS, same family, a pure byte move
+ * — and sampled through its UNORM view, the #1765 technique. Measured with a
+ * standalone probe: a stored 0x80 lands in the atlas as 0x37 through the
+ * decoding view and 0x80 through this one.
+ *
+ * A draw into the private `_SRGB`-view compose target must NOT use this: that
+ * target re-encodes on write, so it wants the decoding view (see the
+ * projection loop's #1589/#1610 note).
+ *
+ * Caller holds the image's keyed mutex (the copy must see what the draw would
+ * have) and `immediate_ctx_mutex` (the copy is an immediate-context call in
+ * the middle of the caller's draw sequence). Never waits.
+ *
+ * @p pass identifies the caller's draw pass (service_raw_copy_pass_begin()):
+ * within one pass the image is copied once, however many views sample it.
+ *
+ * @p out_decodes is set when the returned view still decodes — an `_SRGB`
+ * image this copy cannot mirror (mipped / multisampled, or the copy could not
+ * be allocated). The caller stamps the atlas from it, so the flag says what
+ * the draw DID rather than what the format asked for (#1665).
+ */
+static ID3D11ShaderResourceView *
+service_raw_sample_srv(struct d3d11_service_system *sys,
+                       struct d3d11_service_swapchain *sc,
+                       uint32_t img_idx,
+                       uint64_t pass,
+                       bool *out_decodes)
+{
+	*out_decodes = false;
+	struct d3d11_service_image *im = &sc->images[img_idx];
+	ID3D11ShaderResourceView *live_srv = im->srv.get();
+	if (live_srv == nullptr || !im->texture) {
+		return live_srv;
+	}
+	D3D11_TEXTURE2D_DESC src_desc = {};
+	im->texture->GetDesc(&src_desc);
+	if (d3d_dxgi_format_srgb_to_unorm(src_desc.Format) == src_desc.Format) {
+		return live_srv; // UNORM / float: the image's own view is already raw
+	}
+	if (!im->raw_copy_tex || !im->raw_copy_srv) {
+		HRESULT hr = E_FAIL;
+		if (src_desc.MipLevels == 1 && src_desc.SampleDesc.Count == 1) {
+			hr = svc_create_decode_free_copy(sys, src_desc.Width, src_desc.Height, src_desc.Format,
+			                                 im->raw_copy_tex, im->raw_copy_srv, src_desc.ArraySize);
+		}
+		if (FAILED(hr)) {
+			im->raw_copy_tex.reset();
+			im->raw_copy_srv.reset();
+			static bool warned = false;
+			if (!warned) {
+				warned = true;
+				U_LOG_W(
+				    "Color (#1769) [d3d11_service]: _SRGB source 0x%X (%ux%u array=%u mips=%u samples=%u) "
+				    "has no decode-free copy (hr=0x%08lx) — a passthrough draw samples its decoding "
+				    "view and the atlas is stamped linear",
+				    (unsigned)src_desc.Format, src_desc.Width, src_desc.Height, src_desc.ArraySize,
+				    src_desc.MipLevels, src_desc.SampleDesc.Count, hr);
+			}
+			*out_decodes = true;
+			return live_srv;
+		}
+	}
+	if (im->raw_copy_pass != pass) {
+		sys->context->CopyResource(im->raw_copy_tex.get(), im->texture.get());
+		im->raw_copy_pass = pass;
+	}
+	return im->raw_copy_srv.get();
+}
+
+//! #1769: a fresh id for one draw pass's service_raw_sample_srv() calls. Never
+//! 0, so a zero-initialised image always copies on its first use.
+static uint64_t
+service_raw_copy_pass_begin(void)
+{
+	static std::atomic<uint64_t> next{0};
+	return next.fetch_add(1, std::memory_order_relaxed) + 1;
+}
 
 /*!
  * Refresh @p cache from image @p img_idx of @p sc and return the SRV to
@@ -2705,29 +3681,11 @@ compose_copy_cache_refresh(struct d3d11_service_system *sys,
 	D3D11_TEXTURE2D_DESC src_desc = {};
 	sc->images[img_idx].texture->GetDesc(&src_desc);
 
-	// Lazy (re)create on dim change — same shape as the HUD cache.
-	if (!cache->tex || cache->w != src_desc.Width || cache->h != src_desc.Height) {
-		cache->tex.reset();
-		cache->srv.reset();
-		cache->valid = false;
-		D3D11_TEXTURE2D_DESC cache_desc = {};
-		cache_desc.Width = src_desc.Width;
-		cache_desc.Height = src_desc.Height;
-		cache_desc.MipLevels = 1;
-		cache_desc.ArraySize = 1;
-		cache_desc.Format = (src_desc.Format == DXGI_FORMAT_UNKNOWN)
-		                        ? DXGI_FORMAT_R8G8B8A8_UNORM
-		                        : src_desc.Format;
-		cache_desc.SampleDesc.Count = 1;
-		cache_desc.Usage = D3D11_USAGE_DEFAULT;
-		cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-		HRESULT hr = sys->device->CreateTexture2D(&cache_desc, nullptr, cache->tex.put());
-		if (FAILED(hr)) {
-			return nullptr;
-		}
-		sys->device->CreateShaderResourceView(cache->tex.get(), nullptr, cache->srv.put());
-		cache->w = src_desc.Width;
-		cache->h = src_desc.Height;
+	// Lazy (re)create on dim or format change — same shape as the HUD cache.
+	// #1765: an `_SRGB` source gets TYPELESS storage + a UNORM SRV, so the
+	// combine pass samples it without a hardware decode.
+	if (!compose_copy_cache_ensure(sys, &src_desc, cache)) {
+		return nullptr;
 	}
 
 	IDXGIKeyedMutex *km = sc->images[img_idx].keyed_mutex.get();
@@ -3234,6 +4192,7 @@ struct d3d11_multi_client_slot
 	wil::com_ptr<ID3D11ShaderResourceView> hud_cache_srv[XRT_MAX_LAYERS];
 	uint32_t hud_cache_w[XRT_MAX_LAYERS];
 	uint32_t hud_cache_h[XRT_MAX_LAYERS];
+	DXGI_FORMAT hud_cache_fmt[XRT_MAX_LAYERS]; // #1765: source format the cache was built for
 	bool hud_cache_valid[XRT_MAX_LAYERS]; // true once at least one acquire succeeded
 
 	//! #925 S5: service-owned copy of the controller's chrome swapchain for
@@ -3376,6 +4335,13 @@ struct d3d11_multi_client_slot
 	float                 window_w_last_emitted;
 	float                 window_h_last_emitted;
 
+	//! spec_version 25 (ADR-052): the screen the controller anchored this
+	//! window on (xrSetWorkspaceClientWindowPlacementDXR); 0 = the primary.
+	//! `window_pose` / `window_width_m` / `window_height_m` stay in the
+	//! primary's display space whatever the anchor — every pre-existing reader
+	//! is unchanged — and the placement getter maps them back to the anchor.
+	uint64_t window_screen_id;
+
 	//! spec_version 10: a Win32 modal popup is open in this client. Set by
 	//! ipc_handle_session_set_modal_state when the in-app CBT hook
 	//! (oxr_workspace_modal_win32) detects a dialog. Read by the drain loop
@@ -3427,9 +4393,35 @@ struct d3d11_multi_compositor
 	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
 
 	//! Combined atlas (all clients composited, input to DP).
+	//!
+	//! #1764: storage is `R8G8B8A8_TYPELESS`, so it carries TWO render-target
+	//! views and every view names its format explicitly (a typeless resource
+	//! cannot be viewed through a nullptr desc):
+	//! - @ref combined_atlas_srv / @ref combined_atlas_rtv are `R8G8B8A8_UNORM`
+	//!   — a byte-exact view. Model A writes through this RTV (b1 = 0, the blit
+	//!   shader already emits encoded bytes, so an `_SRGB` RTV would encode them
+	//!   a SECOND time), the backdrop clear always goes through it, and the DP,
+	//!   the ADR-030 crop, the split egress and the captures all read the atlas
+	//!   as the plain encoded bytes it now always holds.
+	//! - @ref combined_atlas_rtv_srgb is `R8G8B8A8_UNORM_SRGB` — the
+	//!   ENCODE-ON-WRITE view. Model B writes through it: b1 decodes each
+	//!   source to scene-linear, the ROP blends in linear, and the hardware
+	//!   re-encodes on write, so the 8-bit atlas never has to hold linear light
+	//!   (which collapsed the dark end to a handful of codes — banding).
+	//! Pick with @ref multi_combine_rtv, never by name.
 	wil::com_ptr<ID3D11Texture2D> combined_atlas;
 	wil::com_ptr<ID3D11ShaderResourceView> combined_atlas_srv;
 	wil::com_ptr<ID3D11RenderTargetView> combined_atlas_rtv;
+	wil::com_ptr<ID3D11RenderTargetView> combined_atlas_rtv_srgb;
+
+	//! #1764: this tick's combine-pass target. True = Model B with a DP that
+	//! accepts an ENCODED handoff (EITHER): draws go through the `_SRGB` RTV and
+	//! the atlas is handed off ENCODED. False = Model A (UNORM RTV, ENCODED), or
+	//! Model B against a LINEAR-only DP, which keeps the pre-#1764 behaviour
+	//! (UNORM RTV holding linear, handed off LINEAR) because such a DP must not
+	//! be handed encoded bytes. Written by the render thread only, twice per
+	//! tick: at the backdrop clear and again once `compose_linear` is known.
+	bool combine_encodes_on_write;
 
 	//! Phase 2.K: depth target sibling to combined_atlas. Used by the
 	//! multi-window content + chrome blit pass for per-pixel occlusion.
@@ -3601,6 +4593,45 @@ struct d3d11_multi_compositor
 	struct d3d11_multi_client_slot clients[D3D11_MULTI_MAX_CLIENTS];
 	uint32_t client_count;
 
+	/*!
+	 * @name ADR-052 D1: the SECONDARY presenters (one per claimed 3D screen
+	 * other than the primary, whose presenter is the service window above).
+	 *
+	 * Created, rendered and destroyed by the render thread (under
+	 * render_mutex). `ws_presenters_lock` (an SRWLOCK: zero is its initial
+	 * state, so the memset this struct gets keeps it valid) guards the array
+	 * membership for the IPC-thread readers: the input drain, the input-forward
+	 * mirror, the reserved-key mirror and the status. A leaf: nothing is taken
+	 * while it is held.
+	 * @{
+	 */
+	SRWLOCK ws_presenters_lock;
+	struct svc_ws_presenter *ws_presenters[COMP_WS_MAX_SCREENS];
+	uint32_t ws_presenter_count;
+	//! The screen-set generation the presenters were built for.
+	uint32_t ws_presenters_gen;
+	//! False forces a rebuild on the next frame (first frame, a closed presenter window).
+	bool ws_presenters_synced;
+	//! The primary screen as of the last rebuild (the presenters' mapping origin).
+	struct comp_ws_screen ws_primary;
+	//! The controller's reserved-key table, mirrored onto every presenter window.
+	bool ws_reserved_set;
+	uint32_t ws_reserved_count;
+	uint32_t ws_reserved_vks[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	uint32_t ws_reserved_mods[IPC_WORKSPACE_MAX_RESERVED_KEYS];
+	//! The presenter the newest pointer DOWN went down on (0 = the service
+	//! window): where the controller's pointer capture is grabbed. Under
+	//! `ws_presenters_lock`.
+	struct comp_ws_pointer_owner ws_pointer_owner;
+	/*! @} */
+
+	//! A synthetic LMB DOWN the one-click-drag helper posted and still owes
+	//! the UP for (comp_ws_synth_press), and the focused app HWND it was
+	//! posted for (the press target can be a child control of it). Render
+	//! thread only: set in synthesize_focus_click_down, settled every drain.
+	struct comp_ws_synth_press ws_synth_press;
+	HWND ws_synth_press_owner;
+
 	//! Focused client index (-1 = none).
 	int32_t focused_slot;
 
@@ -3700,6 +4731,14 @@ struct d3d11_multi_compositor
 	//! a dead/removed DP reads as "tracking lost" instead of freezing the
 	//! last-known head position forever. Render-thread only.
 	LONG frame_tick_viewer_fail_count;
+	//! ADR-047 Amendment 7: the screen whose presenter's viewer FRAME_TICK
+	//! publishes when the primary sees nobody (0 = the primary's own). Render
+	//! thread only; change-only log latch.
+	uint64_t frame_tick_viewer_screen;
+	//! ...picked through a dwell (util/u_tracking_any.h), so a presence
+	//! transition the screens share, which reaches the DPs a frame apart,
+	//! never flips the published viewer for one frame. Render thread only.
+	struct u_tracking_source frame_tick_viewer_src;
 
 	//! Window dismissed by user (ESC).
 	bool window_dismissed;
@@ -3707,7 +4746,7 @@ struct d3d11_multi_compositor
 	//! True after dismiss cleanup (EXIT_REQUEST sent, captures released).
 	bool dismiss_cleanup_done;
 
-	//! Workspace deactivated (Ctrl+Space): window hidden, DP released, captures stopped.
+	//! Workspace deactivated (launch hotkey): window hidden, DP released, captures stopped.
 	//! Unlike window_dismissed, the multi-comp structure stays alive for re-activation.
 	bool suspended;
 
@@ -4695,6 +5734,176 @@ svc_weave_dp_device_ok(struct d3d11_service_system *sys,
 }
 
 /*!
+ * ADR-060 R2 — DXR_WEAVE_WINDOWLESS=0 keeps every present-owner on a DP bound
+ * to its window (the pre-R2 path). Default on: the path below still engages
+ * only for a DP that declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN.
+ */
+static bool
+svc_weave_windowless_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("DXR_WEAVE_WINDOWLESS");
+		on = (e != nullptr && e[0] == '0') ? 0 : 1;
+		if (on == 0) {
+			U_LOG_W(
+			    "DXR_WEAVE_WINDOWLESS=0: present-owners weave on a DP bound to their window (ADR-060 R2 "
+			    "off)");
+		}
+	}
+	return on == 1;
+}
+
+/*!
+ * ADR-060 R2 — turn the offered screen list into this client's segment list,
+ * once its weave DP is windowless (split rule (a): the predicate runs on
+ * every weave, the per-screen weave only when the window leaves the primary
+ * screen — weave_seg_update). No-op when the client already enabled segments
+ * itself (its own pin stands) or nothing was offered. Client thread.
+ */
+static void
+svc_weave_activate_offered_screens(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (c == nullptr || !c->render.weave_dp_windowless) {
+		return;
+	}
+	struct xrt_screen_list *list = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if (c->seg_screens != nullptr || c->weave_offered_screens == nullptr) {
+			return;
+		}
+		list = c->weave_offered_screens;
+		c->weave_offered_screens = nullptr;
+	}
+	U_LOG_W(
+	    "ADR-060 R2: windowless present-owner %p — segmenting its window per screen (%u screens; a 2D "
+	    "monitor's part stays flat)",
+	    (void *)c, list->count);
+	comp_d3d11_service_set_client_segment_screens(&sys->base, reinterpret_cast<struct xrt_compositor *>(c), list,
+	                                              0);
+	free(list);
+}
+
+/*!
+ * ADR-060 R2 — try to make @p c's weave DP WINDOWLESS.
+ *
+ * The present-owner's window belongs to ANOTHER process. A DP bound to it in
+ * the vendor's own window mode tries to subclass it (refused cross-process,
+ * silently) and runs its own occlusion and 2D-region logic on a window it
+ * cannot see into. The runtime is the placement authority here (ADR-033), so
+ * instead: a DP for the primary screen with NO window, phased every weave from
+ * `set_present_origin` (svc_weave_push_present_origin). Used only when the
+ * instance declares XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN — an SDK
+ * without external routing makes a windowless weaver that ignores the origin,
+ * which would be a wrong phase with nothing in the log.
+ *
+ * Same thread and lock rules as the caller (client thread, no render_mutex).
+ *
+ * @return the DP, or NULL ⟹ the caller makes the window-bound one as before.
+ */
+static struct xrt_display_processor_d3d11 *
+svc_make_windowless_weave_dp(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!svc_weave_windowless_enabled()) {
+		return nullptr;
+	}
+	const struct xrt_system_compositor_info *info = &sys->base.info;
+	const struct xrt_dp_registry_entry *e =
+	    xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
+	const struct xrt_plugin_iface *iface =
+	    e != nullptr ? (const struct xrt_plugin_iface *)e->owning_iface : nullptr;
+	if (e == nullptr || e->dp_factory_d3d11 == nullptr || !xrt_plugin_iface_has_create_dp_d3d11_for_screen(iface) ||
+	    e->pixel_width == 0 || e->pixel_height == 0) {
+		return nullptr; // no per-screen factory, or no screen rect to phase against
+	}
+	if ((e->claim_apis & XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE) == 0) {
+		// The plug-in did not say it can (an older plug-in, or a vendor SDK
+		// without external routing): skip the create rather than bring a
+		// vendor weaver up only to destroy it. Once per client.
+		U_LOG_W("ADR-060 R2: '%s' does not hint windowless phase for this screen — window-bound weave DP",
+		        e->plugin_id);
+		return nullptr;
+	}
+
+	struct xrt_screen_binding b;
+	memset(&b, 0, sizeof(b));
+	b.struct_size = (uint32_t)sizeof(b);
+	b.monitor_id = e->monitor_id;
+	b.desktop_left = e->screen_left;
+	b.desktop_top = e->screen_top;
+	b.desktop_width = e->pixel_width;
+	b.desktop_height = e->pixel_height;
+	snprintf(b.serial, sizeof(b.serial), "%s", e->serial);
+
+	struct xrt_display_processor_d3d11 *dp = nullptr;
+	xrt_result_t ret = iface->create_dp_d3d11_for_screen((struct xrt_plugin_instance *)e->owning_instance,
+	                                                     sys->device.get(), sys->context.get(), nullptr, &b, &dp);
+	if (ret != XRT_SUCCESS || dp == nullptr) {
+		U_LOG_W("ADR-060 R2: windowless weave DP refused by '%s' (error %d) — using the window-bound DP",
+		        e->plugin_id, (int)ret);
+		return nullptr;
+	}
+	if (!xrt_display_processor_d3d11_phases_from_present_origin(dp)) {
+		// One per client: an older plug-in, or a vendor SDK without external routing.
+		U_LOG_W(
+		    "ADR-060 R2: '%s' DP does not declare PHASE_FROM_PRESENT_ORIGIN — destroyed; this present-owner "
+		    "weaves on a DP bound to its window, as before",
+		    e->plugin_id);
+		xrt_display_processor_d3d11_destroy(&dp);
+		return nullptr;
+	}
+	c->render.weave_dp_screen_x = e->screen_left;
+	c->render.weave_dp_screen_y = e->screen_top;
+	return dp;
+}
+
+//! The window's client area in desktop device px (defined with the segment path).
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out);
+
+/*!
+ * ADR-060 R2 — feed a windowless weave DP the window's origin on its screen,
+ * read now from the window manager (the placement authority, ADR-033).
+ * `GetClientRect` / `ClientToScreen` work cross-process and the service is
+ * per-monitor DPI aware, so this is device px in the screen registry's space.
+ * Call before every process_atlas of the weave (cheap; a drag moves it). The
+ * per-segment DPs of a split weave are fed by the segment manager; this is
+ * the client's own DP, which weaves the primary screen's part.
+ *
+ * Holding render_mutex (the caller is weave_submit).
+ */
+static void
+svc_weave_push_present_origin(struct d3d11_service_compositor *c, struct xrt_display_processor_d3d11 *dp, HWND wnd)
+{
+	if (c == nullptr || dp == nullptr || dp != c->render.weave_dp || !c->render.weave_dp_windowless) {
+		return;
+	}
+	struct comp_seg_rect win = {};
+	if (!svc_seg_window_rect(wnd, &win)) {
+		return; // the window is gone or zero-sized: keep the last origin
+	}
+	const int32_t x = win.x - c->render.weave_dp_screen_x;
+	const int32_t y = win.y - c->render.weave_dp_screen_y;
+	xrt_display_processor_d3d11_set_present_origin(dp, x, y);
+	// R3: what this weave was phased for, latched once the submit is accepted.
+	c->render.weave_origin_pending = true;
+	c->render.weave_origin_pending_x = win.x;
+	c->render.weave_origin_pending_y = win.y;
+	if (!c->render.weave_dp_origin_valid) {
+		U_LOG_W(
+		    "ADR-060 R2: windowless weave DP phased from present origin (%d,%d) — window %p at (%d,%d), "
+		    "screen at (%d,%d)",
+		    x, y, (void *)wnd, win.x, win.y, c->render.weave_dp_screen_x, c->render.weave_dp_screen_y);
+	} else if (x != c->render.weave_dp_origin_x || y != c->render.weave_dp_origin_y) {
+		U_LOG_I("ADR-060 R2: present origin -> (%d,%d)", x, y);
+	}
+	c->render.weave_dp_origin_valid = true;
+	c->render.weave_dp_origin_x = x;
+	c->render.weave_dp_origin_y = y;
+}
+
+/*!
  * #1172 — build @p c's own INGEST-device display processor, once.
  *
  * MUST be called from the client's OWN thread and WITHOUT `render_mutex` held.
@@ -4719,6 +5928,9 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 	if (!svc_client_wants_ingest_dp(sys, c) || service_device_removed(sys)) {
 		return;
 	}
+	// Weave-idle release: the render thread may free weave_dp when this client
+	// stops weaving; hold it off for the whole check-or-create below.
+	std::lock_guard<std::mutex> weave_dp_guard(c->weave_dp_mutex);
 
 	HWND hwnd = c->render.weave_hwnd != nullptr ? c->render.weave_hwnd : c->render.hwnd;
 	if (hwnd == nullptr || !IsWindow(hwnd)) {
@@ -4728,6 +5940,16 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		if (c->render.weave_dp_hwnd == hwnd) {
 			return; // already ours, on the right window
 		}
+		if (c->render.weave_dp_windowless) {
+			// ADR-060 R2: a windowless DP holds no window, so a rebind is just a
+			// new window to read the origin from — no destroy, no vendor call.
+			U_LOG_W(
+			    "ADR-060 R2: client window moved %p -> %p — the windowless weave DP follows it in place",
+			    (void *)c->render.weave_dp_hwnd, (void *)hwnd);
+			c->render.weave_dp_hwnd = hwnd;
+			c->render.weave_dp_origin_valid = false;
+			return;
+		}
 		// Rebound to a different window: one weaver per HWND means destroy
 		// before recreate, never two live against the same client.
 		U_LOG_W("#1172 weave DP: client window moved %p -> %p — recreating its ingest DP",
@@ -4735,6 +5957,8 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		xrt_display_processor_d3d11_destroy(&c->render.weave_dp);
 		c->render.weave_dp_hwnd = nullptr;
 		c->render.weave_dp_refused = false;
+		c->render.weave_dp_windowless = false;
+		c->render.weave_dp_origin_valid = false;
 	}
 	if (c->render.weave_dp_refused) {
 		return;
@@ -4773,6 +5997,23 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 		return;
 	}
 
+	// ADR-060 R2: a DP that needs no window, when the plug-in can make one.
+	c->render.weave_dp = svc_make_windowless_weave_dp(sys, c);
+	if (c->render.weave_dp != nullptr) {
+		c->render.weave_dp_windowless = true;
+		c->render.weave_dp_origin_valid = false;
+		c->render.weave_dp_hwnd = hwnd;
+		c->render.weave_dp_client_presents = -1;
+		c->render.weave_dp_encoding = -1;
+		(void)xrt_display_processor_d3d11_set_transparent_background(c->render.weave_dp, true, true);
+		U_LOG_W(
+		    "[pipeline] this client weaves on its OWN WINDOWLESS display processor (ADR-060 R2: dp=%p, window "
+		    "%p read for its origin only, never handed to the vendor; device=%p)",
+		    (void *)c->render.weave_dp, (void *)hwnd, (void *)sys->device.get());
+		svc_weave_activate_offered_screens(sys, c);
+		return;
+	}
+
 	void *dp_fac = comp_dp_factory_for_window(&sys->base.info, COMP_DP_PRIMARY_MONITOR, COMP_DP_API_D3D11);
 	if (dp_fac == nullptr) {
 		c->render.weave_dp_refused = true;
@@ -4794,6 +6035,7 @@ svc_ensure_client_weave_dp(struct d3d11_service_system *sys, struct d3d11_servic
 	}
 
 	c->render.weave_dp_hwnd = hwnd;
+	c->render.weave_dp_windowless = false;
 	// #1016: a fresh DP's state is unknown; the weave sites assert both.
 	c->render.weave_dp_client_presents = -1;
 	c->render.weave_dp_encoding = -1;
@@ -5081,6 +6323,11 @@ resolve_active_view_dims(const struct d3d11_service_system *sys,
 		uint32_t tr = sys->tile_rows > 0 ? sys->tile_rows : 1;
 		vw = fallback_w / tc;
 		vh = fallback_h / tr;
+	} else if (t_ws_pass != nullptr && t_ws_pass->primary_px_w > 0 && t_ws_pass->primary_px_h > 0) {
+		// ADR-052: a secondary presenter's pass — the mode's view tile, scaled
+		// from the primary's panel to the presenter's (one mode per service).
+		vw = (uint32_t)(((uint64_t)vw * t_ws_pass->px_w) / t_ws_pass->primary_px_w);
+		vh = (uint32_t)(((uint64_t)vh * t_ws_pass->px_h) / t_ws_pass->primary_px_h);
 	}
 	*out_vw = vw;
 	*out_vh = vh;
@@ -5472,6 +6719,21 @@ create_layer_resources(struct d3d11_service_system *sys)
 		U_LOG_E("Failed to create color linearize constant buffer: 0x%08lx", hr);
 		return false;
 	}
+	{
+		// The IPC-thread twin: immutable zeros (see the field doc).
+		const float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+		D3D11_BUFFER_DESC zero_desc = {};
+		zero_desc.ByteWidth = sizeof(zeros);
+		zero_desc.Usage = D3D11_USAGE_IMMUTABLE;
+		zero_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		D3D11_SUBRESOURCE_DATA zero_init = {};
+		zero_init.pSysMem = zeros;
+		hr = sys->device->CreateBuffer(&zero_desc, &zero_init, sys->color_passthrough_cb.put());
+		if (FAILED(hr)) {
+			U_LOG_E("Failed to create color passthrough constant buffer: 0x%08lx", hr);
+			return false;
+		}
+	}
 
 	// Create linear sampler
 	D3D11_SAMPLER_DESC samp_desc = {};
@@ -5831,6 +7093,15 @@ blit_to_atlas_texture(struct d3d11_service_system *sys,
 	sys->context->PSSetShader(blit_ps_for_draw, nullptr, 0);
 	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	// b1 is stated EXPLICITLY, to zero: a client's blit never linearizes —
+	// the atlas stays encoded and only the render thread's combine pass
+	// decodes (ADR-021). Without this the ordinary `blit_ps` read whatever
+	// the combine pass last left at b1 (1 under Model B) and a zones /
+	// Local-2D / scaled fast-path commit decoded its content on the way into
+	// its own atlas, to be decoded again by the combine: the "model viewer
+	// goes dark when a second app opens" symptom. The compose variant ignores
+	// b1 anyway; binding it there too keeps the register's owner obvious.
+	sys->context->PSSetConstantBuffers(1, 1, sys->color_passthrough_cb.addressof());
 	sys->context->PSSetShaderResources(0, 1, &src_srv);
 	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 
@@ -6363,6 +7634,31 @@ render_equirect2_layer(struct d3d11_service_system *sys,
  *
  */
 
+//! Defined with the weave submit path below (NT handles are closed by the cache).
+static void
+weave_close_cached(HANDLE h, bool is_dxgi);
+
+//! XR_DXR_cursor_depth v8: drop the weave-rect cursor's held sprite.
+static void
+svc_weave_cursor_release_sprite(struct d3d11_client_render_resources *res)
+{
+	res->wc_sprite_srv.reset();
+	res->wc_sprite_srv_srgb.reset();
+	res->wc_sprite_tex.reset();
+	res->wc_sprite_w = 0;
+	res->wc_sprite_h = 0;
+	res->wc_sprite_gen = 0;
+	res->wc_sprite_kind = 0;
+	res->wc_sprite_os_cursor = 0;
+	res->wc_look_uploaded = 0;
+	comp_cursor_look_fini(&res->wc_look);
+	res->wc_look = {};
+}
+
+//! G7 (roadmap §5.2): a destroyed client DP retires its conversion eyes key.
+static void
+svc_conv_eyes_retire(const struct xrt_display_processor_d3d11 *dp);
+
 /*!
  * Clean up per-client render resources.
  */
@@ -6381,6 +7677,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	if (res->display_processor != nullptr) {
 		DP_REQUEST_DISPLAY_MODE(
 		    res->display_processor, false);
+		svc_conv_eyes_retire(res->display_processor);
 	}
 	xrt_display_processor_d3d11_destroy(&res->display_processor);
 
@@ -6399,6 +7696,8 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_dp_refused = false;
 	res->weave_dp_client_presents = -1;
 	res->weave_dp_encoding = -1;
+	res->weave_dp_windowless = false;
+	res->weave_dp_origin_valid = false;
 
 	res->back_buffer_rtv.reset();
 	res->crop_srv.reset();
@@ -6469,6 +7768,7 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_sbs_srv.reset();
 	res->weave_sbs_rtv.reset();
 	res->weave_sbs_tex.reset();
+	weave_close_cached(res->weave_input_handle_cached, res->weave_input_cached_is_dxgi);
 	res->weave_input_handle_cached = nullptr;
 	res->weave_input_km.reset();
 	res->weave_input_srv.reset();
@@ -6478,6 +7778,21 @@ fini_client_render_resources(struct d3d11_client_render_resources *res)
 	res->weave_saw_frame_first = false;
 	res->weave_gen_count = 0;
 	res->weave_legacy_warned = false;
+	res->lift_rect_count = 0;
+	res->weave_crop_rtv.reset();
+	// XR_DXR_cursor_depth v8: the weave-rect cursor's sprite and staged carrier.
+	svc_weave_cursor_release_sprite(res);
+	if (res->wc_tex_handle != nullptr) {
+		weave_close_cached(res->wc_tex_handle, res->wc_tex_is_dxgi);
+		res->wc_tex_handle = nullptr;
+	}
+	res->wc_req_next_valid = false;
+	res->wc_out = {};
+	res->wc_state = {};
+	for (auto &m : res->wc_memo) {
+		m = {};
+	}
+	weave_close_cached(res->weave_overlay_handle_cached, res->weave_overlay_cached_is_dxgi);
 	res->weave_overlay_handle_cached = nullptr;
 	res->weave_overlay_km.reset();
 	res->weave_overlay_srv.reset();
@@ -7466,6 +8781,8 @@ swapchain_destroy(struct xrt_swapchain *xsc)
 			sc->images[i].keyed_mutex->ReleaseSync(0);
 		}
 		sc->images[i].srv.reset();
+		sc->images[i].raw_copy_srv.reset();
+		sc->images[i].raw_copy_tex.reset();
 		sc->images[i].keyed_mutex.reset();
 		sc->images[i].texture.reset();
 
@@ -7661,51 +8978,6 @@ compositor_get_swapchain_create_properties(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
-/*!
- * Convert XRT format to DXGI format.
- */
-static DXGI_FORMAT
-xrt_format_to_dxgi(int64_t format)
-{
-	// Check if this is already a DXGI format (common D3D11 formats are < 130)
-	switch (format) {
-	// Pass through DXGI formats directly
-	case DXGI_FORMAT_R8G8B8A8_UNORM:        // 28
-	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   // 29
-	case DXGI_FORMAT_B8G8R8A8_UNORM:        // 87
-	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:   // 91
-	case DXGI_FORMAT_R16G16B16A16_FLOAT:    // 10
-	case DXGI_FORMAT_R16G16B16A16_UNORM:    // 11
-	case DXGI_FORMAT_D24_UNORM_S8_UINT:     // 45
-	case DXGI_FORMAT_D32_FLOAT:             // 40
-	case DXGI_FORMAT_D16_UNORM:             // 55
-	case DXGI_FORMAT_R10G10B10A2_UNORM:     // 24
-		return static_cast<DXGI_FORMAT>(format);
-
-	// Convert VK_FORMAT values to DXGI (for Vulkan compositor interop)
-	case 37: // VK_FORMAT_R8G8B8A8_UNORM
-		return DXGI_FORMAT_R8G8B8A8_UNORM;
-	case 43: // VK_FORMAT_R8G8B8A8_SRGB
-		return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-	case 44: // VK_FORMAT_B8G8R8A8_UNORM
-		return DXGI_FORMAT_B8G8R8A8_UNORM;
-	case 50: // VK_FORMAT_B8G8R8A8_SRGB
-		return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-	case 64: // VK_FORMAT_A2B10G10R10_UNORM_PACK32
-		return DXGI_FORMAT_R10G10B10A2_UNORM;
-	case 97: // VK_FORMAT_R16G16B16A16_SFLOAT
-		return DXGI_FORMAT_R16G16B16A16_FLOAT;
-	case 129: // VK_FORMAT_D24_UNORM_S8_UINT
-		return DXGI_FORMAT_D24_UNORM_S8_UINT;
-	case 130: // VK_FORMAT_D32_SFLOAT
-		return DXGI_FORMAT_D32_FLOAT;
-
-	default:
-		U_LOG_W("Unknown format %ld, using RGBA8", format);
-		return DXGI_FORMAT_R8G8B8A8_UNORM;
-	}
-}
-
 static xrt_result_t
 compositor_create_swapchain(struct xrt_compositor *xc,
                              const struct xrt_swapchain_create_info *info,
@@ -7756,36 +9028,24 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 	sc->info = *info;
 	sc->service_created = true; // Created by service for client
 
-	// Convert format
-	DXGI_FORMAT dxgi_format = xrt_format_to_dxgi(info->format);
+	// Convert format. The wire format is a VkFormat (#1956): see
+	// comp_d3d11_service_formats.h for why an unknown value now FAILS the
+	// create instead of silently allocating RGBA8.
+	DXGI_FORMAT dxgi_format = d3d11_service_wire_format_to_dxgi(info->format);
+	if (dxgi_format == DXGI_FORMAT_UNKNOWN) {
+		U_LOG_E("create_swapchain: unsupported wire format %lld", (long long)info->format);
+		swapchain_destroy(&sc->base.base);
+		return XRT_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+	}
+	// #1956: a depth image is TYPELESS storage + a typed SRV, like the
+	// in-process D3D11/D3D12 compositors; colour is unchanged (typed texture,
+	// same-format SRV).
+	const struct d3d11_service_image_formats img_fmt = d3d11_service_image_formats_for(dxgi_format);
 
-	// Determine bind flags
-	UINT bind_flags = D3D11_BIND_SHADER_RESOURCE; // Always need SRV for compositor
-	if (info->bits & XRT_SWAPCHAIN_USAGE_COLOR) {
-		bind_flags |= D3D11_BIND_RENDER_TARGET;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_DEPTH_STENCIL) {
-		bind_flags |= D3D11_BIND_DEPTH_STENCIL;
-	}
-	if (info->bits & XRT_SWAPCHAIN_USAGE_UNORDERED_ACCESS) {
-		bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
-	}
-
-	// Create texture descriptor with SHARED_KEYEDMUTEX for cross-process sharing
-	D3D11_TEXTURE2D_DESC tex_desc = {};
-	tex_desc.Width = info->width;
-	tex_desc.Height = info->height;
-	tex_desc.MipLevels = info->mip_count > 0 ? info->mip_count : 1;
-	tex_desc.ArraySize = info->array_size > 0 ? info->array_size : 1;
-	tex_desc.Format = dxgi_format;
-	tex_desc.SampleDesc.Count = info->sample_count > 0 ? info->sample_count : 1;
-	tex_desc.SampleDesc.Quality = 0;
-	tex_desc.Usage = D3D11_USAGE_DEFAULT;
-	tex_desc.BindFlags = bind_flags;
-	tex_desc.CPUAccessFlags = 0;
-	// SHARED_KEYEDMUTEX enables cross-process sharing with synchronization
-	// SHARED_NTHANDLE creates real kernel handles that can be DuplicateHandle'd to Chrome
-	tex_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	// Texture descriptor: NT-handle shared + SHARED_KEYEDMUTEX for
+	// cross-process sharing; NT handles can be DuplicateHandle'd to Chrome.
+	D3D11_TEXTURE2D_DESC tex_desc = d3d11_service_shared_texture_desc(
+	    info->width, info->height, info->mip_count, info->array_size, info->sample_count, dxgi_format, info->bits);
 
 	// Create textures and get shared handles
 	for (uint32_t i = 0; i < image_count; i++) {
@@ -7845,11 +9105,14 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		// Calculate texture memory size for cross-API import validation (VK needs this).
 		// VK's vkGetImageMemoryRequirements adds row pitch and page alignment padding,
 		// so we round up to 1MB to ensure our reported size >= VK's requirements.
-		uint32_t bpp = dxgi_format_bytes_per_pixel(tex_desc.Format);
+		// Typed format: a TYPELESS depth family is not in the bpp table (#1956).
+		uint32_t bpp = dxgi_format_bytes_per_pixel(dxgi_format);
 		uint64_t raw_size = (uint64_t)tex_desc.Width * tex_desc.Height * bpp * tex_desc.ArraySize;
 		sc->base.images[i].size = (raw_size + 0xFFFFF) & ~(uint64_t)0xFFFFF;
 		sc->base.images[i].use_dedicated_allocation = false;
 		sc->base.images[i].is_dxgi_handle = false; // NT handle, use OpenSharedResource1
+		// #1767: tells a Vulkan client to import it as D3D11_TEXTURE, not OPAQUE_WIN32.
+		sc->base.images[i].is_d3d11_texture = true;
 
 		U_LOG_W("Created shared texture [%u]: handle=%p (NT handle)", i, shared_handle);
 
@@ -7858,7 +9121,7 @@ compositor_create_swapchain(struct xrt_compositor *xc,
 		// slice 0, so create a whole-array Texture2DArray SRV instead (the
 		// blit reads the requested slice via blit_ps_array).
 		D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = dxgi_format;
+		srv_desc.Format = img_fmt.srv;
 		if (tex_desc.ArraySize > 1) {
 			srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
 			srv_desc.Texture2DArray.MostDetailedMip = 0;
@@ -8087,6 +9350,19 @@ compositor_create_semaphore(struct xrt_compositor *xc,
 
 static void
 multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc); // forward decl (#929)
+// ADR-052: the secondary presenters' share of input (defined with the presenters).
+static void
+svc_ws_presenters_mirror_input_forward(
+    struct d3d11_multi_compositor *mc, void *target, int32_t rx, int32_t ry, int32_t rw, int32_t rh, bool is_capture);
+static uint32_t
+svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
+                                 struct workspace_public_event_raw *raw,
+                                 uint32_t primary_count,
+                                 uint32_t capacity);
+static void
+svc_ws_pointer_capture_set(struct d3d11_multi_compositor *mc, bool enabled, uint32_t button);
+static void *
+svc_ws_last_pointer_down_target(struct d3d11_multi_compositor *mc);
 
 static xrt_result_t
 compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin_session_info *info)
@@ -8122,6 +9398,13 @@ compositor_end_session(struct xrt_compositor *xc)
 	// reassigned: the controller's client-list diff picks the successor.
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
 	struct d3d11_service_system *sys = c->sys;
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): an ended session has
+	// no cursor - the shell stops lifting onto its window.
+	{
+		std::lock_guard<std::mutex> clk(c->cursor_draw.mutex);
+		c->cursor_draw.pending_valid = false;
+		c->cursor_draw.frame_valid = false;
+	}
 	if (sys != nullptr && sys->multi_comp != nullptr) {
 		render_mutex_fair_lock lock(sys);
 		struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -8143,6 +9426,259 @@ compositor_end_session(struct xrt_compositor *xc)
 		}
 	}
 	return XRT_SUCCESS;
+}
+
+/*
+ *
+ * #2245 (ADR-047 Amendment 9, phase A): a window's frame period is its screen's.
+ *
+ * `sys->refresh_rate` is the OS primary monitor's current rate, read once at
+ * create. A window on another monitor at another rate was paced at it anyway:
+ * the commit backpressure, the predicted display period and the period handed
+ * to the display processor all came from the primary. The rates of every OS
+ * monitor are cached here (EnumDisplayMonitors + EnumDisplaySettingsW, current
+ * mode) and dropped on the display re-probe (WM_DISPLAYCHANGE ->
+ * comp_d3d11_service_refresh_segment_screens), which a rate-only mode change
+ * also raises. A window wholly on the primary keeps `sys->refresh_rate` itself,
+ * not a re-read (comp_segments_window_refresh_hz).
+ *
+ * The adapter gate (comp_segments_gated_refresh_hz): a screen's own rate is
+ * used only when the adapter that scans it out (QueryDisplayConfig's path
+ * adapterId) is the adapter the presenting chain and the segment DPs live on
+ * (`svc_out_device`). Until phase B gives each screen its own output adapter,
+ * a screen on the other adapter is reached through a cross-adapter copy and a
+ * DWM composition, and pacing it faster than the primary is wasted work.
+ *
+ */
+
+struct svc_screen_rates
+{
+	std::mutex mutex;
+	bool valid = false;
+	uint32_t count = 0;
+	struct comp_segments_screen screens[COMP_SEGMENTS_MAX_SCREENS] = {};
+	float hz[COMP_SEGMENTS_MAX_SCREENS] = {};
+	//! The adapter scanning each monitor out (packed LUID, 0 = unknown).
+	uint64_t luid[COMP_SEGMENTS_MAX_SCREENS] = {};
+	//! Each monitor's GDI device name (MONITORINFOEXW::szDevice), to join
+	//! QueryDisplayConfig's paths.
+	wchar_t device[COMP_SEGMENTS_MAX_SCREENS][CCHDEVICENAME] = {};
+	//! The output device whose adapter LUID is cached below (process-latched).
+	ID3D11Device *luid_device = nullptr;
+	uint64_t device_luid = 0;
+};
+
+static svc_screen_rates g_svc_screen_rates;
+
+static BOOL CALLBACK
+svc_screen_rates_enum_cb(HMONITOR mon, HDC hdc, LPRECT rect, LPARAM lp)
+{
+	(void)hdc;
+	(void)rect;
+	auto *r = reinterpret_cast<svc_screen_rates *>(lp);
+	if (r->count >= COMP_SEGMENTS_MAX_SCREENS) {
+		return FALSE;
+	}
+	MONITORINFOEXW mi;
+	memset(&mi, 0, sizeof(mi));
+	mi.cbSize = sizeof(mi);
+	if (!GetMonitorInfoW(mon, (MONITORINFO *)&mi) || mi.rcMonitor.right <= mi.rcMonitor.left ||
+	    mi.rcMonitor.bottom <= mi.rcMonitor.top) {
+		return TRUE;
+	}
+	struct comp_segments_screen *sc = &r->screens[r->count];
+	memset(sc, 0, sizeof(*sc));
+	sc->id = (uint64_t)(uintptr_t)mon; // only ever compared and logged; never 0
+	sc->desktop.x = mi.rcMonitor.left;
+	sc->desktop.y = mi.rcMonitor.top;
+	sc->desktop.w = (uint32_t)(mi.rcMonitor.right - mi.rcMonitor.left);
+	sc->desktop.h = (uint32_t)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+	sc->is_primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+	memcpy(r->device[r->count], mi.szDevice, sizeof(r->device[r->count]));
+	r->luid[r->count] = 0;
+	DEVMODEW dm;
+	memset(&dm, 0, sizeof(dm));
+	dm.dmSize = sizeof(dm);
+	// dmDisplayFrequency 0 / 1 = "hardware default": unknown, as in
+	// comp_display_refresh_hz_win.
+	r->hz[r->count] = (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+	                      ? (float)dm.dmDisplayFrequency
+	                      : 0.0f;
+	r->count++;
+	return TRUE;
+}
+
+//! Caller holds g_svc_screen_rates.mutex.
+static void
+svc_screen_rates_ensure_locked(void)
+{
+	svc_screen_rates &r = g_svc_screen_rates;
+	if (r.valid) {
+		return;
+	}
+	r.count = 0;
+	(void)EnumDisplayMonitors(nullptr, nullptr, svc_screen_rates_enum_cb, (LPARAM)&r);
+
+	// Which adapter scans each monitor out: the active display paths' source
+	// adapter, joined by GDI device name. A monitor left at 0 is "unknown",
+	// which the gate treats as another adapter (it keeps the primary's rate).
+	UINT32 path_count = 0;
+	UINT32 mode_count = 0;
+	if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) == ERROR_SUCCESS &&
+	    path_count > 0) {
+		std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+		std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count > 0 ? mode_count : 1);
+		if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(),
+		                       nullptr) == ERROR_SUCCESS) {
+			for (UINT32 pi = 0; pi < path_count; pi++) {
+				DISPLAYCONFIG_SOURCE_DEVICE_NAME sn = {};
+				sn.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+				sn.header.size = sizeof(sn);
+				sn.header.adapterId = paths[pi].sourceInfo.adapterId;
+				sn.header.id = paths[pi].sourceInfo.id;
+				if (DisplayConfigGetDeviceInfo(&sn.header) != ERROR_SUCCESS) {
+					continue;
+				}
+				const LUID a = paths[pi].sourceInfo.adapterId;
+				for (uint32_t i = 0; i < r.count; i++) {
+					if (wcsncmp(r.device[i], sn.viewGdiDeviceName, CCHDEVICENAME) == 0) {
+						r.luid[i] =
+						    ((uint64_t)(uint32_t)a.HighPart << 32) | (uint64_t)a.LowPart;
+					}
+				}
+			}
+		}
+	}
+	r.valid = true; // an empty answer is cached too: every window then keeps today's period
+}
+
+//! The adapter @p dev lives on (packed LUID, 0 = unknown). Caller holds the
+//! rates mutex; cached per device (the output device is process-latched).
+static uint64_t
+svc_screen_rates_device_luid_locked(ID3D11Device *dev)
+{
+	svc_screen_rates &r = g_svc_screen_rates;
+	if (dev == nullptr) {
+		return 0;
+	}
+	if (r.luid_device == dev) {
+		return r.device_luid;
+	}
+	uint64_t packed = 0;
+	wil::com_ptr<IDXGIDevice> dxgi_dev;
+	wil::com_ptr<IDXGIAdapter> adapter;
+	DXGI_ADAPTER_DESC desc = {};
+	if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+	    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(&desc))) {
+		packed = ((uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32) | (uint64_t)desc.AdapterLuid.LowPart;
+	}
+	r.luid_device = dev;
+	r.device_luid = packed;
+	return packed;
+}
+
+//! The display re-probe: re-read every monitor's rate on next use.
+static void
+svc_screen_rates_invalidate(void)
+{
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	g_svc_screen_rates.valid = false;
+}
+
+//! A copy of the monitors and their rates for a segment frame, each rate
+//! already gated against @p dev (the segment DPs' device): a monitor scanned
+//! out by another adapter carries @p primary_hz. Returns the count.
+static uint32_t
+svc_screen_rates_copy(ID3D11Device *dev, float primary_hz, struct comp_segments_screen *out_screens, float *out_hz)
+{
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	svc_screen_rates_ensure_locked();
+	const uint64_t dev_luid = svc_screen_rates_device_luid_locked(dev);
+	const uint32_t n = g_svc_screen_rates.count;
+	memcpy(out_screens, g_svc_screen_rates.screens, sizeof(out_screens[0]) * n);
+	for (uint32_t i = 0; i < n; i++) {
+		out_hz[i] = comp_segments_gated_refresh_hz(g_svc_screen_rates.hz[i], g_svc_screen_rates.luid[i],
+		                                           dev_luid, primary_hz, nullptr);
+	}
+	return n;
+}
+
+// Defined with the segment path.
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out);
+
+//! The rate a window is paced at: its majority screen's; `sys->refresh_rate`
+//! when that is the primary, unknown, or the window cannot be read.
+static float
+svc_window_refresh_hz(struct d3d11_service_system *sys, HWND hwnd, uint64_t *out_monitor, bool *out_other_adapter)
+{
+	*out_monitor = 0;
+	*out_other_adapter = false;
+	struct comp_seg_rect win = {};
+	if (hwnd == nullptr || !svc_seg_window_rect(hwnd, &win)) {
+		return sys->refresh_rate;
+	}
+	std::lock_guard<std::mutex> lk(g_svc_screen_rates.mutex);
+	svc_screen_rates_ensure_locked();
+	uint32_t idx = UINT32_MAX;
+	float hz = comp_segments_window_refresh_hz(&win, g_svc_screen_rates.screens, g_svc_screen_rates.hz,
+	                                           g_svc_screen_rates.count, sys->refresh_rate, &idx);
+	if (idx != UINT32_MAX) {
+		*out_monitor = g_svc_screen_rates.screens[idx].id;
+		if (!g_svc_screen_rates.screens[idx].is_primary) {
+			// The gate: the chain lives on the output device (APP_HWND chains
+			// are made on svc_out_device).
+			hz = comp_segments_gated_refresh_hz(hz, g_svc_screen_rates.luid[idx],
+			                                    svc_screen_rates_device_luid_locked(svc_out_device(sys)),
+			                                    sys->refresh_rate, out_other_adapter);
+		}
+	}
+	return hz;
+}
+
+//! The rate this client is paced at (any thread).
+static inline float
+svc_client_hz(const struct d3d11_service_compositor *c)
+{
+	const float hz = c->screen_hz.load(std::memory_order_relaxed);
+	return hz > 0.0f ? hz : c->sys->refresh_rate;
+}
+
+/*!
+ * Re-evaluate the client's rate from where its window is now. The client's IPC
+ * thread, once per commit (the writer of `c->render.hwnd`). Only an app-owned
+ * window on the direct pipeline can sit on another screen; everything else (the
+ * service window, a client texture, the workspace) keeps the primary's rate.
+ * One WARN per change, never per frame.
+ */
+static float
+svc_client_update_screen_hz(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	float hz = sys->refresh_rate;
+	uint64_t mon = 0;
+	bool other_adapter = false;
+	if (!sys->workspace_mode && c->presenter == PRESENTER_APP_HWND) {
+		hz = svc_window_refresh_hz(sys, c->render.hwnd, &mon, &other_adapter);
+	}
+	const uint64_t gated = other_adapter ? mon : 0;
+	if (gated != c->screen_gated_monitor) {
+		c->screen_gated_monitor = gated;
+		if (gated != 0) {
+			U_LOG_W(
+			    "pipeline: client %p (pid %ld) — screen 0x%llx is on another adapter — paced at the "
+			    "primary's %.2f Hz until the per-screen output adapter (phase B, ADR-047 Amendment 9)",
+			    (void *)c, c->client_pid, (unsigned long long)gated, sys->refresh_rate);
+		}
+	}
+	const float stored = c->screen_hz.exchange(hz, std::memory_order_relaxed);
+	const float was = stored > 0.0f ? stored : sys->refresh_rate;
+	if (hz != was) {
+		U_LOG_W(
+		    "pipeline: client %p (pid %ld) paced at %.2f Hz from screen 0x%llx (was %.2f) — its window's "
+		    "majority screen (ADR-047 Amendment 9)",
+		    (void *)c, c->client_pid, hz, (unsigned long long)mon, was);
+	}
+	return hz;
 }
 
 // Per-client frame-rate cap (spec_version 14, xrSetWorkspaceClientFrameRateCapDXR).
@@ -8225,7 +9761,8 @@ compositor_predict_frame(struct xrt_compositor *xc,
 	*out_frame_id = c->frame_id;
 
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+	// #2245: the period of the screen the client's window is on.
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / svc_client_hz(c));
 
 	// IPC clients drive xrWaitFrame entirely via predict_frame's out_wake_time_ns
 	// (see ipc_client_compositor.c:ipc_compositor_wait_frame — client sleeps
@@ -8274,7 +9811,7 @@ compositor_wait_frame(struct xrt_compositor *xc,
 	*out_frame_id = c->frame_id;
 
 	int64_t now_ns = static_cast<int64_t>(os_monotonic_get_ns());
-	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / c->sys->refresh_rate);
+	int64_t period_ns = static_cast<int64_t>(U_TIME_1S_IN_NS / svc_client_hz(c)); // #2245
 
 	*out_predicted_display_time_ns = now_ns + period_ns * 2;
 	*out_predicted_display_period_ns = period_ns;
@@ -8841,6 +10378,9 @@ service_crop_atlas_for_dp(struct d3d11_service_system *sys,
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+		// The direct path never linearizes (handoff is always ENCODED); state
+		// b1 rather than inherit a stale value from an earlier combine pass.
+		sys->context->PSSetConstantBuffers(1, 1, sys->color_passthrough_cb.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
 		ID3D11ShaderResourceView *src_srv = res->atlas_srv.get();
 		sys->context->PSSetShaderResources(0, 1, &src_srv);
@@ -9001,6 +10541,8 @@ multi_compositor_update_input_forward(struct d3d11_multi_compositor *mc)
 	(void)is_capture; // (kept for the capture-path branch below)
 
 	comp_d3d11_window_set_input_forward(mc->window, (void *)target, rx, ry, rw, rh, is_capture);
+	// ADR-052: the same rect on every secondary presenter window, in its pixels.
+	svc_ws_presenters_mirror_input_forward(mc, (void *)target, rx, ry, rw, rh, is_capture);
 
 	// Track focused capture client (preview only — no foreground/input injection).
 	// SetForegroundWindow disabled: it steals OS focus and constrains the mouse.
@@ -9455,28 +10997,26 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		return;
 	}
 
-	uint32_t cap_r =
-	    sys->render_diag_capture_renders.exchange(0, std::memory_order_relaxed);
-	int64_t cap_total =
-	    sys->render_diag_capture_render_total_ns.exchange(0, std::memory_order_relaxed);
-	uint32_t cli_r =
-	    sys->render_diag_client_renders.exchange(0, std::memory_order_relaxed);
-	uint32_t cli_s =
-	    sys->render_diag_client_skips.exchange(0, std::memory_order_relaxed);
-	int64_t cli_total =
-	    sys->render_diag_client_render_total_ns.exchange(0, std::memory_order_relaxed);
-	int64_t wait_total =
-	    sys->render_diag_mutex_wait_total_ns.exchange(0, std::memory_order_relaxed);
-	uint32_t wait_count =
-	    sys->render_diag_mutex_wait_count.exchange(0, std::memory_order_relaxed);
-
-	uint32_t cap_avg_us = (cap_r > 0) ? (uint32_t)(cap_total / 1000 / cap_r) : 0u;
-	uint32_t cli_avg_us = (cli_r > 0) ? (uint32_t)(cli_total / 1000 / cli_r) : 0u;
-	uint32_t wait_avg_us = (wait_count > 0) ? (uint32_t)(wait_total / 1000 / wait_count) : 0u;
-
-	U_LOG_W(
-	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u wait_avg_us=%u window_s=10",
-	    cap_r, cap_avg_us, cli_r, cli_s, cli_avg_us, wait_avg_us);
+	// Drain the window into one struct; the log lines below format it and
+	// comp_d3d11_service_get_render_diag hands it out (ADR-051).
+	struct comp_d3d11_render_diag d = {};
+	d.valid = true;
+	d.window_s = 10;
+	{
+		uint32_t cap_r = sys->render_diag_capture_renders.exchange(0, std::memory_order_relaxed);
+		int64_t cap_total = sys->render_diag_capture_render_total_ns.exchange(0, std::memory_order_relaxed);
+		uint32_t cli_r = sys->render_diag_client_renders.exchange(0, std::memory_order_relaxed);
+		uint32_t cli_s = sys->render_diag_client_skips.exchange(0, std::memory_order_relaxed);
+		int64_t cli_total = sys->render_diag_client_render_total_ns.exchange(0, std::memory_order_relaxed);
+		int64_t wait_total = sys->render_diag_mutex_wait_total_ns.exchange(0, std::memory_order_relaxed);
+		uint32_t wait_count = sys->render_diag_mutex_wait_count.exchange(0, std::memory_order_relaxed);
+		d.capture_renders = cap_r;
+		d.capture_avg_us = (cap_r > 0) ? (uint32_t)(cap_total / 1000 / cap_r) : 0u;
+		d.client_renders = cli_r;
+		d.client_skips = cli_s;
+		d.client_avg_us = (cli_r > 0) ? (uint32_t)(cli_total / 1000 / cli_r) : 0u;
+		d.wait_avg_us = (wait_count > 0) ? (uint32_t)(wait_total / 1000 / wait_count) : 0u;
+	}
 
 	// #964: pipeline presenter counters on the same window. The ratio
 	// pipe_active_present : pipe_active_skip is the diagnostic for the
@@ -9486,25 +11026,20 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 	// pipe_active_backoff counts only the watchdog/occlusion parking.
 	// presenter = enum d3d11_presenter_kind of the active presenter at emit.
 	if (pipeline_always_on(sys)) {
-		uint32_t ap = sys->render_diag_pipe_active_present.exchange(0, std::memory_order_relaxed);
-		uint32_t as = sys->render_diag_pipe_active_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t ab = sys->render_diag_pipe_active_backoff.exchange(0, std::memory_order_relaxed);
-		uint32_t fp = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
-		uint32_t fs = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t rb = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
-		uint32_t sr = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
-		uint32_t ac = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
-		uint32_t cw = sys->render_diag_ctx_waits.exchange(0, std::memory_order_relaxed);
-		int pk = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
-		uint32_t rh = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
-		uint32_t zk = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
-		uint32_t uk = sys->render_diag_ui_acq_skip.exchange(0, std::memory_order_relaxed);
-		U_LOG_W(
-		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
-		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
-		    "atlas_contention=%u ctx_waits=%u presenter=%d recipe_hold=%u zones_skip=%u "
-		    "ui_acq_skip=%u window_s=10",
-		    ap, as, ab, fp, fs, rb, sr, ac, cw, pk, rh, zk, uk);
+		d.pipe_valid = true;
+		d.pipe_active_present = sys->render_diag_pipe_active_present.exchange(0, std::memory_order_relaxed);
+		d.pipe_active_skip = sys->render_diag_pipe_active_skip.exchange(0, std::memory_order_relaxed);
+		d.pipe_active_backoff = sys->render_diag_pipe_active_backoff.exchange(0, std::memory_order_relaxed);
+		d.pipe_flat_present = sys->render_diag_pipe_flat_present.exchange(0, std::memory_order_relaxed);
+		d.pipe_flat_skip = sys->render_diag_pipe_flat_skip.exchange(0, std::memory_order_relaxed);
+		d.pipe_rebind = sys->render_diag_pipe_rebind.exchange(0, std::memory_order_relaxed);
+		d.dp_stale_recreate = sys->render_diag_dp_stale_recreate.exchange(0, std::memory_order_relaxed);
+		d.atlas_contention = sys->render_diag_atlas_contention.exchange(0, std::memory_order_relaxed);
+		d.ctx_waits = sys->render_diag_ctx_waits.exchange(0, std::memory_order_relaxed);
+		d.presenter = sys->render_diag_pipe_presenter.load(std::memory_order_relaxed);
+		d.recipe_hold = sys->render_diag_recipe_hold.exchange(0, std::memory_order_relaxed);
+		d.zones_skip = sys->render_diag_zones_skip.exchange(0, std::memory_order_relaxed);
+		d.ui_acq_skip = sys->render_diag_ui_acq_skip.exchange(0, std::memory_order_relaxed);
 
 		/*
 		 * #918: the split's own window. `xb_kb` is atlas transport per window,
@@ -9514,12 +11049,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 		 * output-device crop rescued from a worst-case egress ring. Emitted only
 		 * when Stage A succeeded, so an ordinary session's log is unchanged.
 		 */
+		d.split_available = sys->split_available;
 		if (sys->split_available) {
-			uint32_t dr = sys->render_diag_pipe_dev_rebind.exchange(0, std::memory_order_relaxed);
-			uint32_t fk = sys->render_diag_flat_skip_split.exchange(0, std::memory_order_relaxed);
-			uint32_t mk = sys->render_diag_maskpub_skip.exchange(0, std::memory_order_relaxed);
-			uint32_t ns = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
-			uint32_t oc = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
+			d.pipe_dev_rebind = sys->render_diag_pipe_dev_rebind.exchange(0, std::memory_order_relaxed);
+			d.flat_skip = sys->render_diag_flat_skip_split.exchange(0, std::memory_order_relaxed);
+			d.maskpub_skip = sys->render_diag_maskpub_skip.exchange(0, std::memory_order_relaxed);
+			d.no_slot = sys->render_diag_split_no_slot.exchange(0, std::memory_order_relaxed);
+			d.out_crop = sys->render_diag_split_out_crop.exchange(0, std::memory_order_relaxed);
 			const uint64_t xb_bytes =
 			    sys->xbridge != nullptr ? comp_xbridge_take_atlas_bytes(sys->xbridge) : 0;
 			/*
@@ -9538,15 +11074,43 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			                       : ing.mode == COMP_XBRIDGE_INGRESS_DIRECT ? "direct"
 			                       : ing.mode == COMP_XBRIDGE_INGRESS_STAGED ? "staged"
 			                                                                 : "none";
+			d.split_active = (int)sys->split_active;
+			d.xb_kb = xb_bytes / 1024u;
+			d.xb_degraded = (int)(sys->xbridge != nullptr && comp_xbridge_is_degraded(sys->xbridge));
+			snprintf(d.ingress, sizeof(d.ingress), "%s", ing_name);
+			d.ing_direct = (uint64_t)ing.direct;
+			d.ing_staged = (uint64_t)ing.staged;
+			d.ing_rebind = (uint64_t)ing.rebind;
+			d.ing_churn = (uint64_t)ing.churn;
+			d.ing_leak = (uint64_t)ing.leak;
+		} else {
+			snprintf(d.split_off_reason, sizeof(d.split_off_reason), "%s", sys->split_off_reason);
+		}
+	}
+
+	// The [RENDER] lines are grepped by peers: keep them byte-identical.
+	U_LOG_W(
+	    "[RENDER] capture_renders=%u capture_avg_us=%u client_renders=%u client_skips=%u client_avg_us=%u "
+	    "wait_avg_us=%u window_s=10",
+	    d.capture_renders, d.capture_avg_us, d.client_renders, d.client_skips, d.client_avg_us, d.wait_avg_us);
+	if (d.pipe_valid) {
+		U_LOG_W(
+		    "[RENDER] pipe_active_present=%u pipe_active_skip=%u pipe_active_backoff=%u "
+		    "pipe_flat_present=%u pipe_flat_skip=%u pipe_rebind=%u dp_stale_recreate=%u "
+		    "atlas_contention=%u ctx_waits=%u presenter=%d recipe_hold=%u zones_skip=%u "
+		    "ui_acq_skip=%u window_s=10",
+		    d.pipe_active_present, d.pipe_active_skip, d.pipe_active_backoff, d.pipe_flat_present,
+		    d.pipe_flat_skip, d.pipe_rebind, d.dp_stale_recreate, d.atlas_contention, d.ctx_waits, d.presenter,
+		    d.recipe_hold, d.zones_skip, d.ui_acq_skip);
+		if (d.split_available) {
 			U_LOG_W(
 			    "[RENDER] split=%d xb_kb=%llu xb_degraded=%d pipe_dev_rebind=%u "
 			    "flat_skip=%u maskpub_skip=%u no_slot=%u out_crop=%u ingress=%s ing_direct=%llu "
 			    "ing_staged=%llu ing_rebind=%llu ing_churn=%llu ing_leak=%llu window_s=10",
-			    (int)sys->split_active, (unsigned long long)(xb_bytes / 1024u),
-			    (int)(sys->xbridge != nullptr && comp_xbridge_is_degraded(sys->xbridge)), dr, fk, mk, ns,
-			    oc, ing_name, (unsigned long long)ing.direct, (unsigned long long)ing.staged,
-			    (unsigned long long)ing.rebind, (unsigned long long)ing.churn,
-			    (unsigned long long)ing.leak);
+			    d.split_active, (unsigned long long)d.xb_kb, d.xb_degraded, d.pipe_dev_rebind, d.flat_skip,
+			    d.maskpub_skip, d.no_slot, d.out_crop, d.ingress, (unsigned long long)d.ing_direct,
+			    (unsigned long long)d.ing_staged, (unsigned long long)d.ing_rebind,
+			    (unsigned long long)d.ing_churn, (unsigned long long)d.ing_leak);
 		} else {
 			/*
 			 * SPLIT OFF — say so, and say why. Without this the whole
@@ -9559,8 +11123,13 @@ emit_render_diag_if_window_elapsed(struct d3d11_service_system *sys)
 			 * them as zeros would put eleven meaningless fields into every
 			 * 10 s window on every single-GPU box.
 			 */
-			U_LOG_W("[RENDER] split=0 reason=%s", sys->split_off_reason);
+			U_LOG_W("[RENDER] split=0 reason=%s", d.split_off_reason);
 		}
+	}
+
+	{
+		std::lock_guard<std::mutex> lk(sys->render_diag_last_mutex);
+		sys->render_diag_last = d;
 	}
 
 	sys->render_diag_window_start_ns.store(now_ns, std::memory_order_relaxed);
@@ -9626,6 +11195,9 @@ try {
 			// The service window's own token (if any) stays until spent.
 		} else if (mc->frame_latency_waitable) {
 			// (app token, if any, stays until spent or re-keyed — see above)
+			// #2564: take back tokens a governor depth decrease left behind,
+			// before the wait that would otherwise return a frame early.
+			g_lw_ledger_workspace.pay(mc->frame_latency_waitable, "workspace");
 			HANDLE waits[2] = {mc->frame_latency_waitable, mc->render_wakeup_event};
 			// #964: when the SERVICE WINDOW is not the active presenter it is
 			// hidden, and a hidden swap chain's waitable stops signaling — the
@@ -9663,7 +11235,7 @@ try {
 				wil::com_ptr<IDXGISwapChain2> sc2;
 				if (mc->swap_chain &&
 				    SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
-					sc2->SetMaximumFrameLatency((UINT)g_lw_gov_workspace.effective);
+					g_lw_ledger_workspace.apply(sc2.get(), g_lw_gov_workspace.effective);
 				}
 				static bool logged_backoff = false, logged_return = false;
 				bool &logged = (tr > 0) ? logged_backoff : logged_return;
@@ -10096,6 +11668,7 @@ multi_compositor_destroy(struct d3d11_multi_compositor *mc)
 	pipeline_dp_graveyard_sweep(mc, /*force*/ true);
 
 	mc->back_buffer_rtv.reset();
+	mc->combined_atlas_rtv_srgb.reset();
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
@@ -10162,7 +11735,9 @@ multi_compositor_create_service_chain(struct d3d11_service_system *sys,
 		wil::com_ptr<IDXGISwapChain2> sc2;
 		if (SUCCEEDED(mc->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
 			const int lat = g_lw_gov_workspace.base_latency();
-			sc2->SetMaximumFrameLatency(lat);
+			// #2564: a fresh chain owes no tokens.
+			g_lw_ledger_workspace.reset();
+			g_lw_ledger_workspace.apply(sc2.get(), lat);
 			mc->frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			U_LOG_W("Late-weave: workspace swap chain waitable, max latency %d%s (waitable=%p)", lat,
 			        (lat == 1 && g_lw_gov_workspace.auto_backoff == 1) ? " + saturation auto-backoff" : "",
@@ -10320,7 +11895,10 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 		atlas_desc.Height = ca_h;
 		atlas_desc.MipLevels = 1;
 		atlas_desc.ArraySize = 1;
-		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		// #1764: TYPELESS so one allocation carries both a byte-exact UNORM
+		// view (Model A draws, the backdrop clear, every reader) and an
+		// encode-on-write `_SRGB` RTV (Model B draws). See the field comment.
+		atlas_desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 		atlas_desc.SampleDesc.Count = 1;
 		atlas_desc.Usage = D3D11_USAGE_DEFAULT;
 		atlas_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -10336,8 +11914,47 @@ multi_compositor_ensure_output(struct d3d11_service_system *sys)
 			U_LOG_E("Multi-comp: failed to create combined atlas (hr=0x%08X)", hr);
 			return XRT_ERROR_D3D11;
 		}
-		sys->device->CreateShaderResourceView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_srv.put());
-		sys->device->CreateRenderTargetView(mc->combined_atlas.get(), nullptr, mc->combined_atlas_rtv.put());
+		// #1764: every view names its format — a TYPELESS resource rejects a
+		// nullptr view desc. The UNORM SRV/RTV are load-bearing (the DP input
+		// and the Model-A / clear target); a failed `_SRGB` RTV only costs
+		// Model B its encode-on-write, so it degrades to the pre-#1764 path
+		// (UNORM RTV holding linear, LINEAR handoff) instead of failing.
+		D3D11_SHADER_RESOURCE_VIEW_DESC ca_srv_desc = {};
+		ca_srv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		ca_srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		ca_srv_desc.Texture2D.MostDetailedMip = 0;
+		ca_srv_desc.Texture2D.MipLevels = 1;
+		D3D11_RENDER_TARGET_VIEW_DESC ca_rtv_desc = {};
+		ca_rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		ca_rtv_desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+		ca_rtv_desc.Texture2D.MipSlice = 0;
+		HRESULT hr_srv =
+		    sys->device->CreateShaderResourceView(mc->combined_atlas.get(), &ca_srv_desc, mc->combined_atlas_srv.put());
+		HRESULT hr_rtv =
+		    sys->device->CreateRenderTargetView(mc->combined_atlas.get(), &ca_rtv_desc, mc->combined_atlas_rtv.put());
+		if (FAILED(hr_srv) || FAILED(hr_rtv)) {
+			U_LOG_E("Multi-comp: combined atlas UNORM views failed (srv=0x%08lX rtv=0x%08lX)", hr_srv, hr_rtv);
+			mc->combined_atlas_srv.reset();
+			mc->combined_atlas_rtv.reset();
+			mc->combined_atlas.reset();
+			return XRT_ERROR_D3D11;
+		}
+		D3D11_RENDER_TARGET_VIEW_DESC ca_rtv_srgb_desc = ca_rtv_desc;
+		ca_rtv_srgb_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		HRESULT hr_rtv_srgb = sys->device->CreateRenderTargetView(mc->combined_atlas.get(), &ca_rtv_srgb_desc,
+		                                                          mc->combined_atlas_rtv_srgb.put());
+		if (FAILED(hr_rtv_srgb)) {
+			mc->combined_atlas_rtv_srgb.reset();
+		}
+		// One-off per (re)allocation: the line a hardware check greps to see
+		// which views the combine pass can pick from.
+		U_LOG_W(
+		    "Color (#1764) [d3d11_service]: combined atlas storage=0x%X srv=0x%X rtv=0x%X rtv_srgb=0x%X%s "
+		    "(same typeless family=%d)",
+		    (unsigned)atlas_desc.Format, (unsigned)ca_srv_desc.Format, (unsigned)ca_rtv_desc.Format,
+		    (unsigned)ca_rtv_srgb_desc.Format,
+		    mc->combined_atlas_rtv_srgb ? "" : " FAILED - Model B keeps the linear UNORM handoff",
+		    (int)d3d_dxgi_format_same_typeless_family(atlas_desc.Format, ca_rtv_srgb_desc.Format));
 		svc_split_share_source(sys, mc->combined_atlas.get(), &mc->atlas_share_handle, &mc->atlas_share_key);
 
 		// Phase 2.K: depth target sibling (D32_FLOAT). Per-eye tiles share
@@ -10833,6 +12450,27 @@ dxr_idle_quiesce_ns()
 	return ns;
 }
 
+//! Weave-idle release (#2582): how long a weave present-owner (the DisplayXR
+//! Browser) may go without an xrWeaveSubmitDXR before its display processors —
+//! and the eye-tracking camera behind them — are released while it stays
+//! connected. Its own knob, NOT DXR_IDLE_QUIESCE_MS: 0 here keeps the camera on
+//! between 3D pages without also disabling the #1319 no-client release, and
+//! DXR_IDLE_QUIESCE_MS=0 no longer disables this one. DXR_WEAVE_IDLE_MS.
+static int64_t
+dxr_weave_idle_ns()
+{
+	static int64_t ns = -1;
+	if (ns < 0) {
+		const char *e = getenv("DXR_WEAVE_IDLE_MS");
+		int64_t ms = (e != nullptr && e[0] != '\0') ? atoll(e) : 5000;
+		if (ms < 0) {
+			ms = 0;
+		}
+		ns = ms * 1000000LL;
+	}
+	return ns;
+}
+
 /*!
  * #964: park a retired panel DP instead of destroying it. Caller holds
  * render_mutex and has ALREADY published its replacement (or nullptr).
@@ -11058,9 +12696,13 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 	if (sys == nullptr || mc == nullptr || mc->idle_quiesced) {
 		return false;
 	}
-	// `suspended` is the workspace-deactivate quiesce (Ctrl+Space) — same
+	// `suspended` is the workspace-deactivate quiesce (launch hotkey) — same
 	// teardown, different trigger, and it already released the DP.
-	if (mc->suspended || mc->client_count != 0 || mc->capture_client_count != 0) {
+	// An active workspace controller is not in `clients[]` (it owns the
+	// workspace, it is not a slot in it), so a controller with no apps open
+	// would read as idle and freeze its own launcher/chrome after the grace
+	// period. The controller keeps the pipeline up while the workspace is on.
+	if (mc->suspended || sys->workspace_mode || mc->client_count != 0 || mc->capture_client_count != 0) {
 		mc->idle_since_ns = 0;
 		return false;
 	}
@@ -11105,6 +12747,106 @@ pipeline_idle_quiesce_if_due(struct d3d11_service_system *sys, struct d3d11_mult
 	capture_render_thread_request_stop(sys);
 	U_LOG_W("[pipeline] idle: no clients for %lld ms — panel DP released, render thread parking (#1319)",
 	        (long long)(grace_ns / 1000000LL));
+	return true;
+}
+
+/*!
+ * Weave-idle release: #1319's quiesce for a present-owner that is CONNECTED but
+ * no longer weaving.
+ *
+ * #1319 only fires with zero clients. The DisplayXR Browser keeps its
+ * XR_DXR_weave session for the life of the process, and only submits while a
+ * page has an inline-3D tile (Viz returns before any xrWeaveSubmitDXR when the
+ * last tile is gone; the runtime refuses a zero-rect batch anyway). So after
+ * its last 3D page the browser stays a client forever, this pipeline keeps the
+ * panel DP bound to its window every frame, and the SR context behind that DP
+ * keeps the eye-tracking camera streaming (LED lit) on a 2D page.
+ *
+ * Once the focused PRESENTER_SELF client has not submitted for the weave-idle
+ * window (DXR_WEAVE_IDLE_MS, default 5000; 0 disables this release only — the
+ * #1319 no-client release keeps its own DXR_IDLE_QUIESCE_MS), release every
+ * DP it holds the camera through: the panel DP (retired into the graveyard, so
+ * a lock-free reader still inside a bounded call stays safe; the per-frame sweep
+ * destroys it after the graveyard grace) and its own #1172/#939 ingest DP.
+ * Unlike #1319 the render thread keeps running: the client is still here.
+ *
+ * Coming back needs no resume path: the next submit stamps
+ * `weave_last_submit_ns` before anything else, svc_ensure_client_weave_dp
+ * rebuilds the ingest DP on the submitting thread, and the next render tick
+ * sees the fresh stamp, clears the latch and binds the panel DP as usual. A
+ * submit that lands before that rebind returns false (the client keeps its last
+ * frame and retries), the same degrade as the #1172 tripwire.
+ *
+ * Render thread, under render_mutex. Returns true while the client is released
+ * (the caller must not bind a DP to it this frame).
+ */
+static bool
+pipeline_weave_idle_release_if_due(struct d3d11_service_system *sys,
+                                   struct d3d11_multi_compositor *mc,
+                                   struct d3d11_service_compositor *fc)
+{
+	if (sys == nullptr || mc == nullptr || fc == nullptr) {
+		return false;
+	}
+	const int64_t grace_ns = dxr_weave_idle_ns();
+	const int64_t last_ns = fc->weave_last_submit_ns.load(std::memory_order_acquire);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	// A workspace controller owns the panel; a client that has never woven has
+	// nothing of its own to release yet.
+	const bool idle = grace_ns > 0 && !sys->workspace_mode && last_ns != 0 && now_ns - last_ns >= grace_ns;
+	if (!idle) {
+		if (fc->weave_idle_released) {
+			fc->weave_idle_released = false;
+			// Only the ingest-DP branch keeps the panel DP off the client's
+			// window; everywhere else the ordinary per-frame bind restores it.
+			fc->weave_idle_rebind_panel =
+			    fc->weave_idle_rebind_panel && svc_client_wants_ingest_dp(sys, fc);
+			U_LOG_W("[pipeline] weave-idle: '%s' is weaving again — rebinding its display processors",
+			        fc->slot_app_name);
+		}
+		return false;
+	}
+	if (fc->weave_idle_released) {
+		return true;
+	}
+	// The ingest DP is created OUTSIDE render_mutex (svc_ensure_client_weave_dp);
+	// never wait for that create here, just try again next frame.
+	std::unique_lock<std::mutex> dp_guard(fc->weave_dp_mutex, std::try_to_lock);
+	if (!dp_guard.owns_lock()) {
+		return false;
+	}
+	if (fc->render.weave_dp != nullptr) {
+		(void)DP_REQUEST_DISPLAY_MODE(fc->render.weave_dp, false);
+		xrt_display_processor_d3d11_destroy(&fc->render.weave_dp);
+		fc->render.weave_dp = nullptr;
+		fc->render.weave_dp_hwnd = nullptr;
+		fc->render.weave_dp_refused = false;
+		fc->render.weave_dp_windowless = false;
+		fc->render.weave_dp_origin_valid = false;
+		fc->render.weave_dp_client_presents = -1;
+		fc->render.weave_dp_encoding = -1;
+	}
+	dp_guard.unlock();
+	fc->weave_idle_rebind_panel = false;
+	if (mc->display_processor != nullptr) {
+		if (mc->window != nullptr) {
+			comp_d3d11_window_set_workspace_dp(mc->window, nullptr);
+		}
+		struct xrt_display_processor_d3d11 *dead = mc->display_processor;
+		HWND dead_hwnd = mc->panel_dp_hwnd;
+		ID3D11Device *dead_dev = mc->panel_dp_device;
+		fc->weave_idle_rebind_panel = (dead_hwnd != nullptr && dead_hwnd == mc->hwnd);
+		mc->display_processor = nullptr;
+		mc->panel_dp_hwnd = nullptr;
+		mc->panel_dp_device = nullptr;
+		pipeline_dp_forget_beliefs(mc);
+		pipeline_dp_retire(mc, dead, dead_hwnd, dead_dev); // drops the lens vote now
+	}
+	fc->weave_idle_released = true;
+	U_LOG_W(
+	    "[pipeline] weave-idle: '%s' has not woven for %lld ms — display processors released, eye-tracking "
+	    "camera off until its next weave (DXR_WEAVE_IDLE_MS)",
+	    fc->slot_app_name, (long long)((now_ns - last_ns) / 1000000LL));
 	return true;
 }
 
@@ -11218,6 +12960,36 @@ pipeline_dp_set_transparency(struct d3d11_multi_compositor *mc,
 	mc->panel_dp_client_presents = client_presents;
 	mc->panel_dp_client_presents_valid = true;
 	pipeline_dp_note_state_flip(mc, "transparency", who);
+}
+
+/*!
+ * #1764: the RTV every combine-pass DRAW into the combined atlas binds.
+ *
+ * The `_SRGB` (encode-on-write) view only when this tick composes in linear
+ * AND hands off ENCODED (@ref d3d11_multi_compositor::combine_encodes_on_write);
+ * the byte-exact UNORM view otherwise. Model A must never get the `_SRGB` view:
+ * its b1 is 0, the blit shader emits encoded bytes, and the RTV would encode
+ * them again. The backdrop clear deliberately does NOT use this — it always
+ * clears through the UNORM view with a byte value (see the clear).
+ */
+static inline ID3D11RenderTargetView *
+multi_combine_rtv(struct d3d11_multi_compositor *mc)
+{
+	if (mc->combine_encodes_on_write && mc->combined_atlas_rtv_srgb) {
+		return mc->combined_atlas_rtv_srgb.get();
+	}
+	return mc->combined_atlas_rtv.get();
+}
+
+/*!
+ * #1764: may this tick's Model-B combine encode on write? Needs the `_SRGB`
+ * view AND a DP that accepts an ENCODED handoff — a LINEAR-only DP must be
+ * handed linear, so it keeps the pre-#1764 path (UNORM RTV holding linear).
+ */
+static inline bool
+multi_combine_can_encode_on_write(const struct d3d11_multi_compositor *mc, enum xrt_dp_color_capability cap)
+{
+	return mc->combined_atlas_rtv_srgb && cap == XRT_DP_COLOR_EITHER;
 }
 
 /*!
@@ -13297,6 +15069,9 @@ svc_after_present(weave_latency_log *log, const char *site, IDXGISwapChain1 *sc)
  *        grid is part of the generation signature and a slot of a foreign
  *        generation is refused above, so this is the grid that painted the slot
  *        — never live `pipe_tile_*` state, which may have moved since. Optional.
+ * @param io_seg_content In: the multi-screen segment partition this frame's
+ *        atlas was painted with (#1883). Out: the woven slot's own, zeroed
+ *        (unrouted) when no longer recorded. Optional; NULL submits unrouted.
  *
  * #1140 — SINGLE SOURCE. All four DP-recipe terms (view w/h, cols/rows) leave
  * this helper together, describing the ONE slot being woven. Mixing a slot's
@@ -13319,7 +15094,8 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
                             uint32_t *io_view_w,
                             uint32_t *io_view_h,
                             uint32_t *out_cols = nullptr,
-                            uint32_t *out_rows = nullptr)
+                            uint32_t *out_rows = nullptr,
+                            struct comp_segments_content *io_seg_content = nullptr)
 {
 	if (sys->xbridge == nullptr || crop_tex == nullptr || cols == 0 || rows == 0) {
 		return nullptr;
@@ -13375,6 +15151,9 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	(void)comp_xbridge_set_source(sys->xbridge, src_share, src_key);
 
 	sys->split_seq++;
+	// #1883: the slot carries this frame's segment partition (by seq); the
+	// compose path passes none (unrouted).
+	comp_segments_content_ring_put(&sys->split_seg_content_ring, sys->split_seq, io_seg_content);
 	comp_xbridge_submit(sys->xbridge, sys->split_seq, sys->split_layout_gen, crop_tex, content_w, content_h);
 
 	// Opportunistic: the newest slot whose consumer copy has already completed,
@@ -13453,6 +15232,15 @@ pipeline_split_bridge_atlas(struct d3d11_service_system *sys,
 	if (out_rows != nullptr) {
 		*out_rows = sys->split_layout_rows;
 	}
+	// #1883: and at its own segment partition — the one the frame that
+	// filled this slot was painted with, not this tick's.
+	if (io_seg_content != nullptr) {
+		uint64_t slot_seq = 0;
+		if (!comp_xbridge_slot_seq(sys->xbridge, slot, &slot_seq) ||
+		    !comp_segments_content_ring_get(&sys->split_seg_content_ring, slot_seq, io_seg_content)) {
+			memset(io_seg_content, 0, sizeof(*io_seg_content));
+		}
+	}
 	return srv;
 }
 
@@ -13521,6 +15309,250 @@ pipeline_return_app_grant(struct d3d11_multi_compositor *mc,
 	}
 }
 
+/*
+ *
+ * Multi-screen M6/M3 on the service path (ADR-047 Amendment 3): a direct IPC
+ * client's window that spans monitors, woven per screen.
+ *
+ */
+
+//! How long a direct weave's segment table stays valid for the client's
+//! locates (~15 frames at 60 Hz): long enough for a skipped or slow frame,
+//! short enough that a client which lost the panel stops locating per segment.
+#define SVC_SEG_PUB_FRESH_NS ((int64_t)250 * 1000 * 1000)
+
+//! The window's client area in desktop device px. The service is per-monitor
+//! DPI aware (dpi_aware.manifest), so this is the space the screen registry's
+//! monitor rects are in; GetClientRect / ClientToScreen work cross-process on
+//! the app's real HWND and send no message.
+static bool
+svc_seg_window_rect(HWND hwnd, struct comp_seg_rect *out)
+{
+	RECT cr;
+	POINT origin = {0, 0};
+	if (hwnd == nullptr || !IsWindow(hwnd) || !GetClientRect(hwnd, &cr) || cr.right <= 0 || cr.bottom <= 0 ||
+	    !ClientToScreen(hwnd, &origin)) {
+		return false;
+	}
+	out->x = origin.x;
+	out->y = origin.y;
+	out->w = (uint32_t)cr.right;
+	out->h = (uint32_t)cr.bottom;
+	return true;
+}
+
+//! Drop the client's segment manager and its flat-2D unit. Render thread (or
+//! compositor_destroy), holding render_mutex: no weave is in flight. The
+//! pointer is swapped out under seg_mutex, which is what the IPC thread reads
+//! segment eyes under, so no reader can still be inside the manager when it
+//! is destroyed.
+static void
+svc_seg_release(struct d3d11_service_compositor *c)
+{
+	struct comp_d3d11_segments *old = nullptr;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		old = c->segments;
+		c->segments = nullptr;
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none)); // memcmp'd: padding too
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+	comp_d3d11_segments_destroy(&old);
+	comp_d3d11_outcomp_destroy(&c->seg_outcomp);
+	c->seg_device = nullptr;
+}
+
+//! #1884: the present-owner's weave segment manager (defined with weave_submit).
+static void
+weave_seg_release(struct d3d11_service_compositor *c);
+
+/*!
+ * #2244: a tick that does NOT weave (the presenter has no free back buffer,
+ * the split bridge has nothing weavable) must not let the published segment
+ * table age out. The reader (`SVC_SEG_PUB_FRESH_NS`) treats a table older than
+ * 250 ms as "not the direct presenter" and hands the client ONE view set, so a
+ * presenter that skips for longer than that (a 30 Hz secondary, the 1 s
+ * occlusion backoff) made `segments.split` alternate false (stale) / true (the
+ * next weave republished) with the window standing still. The table itself is
+ * left exactly as the last weave published it; only its freshness is renewed,
+ * and only for a table that exists (count 0 = not split needs no keep-alive:
+ * stale and empty read the same). A window that genuinely leaves the split
+ * state republishes empty on its next weave, as before.
+ *
+ * Render thread, focused client's compositor.
+ */
+static void
+pipeline_segments_keepalive(struct d3d11_service_compositor *fc)
+{
+	std::lock_guard<std::mutex> lk(fc->seg_mutex);
+	if (fc->segments != nullptr && fc->seg_pub.count > 0) {
+		fc->seg_pub_ns = (int64_t)os_monotonic_get_ns();
+	}
+}
+
+/*!
+ * The direct pipeline's segment path for the focused client: when its window
+ * spans monitors, weave it per screen into the presenter's back buffer — the
+ * panel DP (bound to the app's HWND, so it keeps the vendor's phase-snap) on
+ * the primary screen's segment, a windowless per-screen DP from the registry
+ * (`create_dp_d3d11_for_screen`, phase from `set_present_origin`) on every
+ * other, flat 2D where no DP can weave. The in-process D3D11 compositor's own
+ * manager (comp_d3d11_segments), made on the OUTPUT device so it is right
+ * under the #918 split too; the atlas it crops is the one the single-DP path
+ * would have woven (the client's crop, or the egress slot under the split).
+ *
+ * Scope: an APP_HWND presenter (a window the app owns, which is what can sit
+ * across a seam). A hosted client presents into the service's own window on
+ * the panel, a present-owner / client-texture client weaves on its own, and a
+ * zones frame keeps the single-DP path — as in-process. A client that never
+ * sent `compositor_segments_enable` returns false before anything else: the
+ * frame is the single-DP one, byte for byte.
+ *
+ * Every call also publishes the table this weave took (count 0 = one view
+ * set), for the client's next xrLocateViews. @p content is the partition the
+ * woven atlas was painted with (#1883): the table is cut from the live window,
+ * each segment's views are cropped from where that frame put them.
+ *
+ * Render thread, holding render_mutex. The caller has bound @p present_rtv and
+ * fed @p dp this frame's transparency, encoding and timing.
+ *
+ * @return true when the frame was woven per segment (the caller then skips
+ *         its single process_atlas).
+ */
+static bool
+pipeline_segments_weave(struct d3d11_service_system *sys,
+                        struct d3d11_service_compositor *fc,
+                        enum d3d11_presenter_kind kind,
+                        HWND present_hwnd,
+                        ID3D11RenderTargetView *present_rtv,
+                        struct xrt_display_processor_d3d11 *dp,
+                        ID3D11ShaderResourceView *dp_input_srv,
+                        uint32_t view_w,
+                        uint32_t view_h,
+                        uint32_t cols,
+                        uint32_t rows,
+                        uint32_t target_w,
+                        uint32_t target_h,
+                        const struct comp_segments_content *content)
+{
+	ID3D11Device *dev = svc_out_device(sys);
+	ID3D11DeviceContext *ctx = svc_out_context(sys);
+	bool rebuild = false;
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		if (fc->seg_screens == nullptr) {
+			return false; // never enabled: the single-DP path, untouched
+		}
+		rebuild = fc->seg_rebuild || fc->seg_device != dev;
+	}
+
+	if (rebuild) {
+		// A new screen list, or the output device moved (#918 split engaged
+		// or released): the segment DPs and crops belong to the old device.
+		svc_seg_release(fc);
+		struct comp_d3d11_segments *ns = comp_d3d11_segments_create(dev);
+		bool enabled = false;
+		{
+			std::lock_guard<std::mutex> lk(fc->seg_mutex);
+			if (ns != nullptr) {
+				comp_d3d11_segments_set_screens(ns, fc->seg_screens, fc->seg_sys_info,
+				                                fc->seg_pinned_display_id);
+				enabled = comp_d3d11_segments_enabled(ns);
+			}
+			fc->segments = ns;
+			fc->seg_rebuild = false;
+		}
+		if (comp_d3d11_outcomp_create(dev, ctx, &fc->seg_outcomp) != XRT_SUCCESS) {
+			fc->seg_outcomp = nullptr; // segments that cannot weave then stay black, not flat 2D
+		}
+		fc->seg_device = dev; // tried once per device / list, never per frame
+		if (enabled) {
+			// Lifecycle (once per manager): the rig's proof that this IPC
+			// client's segment DPs are made in the service, on the device
+			// that presents.
+			U_LOG_W(
+			    "segments: IPC client %p (pid %ld) — a window spanning monitors is woven per screen by the "
+			    "service's direct pipeline; segment DPs on the %s device %p (multi-screen M6, service "
+			    "path)",
+			    (void *)fc, fc->client_pid, sys->split_active ? "OUTPUT" : "app", (void *)dev);
+		}
+	}
+
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m)); // memcmp'd by the publish: padding too
+	bool split = false;
+	struct comp_seg_rect win = {};
+	// #2218 (#4): a zones frame (fc->zone_published) no longer keeps the single-DP
+	// path — the per-segment weave is exact for it, and each segment DP gets its
+	// share of the wish mask from service_update_zone_wish_publish.
+	if (kind == PRESENTER_APP_HWND && fc->segments != nullptr && comp_d3d11_segments_enabled(fc->segments) &&
+	    dp != nullptr && dp_input_srv != nullptr && present_rtv != nullptr &&
+	    svc_seg_window_rect(present_hwnd, &win)) {
+		const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+		const uint32_t mode_index = (sys->xdev != nullptr && sys->xdev->hmd != nullptr)
+		                                ? sys->xdev->hmd->active_rendering_mode_index
+		                                : 0;
+		split = comp_d3d11_segments_update(fc->segments, &win, &canvas, ctx, mode_index);
+		// Every segment DP follows the panel's 2D/3D state on the screens the
+		// window covers, 2D on one it left (#2247). The panel DP itself keeps
+		// the panel's state: it is shared, and "no 3D client covers the
+		// primary" needs the union over the service's clients (follow-up).
+		comp_d3d11_segments_set_display_mode(fc->segments, sys->hardware_display_3d);
+		if (split) {
+			(void)comp_d3d11_segments_get_metrics(fc->segments, &win, &canvas, /*primary_has_dp*/ true, &m);
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		(void)comp_segments_publish(&fc->seg_pub, &m);
+		fc->seg_pub_ns = (int64_t)os_monotonic_get_ns();
+	}
+	if (!split) {
+		return false;
+	}
+
+	struct comp_d3d11_segments_frame sf = {};
+	sf.context = ctx;
+	sf.src_srv = dp_input_srv;
+	sf.view_width = view_w;
+	sf.view_height = view_h;
+	sf.tile_columns = cols;
+	sf.tile_rows = rows;
+	sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM;
+	sf.target_rtv = present_rtv;
+	sf.target_width = target_w;
+	sf.target_height = target_h;
+	sf.canvas.x = 0;
+	sf.canvas.y = 0;
+	sf.canvas.w = win.w;
+	sf.canvas.h = win.h;
+	sf.content = content;              // #1883: crop where the views were painted
+	sf.transparent_background = false; // an APP_HWND presenter is woven opaque (pipeline_dp_set_transparency)
+	sf.atlas_encoding = (int)service_single_client_atlas_encoding(fc);
+	sf.primary_dp = dp;
+	sf.outcomp = fc->seg_outcomp;
+	// #2245: every segment DP paced at its own screen's period.
+	struct comp_segments_screen rate_screens[COMP_SEGMENTS_MAX_SCREENS];
+	float rate_hz[COMP_SEGMENTS_MAX_SCREENS];
+	sf.rate_count = svc_screen_rates_copy(dev, sys->refresh_rate, rate_screens, rate_hz);
+	sf.rate_screens = rate_screens;
+	sf.rate_hz = rate_hz;
+	comp_d3d11_segments_record(fc->segments, &sf);
+
+	// Leave exactly the state the single-DP path leaves: the back buffer
+	// bound, full-target viewport and scissor.
+	ctx->OMSetRenderTargets(1, &present_rtv, nullptr);
+	D3D11_VIEWPORT full_vp = {};
+	full_vp.Width = (float)target_w;
+	full_vp.Height = (float)target_h;
+	full_vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &full_vp);
+	D3D11_RECT full_scissor = {0, 0, (LONG)target_w, (LONG)target_h};
+	ctx->RSSetScissorRects(1, &full_scissor);
+	return true;
+}
+
 static void
 pipeline_default_policy_render(struct d3d11_service_system *sys,
                                struct d3d11_multi_compositor *mc,
@@ -13570,6 +15602,16 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			// (#939): there both are desktop peers and z-order already shows
 			// the foreground one.
 			pipeline_park_loser_for_winner(mc, was_focused, best);
+			// Multi-screen M6: the outgoing presenter's segment DPs go with
+			// the panel — one set of per-screen weavers at a time, rebuilt
+			// if it takes the panel back (svc_seg_release clears the device
+			// it was made on, which is the rebuild trigger).
+			if (was_focused >= 0 && was_focused < D3D11_MULTI_MAX_CLIENTS) {
+				struct d3d11_service_compositor *oc = mc->clients[was_focused].compositor;
+				if (oc != nullptr && (oc->segments != nullptr || oc->seg_outcomp != nullptr)) {
+					svc_seg_release(oc);
+				}
+			}
 			// #1018: the INCOMING one may itself be parked — restore it, or
 			// the ready-probe skips it every frame and the panel goes black.
 			// Covers the survivor-fallback path too (holder exits -> next).
@@ -13715,6 +15757,23 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		// CLIENT presents. Here we only bind the panel to its window.
 		mc->pace_app_waitable = nullptr;
 		mc->pace_app_sc = nullptr;
+		// Weave-idle release: a present-owner that stopped weaving (the browser
+		// on a 2D page) must not keep the panel DP — and the camera behind it —
+		// bound by merely being focused. Bind nothing while it is released; its
+		// next submit brings it back on the following tick.
+		if (kind == PRESENTER_SELF && pipeline_weave_idle_release_if_due(sys, mc, fc)) {
+			sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
+			for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+				if (s == focused || !pipeline_slot_presenting(&mc->clients[s])) {
+					continue;
+				}
+				struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+				if (oc->presenter == PRESENTER_APP_HWND) {
+					pipeline_flat_present(sys, oc);
+				}
+			}
+			return;
+		}
 		// A present-owner composes the woven output over its OWN window content
 		// (displayxr-browser: page below, inline-3D tiles above, alpha outside
 		// the tiles). The DP must alpha-gate only -- never compose-under a
@@ -13754,8 +15813,19 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			 * false, so this is a transition, not a steady state — the log is
 			 * throttled anyway because a bind can legitimately defer.
 			 */
-			if (mc->panel_dp_hwnd != nullptr && mc->panel_dp_hwnd != mc->hwnd && mc->hwnd != nullptr &&
-			    !IsWindow(mc->panel_dp_hwnd)) {
+			if (fc->weave_idle_rebind_panel && mc->hwnd != nullptr) {
+				// Weave-idle release retired the panel DP that lived on the
+				// service window; this client weaves again, so put it back
+				// there. The bind can defer while the retired one still owns
+				// the window (~250 ms), hence the latch clears only once bound.
+				pipeline_bind_panel_dp(sys, mc, mc->hwnd, /*client_presents*/ false,
+				                       /*force_recreate*/ false,
+				                       svc_panel_dp_device(sys, PRESENTER_SERVICE_WINDOW));
+				if (mc->display_processor != nullptr) {
+					fc->weave_idle_rebind_panel = false;
+				}
+			} else if (mc->panel_dp_hwnd != nullptr && mc->panel_dp_hwnd != mc->hwnd &&
+			           mc->hwnd != nullptr && !IsWindow(mc->panel_dp_hwnd)) {
 				static int64_t s_last_dead_log_ns = 0;
 				const int64_t dead_now_ns = (int64_t)os_monotonic_get_ns();
 				if (dead_now_ns - s_last_dead_log_ns > 5LL * 1000000000LL) {
@@ -13795,6 +15865,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		if (active_backoff) {
 			sys->render_diag_pipe_active_backoff.fetch_add(1, std::memory_order_relaxed);
 		}
+		pipeline_segments_keepalive(fc); // #2244: a skipped weave keeps its table fresh
 		sys->render_diag_pipe_presenter.store((int)kind, std::memory_order_relaxed);
 		static std::atomic<int64_t> s_last_skip_log_ns{0};
 		int64_t now_ns = (int64_t)os_monotonic_get_ns();
@@ -13866,6 +15937,14 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 	// than guessing from the active rendering mode.
 	fc->render.last_dp_content_w = fc->pipe_content_w;
 	fc->render.last_dp_content_h = fc->pipe_content_h;
+	// #1883: the segment partition of what was just cropped (published with
+	// pipe_content_*), so a window across a seam is cropped where its views
+	// were painted — under the split, replaced by the woven slot's own below.
+	struct comp_segments_content seg_content;
+	{
+		std::lock_guard<std::mutex> lk(fc->seg_mutex);
+		seg_content = fc->pipe_seg_content;
+	}
 
 	/*
 	 * #918 — THE SPLIT. Crop first (on the app device, where the client's atlas
@@ -13898,10 +15977,10 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 		 * 2D.
 		 */
 		const bool crop_is_source = (crop_tex != nullptr && crop_tex == fc->render.crop_texture.get());
-		dp_input_srv = pipeline_split_bridge_atlas(sys, focused, crop_tex,
-		                                           crop_is_source ? fc->render.split_share_handle : nullptr,
-		                                           crop_is_source ? fc->render.split_share_key : 0, cols, rows,
-		                                           &weave_view_w, &weave_view_h, &weave_cols, &weave_rows);
+		dp_input_srv = pipeline_split_bridge_atlas(
+		    sys, focused, crop_tex, crop_is_source ? fc->render.split_share_handle : nullptr,
+		    crop_is_source ? fc->render.split_share_key : 0, cols, rows, &weave_view_w, &weave_view_h,
+		    &weave_cols, &weave_rows, &seg_content);
 		if (dp_input_srv == nullptr) {
 			/*
 			 * Nothing weavable this frame — warmup, or a slot whose recipe the
@@ -13914,6 +15993,7 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			 * survive — this return is what drained the hosted chain under
 			 * the split (see pipeline_return_app_grant).
 			 */
+			pipeline_segments_keepalive(fc); // #2244
 			pipeline_return_app_grant(mc, fc, kind);
 			return;
 		}
@@ -13998,13 +16078,26 @@ pipeline_default_policy_render(struct d3d11_service_system *sys,
 			QueryPerformanceCounter(&pq);
 			mc->panel_r_qpc = (uint64_t)pq.QuadPart;
 		}
-		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns,
-		                                             (uint64_t)(U_TIME_1S_IN_NS / sys->refresh_rate));
+		/*
+		 * #2245 (ADR-047 Amendment 9): an app window is paced at its majority
+		 * screen's period. A client that segments keeps the primary's: its
+		 * session DP then weaves only the primary screen's segment, and each
+		 * segment DP is handed its own screen's (pipeline_segments_weave).
+		 */
+		const bool dp_weaves_window = kind == PRESENTER_APP_HWND &&
+		                              !(fc->segments != nullptr && comp_d3d11_segments_enabled(fc->segments));
+		const float dp_hz = dp_weaves_window ? svc_client_hz(fc) : sys->refresh_rate;
+		xrt_display_processor_d3d11_set_frame_timing(dp, mc->panel_r_ns, (uint64_t)(U_TIME_1S_IN_NS / dp_hz));
 		svc_assert_same_device(dp_input_srv, svc_out_device(sys));
-		xrt_display_processor_d3d11_process_atlas(dp, svc_out_context(sys), dp_input_srv, weave_view_w,
-		                                          weave_view_h, weave_cols, weave_rows,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0,
-		                                          0);
+		// Multi-screen M6 (ADR-047 Amendment 3): a window across a seam is
+		// woven per screen; anything else (and every client that never
+		// enabled segments) takes the single weave below, unchanged.
+		if (!pipeline_segments_weave(sys, fc, kind, present_hwnd, present_rtv, dp, dp_input_srv, weave_view_w,
+		                             weave_view_h, weave_cols, weave_rows, target_w, target_h, &seg_content)) {
+			xrt_display_processor_d3d11_process_atlas(
+			    dp, svc_out_context(sys), dp_input_srv, weave_view_w, weave_view_h, weave_cols, weave_rows,
+			    DXGI_FORMAT_R8G8B8A8_UNORM, target_w, target_h, 0, 0, 0, 0);
+		}
 		g_frame_witness_service.count_weave(!witness_take_fresh_paint(fc), sys->hardware_display_3d);
 	} else if (sys->split_active && dp_input_srv != nullptr) {
 		/*
@@ -14331,6 +16424,7 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 		pipeline_dp_forget_beliefs(mc); // #1319
 	}
 	mc->back_buffer_rtv.reset();
+	mc->combined_atlas_rtv_srgb.reset();
 	mc->combined_atlas_rtv.reset();
 	mc->combined_atlas_srv.reset();
 	mc->combined_atlas.reset();
@@ -14347,6 +16441,928 @@ pipeline_service_window_closed(struct d3d11_service_system *sys, struct d3d11_mu
 	mc->dismiss_cleanup_done = false;
 	(void)multi_compositor_ensure_output(sys);
 }
+
+// ADR-052: the compose / present halves of multi_compositor_render, defined after it.
+static void
+svc_ws_presenters_destroy_all(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, const char *why);
+static void
+multi_compositor_render_frame(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos);
+
+/*!
+ * One cursor sprite draw: the top-left corner and size of the sprite in the
+ * target's pixels, and the rect it may not leave (its view's tile).
+ */
+struct svc_cursor_quad
+{
+	float x, y;
+	float w, h;
+	D3D11_RECT clip;
+};
+
+//! Most cursor quads one svc_draw_cursor_quads call draws (one per view tile).
+#define SVC_CURSOR_MAX_QUADS 64
+
+/*!
+ * How svc_draw_cursor_quads draws when it does NOT take its original path
+ * (NULL style = that path, byte for byte).
+ *
+ * - @ref premultiplied: the sprite's alpha convention (blend state and the B.7
+ *   kernel). The default look is premultiplied; app and controller sprites are
+ *   straight.
+ * - @ref shared_shaders: draw through the in-process compositors' own cursor
+ *   shaders (d3d_shared/comp_cursor_shaders.h), which do no colour arithmetic -
+ *   the caller picks the SRV (decoding or not) and the RTV (`_SRGB` or not), as
+ *   every in-process backend does. A runtime-drawn cursor of an IPC client
+ *   (ADR-046 Phase 4) draws this way, crisp or softened.
+ * - @ref radius_uv / @ref alpha: ADR-046 Amendment 2 B.7 crosstalk softening (blur
+ *   radius in sprite uv, opacity). (0, 0, 1) is no softening: the crisp draw.
+ *   A softened draw always uses the shared shaders' `DXR_SOFTEN` kernel; with
+ *   @ref shared_shaders false it runs under the compose pass's ADR-021 colour
+ *   model (`DXR_SVC_LINEARIZE`, the pass's flag at b2), exactly as the
+ *   original path's blit shader does.
+ */
+struct svc_cursor_style
+{
+	bool premultiplied;
+	bool shared_shaders;
+	float radius_uv[2];
+	float alpha;
+};
+
+/*!
+ * Build the shared cursor shaders (once; a failure is not retried). Any thread;
+ * device calls only (no immediate context).
+ */
+static bool
+svc_cursor_shaders_ensure(struct d3d11_service_system *sys)
+{
+	std::lock_guard<std::mutex> lk(sys->cursor_shaders_mutex);
+	if (sys->cursor_shaders_tried) {
+		return sys->cursor_shaders_ok;
+	}
+	sys->cursor_shaders_tried = true;
+
+	ID3DBlob *blob = nullptr;
+	HRESULT hr = compile_shader(cursor_quad_vs_source, "main", "vs_5_0", &blob);
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateVertexShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+		                                     sys->cursor_vs.put());
+		blob->Release();
+	}
+	const D3D_SHADER_MACRO soft_defs[] = {{"DXR_SOFTEN", "1"}, {nullptr, nullptr}};
+	const D3D_SHADER_MACRO soft_lin_defs[] = {{"DXR_SOFTEN", "1"}, {"DXR_SVC_LINEARIZE", "1"}, {nullptr, nullptr}};
+	struct
+	{
+		const D3D_SHADER_MACRO *defs;
+		wil::com_ptr<ID3D11PixelShader> *ps;
+	} variants[] = {
+	    // std::addressof: wil::com_ptr overloads unary & (it yields T **).
+	    {nullptr, std::addressof(sys->cursor_ps)},
+	    {soft_defs, std::addressof(sys->cursor_ps_soft)},
+	    {soft_lin_defs, std::addressof(sys->cursor_ps_soft_lin)},
+	};
+	for (size_t i = 0; i < ARRAY_SIZE(variants) && SUCCEEDED(hr); i++) {
+		blob = nullptr;
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &blob, variants[i].defs);
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr,
+			                                    variants[i].ps->put());
+			blob->Release();
+		}
+	}
+	if (SUCCEEDED(hr)) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bd.ByteWidth = (UINT)((sizeof(CursorQuadConstants) + 15) & ~15u);
+		hr = sys->device->CreateBuffer(&bd, nullptr, sys->cursor_cb_quad.put());
+		if (SUCCEEDED(hr)) {
+			bd.ByteWidth = (UINT)((sizeof(CursorSoftenConstants) + 15) & ~15u);
+			hr = sys->device->CreateBuffer(&bd, nullptr, sys->cursor_cb_soften.put());
+		}
+	}
+	sys->cursor_shaders_ok = SUCCEEDED(hr);
+	if (!sys->cursor_shaders_ok) {
+		U_LOG_W("[cursor_draw] the cursor shaders could not be built (0x%08lx) - the runtime-drawn cursor is "
+		        "refused / drawn crisp (one-time warning)",
+		        (long)hr);
+	}
+	return sys->cursor_shaders_ok;
+}
+
+//! The style's B.7 softening is on (a crisp style is (0, 0, 1)).
+static inline bool
+svc_cursor_style_softened(const struct svc_cursor_style *s)
+{
+	return s != nullptr && (s->radius_uv[0] > 0.0f || s->radius_uv[1] > 0.0f || s->alpha < 1.0f);
+}
+
+/*!
+ * The shared-shader draw of svc_draw_cursor_quads: one quad per view through
+ * comp_cursor_shaders, padded by the blur radius when softened (the quad grows,
+ * its uv runs outside 0..1 on the pad, the hotspot does not move). Restores the
+ * VS/PS constant-buffer slots it uses: those bindings are sticky across the
+ * threads that share the immediate context.
+ */
+static void
+svc_draw_cursor_quads_shared(struct d3d11_service_system *sys,
+                             float target_w,
+                             float target_h,
+                             ID3D11ShaderResourceView *sprite_srv,
+                             const struct svc_cursor_quad *quads,
+                             uint32_t quad_count,
+                             const struct svc_cursor_style *style)
+{
+	const bool soft = svc_cursor_style_softened(style);
+	ID3D11PixelShader *ps = !soft ? sys->cursor_ps.get()
+	                        : style->shared_shaders ? sys->cursor_ps_soft.get()
+	                                                : sys->cursor_ps_soft_lin.get();
+
+	ID3D11Buffer *saved_vs_b0 = nullptr;
+	ID3D11Buffer *saved_ps_b[3] = {nullptr, nullptr, nullptr};
+	sys->context->VSGetConstantBuffers(0, 1, &saved_vs_b0);
+	sys->context->PSGetConstantBuffers(0, 3, saved_ps_b);
+
+	sys->context->VSSetShader(sys->cursor_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(ps, nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->cursor_cb_quad.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->cursor_cb_quad.addressof());
+	if (soft) {
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (SUCCEEDED(sys->context->Map(sys->cursor_cb_soften.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			CursorSoftenConstants sc = {};
+			sc.soften[0] = style->radius_uv[0];
+			sc.soften[1] = style->radius_uv[1];
+			sc.soften[2] = style->alpha;
+			sc.soften[3] = style->premultiplied ? 0.0f : 1.0f; // 1 = straight
+			memcpy(m.pData, &sc, sizeof(sc));
+			sys->context->Unmap(sys->cursor_cb_soften.get(), 0);
+		}
+		sys->context->PSSetConstantBuffers(1, 1, sys->cursor_cb_soften.addressof());
+		if (!style->shared_shaders) {
+			// The compose pass's own colour model (its linearize flag).
+			sys->context->PSSetConstantBuffers(2, 1, sys->color_linearize_cb.addressof());
+		}
+	}
+	sys->context->PSSetShaderResources(0, 1, &sprite_srv);
+
+	const float ru = soft ? style->radius_uv[0] : 0.0f;
+	const float rv = soft ? style->radius_uv[1] : 0.0f;
+	for (uint32_t i = 0; i < quad_count; i++) {
+		const struct svc_cursor_quad *q = &quads[i];
+		// Padded by the radius on every side (zero when crisp).
+		const float x0 = q->x - ru * q->w, x1 = q->x + q->w * (1.0f + ru);
+		const float y0 = q->y - rv * q->h, y1 = q->y + q->h * (1.0f + rv);
+		const float u0 = -ru, u1 = 1.0f + ru, v0 = -rv, v1 = 1.0f + rv;
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (FAILED(sys->context->Map(sys->cursor_cb_quad.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			continue;
+		}
+		// Strip order TL, BL, TR, BR; target-normalised (the viewport is the target).
+		const CursorQuadConstants qc = {{
+		    {x0 / target_w, y0 / target_h, u0, v0},
+		    {x0 / target_w, y1 / target_h, u0, v1},
+		    {x1 / target_w, y0 / target_h, u1, v0},
+		    {x1 / target_w, y1 / target_h, u1, v1},
+		}};
+		memcpy(m.pData, &qc, sizeof(qc));
+		sys->context->Unmap(sys->cursor_cb_quad.get(), 0);
+		sys->context->RSSetScissorRects(1, &q->clip);
+		sys->context->Draw(4, 0);
+	}
+
+	sys->context->VSSetConstantBuffers(0, 1, &saved_vs_b0);
+	sys->context->PSSetConstantBuffers(0, 3, saved_ps_b);
+	if (saved_vs_b0 != nullptr) {
+		saved_vs_b0->Release();
+	}
+	for (ID3D11Buffer *b : saved_ps_b) {
+		if (b != nullptr) {
+			b->Release();
+		}
+	}
+}
+
+/*!
+ * Draw a cursor sprite once per view into an atlas, before the display
+ * processor weaves it (ADR-046 Phase 2 drawer). The workspace cursor pass, the
+ * lifted-content cursor (ADR-046 Amendment 1) and IPC clients' runtime-drawn
+ * cursor (Phase 4) all go through here; the caller computes the per-view
+ * positions, which is where disparity lives.
+ *
+ * Binds its own pipeline state and leaves the scissor at the full target.
+ * The caller holds the immediate-context lock for the whole call.
+ *
+ * @param tint_rgba    multiplicative tint (alpha = opacity), or NULL for none.
+ *                     Original path only (a styled draw has no tint: B.7's
+ *                     opacity is its only fade - the one-fade rule).
+ * @param convert_srgb true when the target stores linear values (an _SRGB RTV)
+ *                     and the sprite is sRGB-encoded. Original path only.
+ * @param style        NULL: the original path, unchanged. Else see
+ *                     svc_cursor_style. A softened style whose shaders cannot
+ *                     be built falls back to the original path, crisp.
+ */
+static void
+svc_draw_cursor_quads(struct d3d11_service_system *sys,
+                      ID3D11RenderTargetView *rtv,
+                      float target_w,
+                      float target_h,
+                      ID3D11ShaderResourceView *sprite_srv,
+                      uint32_t sprite_w,
+                      uint32_t sprite_h,
+                      const struct svc_cursor_quad *quads,
+                      uint32_t quad_count,
+                      const float *tint_rgba,
+                      bool convert_srgb,
+                      const struct svc_cursor_style *style = nullptr)
+{
+	if (rtv == nullptr || sprite_srv == nullptr || sprite_w == 0 || sprite_h == 0 || quad_count == 0) {
+		return;
+	}
+	if (style != nullptr && (style->shared_shaders || svc_cursor_style_softened(style)) &&
+	    svc_cursor_shaders_ensure(sys)) {
+		ID3D11RenderTargetView *rtvs[] = {rtv};
+		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+		sys->context->OMSetBlendState(style->premultiplied ? sys->blend_premul.get() : sys->blend_alpha.get(),
+		                              nullptr, 0xFFFFFFFF);
+		sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+		sys->context->RSSetState(sys->rasterizer_state.get());
+		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+		sys->context->IASetInputLayout(nullptr);
+		D3D11_VIEWPORT vp = {};
+		vp.Width = target_w;
+		vp.Height = target_h;
+		vp.MaxDepth = 1.0f;
+		sys->context->RSSetViewports(1, &vp);
+		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+		svc_draw_cursor_quads_shared(sys, target_w, target_h, sprite_srv, quads, quad_count, style);
+		D3D11_RECT full = {0, 0, (LONG)target_w, (LONG)target_h};
+		sys->context->RSSetScissorRects(1, &full);
+		return;
+	}
+	sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
+	ID3D11RenderTargetView *rtvs[] = {rtv};
+	sys->context->OMSetRenderTargets(1, rtvs, nullptr);
+	sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
+	sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
+	sys->context->RSSetState(sys->rasterizer_state.get());
+	sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+	sys->context->IASetInputLayout(nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.Width = target_w;
+	vp.Height = target_h;
+	vp.MaxDepth = 1.0f;
+	sys->context->RSSetViewports(1, &vp);
+	sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
+	sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
+	sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
+	sys->context->PSSetShaderResources(0, 1, &sprite_srv);
+	sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
+
+	for (uint32_t i = 0; i < quad_count; i++) {
+		const struct svc_cursor_quad *q = &quads[i];
+		D3D11_MAPPED_SUBRESOURCE m;
+		if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+			continue;
+		}
+		BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
+		memset(cb, 0, sizeof(*cb));
+		cb->src_rect[0] = 0;
+		cb->src_rect[1] = 0;
+		cb->src_rect[2] = (float)sprite_w;
+		cb->src_rect[3] = (float)sprite_h;
+		cb->src_size[0] = (float)sprite_w;
+		cb->src_size[1] = (float)sprite_h;
+		cb->dst_size[0] = target_w;
+		cb->dst_size[1] = target_h;
+		cb->dst_offset[0] = q->x;
+		cb->dst_offset[1] = q->y;
+		cb->dst_rect_wh[0] = q->w;
+		cb->dst_rect_wh[1] = q->h;
+		cb->convert_srgb = convert_srgb ? 1.0f : 0.0f;
+		cb->chrome_alpha = 0.0f;
+		cb->quad_mode = 0.0f;
+		if (tint_rgba != nullptr) {
+			// The shader's flat-tint path (edge_feather <= 0, glow_intensity > 0).
+			cb->edge_feather = 0.0f;
+			cb->glow_intensity = 1.0f;
+			cb->glow_color[0] = tint_rgba[0];
+			cb->glow_color[1] = tint_rgba[1];
+			cb->glow_color[2] = tint_rgba[2];
+			cb->glow_color[3] = tint_rgba[3];
+		} else {
+			cb->glow_intensity = 0.0f;
+		}
+		sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
+		sys->context->RSSetScissorRects(1, &q->clip);
+		sys->context->Draw(4, 0);
+	}
+
+	// Restore the full-target scissor for downstream passes (DP, etc.).
+	D3D11_RECT full = {0, 0, (LONG)target_w, (LONG)target_h};
+	sys->context->RSSetScissorRects(1, &full);
+}
+
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): the service draws an IPC
+ * client's runtime-drawn cursor.
+ *
+ */
+
+//! The default look, as one draw needs it (views AddRef'd: the look may be
+//! re-uploaded by another client's commit meanwhile).
+struct svc_cursor_look_ref
+{
+	wil::com_ptr<ID3D11ShaderResourceView> srv;      //!< non-decoding (stored bytes)
+	wil::com_ptr<ID3D11ShaderResourceView> srv_srgb; //!< decoding
+	uint32_t w, h;
+	float aspect, hot_u, hot_v, height_pt;
+};
+
+/*!
+ * Refresh the default look (comp_cursor_look: the mirrored OS cursor at
+ * @p backing_scale, else the classic arrow) and hand back its views. Uploads
+ * only when the look's generation moves. Any IPC thread; device calls only.
+ */
+static bool
+svc_cursor_look_get(struct d3d11_service_system *sys, float backing_scale, struct svc_cursor_look_ref *out)
+{
+	std::lock_guard<std::mutex> lk(sys->cursor_look_mutex);
+	if (!comp_cursor_look_update(&sys->cursor_look, backing_scale)) {
+		return false;
+	}
+	const struct comp_cursor_look *look = &sys->cursor_look;
+	if (look->rgba == nullptr || look->w == 0 || look->h == 0) {
+		return false;
+	}
+	if (!sys->cursor_look_tex || sys->cursor_look_generation != look->generation) {
+		sys->cursor_look_srv.reset();
+		sys->cursor_look_srv_srgb.reset();
+		sys->cursor_look_tex.reset();
+		// TYPELESS: a composing commit samples it decoded into its `_SRGB`
+		// target, a fast-path one as stored into the encoded atlas - the same
+		// two views the in-process D3D11 renderer makes. Immutable: a new shape
+		// is a new texture, so no immediate-context upload is needed.
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = look->w;
+		td.Height = look->h;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_IMMUTABLE;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		D3D11_SUBRESOURCE_DATA init = {};
+		init.pSysMem = look->rgba;
+		init.SysMemPitch = look->w * 4;
+		if (FAILED(sys->device->CreateTexture2D(&td, &init, sys->cursor_look_tex.put()))) {
+			return false;
+		}
+		D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+		sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		sd.Texture2D.MipLevels = 1;
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		HRESULT hr = sys->device->CreateShaderResourceView(sys->cursor_look_tex.get(), &sd, sys->cursor_look_srv.put());
+		if (SUCCEEDED(hr)) {
+			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+			hr = sys->device->CreateShaderResourceView(sys->cursor_look_tex.get(), &sd,
+			                                           sys->cursor_look_srv_srgb.put());
+		}
+		if (FAILED(hr)) {
+			sys->cursor_look_srv.reset();
+			sys->cursor_look_srv_srgb.reset();
+			sys->cursor_look_tex.reset();
+			return false;
+		}
+		sys->cursor_look_generation = look->generation;
+	}
+	out->srv = sys->cursor_look_srv;
+	out->srv_srgb = sys->cursor_look_srv_srgb;
+	out->w = look->w;
+	out->h = look->h;
+	out->aspect = look->aspect;
+	out->hot_u = look->hot_u;
+	out->hot_v = look->hot_v;
+	out->height_pt = look->height_pt;
+	return true;
+}
+
+//! The wire request back as the shared request (no sprite swapchain, nobody
+//! listening on `report`: the service answers through the client's outcome).
+static void
+svc_cursor_request_from_wire(const struct ipc_cursor_draw_request *w, struct u_cursor_draw_request *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->requested = true;
+	out->view_count = w->view_count < XRT_MAX_VIEWS ? w->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->view_count; i++) {
+		out->view[i].origin[0] = w->view[i][0];
+		out->view[i].origin[1] = w->view[i][1];
+		out->view[i].axis_x[0] = w->view[i][2];
+		out->view[i].axis_x[1] = w->view[i][3];
+		out->view[i].axis_y[0] = w->view[i][4];
+		out->view[i].axis_y[1] = w->view[i][5];
+	}
+	out->hot_u = w->hot_u;
+	out->hot_v = w->hot_v;
+	out->size_m = w->size_m;
+	out->disparity = w->disparity;
+	out->report_only = w->report_only != 0;
+	out->zone_valid = w->zone_valid != 0;
+	out->zone_id = w->zone_id;
+	out->zone_rect.offset.w = w->zone_rect[0];
+	out->zone_rect.offset.h = w->zone_rect[1];
+	out->zone_rect.extent.w = w->zone_rect[2];
+	out->zone_rect.extent.h = w->zone_rect[3];
+}
+
+//! Record the latest decision about request @p seq of client @p c (#1952).
+static void
+svc_cursor_record_outcome(struct d3d11_service_compositor *c, uint64_t seq, bool drew, enum u_cursor_draw_refusal why)
+{
+	std::lock_guard<std::mutex> lk(c->cursor_draw.mutex);
+	if (seq < c->cursor_draw.outcome_seq) {
+		return; // never overwrite a newer answer with an older one
+	}
+	c->cursor_draw.outcome_seq = seq;
+	c->cursor_draw.outcome_drew = drew;
+	c->cursor_draw.outcome_reason = drew ? 0u : (uint32_t)why;
+}
+
+/*!
+ * Is @p c a PLACED workspace tile - composed into the workspace by the render
+ * thread, so its cursor is the lifted workspace cursor and nothing may be drawn
+ * into its window? Any other client (no workspace, or not placed: one running
+ * beside the workspace under the foreground override) is drawn directly. The
+ * same test comp_d3d11_service_get_client_window_metrics uses for its canvas.
+ */
+static bool
+svc_cursor_client_is_tile(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return false;
+	}
+	const int idx = multi_comp_find_slot(sys->multi_comp, c);
+	return idx >= 0 && sys->multi_comp->clients[idx].placed;
+}
+
+//! Where one view of a direct client's base projection layer was painted in
+//! its atlas (target px), for the cursor.
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): the in-process
+ * D3D11 compositor's measured-disparity copy and readback, run at a client's
+ * commit on the service's immediate context. The matcher is the shared
+ * u_cursor_measure_run(), so the service and every in-process compositor agree.
+ */
+static enum u_cursor_measure_format
+svc_cursor_measure_format(DXGI_FORMAT f)
+{
+	switch (f) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+//! Read back every finished copy (never waits) and match it.
+static void
+svc_cursor_measure_harvest(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+	for (uint32_t s = 0; s < 3; s++) {
+		auto &sl = cm->slot[s];
+		if (!sl.in_flight) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		const HRESULT hr = sys->context->Map(sl.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			continue; // still in flight: look again next commit
+		}
+		sl.in_flight = false;
+		cm->in_flight--;
+		if (FAILED(hr)) {
+			continue;
+		}
+		const uint8_t *base = (const uint8_t *)m.pData;
+		const struct u_cursor_measure_patch pa = {base, m.RowPitch, sl.mformat};
+		const struct u_cursor_measure_patch pb = {base + (size_t)m.RowPitch * (size_t)sl.plan.h, m.RowPitch,
+		                                          sl.mformat};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		const bool ok = u_cursor_measure_run(&sl.req, &sl.plan, &pa, &pb, &cm->cache, &res);
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+		sys->context->Unmap(sl.staging.get(), 0);
+		if (!ok) {
+			continue;
+		}
+		{
+			std::lock_guard<std::mutex> rl(cm->result_mutex);
+			if (res.tag > cm->result.tag) {
+				cm->result = res;
+			}
+		}
+		cm->stat_n++;
+		cm->stat_reused += res.reused ? 1 : 0;
+		cm->stat_cpu_ns += cpu_ns;
+		if (cpu_ns > cm->stat_cpu_max_ns) {
+			cm->stat_cpu_max_ns = cpu_ns;
+		}
+		if (cm->stat_n >= 120) {
+			U_LOG_I("[cursor_measure] client %p: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms; "
+			        "last: %s %.2f px (matched %u, L-R rejected %u)",
+			        (void *)c, cm->stat_n, cm->stat_reused, (double)cm->stat_cpu_ns / cm->stat_n * 1e-6,
+			        (double)cm->stat_cpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			        res.disparity_px, res.matched, res.lr_rejected);
+			cm->stat_n = cm->stat_reused = 0;
+			cm->stat_cpu_ns = cm->stat_cpu_max_ns = 0;
+		}
+	}
+}
+
+/*!
+ * Copy the request's patch out of the two views (already acquired by the
+ * commit, so readable on this context) into the next staging slot.
+ */
+static void
+svc_cursor_measure_sample(struct d3d11_service_system *sys,
+                          struct d3d11_service_compositor *c,
+                          const struct u_cursor_measure_request *req,
+                          ID3D11Texture2D *const tex[U_CURSOR_DEPTH_PATCH_VIEWS],
+                          const struct xrt_sub_image *const sub[U_CURSOR_DEPTH_PATCH_VIEWS])
+{
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+	D3D11_TEXTURE2D_DESC desc[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		if (tex[i] == nullptr || sub[i] == nullptr) {
+			return;
+		}
+		tex[i]->GetDesc(&desc[i]);
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (UINT)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > desc[i].Width ||
+		    (UINT)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > desc[i].Height ||
+		    sub[i]->array_index >= desc[i].ArraySize || desc[i].SampleDesc.Count != 1) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    desc[0].Format != desc[1].Format) {
+		return;
+	}
+	const enum u_cursor_measure_format mformat = svc_cursor_measure_format(desc[0].Format);
+	if (mformat == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!cm->warned_format) {
+			cm->warned_format = true;
+			U_LOG_W("[cursor_measure] client %p: DXGI format %d is not read by the matcher - no content "
+			        "(one-time warning)",
+			        (void *)c, (int)desc[0].Format);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+	const uint32_t s = cm->next_slot;
+	auto &sl = cm->slot[s];
+	if (sl.in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	if (!sl.staging || sl.w < (UINT)plan.w || sl.h < (UINT)plan.h * 2 || sl.format != desc[0].Format) {
+		// First real request (or a larger patch): the only allocation this feature makes.
+		sl.staging.reset();
+		D3D11_TEXTURE2D_DESC sd = {};
+		sd.Width = (UINT)plan.w;
+		sd.Height = (UINT)plan.h * 2;
+		sd.MipLevels = 1;
+		sd.ArraySize = 1;
+		sd.Format = desc[0].Format;
+		sd.SampleDesc.Count = 1;
+		sd.Usage = D3D11_USAGE_STAGING;
+		sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(sys->device->CreateTexture2D(&sd, nullptr, sl.staging.put()))) {
+			sl.staging.reset();
+			return;
+		}
+		sl.w = sd.Width;
+		sl.h = sd.Height;
+		sl.format = sd.Format;
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		D3D11_BOX box = {};
+		box.left = (UINT)(sub[i]->rect.offset.w + plan.x);
+		box.top = (UINT)(sub[i]->rect.offset.h + plan.y);
+		box.front = 0;
+		box.right = box.left + (UINT)plan.w;
+		box.bottom = box.top + (UINT)plan.h;
+		box.back = 1;
+		const UINT src_sub = (UINT)sub[i]->array_index * desc[i].MipLevels; // mip 0
+		sys->context->CopySubresourceRegion(sl.staging.get(), 0, 0, (UINT)plan.h * i, 0, tex[i], src_sub, &box);
+	}
+	sl.in_flight = true;
+	sl.req = *req;
+	sl.plan = plan;
+	sl.mformat = mformat;
+	cm->in_flight++;
+	cm->next_slot = (s + 1) % 3;
+	if (!cm->announced) {
+		cm->announced = true;
+		U_LOG_W("[cursor_measure] client %p: copying a %dx%d px patch per view for the measured-disparity cursor "
+		        "over IPC (ADR-046 Amendment 3, first request)",
+		        (void *)c, plan.w, plan.h);
+	}
+}
+
+struct svc_cursor_tile
+{
+	bool ok;
+	float rect[4]; //!< x, y, w, h
+};
+
+/*!
+ * A DIRECT client's cursor (ADR-046 Phase 4): drawn into the client's own
+ * atlas at its commit, after its layers and before the publish and the display
+ * processor - the in-process D3D11 compositor's semantics, through the same
+ * shared look, placement helpers, softening and shaders.
+ *
+ * @param rtv           this commit's write target: the private `_SRGB` compose
+ *                      target (@p target_decodes) or the encoded atlas itself.
+ * @param tiles         where the base projection layer's views were painted.
+ * @param out_why       the refusal when this returns false.
+ * @return true if drawn (or, report-only, if it would have been).
+ *
+ * Caller holds c->mutex (the commit); takes the immediate-context lock for the
+ * draw only.
+ */
+static bool
+svc_cursor_draw_direct_impl(struct d3d11_service_system *sys,
+                            struct d3d11_service_compositor *c,
+                            const struct ipc_cursor_draw_request *wire,
+                            const struct svc_cursor_tile *tiles,
+                            uint32_t tile_count,
+                            bool routed,
+                            ID3D11RenderTargetView *rtv,
+                            bool target_decodes,
+                            enum u_cursor_draw_refusal *out_why)
+{
+	struct u_cursor_draw_request req;
+	svc_cursor_request_from_wire(wire, &req);
+	if (!u_cursor_draw_should_draw(&req)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST;
+		return false;
+	}
+	if (routed) {
+		// Multi-screen M3: a routed frame's tiles are per-segment mosaics.
+		*out_why = U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN;
+		return false;
+	}
+	// DXR_CURSOR_DRAW_REFUSE(_PERIOD_MS): read from the SERVICE's environment.
+	if (comp_cursor_draw_debug_refuse(&req)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_FORCED;
+		return false;
+	}
+	if (req.zone_valid) {
+		// Display zones through the service (the zones composite's placement
+		// of a zone's tiles) are a follow-up; the client keeps its OS cursor.
+		if (!c->cursor_draw.warned_zone) {
+			c->cursor_draw.warned_zone = true;
+			U_LOG_W("[cursor_draw] client %p: a display-zones cursor is not drawn by the service yet - "
+			        "willDraw = false (one-time warning)",
+			        (void *)c);
+		}
+		*out_why = U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE;
+		return false;
+	}
+	if (rtv == nullptr) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS;
+		return false;
+	}
+
+	// Panel pixel pitch, and the canvas the request's unit was built for (the
+	// client's window, else the display). Every DisplayXR process is per-
+	// monitor DPI aware, so window and panel pixels are the same pixels.
+	const uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	const float disp_h_m = sys->base.info.display_height_m;
+	if (disp_px_h == 0 || !(disp_h_m > 0.0f)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+	const float m_per_px = disp_h_m / (float)disp_px_h;
+	const uint32_t canvas_w = c->canvas_w > 0 ? c->canvas_w : sys->base.info.display_pixel_width;
+	const uint32_t canvas_h = c->canvas_h > 0 ? c->canvas_h : disp_px_h;
+	if (canvas_w == 0 || canvas_h == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+	const float canvas_h_m = (float)canvas_h * m_per_px;
+
+	// The DPI of the client's window sizes the OS cursor (and the arrow).
+	HWND dpi_hwnd = c->app_hwnd != nullptr ? c->app_hwnd : c->render.hwnd;
+	UINT dpi = dpi_hwnd != nullptr ? GetDpiForWindow(dpi_hwnd) : 0;
+	if (dpi == 0) {
+		dpi = 96;
+	}
+	const float scale = (float)dpi / 96.0f;
+
+	struct svc_cursor_look_ref look = {};
+	if (!svc_cursor_look_get(sys, scale, &look)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK;
+		return false;
+	}
+	const float size_m = req.size_m > 0.0f ? req.size_m : look.height_pt * scale * m_per_px;
+	const float height = size_m / canvas_h_m; // sprite height, in units (canvas heights at t)
+	if (!(height > 0.0f) || !std::isfinite(height)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO;
+		return false;
+	}
+
+	// B.7: soften the lifted cursor against crosstalk. 0..1 of the views spans
+	// the canvas; the blur cap follows the DRAWN sprite (its panel px).
+	const float sprite_px_h = height * (float)canvas_h;
+	const float sprite_px_w = sprite_px_h * look.aspect;
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req.disparity, u_cursor_draw_ghost_px(&req, (float)canvas_w, (float)canvas_h),
+	                               sprite_px_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = true; // comp_cursor_look
+	style.shared_shaders = true;
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && sprite_px_w > 0.0f && sprite_px_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / sprite_px_w;
+		style.radius_uv[1] = soften.blur_px / sprite_px_h;
+	}
+
+	struct svc_cursor_quad quads[XRT_MAX_VIEWS];
+	uint32_t nq = 0;
+	const uint32_t n = req.view_count < tile_count ? req.view_count : tile_count;
+	for (uint32_t i = 0; i < n; i++) {
+		if (!tiles[i].ok) {
+			continue;
+		}
+		float corners[4][2];
+		u_cursor_draw_corners(&req.view[i], height, look.aspect, look.hot_u, look.hot_v, corners);
+		float r[4];
+		if (!u_cursor_draw_quad_rect(corners, tiles[i].rect, r)) {
+			continue;
+		}
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = r[0];
+		q->y = r[1];
+		q->w = r[2];
+		q->h = r[3];
+		q->clip.left = (LONG)tiles[i].rect[0];
+		q->clip.top = (LONG)tiles[i].rect[1];
+		q->clip.right = (LONG)(tiles[i].rect[0] + tiles[i].rect[2]);
+		q->clip.bottom = (LONG)(tiles[i].rect[1] + tiles[i].rect[3]);
+	}
+	if (nq == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_TILES;
+		return false;
+	}
+	if (!svc_cursor_shaders_ensure(sys)) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_PIPELINE;
+		return false;
+	}
+	if (req.report_only) {
+		return true; // every check passed; the app is showing its OS cursor
+	}
+
+	wil::com_ptr<ID3D11Resource> res;
+	rtv->GetResource(res.put());
+	wil::com_ptr<ID3D11Texture2D> tex = res.try_query<ID3D11Texture2D>();
+	D3D11_TEXTURE2D_DESC td = {};
+	if (tex) {
+		tex->GetDesc(&td);
+	}
+	if (td.Width == 0 || td.Height == 0) {
+		*out_why = U_CURSOR_DRAW_REFUSAL_NO_TILES;
+		return false;
+	}
+	// Colour (ADR-044, as in-process): a composing commit decodes the sprite
+	// into its `_SRGB` target; a fast-path one writes it as stored into the
+	// encoded atlas.
+	ID3D11ShaderResourceView *srv = target_decodes ? look.srv_srgb.get() : look.srv.get();
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+	svc_draw_cursor_quads(sys, rtv, (float)td.Width, (float)td.Height, srv, look.w, look.h, quads, nq,
+	                      /*tint*/ nullptr, /*convert_srgb*/ false, &style);
+	return true;
+}
+
+//! svc_cursor_draw_direct_impl + the outcome the client reads with its next request.
+static void
+svc_cursor_draw_direct(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       const struct ipc_cursor_draw_request *wire,
+                       uint64_t seq,
+                       const struct svc_cursor_tile *tiles,
+                       uint32_t tile_count,
+                       bool routed,
+                       ID3D11RenderTargetView *rtv,
+                       bool target_decodes)
+{
+	enum u_cursor_draw_refusal why = U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	const bool drew =
+	    svc_cursor_draw_direct_impl(sys, c, wire, tiles, tile_count, routed, rtv, target_decodes, &why);
+	svc_cursor_record_outcome(c, seq, drew, why);
+}
+
+/*!
+ * Under the shell (ADR-046 Phase 4): the slot whose window CONTENT the
+ * workspace cursor is over, if that client's last frame carried a runtime-
+ * drawn cursor request (returned in @p out_req / @p out_seq); else -1, and the
+ * workspace cursor stays exactly as it was.
+ *
+ * "Over the content" is the controller's over-window flag plus the focused
+ * slot's content rect - the same rect the service forwards pointer input
+ * through, so the client whose hint follows the pointer is the one lifted.
+ * A display-zones request is not lifted (follow-up).
+ *
+ * Render thread. Zero cost for a workspace whose clients never ask: one
+ * unlocked bool test (frame_valid is written only by that client's commit).
+ */
+static int
+svc_cursor_lift_target(struct d3d11_multi_compositor *mc, struct u_cursor_draw_request *out_req, uint64_t *out_seq)
+{
+	memset(out_req, 0, sizeof(*out_req));
+	*out_seq = 0;
+	if (mc == nullptr || !mc->cursor_over_window) {
+		return -1;
+	}
+	const int32_t f = mc->focused_slot;
+	if (f < 0 || f >= D3D11_MULTI_MAX_CLIENTS) {
+		return -1;
+	}
+	const struct d3d11_multi_client_slot *cs = &mc->clients[f];
+	struct d3d11_service_compositor *fc = cs->compositor;
+	if (!cs->active || !cs->placed || cs->minimized || fc == nullptr || !fc->cursor_draw.frame_valid) {
+		return -1;
+	}
+	const int32_t px = mc->cursor_panel_x, py = mc->cursor_panel_y;
+	if (cs->window_rect_w <= 0 || cs->window_rect_h <= 0 || px < cs->window_rect_x ||
+	    px >= cs->window_rect_x + cs->window_rect_w || py < cs->window_rect_y ||
+	    py >= cs->window_rect_y + cs->window_rect_h) {
+		return -1;
+	}
+	{
+		std::lock_guard<std::mutex> lk(fc->cursor_draw.mutex);
+		if (!fc->cursor_draw.frame_valid) {
+			return -1;
+		}
+		svc_cursor_request_from_wire(&fc->cursor_draw.frame, out_req);
+		*out_seq = fc->cursor_draw.frame_seq;
+	}
+	if (out_req->zone_valid || !u_cursor_draw_should_draw(out_req) || comp_cursor_draw_debug_refuse(out_req)) {
+		return -1;
+	}
+	return f;
+}
+
+/*!
+ * Under the shell: every client whose last frame asked for a runtime-drawn
+ * cursor learns whether it was drawn (lifted onto its window) - #1952 across
+ * the process boundary, so its willDraw stays honest. Render thread.
+ */
+static void
+svc_cursor_record_lift_outcomes(struct d3d11_multi_compositor *mc, int lift_slot, uint64_t lift_seq, bool lift_drew)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	for (int s = 0; s < D3D11_MULTI_MAX_CLIENTS; s++) {
+		struct d3d11_service_compositor *oc = mc->clients[s].compositor;
+		if (!mc->clients[s].active || oc == nullptr || !oc->cursor_draw.frame_valid) {
+			continue; // never asked (or not this frame): nothing to answer
+		}
+		if (!mc->clients[s].placed) {
+			continue; // not a tile: drawn (and answered) at its own commit
+		}
+		uint64_t seq;
+		{
+			std::lock_guard<std::mutex> lk(oc->cursor_draw.mutex);
+			if (!oc->cursor_draw.frame_valid) {
+				continue;
+			}
+			seq = oc->cursor_draw.frame_seq;
+		}
+		const bool drew = s == lift_slot && lift_drew;
+		svc_cursor_record_outcome(oc, s == lift_slot ? lift_seq : seq, drew, U_CURSOR_DRAW_REFUSAL_NOT_REACHED);
+	}
+}
+
 
 /*!
  * Render all client atlases into the combined atlas using Level 2 Kooima,
@@ -14366,6 +17382,11 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			return;
 		}
 		mc = sys->multi_comp;
+	}
+
+	// ADR-052 D1: the secondary presenters live only while a workspace composes.
+	if (mc->ws_presenter_count > 0 && (!sys->workspace_mode || mc->suspended || mc->window_dismissed)) {
+		svc_ws_presenters_destroy_all(sys, mc, "workspace not composing");
 	}
 
 	// #966: the window thread asked for a flat panel on WM_CLOSE (it may not
@@ -14446,7 +17467,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	if (mc->window_dismissed) {
 		// Workspace window closed (ESC / close button). Behaves like deactivate:
 		// restore 2D windows, send LOSS_PENDING (not EXIT_REQUEST) to IPC
-		// clients. The workspace can re-activate via Ctrl+Space.
+		// clients. The workspace can re-activate via the launch hotkey.
 		if (!mc->dismiss_cleanup_done) {
 			mc->dismiss_cleanup_done = true;
 
@@ -14549,7 +17570,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 
 	// Check window validity — ESC or close button triggers deactivate (suspend),
-	// not the old permanent dismiss. The workspace can re-activate via Ctrl+Space.
+	// not the old permanent dismiss. The workspace can re-activate via the launch hotkey.
 	//
 	// #964: under the DEFAULT policy the service window is just the presenter
 	// for hosted clients, so closing it ends that client's session (#999) and
@@ -15064,10 +18085,29 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// Must run before rendering so input arrives promptly (~16ms latency).
 	multi_compositor_dispatch_capture_input(mc);
 
+	// ADR-052: compose once per presenter, then weave and present the primary.
+	multi_compositor_render_frame(sys, mc, eye_pos);
+}
+
+/*!
+ * One compose pass (ADR-052): every placed client, its chrome, the overlays
+ * and the cursor into @p T. Runs once for the primary presenter (no
+ * `svc_ws_pass` installed, behaviour unchanged) and once per secondary
+ * presenter (with its pass installed). Render thread, under render_mutex.
+ */
+static void
+multi_compositor_compose_pass(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos,
+                              struct svc_compose_target *T,
+                              struct svc_compose_out *out)
+{
 	// Clear combined atlas to dark gray background each frame.
 	{
-		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so under
-		// Model B (linear atlas) it must use the LINEAR equivalent of #1a1a1a —
+		// ADR-021 Model B: the backdrop clear bypasses the blit shader, so when
+		// the atlas holds linear (Model B against a LINEAR-only DP; since #1764
+		// an EITHER DP gets an encode-on-write atlas holding ENCODED bytes, see
+		// below) it must use the LINEAR equivalent of #1a1a1a —
 		// otherwise the DP's output encode brightens it (~0.102→0.35), the
 		// "overexposed background". srgb_to_linear(0.102) ≈ 0.01034. This mirrors
 		// the compose_linear gate computed below (render_count == placed count).
@@ -15091,14 +18131,23 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// encoding the DP receives.
 		const bool clear_linear = (cap0 == XRT_DP_COLOR_LINEAR || cap0 == XRT_DP_COLOR_EITHER) &&
 		                          placed_count > 1 && placed_srgb == placed_count;
-		const float bg = clear_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
+		// #1764: the draws of this tick go through the `_SRGB` RTV when Model B
+		// can encode on write; re-decided below from `compose_linear` itself.
+		T->encodes_on_write = clear_linear && T->rtv_srgb != nullptr && cap0 == XRT_DP_COLOR_EITHER;
+		// The clear ALWAYS goes through the byte-exact UNORM RTV, so the value
+		// is the byte the atlas must hold: encoded #1a1a1a whenever the atlas
+		// holds encoded bytes (Model A, and Model B encoding on write), and the
+		// linear equivalent only for a LINEAR-only DP, whose atlas still holds
+		// linear. (Not through the `_SRGB` view: whether a clear on an sRGB RTV
+		// encodes its colour is exactly the kind of rule this should not lean on.)
+		const bool atlas_holds_linear = clear_linear && !T->encodes_on_write;
+		const float bg = atlas_holds_linear ? 0.01034f : 0.102f; // #1a1a1a (linear vs encoded)
 		float bg_color[4] = {bg, bg, bg, 1.0f};
-		sys->context->ClearRenderTargetView(mc->combined_atlas_rtv.get(), bg_color);
+		sys->context->ClearRenderTargetView(T->rtv, bg_color);
 		// Phase 2.K: clear depth target to far (1.0) so the per-slot LESS
 		// test resolves occlusion from scratch each frame.
-		if (mc->combined_atlas_dsv) {
-			sys->context->ClearDepthStencilView(mc->combined_atlas_dsv.get(),
-			                                    D3D11_CLEAR_DEPTH, 1.0f, 0);
+		if (T->dsv != nullptr) {
+			sys->context->ClearDepthStencilView(T->dsv, D3D11_CLEAR_DEPTH, 1.0f, 0);
 		}
 	}
 
@@ -15116,7 +18165,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			break;
 		}
 	}
-	if (!any_placed && mc->font_atlas_srv) {
+	if (!any_placed && mc->font_atlas_srv && t_ws_pass == nullptr) { // ADR-052: the logo is the primary's
 		// Lazy-load the embedded logo PNG on first entry.
 		if (!mc->logo_load_tried) {
 			mc->logo_load_tried = true;
@@ -15131,8 +18180,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			}
 		}
 
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 		uint32_t num_views = sys->tile_columns * sys->tile_rows;
@@ -15154,12 +18203,13 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// context — bound once here and relied on by every glyph draw below.
 		// See combine_ctx_lock.
 		combine_ctx_lock ctx_lock(sys);
+		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 		sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
 		sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 		sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 		sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-		ID3D11RenderTargetView *rtvs[] = {mc->combined_atlas_rtv.get()};
+		ID3D11RenderTargetView *rtvs[] = {svc_compose_rtv(T)};
 		sys->context->OMSetRenderTargets(1, rtvs, nullptr);
 		sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 		sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
@@ -15390,8 +18440,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// format here instead kept two such clients on Model A, blending them in
 	// encoded space and passing the encoded bytes on as linear. The gate itself
 	// is deliberately NOT widened to "any two clients": an atlas that genuinely
-	// holds linear bytes still exists (a pure-zones UNORM commit, and every
-	// client under DXR_COLOR_LEGACY_UNORM_ENCODED=1), and Model B would
+	// holds linear bytes still exists (every UNORM client under
+	// DXR_COLOR_LEGACY_UNORM_ENCODED=1 — a pure-zones UNORM commit composes
+	// since #1795), and Model B would
 	// double-decode it.
 	int honest_srgb_count = 0;
 	for (int ri = 0; ri < render_count; ri++) {
@@ -15403,20 +18454,32 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	}
 	bool compose_linear = dp_accepts_linear && render_count > 1 && honest_srgb_count == render_count;
 
+	// #1764: the authoritative target choice for every draw below (the clear
+	// above made the same call from the placed set; the two agree whenever
+	// render_count == placed count). Model B + an EITHER DP composes through the
+	// `_SRGB` RTV: b1 still decodes each source, the ROP blends in linear, and
+	// the hardware re-encodes on write — so the 8-bit atlas holds ENCODED bytes
+	// and is handed off ENCODED (see pipeline_dp_set_encoding below).
+	T->encodes_on_write = compose_linear && T->rtv_srgb != nullptr && dp_color_cap == XRT_DP_COLOR_EITHER;
+
 	// On-change diagnostic: the compose-model decision + every gate input, so a
-	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB.
-	{
+	// "stuck on A" is attributable to dp_cap / layer-count / honest-sRGB. The
+	// primary's pass only (ADR-052): a presenter whose views differ would
+	// otherwise flip the key every frame.
+	if (t_ws_pass == nullptr) {
 		static int last_key = -1;
-		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) |
-		                (render_count << 4) | (honest_srgb_count << 8);
+		const int key = (compose_linear ? 1 : 0) | ((int)dp_color_cap << 1) | (render_count << 4) |
+		                (honest_srgb_count << 8) | ((T->encodes_on_write ? 1 : 0) << 16);
 		if (key != last_key) {
 			last_key = key;
-			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d",
+			U_LOG_W("Color (ADR-021): model=%s  dp_cap=%d(%s) layers=%d honest_srgb=%d atlas=%s handoff=%s",
 			        compose_linear ? "B/linear" : "A/passthrough", (int)dp_color_cap,
-			        dp_color_cap == XRT_DP_COLOR_EITHER    ? "EITHER"
+			        dp_color_cap == XRT_DP_COLOR_EITHER   ? "EITHER"
 			        : dp_color_cap == XRT_DP_COLOR_LINEAR ? "LINEAR"
 			                                              : "ENCODED",
-			        render_count, honest_srgb_count);
+			        render_count, honest_srgb_count,
+			        T->encodes_on_write ? "srgb-rtv(encode-on-write)" : "unorm-rtv",
+			        (compose_linear && !T->encodes_on_write) ? "LINEAR" : "ENCODED");
 		}
 	}
 
@@ -15433,11 +18496,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			sys->context->Unmap(sys->color_linearize_cb.get(), 0);
 		}
 		sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
-		// #1610: b1 is safe to state once per pass because NOTHING a client's
-		// IPC thread does touches it. The compose-passthrough decision is NOT a
-		// register for exactly that reason — it is a shader variant a client
-		// selects for its own draw (blit_ps_compose), so it cannot outlive that
-		// draw and poison the rest of this pass.
+		// The VALUE is written once per pass here; the BINDING is re-stated
+		// inside every combine_ctx_lock hold below, because a client's IPC
+		// thread binds its own zero b1 (`color_passthrough_cb`) for its blits
+		// and that binding is sticky across threads. The compose-passthrough
+		// decision is a shader variant, not a register, for the same reason —
+		// see blit_to_atlas_texture.
 	}
 
 	uint32_t dp_view_w = sys->view_width;
@@ -15493,8 +18557,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			//   Model B: the blit shader's b1-gated `srgb_to_linear` does the
 			//     decode on OUTPUT (uniformly for content + chrome), so we still
 			//     sample raw here and let the shader linearize. Using the sRGB
-			//     SRV too would double-decode. The atlas then holds linear bytes,
-			//     is declared LINEAR, and the DP performs the matched encode (§4).
+			//     SRV too would double-decode. The ROP blends that linear
+			//     output; since #1764 an EITHER DP's combine writes it through
+			//     the combined atlas's `_SRGB` RTV (re-encoded on write, handed
+			//     off ENCODED), and only a LINEAR-only DP still gets an atlas
+			//     holding linear bytes, declared LINEAR, with the DP performing
+			//     the matched encode (§4).
 			slot_srv = cc->render.atlas_srv.get();
 			cvw = mc->clients[s].content_view_w;
 			cvh = mc->clients[s].content_view_h;
@@ -15541,8 +18609,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		}
 
 		// Combined atlas dimensions.
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 		// Tile layout dims: non-legacy sessions use the true per-view dims
@@ -15658,31 +18726,24 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// compose from missed AcquireSync (cube cpu-format path
 					// holds the keyed mutex 5–10 ms; a missed acquire just
 					// re-uses last tick's content).
-					if (!slot_hud->hud_cache_tex[0] ||
+					//
+					// #1765: also on a FORMAT change, and an `_SRGB` HUD
+					// swapchain gets TYPELESS storage + a UNORM SRV — the
+					// cache used to copy the swapchain's own format and
+					// view it through a decoding SRV, so the HUD was decoded
+					// in hardware and then again by b1 under Model B.
+					if (!slot_hud->hud_cache_tex[0] || !slot_hud->hud_cache_srv[0] ||
 					    slot_hud->hud_cache_w[0] != hud_tex_desc.Width ||
-					    slot_hud->hud_cache_h[0] != hud_tex_desc.Height) {
-						slot_hud->hud_cache_tex[0].reset();
-						slot_hud->hud_cache_srv[0].reset();
-						D3D11_TEXTURE2D_DESC cache_desc = {};
-						cache_desc.Width = hud_tex_desc.Width;
-						cache_desc.Height = hud_tex_desc.Height;
-						cache_desc.MipLevels = 1;
-						cache_desc.ArraySize = 1;
-						cache_desc.Format = (hud_tex_desc.Format == DXGI_FORMAT_UNKNOWN)
-						                        ? DXGI_FORMAT_R8G8B8A8_UNORM
-						                        : hud_tex_desc.Format;
-						cache_desc.SampleDesc.Count = 1;
-						cache_desc.Usage = D3D11_USAGE_DEFAULT;
-						cache_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-						HRESULT hr_c = sys->device->CreateTexture2D(
-						    &cache_desc, nullptr, slot_hud->hud_cache_tex[0].put());
+					    slot_hud->hud_cache_h[0] != hud_tex_desc.Height ||
+					    slot_hud->hud_cache_fmt[0] != hud_tex_desc.Format) {
+						slot_hud->hud_cache_valid[0] = false;
+						HRESULT hr_c = svc_create_decode_free_copy(
+						    sys, hud_tex_desc.Width, hud_tex_desc.Height, hud_tex_desc.Format,
+						    slot_hud->hud_cache_tex[0], slot_hud->hud_cache_srv[0]);
 						if (SUCCEEDED(hr_c)) {
-							sys->device->CreateShaderResourceView(
-							    slot_hud->hud_cache_tex[0].get(), nullptr,
-							    slot_hud->hud_cache_srv[0].put());
 							slot_hud->hud_cache_w[0] = hud_tex_desc.Width;
 							slot_hud->hud_cache_h[0] = hud_tex_desc.Height;
-							slot_hud->hud_cache_valid[0] = false;
+							slot_hud->hud_cache_fmt[0] = hud_tex_desc.Format;
 						}
 					}
 
@@ -15762,6 +18823,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				}
 			}
 			combine_ctx_lock ctx_lock(sys);
+			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 
 			uint32_t src_col = v % sys->tile_columns;
 			uint32_t src_row = v / sys->tile_columns;
@@ -15882,8 +18944,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				    0, 1, sys->blit_constant_buffer.addressof());
 				sys->context->PSSetSamplers(
 				    0, 1, sys->sampler_linear.addressof());
-				ID3D11RenderTargetView *spin_rtvs[] = {
-				    mc->combined_atlas_rtv.get()};
+				ID3D11RenderTargetView *spin_rtvs[] = {svc_compose_rtv(T)};
 				sys->context->OMSetRenderTargets(
 				    1, spin_rtvs, nullptr);
 				D3D11_VIEWPORT spin_vp = {};
@@ -16162,8 +19223,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 				// Phase 2.K: bind DSV alongside the atlas RTV so the depth
 				// test resolves per-pixel occlusion between this window and
 				// other windows that have already rendered this frame.
-				ID3D11RenderTargetView *ca_rtvs[] = {mc->combined_atlas_rtv.get()};
-				sys->context->OMSetRenderTargets(1, ca_rtvs, mc->combined_atlas_dsv.get());
+				ID3D11RenderTargetView *ca_rtvs[] = {svc_compose_rtv(T)};
+				sys->context->OMSetRenderTargets(1, ca_rtvs, T->dsv);
 				D3D11_VIEWPORT vp = {};
 				vp.Width = static_cast<float>(ca_w);
 				vp.Height = static_cast<float>(ca_h);
@@ -16265,11 +19326,17 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						// First-frame-before-acquire — skip chrome this tick.
 						continue;
 					}
-				} else if (chrome_mutex != nullptr) {
-					HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
-					if (SUCCEEDED(hr)) {
-						chrome_mutex_held = true;
+				} else {
+					if (chrome_mutex != nullptr) {
+						HRESULT hr = chrome_mutex->AcquireSync(0, 4 /* ms */);
+						if (SUCCEEDED(hr)) {
+							chrome_mutex_held = true;
+						}
 					}
+					// #1765: the shell's chrome swapchain is `_SRGB`; its own
+					// SRV would decode, then b1 would decode again under
+					// Model B. Sample a byte copy through a UNORM view.
+					chrome_srv = compose_decode_free_srv(sys, csc, 0, &cs->chrome_copy_cache, chrome_srv);
 				}
 
 				float chrome_cx = cs->chrome_pose_in_client.position.x;
@@ -16317,6 +19384,7 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					// → SRV → Draw), so the lock belongs here and the keyed
 					// acquire above stays outside it. See combine_ctx_lock.
 					combine_ctx_lock ctx_lock(sys);
+					sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
 
 					uint32_t col3 = v3 % sys->tile_columns;
 					uint32_t row3 = v3 / sys->tile_columns;
@@ -16345,8 +19413,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 					sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
 					sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
 					sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-					ID3D11RenderTargetView *cc_rtvs[] = {mc->combined_atlas_rtv.get()};
-					sys->context->OMSetRenderTargets(1, cc_rtvs, mc->combined_atlas_dsv.get());
+					ID3D11RenderTargetView *cc_rtvs[] = {svc_compose_rtv(T)};
+					sys->context->OMSetRenderTargets(1, cc_rtvs, T->dsv);
 					sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
 					sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
 					sys->context->IASetInputLayout(nullptr);
@@ -16412,8 +19480,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 	// Reset scissor to full atlas for non-tiled draws (DP processing)
 	{
-		uint32_t full_w = sys->base.info.display_pixel_width;
-		uint32_t full_h = sys->base.info.display_pixel_height;
+		uint32_t full_w = svc_geom_px_w(sys);
+		uint32_t full_h = svc_geom_px_h(sys);
 		if (full_w == 0) full_w = 3840;
 		if (full_h == 0) full_h = 2160;
 		D3D11_RECT full_scissor = {0, 0, (LONG)full_w, (LONG)full_h};
@@ -16444,13 +19512,27 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// xrCreateWorkspaceOverlaySwapchainDXR + xrSetWorkspaceOverlayDXR. The map is
 	// keyed by overlayId; std::map iterates ascending so lower ids composite
 	// behind higher ids (the shell picks ids to control z-order).
+	//
+	// ADR-052 Amendment 2 (spec_version 26): each overlay belongs to ONE
+	// presenter -- the screen it was tagged with when that screen is a live
+	// secondary presenter, else the primary (untagged, the primary's own id, or
+	// a screen that is gone: never lost). In a secondary's pass every geometry
+	// read below (svc_geom_*, the tile dims) is already that presenter's, so the
+	// overlay docks in its screen's own normalized space and metres.
+	uint64_t ov_presenter_ids[COMP_WS_MAX_SCREENS] = {};
+	const uint32_t ov_presenter_count =
+	    sys->overlays.empty() ? 0u : svc_ws_presenter_ids(mc, ov_presenter_ids, COMP_WS_MAX_SCREENS);
+	const uint64_t ov_pass_screen = t_ws_pass != nullptr ? t_ws_pass->screen_id : 0;
 	for (auto &ov_kv : sys->overlays) {
 		overlay_slot &ov = ov_kv.second; // mutable: S5 copy_cache lives here
+		if (comp_ws_overlay_screen(ov.screen_id, ov_presenter_ids, ov_presenter_count) != ov_pass_screen) {
+			continue; // another presenter's overlay
+		}
 		if (ov.xsc == nullptr) {
 			continue;
 		}
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 
@@ -16480,12 +19562,14 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						overlay_mutex_held = true;
 					}
 				}
+				// #1765: never sample an `_SRGB` image through its decoding SRV.
+				overlay_srv = compose_decode_free_srv(sys, ov_sc, 0, &ov.copy_cache, overlay_srv);
 			}
 		}
 		if (overlay_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
-			float disp_w_m = sys->base.info.display_width_m;
+			float disp_w_m = svc_geom_w_m(sys);
 			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-			float disp_h_m = sys->base.info.display_height_m;
+			float disp_h_m = svc_geom_h_m(sys);
 			if (disp_h_m <= 0.0f) disp_h_m = 0.392f;
 
 			// Per-tile atlas region from the active rendering mode (matches the
@@ -16519,7 +19603,8 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// draw below, so the lock spans the whole block. The keyed-mutex
 			// acquire above is deliberately outside it. See combine_ctx_lock.
 			combine_ctx_lock ctx_lock(sys);
-			ID3D11RenderTargetView *ortvs[] = {mc->combined_atlas_rtv.get()};
+			sys->context->PSSetConstantBuffers(1, 1, sys->color_linearize_cb.addressof());
+			ID3D11RenderTargetView *ortvs[] = {svc_compose_rtv(T)};
 			sys->context->OMSetRenderTargets(1, ortvs, nullptr);
 			sys->context->OMSetBlendState(sys->blend_premul.get(), nullptr, 0xFFFFFFFF);
 			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
@@ -16610,9 +19695,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// eye-disparity rendering with hit-Z math + over-window dimming;
 	// controller owns the sprite content (shape, color, animation,
 	// branding) via xrCreateWorkspaceCursorSwapchainDXR + xrSetWorkspaceCursorDXR.
+	//
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): when the cursor is over
+	// the content of a client whose last frame carried a runtime-drawn cursor
+	// request, the workspace cursor is LIFTED onto that content (the client's
+	// per-view placement offsets on top of the window plane's disparity), and
+	// the ONE-FADE RULE applies: the controller's over-window dim does not, B.7
+	// softening is the only fade. Anywhere else: exactly the flat behaviour.
+	struct u_cursor_draw_request lift_req;
+	uint64_t lift_seq = 0;
+	const int lift_slot = svc_cursor_lift_target(mc, &lift_req, &lift_seq);
+	bool lift_drew = false;
 	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
-		uint32_t ca_w = sys->base.info.display_pixel_width;
-		uint32_t ca_h = sys->base.info.display_pixel_height;
+		uint32_t ca_w = svc_geom_px_w(sys);
+		uint32_t ca_h = svc_geom_px_h(sys);
 		if (ca_w == 0) ca_w = 3840;
 		if (ca_h == 0) ca_h = 2160;
 
@@ -16642,6 +19738,9 @@ multi_compositor_render(struct d3d11_service_system *sys)
 						cursor_mutex_held = true;
 					}
 				}
+				// #1765: never sample an `_SRGB` image through its decoding SRV.
+				cursor_srv =
+				    compose_decode_free_srv(sys, cur_sc, 0, &sys->cursor_copy_cache, cursor_srv);
 			}
 		}
 		if (cursor_srv != nullptr && sprite_w_px > 0 && sprite_h_px > 0) {
@@ -16650,13 +19749,20 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// 64 mm IPD at 60 cm if unavailable.
 			struct xrt_vec3 eye_l = {-0.032f, 0.0f, 0.6f};
 			struct xrt_vec3 eye_r = {+0.032f, 0.0f, 0.6f};
-			(void)comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_l, &eye_r);
+			if (t_ws_pass != nullptr && eye_pos.count >= 2) {
+				// ADR-052: a presenter's pass — its own screen's eyes (mapped
+				// into the primary's space, like the windows).
+				eye_l = {eye_pos.eyes[0].x, eye_pos.eyes[0].y, eye_pos.eyes[0].z};
+				eye_r = {eye_pos.eyes[1].x, eye_pos.eyes[1].y, eye_pos.eyes[1].z};
+			} else {
+				(void)comp_d3d11_service_get_predicted_eye_positions(&sys->base, &eye_l, &eye_r);
+			}
 
-			float disp_w_m = sys->base.info.display_width_m;
+			float disp_w_m = svc_geom_w_m(sys);
 			if (disp_w_m <= 0.0f) disp_w_m = 0.700f;
-			uint32_t panel_w = sys->base.info.display_pixel_width;
+			uint32_t panel_w = svc_geom_px_w(sys);
 			if (panel_w == 0) panel_w = ca_w;
-			uint32_t panel_h = sys->base.info.display_pixel_height;
+			uint32_t panel_h = svc_geom_px_h(sys);
 			if (panel_h == 0) panel_h = ca_h;
 
 			// Per-tile atlas region size from the active rendering mode.
@@ -16698,8 +19804,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 			// sprite renders at native dimensions.
 			const float scale_x = (float)tile_w / (float)panel_w;
 			const float scale_y = (float)tile_h / (float)panel_h;
-			float base_tile_x = (float)mc->cursor_panel_x * scale_x;
-			float base_tile_y = (float)mc->cursor_panel_y * scale_y;
+			// ADR-052: the cursor is in workspace pixels; a presenter's pass
+			// draws it relative to its own top-left (off its panel = clipped).
+			float base_tile_x = (float)(mc->cursor_panel_x - svc_ws_pass_origin_dx()) * scale_x;
+			float base_tile_y = (float)(mc->cursor_panel_y - svc_ws_pass_origin_dy()) * scale_y;
 
 			// Cursor sprite size + hot spot. spec_version 13: physical
 			// size comes from the controller (sys->cursor_size_m), hot
@@ -16731,109 +19839,907 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 			// Common pipeline state.
 			//
-			// #1589/#1610: bound ONCE here and relied on by every per-tile
-			// draw below, so the lock spans the whole block. The keyed-mutex
-			// acquire above is deliberately outside it. See combine_ctx_lock.
-			combine_ctx_lock ctx_lock(sys);
-			ID3D11RenderTargetView *crtvs[] = {mc->combined_atlas_rtv.get()};
-			sys->context->OMSetRenderTargets(1, crtvs, nullptr);
-			sys->context->OMSetBlendState(sys->blend_alpha.get(), nullptr, 0xFFFFFFFF);
-			sys->context->OMSetDepthStencilState(sys->depth_disabled.get(), 0);
-			sys->context->RSSetState(sys->rasterizer_state.get());
-			sys->context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-			sys->context->IASetInputLayout(nullptr);
-			D3D11_VIEWPORT cvp = {};
-			cvp.Width = (float)ca_w;
-			cvp.Height = (float)ca_h;
-			cvp.MaxDepth = 1.0f;
-			sys->context->RSSetViewports(1, &cvp);
-			sys->context->VSSetShader(sys->blit_vs.get(), nullptr, 0);
-			sys->context->PSSetShader(sys->blit_ps.get(), nullptr, 0);
-			sys->context->VSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-			sys->context->PSSetConstantBuffers(0, 1, sys->blit_constant_buffer.addressof());
-
-			sys->context->PSSetShaderResources(0, 1, &cursor_srv);
-			sys->context->PSSetSamplers(0, 1, sys->sampler_linear.addressof());
-
 			// Iterate every (col, row) tile in the atlas. Each tile gets
 			// one cursor draw at the proportional in-tile position with
 			// per-eye disparity offset. eye_idx = col % 2 matches the
 			// existing window-blit eye-mapping convention; multiview
 			// layouts (col > 1) collapse to one of the two tracked eye
 			// positions the same way windows do.
-			for (uint32_t row = 0; row < n_rows; row++) {
-				for (uint32_t col = 0; col < n_cols; col++) {
-					int eye_idx = (int)(col % 2);
-					float disp_off = (eye_idx == 0) ? +half_disp_tile_px
-					                                : -half_disp_tile_px;
-					float dest_x = (float)(col * tile_w)
-					             + base_tile_x - hot_x_atlas + disp_off;
-					float dest_y = (float)(row * tile_h)
-					             + base_tile_y - hot_y_atlas;
-
-					D3D11_MAPPED_SUBRESOURCE m;
-					if (FAILED(sys->context->Map(sys->blit_constant_buffer.get(), 0,
-					                              D3D11_MAP_WRITE_DISCARD, 0, &m))) {
-						continue;
-					}
-					BlitConstants *cb = static_cast<BlitConstants *>(m.pData);
-					memset(cb, 0, sizeof(*cb));
-					cb->src_rect[0] = 0;
-					cb->src_rect[1] = 0;
-					cb->src_rect[2] = (float)sprite_w_px;
-					cb->src_rect[3] = (float)sprite_h_px;
-					cb->src_size[0] = (float)sprite_w_px;
-					cb->src_size[1] = (float)sprite_h_px;
-					cb->dst_size[0] = (float)ca_w;
-					cb->dst_size[1] = (float)ca_h;
-					cb->dst_offset[0] = dest_x;
-					cb->dst_offset[1] = dest_y;
-					cb->dst_rect_wh[0] = cursor_w_atlas;
-					cb->dst_rect_wh[1] = cursor_h_atlas;
-					cb->convert_srgb = 0.0f;
-					cb->chrome_alpha = 0.0f;
-					cb->quad_mode = 0.0f;
-					if (over_window) {
-						// Multiplicative tint via the shader's
-						// flat-tint path (edge_feather <= 0,
-						// glow_intensity > 0). RGB stays at 1.0
-						// so the cursor keeps its natural color;
-						// alpha drops to 0.55 so the cursor reads
-						// as semi-transparent over content,
-						// reducing lenticular crosstalk on its
-						// bright pixels.
-						cb->edge_feather = 0.0f;
-						cb->glow_intensity = 1.0f;
-						cb->glow_color[0] = body_tint[0];
-						cb->glow_color[1] = body_tint[1];
-						cb->glow_color[2] = body_tint[2];
-						cb->glow_color[3] = body_tint[3];
-					} else {
-						cb->glow_intensity = 0.0f;
-					}
-					sys->context->Unmap(sys->blit_constant_buffer.get(), 0);
-
-					// Tile-local scissor — keeps a left-tile cursor with
-					// positive disparity from spilling into the right tile.
-					D3D11_RECT cscissor;
-					cscissor.left   = (LONG)(col * tile_w);
-					cscissor.top    = (LONG)(row * tile_h);
-					cscissor.right  = (LONG)((col + 1) * tile_w);
-					cscissor.bottom = (LONG)((row + 1) * tile_h);
-					sys->context->RSSetScissorRects(1, &cscissor);
-
-					sys->context->Draw(4, 0);
+			// ADR-046 Phase 4: the lifted cursor's per-eye content offset, in
+			// tile px - the client's view offsets (tile-normalised over its
+			// window) scaled by the window's size in the tile. Eye 0 takes the
+			// client's first view, eye 1 its last (the outermost pair).
+			const bool lifting = lift_slot >= 0 && !lift_req.report_only;
+			float lift_off[2][2] = {{0.0f, 0.0f}, {0.0f, 0.0f}};
+			if (lift_slot >= 0) {
+				const struct d3d11_multi_client_slot *ls = &mc->clients[lift_slot];
+				const float win_w_tile = (float)ls->window_rect_w * scale_x;
+				const float win_h_tile = (float)ls->window_rect_h * scale_y;
+				const uint32_t nv = lift_req.view_count;
+				float o[2];
+				if (u_cursor_draw_view_offset(&lift_req, 0, o)) {
+					lift_off[0][0] = o[0] * win_w_tile;
+					lift_off[0][1] = o[1] * win_h_tile;
+				}
+				if (nv >= 2 && u_cursor_draw_view_offset(&lift_req, nv - 1, o)) {
+					lift_off[1][0] = o[0] * win_w_tile;
+					lift_off[1][1] = o[1] * win_h_tile;
 				}
 			}
 
-			// Restore full-atlas scissor for downstream passes (DP, etc.).
-			D3D11_RECT cfull = {0, 0, (LONG)ca_w, (LONG)ca_h};
-			sys->context->RSSetScissorRects(1, &cfull);
+			struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+			uint32_t quad_count = 0;
+			for (uint32_t row = 0; row < n_rows; row++) {
+				for (uint32_t col = 0; col < n_cols && quad_count < SVC_CURSOR_MAX_QUADS; col++) {
+					int eye_idx = (int)(col % 2);
+					float disp_off = (eye_idx == 0) ? +half_disp_tile_px
+					                                : -half_disp_tile_px;
+					float lift_dy = 0.0f;
+					if (lifting) {
+						disp_off += lift_off[eye_idx][0];
+						lift_dy = lift_off[eye_idx][1];
+					}
+					struct svc_cursor_quad *q = &quads[quad_count++];
+					q->x = (float)(col * tile_w) + base_tile_x - hot_x_atlas + disp_off;
+					q->y = (float)(row * tile_h) + base_tile_y - hot_y_atlas + lift_dy;
+					q->w = cursor_w_atlas;
+					q->h = cursor_h_atlas;
+					// Tile-local clip — keeps a left-tile cursor with
+					// positive disparity from spilling into the right tile.
+					q->clip.left   = (LONG)(col * tile_w);
+					q->clip.top    = (LONG)(row * tile_h);
+					q->clip.right  = (LONG)((col + 1) * tile_w);
+					q->clip.bottom = (LONG)((row + 1) * tile_h);
+				}
+			}
+
+			// #1589/#1610: the helper binds its pipeline state once and every
+			// per-tile draw relies on it, so the lock spans the whole call. The
+			// keyed-mutex acquire above is deliberately outside it. See
+			// combine_ctx_lock.
+			if (lift_slot >= 0) {
+				// The lift draws (or, report-only, would draw) on every pass;
+				// the outcome is the primary pass's to record (below).
+				lift_drew = quad_count > 0;
+			}
+			if (lifting) {
+				// The ONE-FADE RULE (ADR-046 Phase 4): no controller dim on the
+				// runtime-lifted cursor; B.7 softening is its only fade. The ghost
+				// is the drawn eye-to-eye offset, in panel px; the blur cap follows
+				// the drawn sprite.
+				const float ghost_tile_px = fabsf(2.0f * half_disp_tile_px + lift_off[0][0] - lift_off[1][0]);
+				const float ghost_px = scale_x > 0.0f ? ghost_tile_px / scale_x : 0.0f;
+				const float sprite_px = scale_y > 0.0f ? cursor_h_atlas / scale_y : 0.0f;
+				const struct u_cursor_soften soften = u_cursor_draw_soften_sized(
+				    lift_req.disparity, ghost_px, sprite_px, comp_cursor_soften_params());
+				struct svc_cursor_style style = {};
+				style.premultiplied = false; // the controller's sprite is straight alpha
+				style.shared_shaders = false; // the compose pass's colour model
+				style.alpha = soften.alpha;
+				if (soften.blur_px > 0.0f && cursor_w_atlas > 0.0f && cursor_h_atlas > 0.0f) {
+					style.radius_uv[0] = soften.blur_px * scale_x / cursor_w_atlas;
+					style.radius_uv[1] = soften.blur_px * scale_y / cursor_h_atlas;
+				}
+				combine_ctx_lock ctx_lock(sys);
+				svc_draw_cursor_quads(sys, svc_compose_rtv(T), (float)ca_w, (float)ca_h, cursor_srv,
+				                      sprite_w_px, sprite_h_px, quads, quad_count, /*tint*/ nullptr,
+				                      /*convert_srgb*/ false, &style);
+			} else {
+				combine_ctx_lock ctx_lock(sys);
+				// Over-window cosmetic (spec 22/23): multiplicative tint, RGB 1 so
+				// the cursor keeps its colour, alpha = the controller's dim factor,
+				// to cut lenticular crosstalk on its bright pixels over content.
+				svc_draw_cursor_quads(sys, svc_compose_rtv(T), (float)ca_w, (float)ca_h, cursor_srv,
+				                      sprite_w_px, sprite_h_px, quads, quad_count,
+				                      over_window ? body_tint : nullptr, /*convert_srgb*/ false);
+			}
 		}
 		if (cursor_mutex_held) {
 			cursor_mutex->ReleaseSync(0);
 		}
 	}
+	// ADR-046 Phase 4 (#1952 across IPC): every client whose last frame asked
+	// for a runtime-drawn cursor learns whether it was drawn - lifted onto its
+	// window, or not (the cursor is elsewhere, hidden, or over its chrome).
+	// The primary pass only: one decision per compose tick.
+	if (t_ws_pass == nullptr) {
+		svc_cursor_record_lift_outcomes(mc, lift_slot, lift_seq, lift_drew);
+	}
+
+	out->compose_linear = compose_linear;
+	out->dp_view_w = dp_view_w;
+	out->dp_view_h = dp_view_h;
+}
+
+/*
+ *
+ * ADR-052 D1: the SECONDARY presenters — one per claimed 3D screen other than
+ * the primary (whose presenter is the service window, unchanged).
+ *
+ * Each is a full-screen window on its screen with its own swap chain, its own
+ * combined atlas (+ depth) and its own display processor, made from that
+ * screen's registry entry through `create_dp_d3d11_for_screen` with the
+ * presenter's window. All of it lives on the RENDER device: the compose pass
+ * samples the clients' atlases there, and a presenter's DP lives where its
+ * target is (ADR-047 Amendment 1's rule — the presenter's swap chain is
+ * created on the render device, so that is the device that presents; the
+ * #918 weave-on-scanout split stays the primary's).
+ *
+ * Render thread only (under render_mutex), except the array membership, which
+ * `ws_presenters_lock` publishes to the IPC-thread readers below.
+ *
+ */
+
+struct svc_ws_presenter
+{
+	uint64_t screen_id;
+	//! The set's entry when the presenter was made (geometry + plug-in).
+	struct comp_ws_screen screen;
+	//! Its desktop origin minus the primary's: workspace px of its top-left.
+	int32_t origin_dx;
+	int32_t origin_dy;
+	//! Client rect = back buffer = atlas.
+	uint32_t px_w;
+	uint32_t px_h;
+
+	struct comp_d3d11_window *window;
+	HWND hwnd;
+	wil::com_ptr<IDXGISwapChain1> swap_chain;
+	//! Frame-latency waitable (max latency 1): a free back buffer, claimed without blocking.
+	HANDLE waitable;
+	wil::com_ptr<ID3D11RenderTargetView> back_buffer_rtv;
+
+	//! The presenter's combined atlas, same recipe as the service window's (#1764 views).
+	wil::com_ptr<ID3D11Texture2D> atlas;
+	wil::com_ptr<ID3D11ShaderResourceView> atlas_srv;
+	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv;
+	wil::com_ptr<ID3D11RenderTargetView> atlas_rtv_srgb;
+	wil::com_ptr<ID3D11Texture2D> atlas_depth;
+	wil::com_ptr<ID3D11DepthStencilView> atlas_dsv;
+	//! ADR-030 crop (content-sized), lazily made.
+	wil::com_ptr<ID3D11Texture2D> crop;
+	wil::com_ptr<ID3D11ShaderResourceView> crop_srv;
+	uint32_t crop_w;
+	uint32_t crop_h;
+
+	//! The screen's DP (NULL: its plug-in could not make one — the composition
+	//! is presented unwoven, the primary's no-DP fallback).
+	struct xrt_display_processor_d3d11 *dp;
+	int encoding_latched; //!< -1 = never set
+	int mode_sent;        //!< -1 = never sent
+};
+
+static uint32_t
+svc_ws_presenter_ids(const struct d3d11_multi_compositor *mc, uint64_t *out_ids, uint32_t cap)
+{
+	// Render thread: the only writer of the presenter array (svc_ws_presenters_sync),
+	// so it reads the array without the IPC readers' lock.
+	uint32_t n = 0;
+	for (uint32_t i = 0; mc != nullptr && i < mc->ws_presenter_count && n < cap; i++) {
+		if (mc->ws_presenters[i] != nullptr) {
+			out_ids[n++] = mc->ws_presenters[i]->screen_id;
+		}
+	}
+	return n;
+}
+
+//! The registry entry of monitor @p id, or NULL.
+static const struct xrt_dp_registry_entry *
+svc_ws_registry_entry(const struct d3d11_service_system *sys, uint64_t id)
+{
+	const struct xrt_dp_factory_registry *reg = &sys->base.info.dp_registry;
+	for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+		if (reg->entries[e].monitor_id == id) {
+			return &reg->entries[e];
+		}
+	}
+	return nullptr;
+}
+
+static void
+svc_ws_presenter_destroy(struct svc_ws_presenter *p)
+{
+	if (p == nullptr) {
+		return;
+	}
+	// The DP first: it is bound to the window.
+	if (p->dp != nullptr) {
+		xrt_display_processor_d3d11_destroy(&p->dp);
+	}
+	p->crop_srv.reset();
+	p->crop.reset();
+	p->atlas_dsv.reset();
+	p->atlas_depth.reset();
+	p->atlas_rtv_srgb.reset();
+	p->atlas_rtv.reset();
+	p->atlas_srv.reset();
+	p->atlas.reset();
+	p->back_buffer_rtv.reset();
+	if (p->waitable != nullptr) {
+		CloseHandle(p->waitable);
+		p->waitable = nullptr;
+	}
+	p->swap_chain.reset();
+	if (p->window != nullptr) {
+		comp_d3d11_window_destroy(&p->window);
+	}
+	delete p;
+}
+
+static void
+svc_ws_presenters_destroy_all(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc, const char *why)
+{
+	(void)sys;
+	if (mc == nullptr) {
+		return;
+	}
+	struct svc_ws_presenter *gone[COMP_WS_MAX_SCREENS] = {};
+	uint32_t n = 0;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		gone[n++] = mc->ws_presenters[i];
+		mc->ws_presenters[i] = nullptr;
+	}
+	mc->ws_presenter_count = 0;
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	mc->ws_presenters_synced = false;
+	for (uint32_t i = 0; i < n; i++) {
+		svc_ws_presenter_destroy(gone[i]);
+	}
+	if (n > 0) {
+		U_LOG_W("workspace presenters: %u secondary presenter(s) torn down (%s)", n, why);
+	}
+}
+
+//! Make the presenter for @p scr (a non-primary presenter screen). NULL on failure (logged).
+static struct svc_ws_presenter *
+svc_ws_presenter_create(struct d3d11_service_system *sys,
+                        struct d3d11_multi_compositor *mc,
+                        const struct comp_ws_screen *scr,
+                        const struct comp_ws_screen *prim,
+                        const struct xrt_screen *xs)
+{
+	struct svc_ws_presenter *p = new svc_ws_presenter();
+	p->screen_id = scr->id;
+	p->screen = *scr;
+	p->origin_dx = scr->desktop.x - prim->desktop.x;
+	p->origin_dy = scr->desktop.y - prim->desktop.y;
+	p->encoding_latched = -1;
+	p->mode_sent = -1;
+
+	// The window: full screen on its monitor (set_fullscreen fills the monitor
+	// the window was placed on), visible.
+	xrt_result_t wret = comp_d3d11_window_create_ex(scr->desktop.w, scr->desktop.h, scr->desktop.x, scr->desktop.y,
+	                                                /*start_hidden*/ false, &p->window);
+	if (wret != XRT_SUCCESS || p->window == nullptr) {
+		U_LOG_E("workspace presenter: screen 0x%016llx — window creation failed (%d)",
+		        (unsigned long long)scr->id, (int)wret);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+	p->hwnd = (HWND)comp_d3d11_window_get_hwnd(p->window);
+	comp_d3d11_window_set_workspace_mode_active(p->window, true);
+	if (sys->workspace_wakeup_event != nullptr) {
+		comp_d3d11_window_set_workspace_wakeup_event(p->window, sys->workspace_wakeup_event);
+	}
+	if (mc->ws_reserved_set) {
+		comp_d3d11_window_set_reserved_keys(p->window, mc->ws_reserved_vks, mc->ws_reserved_mods,
+		                                    mc->ws_reserved_count);
+	}
+	// A modal grab already up covers a presenter that appears under it (ADR-052 Amendment 2).
+	if (sys->input_grabbed) {
+		comp_d3d11_window_set_input_suppress(p->window, true);
+	}
+
+	uint32_t w = scr->desktop.w;
+	uint32_t h = scr->desktop.h;
+	RECT cr;
+	if (GetClientRect(p->hwnd, &cr) && cr.right > cr.left && cr.bottom > cr.top) {
+		w = (uint32_t)(cr.right - cr.left);
+		h = (uint32_t)(cr.bottom - cr.top);
+	}
+	p->px_w = w;
+	p->px_h = h;
+
+	// The swap chain, on the render device, with a frame-latency waitable so
+	// the render thread never blocks on this presenter (#924's rule).
+	DXGI_SWAP_CHAIN_DESC1 sc_desc = {};
+	sc_desc.Width = w;
+	sc_desc.Height = h;
+	sc_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sc_desc.SampleDesc.Count = 1;
+	sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+	sc_desc.BufferCount = 2;
+	sc_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+	sc_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+	sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+	HRESULT hr = sys->dxgi_factory->CreateSwapChainForHwnd(sys->device.get(), p->hwnd, &sc_desc, nullptr, nullptr,
+	                                                       p->swap_chain.put());
+	if (FAILED(hr)) {
+		(void)service_note_device_lost(sys, hr, "workspace_presenter/swapchain");
+		U_LOG_E("workspace presenter: screen 0x%016llx — swap chain failed (hr=0x%08lX)",
+		        (unsigned long long)scr->id, hr);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+	{
+		wil::com_ptr<IDXGISwapChain2> sc2;
+		if (SUCCEEDED(p->swap_chain->QueryInterface(IID_PPV_ARGS(sc2.put())))) {
+			sc2->SetMaximumFrameLatency(1);
+			p->waitable = sc2->GetFrameLatencyWaitableObject();
+		}
+		wil::com_ptr<ID3D11Texture2D> bb;
+		if (SUCCEEDED(p->swap_chain->GetBuffer(0, IID_PPV_ARGS(bb.put())))) {
+			sys->device->CreateRenderTargetView(bb.get(), nullptr, p->back_buffer_rtv.put());
+		}
+	}
+
+	// The atlas: the service window's recipe (#1764) at this screen's size.
+	{
+		D3D11_TEXTURE2D_DESC ad = {};
+		ad.Width = w;
+		ad.Height = h;
+		ad.MipLevels = 1;
+		ad.ArraySize = 1;
+		ad.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		ad.SampleDesc.Count = 1;
+		ad.Usage = D3D11_USAGE_DEFAULT;
+		ad.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+		hr = sys->device->CreateTexture2D(&ad, nullptr, p->atlas.put());
+		if (SUCCEEDED(hr)) {
+			D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+			sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			sd.Texture2D.MipLevels = 1;
+			D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+			rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			sys->device->CreateShaderResourceView(p->atlas.get(), &sd, p->atlas_srv.put());
+			sys->device->CreateRenderTargetView(p->atlas.get(), &rd, p->atlas_rtv.put());
+			D3D11_RENDER_TARGET_VIEW_DESC rds = rd;
+			rds.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+			if (FAILED(
+			        sys->device->CreateRenderTargetView(p->atlas.get(), &rds, p->atlas_rtv_srgb.put()))) {
+				p->atlas_rtv_srgb.reset();
+			}
+			D3D11_TEXTURE2D_DESC dd = {};
+			dd.Width = w;
+			dd.Height = h;
+			dd.MipLevels = 1;
+			dd.ArraySize = 1;
+			dd.Format = DXGI_FORMAT_D32_FLOAT;
+			dd.SampleDesc.Count = 1;
+			dd.Usage = D3D11_USAGE_DEFAULT;
+			dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+			if (SUCCEEDED(sys->device->CreateTexture2D(&dd, nullptr, p->atlas_depth.put()))) {
+				sys->device->CreateDepthStencilView(p->atlas_depth.get(), nullptr, p->atlas_dsv.put());
+			}
+		}
+	}
+	if (!p->back_buffer_rtv || !p->atlas_srv || !p->atlas_rtv) {
+		(void)service_note_device_lost(sys, hr, "workspace_presenter/resources");
+		U_LOG_E("workspace presenter: screen 0x%016llx — atlas / back buffer creation failed",
+		        (unsigned long long)scr->id);
+		svc_ws_presenter_destroy(p);
+		return nullptr;
+	}
+
+	// The screen's DP, from ITS registry entry, bound to the presenter window.
+	// Same factory slot and screen binding the segment managers use; no
+	// fallback to the plain factory (that DP describes the plug-in's
+	// process-wide panel, not this screen).
+	const struct xrt_dp_registry_entry *e = svc_ws_registry_entry(sys, scr->id);
+	const struct xrt_plugin_iface *iface =
+	    e != nullptr ? (const struct xrt_plugin_iface *)e->owning_iface : nullptr;
+	if (e != nullptr && e->dp_factory_d3d11 != nullptr && xrt_plugin_iface_has_create_dp_d3d11_for_screen(iface)) {
+		struct xrt_screen_binding b;
+		memset(&b, 0, sizeof(b));
+		b.struct_size = (uint32_t)sizeof(b);
+		b.monitor_id = scr->id;
+		b.desktop_left = scr->desktop.x;
+		b.desktop_top = scr->desktop.y;
+		b.desktop_width = scr->desktop.w;
+		b.desktop_height = scr->desktop.h;
+		if (xs != nullptr) {
+			b.native_pixel_width = xs->native_width;
+			b.native_pixel_height = xs->native_height;
+			b.physical_width_mm = xs->physical_width_mm;
+			b.physical_height_mm = xs->physical_height_mm;
+			b.desktop_scale = xs->desktop_scale;
+			snprintf(b.device_name, sizeof(b.device_name), "%s", xs->device_name);
+		}
+		snprintf(b.serial, sizeof(b.serial), "%s", e->serial);
+		struct xrt_display_processor_d3d11 *dp = nullptr;
+		xrt_result_t dret = XRT_ERROR_DEVICE_CREATION_FAILED;
+		{
+			combine_ctx_lock ctx_lock(sys); // the vendor may record on the shared immediate context
+			dret =
+			    iface->create_dp_d3d11_for_screen((struct xrt_plugin_instance *)e->owning_instance,
+			                                      sys->device.get(), sys->context.get(), p->hwnd, &b, &dp);
+		}
+		if (dret == XRT_SUCCESS && dp != nullptr && dp->process_atlas != nullptr) {
+			p->dp = dp;
+			xrt_display_processor_d3d11_set_background_2d(dp, nullptr, 0, 0);
+			xrt_display_processor_d3d11_set_transparent_background(dp, false, false);
+		} else if (dp != nullptr) {
+			xrt_display_processor_d3d11_destroy(&dp);
+		}
+	}
+
+	// Lifecycle (once per presenter).
+	U_LOG_W(
+	    "workspace presenter: screen 0x%016llx up — %ux%u at (%d,%d), plug-in '%s', %s (render device; "
+	    "workspace px origin %d,%d)",
+	    (unsigned long long)scr->id, w, h, scr->desktop.x, scr->desktop.y, scr->plugin_id,
+	    p->dp != nullptr ? "woven by its own DP" : "NO DP — presented unwoven", p->origin_dx, p->origin_dy);
+	return p;
+}
+
+//! Keep the presenters in step with the screen set (rebuilds only when its generation moves).
+static void
+svc_ws_presenters_sync(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	// A presenter window the user closed: rebuild it (the presenter set is the
+	// runtime's, not the user's to dismiss — the workspace itself is closed
+	// through the controller).
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr && !comp_d3d11_window_is_valid(p->window)) {
+			mc->ws_presenters_synced = false;
+		}
+	}
+
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		gen = sys->ws_screens_generation;
+		if (mc->ws_presenters_synced && gen == mc->ws_presenters_gen) {
+			return;
+		}
+	}
+	// Rare (a topology change): copy the set and the registry list out.
+	struct comp_ws_screen_set *set = new comp_ws_screen_set();
+	struct xrt_screen_list *list = new xrt_screen_list();
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		gen = sys->ws_screens_generation;
+		*set = sys->ws_screens;
+		*list = sys->ws_screen_list;
+	}
+	mc->ws_presenters_gen = gen;
+	mc->ws_presenters_synced = true;
+
+	// The primary moving re-origins every presenter (workspace px are relative to it).
+	const struct comp_ws_screen *prim = comp_ws_screens_find(set, 0);
+	const struct comp_ws_screen old_primary = mc->ws_primary;
+	if (prim != nullptr) {
+		mc->ws_primary = *prim;
+	}
+
+	// Keep the presenters whose screen is still a non-primary presenter at the
+	// same place with the same claim; tear the rest down.
+	struct svc_ws_presenter *keep[COMP_WS_MAX_SCREENS] = {};
+	struct svc_ws_presenter *gone[COMP_WS_MAX_SCREENS] = {};
+	uint32_t nk = 0, ng = 0;
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		const struct comp_ws_screen *s = prim != nullptr ? comp_ws_screens_find(set, p->screen_id) : nullptr;
+		const bool same = s != nullptr && (s->flags & COMP_WS_SCREEN_PRESENTER) != 0 &&
+		                  (s->flags & COMP_WS_SCREEN_PRIMARY) == 0 && s->desktop.x == p->screen.desktop.x &&
+		                  s->desktop.y == p->screen.desktop.y && s->desktop.w == p->screen.desktop.w &&
+		                  s->desktop.h == p->screen.desktop.h && s->width_m == p->screen.width_m &&
+		                  s->height_m == p->screen.height_m && strcmp(s->plugin_id, p->screen.plugin_id) == 0 &&
+		                  prim->desktop.x == old_primary.desktop.x &&
+		                  prim->desktop.y == old_primary.desktop.y && p->window != nullptr &&
+		                  comp_d3d11_window_is_valid(p->window);
+		if (same) {
+			keep[nk++] = p;
+		} else {
+			gone[ng++] = p;
+		}
+	}
+
+	// Make the missing ones (outside the lock: window + DP creation is slow).
+	struct svc_ws_presenter *made[COMP_WS_MAX_SCREENS] = {};
+	uint32_t nm = 0;
+	for (uint32_t i = 0; prim != nullptr && i < set->count && i < COMP_WS_MAX_SCREENS; i++) {
+		const struct comp_ws_screen *s = &set->screens[i];
+		if ((s->flags & COMP_WS_SCREEN_PRESENTER) == 0 || (s->flags & COMP_WS_SCREEN_PRIMARY) != 0) {
+			continue;
+		}
+		bool have = false;
+		for (uint32_t k = 0; k < nk; k++) {
+			have = have || keep[k]->screen_id == s->id;
+		}
+		if (have || nk + nm >= COMP_WS_MAX_SCREENS) {
+			continue;
+		}
+		struct svc_ws_presenter *p =
+		    svc_ws_presenter_create(sys, mc, s, prim, xrt_screen_list_find(list, s->id));
+		if (p != nullptr) {
+			made[nm++] = p;
+		}
+	}
+
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < nk; k++) {
+		mc->ws_presenters[n++] = keep[k];
+	}
+	for (uint32_t k = 0; k < nm; k++) {
+		mc->ws_presenters[n++] = made[k];
+	}
+	for (uint32_t k = n; k < COMP_WS_MAX_SCREENS; k++) {
+		mc->ws_presenters[k] = nullptr;
+	}
+	mc->ws_presenter_count = n;
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+
+	for (uint32_t k = 0; k < ng; k++) {
+		svc_ws_presenter_destroy(gone[k]);
+	}
+	if (ng > 0 || nm > 0) {
+		// Lifecycle (topology change), not per frame.
+		U_LOG_W("workspace presenters: generation %u — %u secondary presenter(s) (%u made, %u torn down)", gen,
+		        n, nm, ng);
+		// The new windows need the focused client's input-forward rect.
+		multi_compositor_update_input_forward(mc);
+	}
+	delete list;
+	delete set;
+}
+
+//! A screen's eyes, mapped from its display space into the primary's.
+static void
+svc_ws_presenter_eyes(const struct svc_ws_presenter *p,
+                      const struct comp_ws_screen *prim,
+                      struct xrt_eye_positions *out)
+{
+	struct xrt_eye_positions own = {};
+	if (p->dp != nullptr) {
+		xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, &own);
+	}
+	if (!own.valid || own.count == 0) {
+		// No tracker answer: the screen's nominal viewer, a nominal IPD apart.
+		const float vz = p->screen.nominal_viewer_m[2] > 0.01f ? p->screen.nominal_viewer_m[2] : 0.6f;
+		own.count = 2;
+		own.eyes[0] = {p->screen.nominal_viewer_m[0] - 0.032f, p->screen.nominal_viewer_m[1], vz};
+		own.eyes[1] = {p->screen.nominal_viewer_m[0] + 0.032f, p->screen.nominal_viewer_m[1], vz};
+		own.valid = true;
+	}
+	*out = own;
+	const uint32_t n = own.count < 8 ? own.count : 8;
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_pose in = {};
+		in.orientation.w = 1.0f;
+		in.position.x = own.eyes[i].x;
+		in.position.y = own.eyes[i].y;
+		in.position.z = own.eyes[i].z;
+		struct xrt_pose mapped = in;
+		float mw = 0.0f, mh = 0.0f;
+		if (comp_ws_map_pose(&p->screen, prim, &in, 1.0f, 1.0f, &mapped, &mw, &mh)) {
+			out->eyes[i].x = mapped.position.x;
+			out->eyes[i].y = mapped.position.y;
+			out->eyes[i].z = mapped.position.z;
+		}
+	}
+}
+
+//! Compose, weave and present every secondary presenter (ADR-052 D1/D2).
+static void
+svc_ws_presenters_render(struct d3d11_service_system *sys, struct d3d11_multi_compositor *mc)
+{
+	if (mc->ws_presenter_count == 0) {
+		return;
+	}
+	const struct comp_ws_screen *prim = &mc->ws_primary;
+	if (prim->desktop.w == 0 || prim->desktop.h == 0 || !(prim->width_m > 0.0f) || !(prim->height_m > 0.0f)) {
+		return;
+	}
+
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || !p->swap_chain || !p->back_buffer_rtv || !p->atlas_rtv) {
+			continue;
+		}
+		if (p->window != nullptr && !comp_d3d11_window_is_valid(p->window)) {
+			continue; // rebuilt by the next sync
+		}
+		// Where the primary's display space lands in this presenter's pixels.
+		struct comp_ws_frame frame = {};
+		if (!comp_ws_presenter_frame(prim, &p->screen, &frame)) {
+			continue;
+		}
+		// Claim a back buffer without blocking; none free = DWM is not taking
+		// this screen's flips — keep its last frame (#924's rule).
+		if (p->waitable != nullptr && WaitForSingleObject(p->waitable, 0) != WAIT_OBJECT_0) {
+			continue;
+		}
+
+		struct xrt_eye_positions eyes = {};
+		svc_ws_presenter_eyes(p, prim, &eyes);
+
+		struct svc_ws_pass pass = {};
+		pass.px_w = p->px_w;
+		pass.px_h = p->px_h;
+		pass.w_m = p->screen.width_m;
+		pass.h_m = p->screen.height_m;
+		pass.ppm_x = frame.ppm_x;
+		pass.ppm_y = frame.ppm_y;
+		pass.cx_px = frame.cx_px;
+		pass.cy_px = frame.cy_px;
+		pass.origin_dx = p->origin_dx;
+		pass.origin_dy = p->origin_dy;
+		pass.primary_px_w =
+		    sys->base.info.display_pixel_width > 0 ? sys->base.info.display_pixel_width : prim->desktop.w;
+		pass.primary_px_h =
+		    sys->base.info.display_pixel_height > 0 ? sys->base.info.display_pixel_height : prim->desktop.h;
+		pass.screen_id = p->screen_id;
+
+		struct svc_compose_target target = {};
+		target.rtv = p->atlas_rtv.get();
+		target.rtv_srgb = p->atlas_rtv_srgb.get();
+		target.dsv = p->atlas_dsv.get();
+		struct svc_compose_out out = {};
+		uint32_t vw = 0, vh = 0;
+		t_ws_pass = &pass;
+		multi_compositor_compose_pass(sys, mc, eyes, &target, &out);
+		resolve_active_view_dims(sys, p->px_w, p->px_h, &vw, &vh);
+		t_ws_pass = nullptr;
+
+		const uint32_t cols = sys->tile_columns > 0 ? sys->tile_columns : 1;
+		const uint32_t rows = sys->tile_rows > 0 ? sys->tile_rows : 1;
+		uint32_t cw = cols * vw;
+		uint32_t ch = rows * vh;
+		if (cw > p->px_w) {
+			cw = p->px_w;
+		}
+		if (ch > p->px_h) {
+			ch = p->px_h;
+		}
+
+		{
+			combine_ctx_lock ctx_lock(sys);
+			ID3D11ShaderResourceView *src = p->atlas_srv.get();
+			// ADR-030: crop before the DP whenever the content does not fill the atlas.
+			if (vw > 0 && vh > 0 && (cw != p->px_w || ch != p->px_h)) {
+				if (p->crop_w != cw || p->crop_h != ch) {
+					p->crop_srv.reset();
+					p->crop.reset();
+					D3D11_TEXTURE2D_DESC cd = {};
+					cd.Width = cw;
+					cd.Height = ch;
+					cd.MipLevels = 1;
+					cd.ArraySize = 1;
+					cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+					cd.SampleDesc.Count = 1;
+					cd.Usage = D3D11_USAGE_DEFAULT;
+					cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+					if (SUCCEEDED(sys->device->CreateTexture2D(&cd, nullptr, p->crop.put()))) {
+						sys->device->CreateShaderResourceView(p->crop.get(), nullptr,
+						                                      p->crop_srv.put());
+					}
+					p->crop_w = cw;
+					p->crop_h = ch;
+				}
+				if (p->crop && p->crop_srv) {
+					for (uint32_t v = 0; v < cols * rows && v < XRT_MAX_VIEWS; v++) {
+						const uint32_t c = v % cols;
+						const uint32_t r = v / cols;
+						D3D11_BOX box = {c * vw, r * vh, 0, c * vw + vw, r * vh + vh, 1};
+						if (box.right > p->px_w || box.bottom > p->px_h) {
+							continue;
+						}
+						sys->context->CopySubresourceRegion(p->crop.get(), 0, c * vw, r * vh, 0,
+						                                    p->atlas.get(), 0, &box);
+					}
+					src = p->crop_srv.get();
+				}
+			}
+
+			if (p->dp != nullptr && vw > 0 && vh > 0) {
+				const int enc = (out.compose_linear && !target.encodes_on_write)
+				                    ? (int)XRT_ATLAS_ENCODING_LINEAR
+				                    : (int)XRT_ATLAS_ENCODING_ENCODED;
+				if (p->encoding_latched != enc) {
+					p->encoding_latched = enc;
+					xrt_display_processor_d3d11_set_atlas_encoding(p->dp,
+					                                               (enum xrt_atlas_encoding)enc);
+				}
+				// One rendering mode / lens per service (ADR-052 D5).
+				const int want_3d = sys->hardware_display_3d ? 1 : 0;
+				if (p->mode_sent != want_3d) {
+					p->mode_sent = want_3d;
+					xrt_display_processor_d3d11_request_display_mode(p->dp, want_3d != 0);
+				}
+				ID3D11RenderTargetView *rt[] = {p->back_buffer_rtv.get()};
+				sys->context->OMSetRenderTargets(1, rt, nullptr);
+				xrt_display_processor_d3d11_process_atlas(p->dp, sys->context.get(), src, vw, vh, cols,
+				                                          rows, DXGI_FORMAT_R8G8B8A8_UNORM, p->px_w,
+				                                          p->px_h, 0, 0, 0, 0);
+			} else {
+				// No DP: the composition unwoven, the primary's no-DP fallback.
+				wil::com_ptr<ID3D11Resource> bb;
+				p->back_buffer_rtv->GetResource(bb.put());
+				if (bb) {
+					sys->context->CopyResource(bb.get(), p->atlas.get());
+				}
+			}
+		}
+
+		// The buffer was claimed above, so this queues without blocking.
+		HRESULT phr = p->swap_chain->Present(1, 0);
+		phr = dxr_test_fake_device_removed(phr);
+		(void)service_note_device_lost(sys, phr, "compose/workspace_presenter_present");
+		if (p->window != nullptr) {
+			comp_d3d11_window_signal_paint_done(p->window);
+		}
+	}
+}
+
+static bool
+svc_ws_is_pointer_down(const struct workspace_public_event_raw *r)
+{
+	return r->kind == WORKSPACE_PUBLIC_EVENT_POINTER && r->is_down != 0;
+}
+
+/*!
+ * Drain the presenter windows' public input into @p raw after the
+ * @p primary_count events the service window already put there (capacity
+ * counts from @p raw + @p primary_count), cursor in workspace px. Notes which
+ * presenter the newest pointer DOWN went down on — primary's first, in drain
+ * order — for svc_ws_pointer_capture_set.
+ */
+static uint32_t
+svc_ws_presenters_consume_events(struct d3d11_multi_compositor *mc,
+                                 struct workspace_public_event_raw *raw,
+                                 uint32_t primary_count,
+                                 uint32_t capacity)
+{
+	uint32_t got = 0;
+	if (mc == nullptr) {
+		return 0;
+	}
+	struct workspace_public_event_raw *out = raw + primary_count;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t k = 0; k < primary_count; k++) {
+		if (svc_ws_is_pointer_down(&raw[k])) {
+			comp_ws_pointer_owner_note_down(&mc->ws_pointer_owner, 0, raw[k].timestamp_ms);
+		}
+	}
+	for (uint32_t i = 0; i < mc->ws_presenter_count && got < capacity; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || p->window == nullptr) {
+			continue;
+		}
+		const uint32_t n =
+		    comp_d3d11_window_consume_workspace_public_events(p->window, out + got, capacity - got);
+		for (uint32_t k = got; k < got + n; k++) {
+			out[k].cursor_x += p->origin_dx;
+			out[k].cursor_y += p->origin_dy;
+			if (svc_ws_is_pointer_down(&out[k])) {
+				comp_ws_pointer_owner_note_down(&mc->ws_pointer_owner, p->screen_id,
+				                                out[k].timestamp_ms);
+			}
+		}
+		got += n;
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return got;
+}
+
+/*!
+ * The controller's pointer capture across the presenter windows (ADR-052).
+ * Each presenter window has its own thread, and Win32 capture only takes on
+ * the window the button went down on — so the grab goes to the press's
+ * presenter (the service window when that presenter is gone, or with none).
+ * Every other presenter window gets the flag without the grab: it reports
+ * MOTION and applies the capture's forwarding rules should the pointer reach
+ * it. With no secondary presenters this is exactly the old single call on
+ * the service window.
+ */
+static void
+svc_ws_pointer_capture_set(struct d3d11_multi_compositor *mc, bool enabled, uint32_t button)
+{
+	bool owner_is_secondary = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	const uint64_t owner = comp_ws_pointer_owner_screen(&mc->ws_pointer_owner);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p == nullptr || p->window == nullptr) {
+			continue;
+		}
+		const bool grab = owner != 0 && p->screen_id == owner;
+		owner_is_secondary = owner_is_secondary || grab;
+		comp_d3d11_window_set_workspace_pointer_capture_ex(p->window, enabled, button, grab);
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	comp_d3d11_window_set_workspace_pointer_capture_ex(mc->window, enabled, button, !owner_is_secondary);
+}
+
+//! The app HWND the newest pointer DOWN was forwarded to, by whichever presenter window took it.
+static void *
+svc_ws_last_pointer_down_target(struct d3d11_multi_compositor *mc)
+{
+	void *target = nullptr;
+	bool found = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	const uint64_t owner = comp_ws_pointer_owner_screen(&mc->ws_pointer_owner);
+	for (uint32_t i = 0; owner != 0 && i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr && p->screen_id == owner) {
+			target = comp_d3d11_window_get_last_pointer_down_target(p->window);
+			found = true;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return found ? target : comp_d3d11_window_get_last_pointer_down_target(mc->window);
+}
+
+//! The focused client's input-forward rect on every presenter window, in its pixels.
+static void
+svc_ws_presenters_mirror_input_forward(
+    struct d3d11_multi_compositor *mc, void *target, int32_t rx, int32_t ry, int32_t rw, int32_t rh, bool is_capture)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr) {
+			comp_d3d11_window_set_input_forward(p->window, target, rx - p->origin_dx, ry - p->origin_dy, rw,
+			                                    rh, is_capture);
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+}
+
+//! Status: does screen @p id's presenter have a live DP?
+static bool
+svc_ws_presenter_is_woven(struct d3d11_multi_compositor *mc, uint64_t id)
+{
+	if (mc == nullptr) {
+		return false;
+	}
+	bool woven = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		if (mc->ws_presenters[i] != nullptr && mc->ws_presenters[i]->screen_id == id) {
+			woven = mc->ws_presenters[i]->dp != nullptr;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return woven;
+}
+
+
+/*!
+ * The frame after the prelude of multi_compositor_render: the secondary
+ * presenters (each composed, woven and presented on its own), then the
+ * primary's compose and today's weave + present of the service window.
+ */
+static void
+multi_compositor_render_frame(struct d3d11_service_system *sys,
+                              struct d3d11_multi_compositor *mc,
+                              const struct xrt_eye_positions &eye_pos)
+{
+	// ADR-052 D1: the presenter set follows the screen set; then each secondary
+	// presenter composes its part of the layout and weaves it with its own DP.
+	svc_ws_presenters_sync(sys, mc);
+	svc_ws_presenters_render(sys, mc);
+
+	struct svc_compose_target primary_target = {};
+	primary_target.rtv = mc->combined_atlas_rtv.get();
+	primary_target.rtv_srgb = mc->combined_atlas_rtv_srgb.get();
+	primary_target.dsv = mc->combined_atlas_dsv.get();
+	primary_target.encodes_on_write = mc->combine_encodes_on_write;
+	struct svc_compose_out compose_out = {};
+	multi_compositor_compose_pass(sys, mc, eye_pos, &primary_target, &compose_out);
+	mc->combine_encodes_on_write = primary_target.encodes_on_write;
+	const bool compose_linear = compose_out.compose_linear;
+	uint32_t dp_view_w = compose_out.dp_view_w;
+	uint32_t dp_view_h = compose_out.dp_view_h;
 
 	// Send full combined atlas to DP — content is placed at sub-rect positions,
 	// background is dark gray. The DP interlaces the entire image.
@@ -17025,8 +20931,12 @@ multi_compositor_render(struct d3d11_service_system *sys)
 
 		// ADR-021: declare the encoding of the atlas we are sending out-of-band
 		// (append-only setter; the format arg stays the real DXGI format so
-		// older plug-ins are unaffected). LINEAR under Model B (the DP performs
-		// the matched output encode), ENCODED under Model A (passthrough).
+		// older plug-ins are unaffected). ENCODED under Model A (passthrough),
+		// and — since #1764 — ENCODED under Model B too whenever the combine
+		// encoded on write through the `_SRGB` RTV (an EITHER DP): the blend
+		// still happened in linear, the 8-bit atlas just no longer stores
+		// linear light. LINEAR only for Model B against a LINEAR-only DP, whose
+		// atlas still holds linear (the DP performs the matched output encode).
 		// #1016: same per-call ownership as the other two writers. The model
 		// decision itself is unchanged; what is new is that it is asserted
 		// through the shared tracker, and that the compose path also states
@@ -17036,8 +20946,10 @@ multi_compositor_render(struct d3d11_service_system *sys)
 		// alpha-gate between compose ticks, and nothing flipped it back for
 		// the compose itself.
 		pipeline_dp_set_transparency(mc, compose_dp, /*client_presents*/ false, "compose");
-		pipeline_dp_set_encoding(
-		    mc, compose_dp, compose_linear ? XRT_ATLAS_ENCODING_LINEAR : XRT_ATLAS_ENCODING_ENCODED, "compose");
+		pipeline_dp_set_encoding(mc, compose_dp,
+		                         (compose_linear && !mc->combine_encodes_on_write) ? XRT_ATLAS_ENCODING_LINEAR
+		                                                                           : XRT_ATLAS_ENCODING_ENCODED,
+		                         "compose");
 		mc->weave_lat.mark_weave("workspace");
 		mc->panel_r_ns = mc->weave_lat.measured_weave_ns_fresh(); // fresh-or-0, see above
 		{
@@ -17289,12 +21201,89 @@ multi_compositor_render(struct d3d11_service_system *sys)
 	// staleness); a sustained failure (dead/removed DP) drops viewer_valid to
 	// 0 so the controller sees "tracking lost" instead of a viewer frozen at
 	// the last-known position forever.
+	//
+	// ADR-047 Amendment 7: when the primary's DP sees nobody but a secondary
+	// presenter's DP does, the viewer is that presenter's, mapped from its
+	// screen's display space into the primary's through desktop pixels
+	// (comp_ws_map_pose: x/y via each screen's own pixel pitch, z unchanged —
+	// the workspace's one desktop-space layout, ADR-052 D2, which treats the
+	// screens as coplanar). The presenters are created and destroyed on this
+	// thread, so the array is stable here.
 	{
-		struct xrt_vec3 vl, vr;
-		if (comp_d3d11_service_get_predicted_eye_positions(&sys->base, &vl, &vr)) {
-			mc->frame_tick_viewer_x = 0.5f * (vl.x + vr.x);
-			mc->frame_tick_viewer_y = 0.5f * (vl.y + vr.y);
-			mc->frame_tick_viewer_z = 0.5f * (vl.z + vr.z);
+		struct xrt_eye_positions pe;
+		memset(&pe, 0, sizeof(pe));
+		if (comp_d3d11_service_get_predicted_eye_positions_full(&sys->base, &pe) && pe.valid) {
+			float vx = 0.5f * (pe.eyes[0].x + pe.eyes[1].x);
+			float vy = 0.5f * (pe.eyes[0].y + pe.eyes[1].y);
+			float vz = 0.5f * (pe.eyes[0].z + pe.eyes[1].z);
+			// Which screen's viewer: the primary whenever it sees one; else a
+			// secondary that has been the only one seeing a viewer for the
+			// dwell (u_tracking_source_update). The chosen secondary is
+			// asked first so the choice does not hop.
+			const bool primary_present = u_tracking_dp_viewer_present(&pe);
+			const struct comp_ws_screen *prim = &mc->ws_primary;
+			uint64_t candidate = 0;
+			struct xrt_pose cand_mapped = {};
+			if (!primary_present) {
+				const uint64_t prev = mc->frame_tick_viewer_src.chosen != 0
+				                          ? mc->frame_tick_viewer_src.chosen
+				                          : mc->frame_tick_viewer_src.pending;
+				for (int pass = 0; pass < 2 && candidate == 0; pass++) {
+					for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+						struct svc_ws_presenter *p = mc->ws_presenters[i];
+						if (p == nullptr || p->dp == nullptr) {
+							continue;
+						}
+						// Pass 0: only the previously chosen / pending
+						// screen. Pass 1: any.
+						if (pass == 0 && (prev == 0 || p->screen_id != prev)) {
+							continue;
+						}
+						struct xrt_eye_positions se;
+						memset(&se, 0, sizeof(se));
+						if (!xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, &se) ||
+						    !u_tracking_dp_viewer_present(&se) || se.count < 2) {
+							continue;
+						}
+						struct xrt_pose in = {};
+						in.orientation.w = 1.0f;
+						in.position.x = 0.5f * (se.eyes[0].x + se.eyes[1].x);
+						in.position.y = 0.5f * (se.eyes[0].y + se.eyes[1].y);
+						in.position.z = 0.5f * (se.eyes[0].z + se.eyes[1].z);
+						struct xrt_pose mapped = in;
+						float mw = 0.0f, mh = 0.0f;
+						if (comp_ws_map_pose(&p->screen, prim, &in, 1.0f, 1.0f, &mapped, &mw, &mh)) {
+							candidate = p->screen_id;
+							cand_mapped = mapped;
+							break;
+						}
+					}
+				}
+			}
+			const uint64_t from_screen =
+			    u_tracking_source_update(&mc->frame_tick_viewer_src, os_monotonic_get_ns(), primary_present,
+			                             candidate, U_TRACKING_SOURCE_DWELL_NS);
+			if (from_screen != 0) {
+				vx = cand_mapped.position.x;
+				vy = cand_mapped.position.y;
+				vz = cand_mapped.position.z;
+			}
+			if (from_screen != mc->frame_tick_viewer_screen) {
+				mc->frame_tick_viewer_screen = from_screen;
+				if (from_screen != 0) {
+					U_LOG_W(
+					    "FRAME_TICK viewer: the primary sees nobody — publishing screen "
+					    "0x%016llx's "
+					    "tracked viewer, mapped into the primary's display space (ADR-047 "
+					    "Amendment 7)",
+					    (unsigned long long)from_screen);
+				} else {
+					U_LOG_W("FRAME_TICK viewer: back to the primary screen's viewer");
+				}
+			}
+			mc->frame_tick_viewer_x = vx;
+			mc->frame_tick_viewer_y = vy;
+			mc->frame_tick_viewer_z = vz;
 			mc->frame_tick_viewer_valid = 1;
 			mc->frame_tick_viewer_fail_count = 0;
 		} else if (mc->frame_tick_viewer_valid != 0 &&
@@ -17478,8 +21467,17 @@ struct service_proj_view_blit
 	float dst_w, dst_h;               //!< 0 = no scale (source fits the slot)
 	bool is_array;                    //!< ADR-032 layered source
 	uint32_t array_slice;
+	//! Multi-screen M3: this view has no place in this frame's atlas (a routed
+	//! frame's view past every segment's range, or any view past the packed
+	//! tiles) — the caller draws nothing for it.
+	bool skip;
 };
 
+/*!
+ * @p packed_tiles is the tile count this commit packs (the active mode's, 1
+ * in hardware 2D) — what a routed view's local index must fit (multi-screen
+ * M3, see the routing block at the end).
+ */
 static void
 service_proj_view_blit_resolve(struct d3d11_service_system *sys,
                                struct d3d11_service_compositor *c,
@@ -17489,6 +21487,7 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
                                bool bridge_override,
                                uint32_t active_vw,
                                uint32_t active_vh,
+                               uint32_t packed_tiles,
                                struct service_proj_view_blit *out)
 {
 	float src_x = static_cast<float>(layer->data.proj.v[eye].sub.rect.offset.w);
@@ -17562,6 +21561,77 @@ service_proj_view_blit_resolve(struct d3d11_service_system *sys,
 	// it needs no change.
 	out->is_array = view_desc->ArraySize > 1;
 	out->array_slice = static_cast<uint32_t>(layer->data.proj.v[eye].sub.array_index);
+	out->skip = false;
+
+	/*
+	 * Multi-screen M3 on the service path: per-segment views. The client's
+	 * last splitting xrLocateViews handed out one view set per window segment
+	 * and sent the routing back (compositor_set_view_routing) ahead of this
+	 * commit. The atlas keeps the active mode's grid; tile j becomes a mosaic
+	 * of every segment's j-th view, each scaled into ITS segment's rect inside
+	 * the tile — the rect the segment crop reads (comp_segments_tile_rect), so
+	 * each segment DP weaves exactly its own views. The same placement the
+	 * in-process renderer paints (comp_d3d11_renderer, set_routed_viewport).
+	 * An inconsistent routing (the mode changed between the locate and the
+	 * commit, a degenerate rect) is dropped for the frame and the views are
+	 * placed unrouted.
+	 */
+	if (c->seg_route.count > 0 && packed_tiles > 0) {
+		uint32_t tw =
+		    bridge_override ? active_vw : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.w);
+		uint32_t th =
+		    bridge_override ? active_vh : static_cast<uint32_t>(layer->data.proj.v[0].sub.rect.extent.h);
+		if (tw > layout_vw) {
+			tw = layout_vw; // the content clamp the commit applies after the loop
+		}
+		if (th > layout_vh) {
+			th = layout_vh;
+		}
+		if (comp_segments_route_active(&c->seg_route, layer->data.view_count, packed_tiles, tw, th)) {
+			struct comp_segments_route_slot slot;
+			if (!comp_segments_route_place(&c->seg_route, layer->data.view_count, packed_tiles, tw, th, eye,
+			                               &slot)) {
+				out->skip = true;
+				return;
+			}
+			c->seg_route_painting = true; // #1883: this commit's atlas is a routed mosaic
+			uint32_t rx = 0, ry = 0;
+			u_tiling_view_origin(slot.tile, cols, layout_vw, layout_vh, &rx, &ry);
+			out->dst_x = static_cast<float>(rx + (uint32_t)slot.rect.x);
+			out->dst_y = static_cast<float>(ry + (uint32_t)slot.rect.y);
+			out->dst_w = static_cast<float>(slot.rect.w); // always scaled into the segment rect
+			out->dst_h = static_cast<float>(slot.rect.h);
+			return;
+		}
+	}
+	if (eye >= packed_tiles && packed_tiles > 0) {
+		out->skip = true; // only reachable when a routed range widened the loop
+	}
+}
+
+/*!
+ * Multi-screen M3: how many of a projection layer's views this commit walks
+ * when the client routes per-segment views — the end of the last segment's
+ * range (each clamped to @p packed_tiles), or 0 when the routing does not fit
+ * what the layer submitted (the commit then walks the packed tiles only).
+ */
+static uint32_t
+service_seg_route_end(const struct d3d11_service_compositor *c, uint32_t layer_view_count, uint32_t packed_tiles)
+{
+	const struct xrt_segment_view_routing *r = &c->seg_route;
+	if (r->count == 0 || r->count > XRT_MAX_SEGMENTS || packed_tiles == 0) {
+		return 0;
+	}
+	uint32_t end = 0;
+	for (uint32_t k = 0; k < r->count; k++) {
+		const uint32_t n = r->view_count[k] < packed_tiles ? r->view_count[k] : packed_tiles;
+		const uint32_t e = r->first_view[k] + n;
+		if (n == 0 || e > layer_view_count) {
+			return 0;
+		}
+		end = e > end ? e : end;
+	}
+	return end > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : end;
 }
 
 /*!
@@ -17696,6 +21766,9 @@ service_acquire_source_image(struct d3d11_service_system *sys,
                              uint32_t *acquired_count,
                              uint32_t acquired_cap)
 {
+	if (c->commit_sem_stale) {
+		return false; // #2320: this commit's semaphore timed out -- treat the source as stale.
+	}
 	if (!sc->service_created || sc->images[img].keyed_mutex == nullptr) {
 		return true; // No cross-process mutex on this image.
 	}
@@ -17763,32 +21836,45 @@ struct service_acquired_image_scope
 };
 
 /*!
- * Resolve the SRV to sample a zone/Local-2D source through: always the plain,
- * NON-decoding per-image SRV, in both modes.
+ * Resolve the SRV to sample a zone/Local-2D source through, matched to where
+ * this commit's writes land.
  *
- * #1591: the standalone (non-workspace) branch used to build an sRGB-typed SRV
- * over an honest `_SRGB` source so the sample auto-decoded to linear, "because
- * the DP expects linear input". Nothing re-encoded it and the handoff is
- * declared ENCODED (service_single_client_atlas_encoding), so that was the #409
- * half-conversion in a third branch — the zones twin of the projection blit.
- * Both now sample raw, byte-identically to the shell path.
+ * - **Passthrough** (the commit is not composing — a pure-zones commit whose
+ *   every source is `_SRGB`, or any under the legacy hatch): the write goes to
+ *   the UNORM atlas RTV with b1 zero, so the sample must return the stored
+ *   bytes — service_raw_sample_srv(). The atlas then holds the app's bytes
+ *   verbatim, byte-identically to the projection fast path's raw copy.
+ * - **Composing** (`active_write_rtv` set: a mixed frame whose projection
+ *   layer opened the private `_SRGB`-view target, or — #1795 — a pure-zones
+ *   commit with a non-`_SRGB` source): the image's own format-honest SRV — an
+ *   `_SRGB` source decodes, a UNORM one reads linear, the compose shader
+ *   passes the linear value through and the target encodes on write.
  *
- * @p srgb_srv_out / @p out_is_srgb_blit are retained so the (unchanged) call
- * sites keep compiling; the flag is now always false.
+ * #1591 dropped an sRGB-typed SRV the standalone branch built "because the DP
+ * expects linear input" and declared the result "sample raw". It was not: the
+ * per-image SRV it fell back to is created in the swapchain's OWN format, so
+ * for an `_SRGB` swapchain (the model viewer's zone swapchain is
+ * R8G8B8A8_UNORM_SRGB) it still decoded, and the atlas stamped ENCODED held
+ * linear values — the zones twin of the #409 half-conversion survived in both
+ * modes (#1769).
+ *
+ * @p out_decodes: the returned view decodes and nothing downstream re-encodes
+ * (an `_SRGB` image with no decode-free copy on a passthrough commit). The
+ * atlas stamp reads it.
  */
 static ID3D11ShaderResourceView *
 zones_resolve_src_srv(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
                       struct d3d11_service_swapchain *sc,
                       uint32_t img,
-                      const D3D11_TEXTURE2D_DESC *desc,
-                      wil::com_ptr<ID3D11ShaderResourceView> &srgb_srv_out,
-                      bool *out_is_srgb_blit)
+                      uint64_t raw_pass,
+                      bool *out_decodes)
 {
-	(void)sys;
-	(void)desc;
-	(void)srgb_srv_out;
-	*out_is_srgb_blit = false;
-	return sc->images[img].srv.get();
+	*out_decodes = false;
+	if (c->render.active_write_rtv != nullptr) {
+		return sc->images[img].srv.get();
+	}
+	return service_raw_sample_srv(sys, sc, img, raw_pass, out_decodes);
 }
 
 /*!
@@ -17810,7 +21896,9 @@ zones_resolve_src_srv(struct d3d11_service_system *sys,
  *
  * Caller MUST hold sys->render_mutex — the shader blits run on the immediate
  * context from the commit thread and would otherwise race the capture-render
- * thread's combined-atlas pass. Source acquires are all-or-nothing: any
+ * thread's combined-atlas pass. The pass takes sys->immediate_ctx_mutex itself
+ * for the draw sequence (#939): render_mutex does not order it against another
+ * client's IPC-thread commit. Source acquires are all-or-nothing: any
  * failed acquire skips the whole pass (returns false; the tile keeps last
  * frame's composite) rather than clearing and blitting a partial set.
  *
@@ -17909,6 +21997,11 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 	struct service_acquired_image acquired[XRT_MAX_LAYERS * XRT_MAX_VIEWS];
 	uint32_t acquired_count = 0;
 
+	// #1795 (ADR-044 §7): is every source this pass samples DECLARED `_SRGB`?
+	// Walked over exactly the set the draws below read (same skips), so the
+	// compose decision and the draws cannot disagree on what was sampled.
+	bool all_sources_srgb = true;
+
 	// Acquire EVERY source image up front, all-or-nothing: the composite
 	// clears the tile before blitting, so a per-view skip would flash that
 	// placement black for a frame (visible blink). Skipping the whole pass
@@ -17947,6 +22040,92 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				}
 				return false;
 			}
+			if (all_sources_srgb && sc->images[img].texture) {
+				D3D11_TEXTURE2D_DESC fd = {};
+				sc->images[img].texture->GetDesc(&fd);
+				all_sources_srgb = is_srgb_format(fd.Format);
+			}
+		}
+	}
+
+	/*
+	 * #939 / #1610: from here to the last blit is ONE state-setting sequence
+	 * on the shared immediate context — Map on the shared
+	 * blit_constant_buffer, RTV / viewport / scissor / SRV binds, draws.
+	 * render_mutex (held by the caller) serialises it against the render
+	 * thread's combine pass only; it says nothing about ANOTHER client's IPC
+	 * thread, whose projection commit holds immediate_ctx_mutex alone — and
+	 * since #1610 that commit is a DRAW (the compose blit), not a copy.
+	 * Unserialised, the two threads interleave call by call (D3D11's
+	 * multithread protection orders CALLS, not SEQUENCES) and this client's
+	 * placements draw with the other client's shader / render target /
+	 * constants: a zones app beside a projection app under the shell blinks
+	 * to the backdrop, comes out at the wrong brightness, or lands in the
+	 * other window — the 98d46018d class, between two IPC threads.
+	 *
+	 * Every source was acquired above (all-or-nothing), so nothing below
+	 * waits; the lock is dropped before the keyed-mutex releases, which never
+	 * block. Order is the documented render_mutex -> immediate_ctx_mutex.
+	 */
+	std::unique_lock<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+
+	// #1769: one decode-free copy per source image for this whole pass, taken
+	// inside the lock (it is an immediate-context call) and after every
+	// acquire (it must read what the draws would have read).
+	const uint64_t raw_pass = service_raw_copy_pass_begin();
+
+	/*
+	 * #1795 (ADR-044 §7) — does this PURE-zones commit compose?
+	 *
+	 * A mixed frame already decided on its projection write path (zones /
+	 * Local-2D count as an extra painter there, so it composes unless the
+	 * legacy hatch is on) and `projection_rendered` says so; that decision is
+	 * left alone. A pure-zones commit never reached it, so every one was a
+	 * passthrough and a UNORM source's declared format was ignored: its stored
+	 * bytes landed in the encoded atlas raw.
+	 *
+	 * It composes only when a source OWES the encode — some source is not
+	 * `_SRGB`, and the hatch is off. Every-`_SRGB` (the shipping population)
+	 * stays the passthrough it was: same draws, same raw copies, same atlas
+	 * bytes, no compose target touched. This is a narrower rule than
+	 * u_color_compose_fast_path() states for sub-rect layers (it would compose
+	 * any zones frame, to blend in linear); the all-`_SRGB` passthrough is kept
+	 * byte-identical on purpose, and its edge blends stay encoded-space as
+	 * before.
+	 *
+	 * Same target, seed rule and bookkeeping as the projection decision. The
+	 * publish is the projection path's whole-atlas branch (`compose_publish_full`
+	 * stays at its default for a commit with no projection layer). The seed is
+	 * under the immediate_ctx_mutex this pass already holds — the projection
+	 * path takes exactly that lock for it — and adds no wait.
+	 */
+	if (!projection_rendered) {
+		c->render.active_write_rtv = nullptr;
+		if (!all_sources_srgb && !u_color_legacy_unorm_encoded()) {
+			ID3D11RenderTargetView *compose = client_ensure_compose_target(sys, &c->render);
+			if (compose != nullptr) {
+				// A pure-zones commit always publishes the whole atlas, so the
+				// projection rule's `compose_publish_full` term is always true.
+				if (!c->render.compose_was_active || !c->render.compose_mirrors_atlas) {
+					sys->context->CopyResource(c->render.compose_texture.get(),
+					                           c->render.atlas_texture.get());
+					c->render.compose_mirrors_atlas = true;
+				}
+				c->render.active_write_rtv = compose;
+			}
+		}
+		// Recorded on EVERY pure-zones commit that paints, passthrough ones
+		// included: a passthrough writes the atlas behind the private target's
+		// back, so the next composing commit must re-seed.
+		c->render.compose_was_active = c->render.active_write_rtv != nullptr;
+		// Per client and on change only (two zones clients under the shell can
+		// disagree, and a shared latch would then log every frame).
+		const uint8_t zones_state = c->render.active_write_rtv != nullptr ? 2u : 1u;
+		if (c->render.zones_compose_logged != zones_state) {
+			c->render.zones_compose_logged = zones_state;
+			U_LOG_W("Color (#1795) [d3d11_service]: client %p pure-zones commit %s (all_sources_srgb=%d legacy=%d)",
+			        (void *)c, zones_state == 2u ? "COMPOSES through the _SRGB-view target" : "passes through",
+			        all_sources_srgb ? 1 : 0, u_color_legacy_unorm_encoded() ? 1 : 0);
 		}
 	}
 
@@ -18006,22 +22185,26 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				}
 				D3D11_TEXTURE2D_DESC sd = {};
 				sc->images[img].texture->GetDesc(&sd);
+				// #1769: resolved before the stamp, because what the
+				// stamp records depends on which view this draw samples.
+				bool src_decodes = false;
+				ID3D11ShaderResourceView *src_srv = zones_resolve_src_srv(sys, c, sc, img, raw_pass, &src_decodes);
 				// Mixed frames keep the projection layer's flag — it owns
 				// the bulk of the atlas bytes.
 				//
 				// #1665: the same "what the runtime DID" rule as the
-				// projection stamp, through the same helper. A pure-zones
-				// commit never reaches the compose decision (it lives on
-				// the projection write path — the known gap), so
-				// `active_write_rtv` is null here today and the answer is
-				// the source's format, which is correct BECAUSE this write
-				// is a passthrough: zones sample raw (#1591) and the
-				// composite goes to the atlas RTV. Written this way so
-				// wiring the gap up cannot leave the flag lying.
+				// projection stamp, through the same helper. #1795: a
+				// pure-zones commit decides above; passthrough, the atlas
+				// holds encoded bytes exactly when the source did AND the
+				// sample was raw, composing it holds them regardless.
+				// #1769: it used to pass the source's format alone, while
+				// the sample decoded — an `_SRGB` zone stamped ENCODED over
+				// linear values. Written this way so wiring the gap up
+				// cannot leave the flag lying.
 				if (!src_format_recorded && !projection_rendered) {
 					src_format_recorded = true;
 					c->atlas_holds_srgb_bytes = u_color_atlas_holds_encoded(
-					    is_srgb_format(sd.Format),
+					    is_srgb_format(sd.Format) && !src_decodes,
 					    /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
 					    u_color_legacy_unorm_encoded());
 				}
@@ -18035,10 +22218,6 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				bool is_layered = sd.ArraySize > 1;
 				uint32_t src_slice =
 				    static_cast<uint32_t>(layer->data.zone_3d.proj.v[v].sub.array_index);
-				wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-				bool srgb_blit = false;
-				ID3D11ShaderResourceView *src_srv =
-				    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
 				uint32_t tile_x, tile_y;
 				u_tiling_view_origin(v, tc, slot_w, slot_h, &tile_x, &tile_y);
 				const struct xrt_rect *sr = &layer->data.zone_3d.proj.v[v].sub.rect;
@@ -18049,7 +22228,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)zr->offset.w * scale,
 				    (float)tile_y + (float)zr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend,
+				    /*is_srgb=*/false, blend,
 				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
@@ -18087,10 +22266,8 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			bool is_layered = sd.ArraySize > 1;
 			uint32_t src_slice =
 			    static_cast<uint32_t>(layer->data.local_2d.sub.array_index);
-			wil::com_ptr<ID3D11ShaderResourceView> srgb_srv;
-			bool srgb_blit = false;
-			ID3D11ShaderResourceView *src_srv =
-			    zones_resolve_src_srv(sys, sc, img, &sd, srgb_srv, &srgb_blit);
+			bool src_decodes = false; // the stamp is the zone's; see above
+			ID3D11ShaderResourceView *src_srv = zones_resolve_src_srv(sys, c, sc, img, raw_pass, &src_decodes);
 			ID3D11BlendState *blend =
 			    (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 			        ? sys->blend_alpha.get()
@@ -18106,7 +22283,7 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 				    (float)tile_x + (float)lr->offset.w * scale,
 				    (float)tile_y + (float)lr->offset.h * scale,
 				    dst_w, dst_h,
-				    srgb_blit, blend,
+				    /*is_srgb=*/false, blend,
 				    /*rtv_override=*/nullptr, /*dst_tex_w=*/0.0f, /*dst_tex_h=*/0.0f,
 				    /*is_array=*/is_layered, /*array_slice=*/src_slice);
 				blits_done++;
@@ -18117,6 +22294,18 @@ service_composite_zones_frame(struct d3d11_service_system *sys,
 			local2d_count++;
 		}
 	}
+
+	// #1795: a composing pure-zones commit wrote through the `_SRGB`-view
+	// target, so the atlas holds ENCODED bytes whatever the sources were. The
+	// zone stamp above already says so when a zone painted; a Local-2D-only
+	// commit has no zone to stamp from, and composing is the one case where
+	// the answer needs no source at all.
+	if (!src_format_recorded && !projection_rendered && c->render.active_write_rtv != nullptr) {
+		c->atlas_holds_srgb_bytes = u_color_atlas_holds_encoded(
+		    /*source_is_srgb=*/false, /*composed_through_srgb_target=*/true, u_color_legacy_unorm_encoded());
+	}
+
+	ctx_lock.unlock();
 
 	// Release every cross-process mutex the pass acquired.
 	for (uint32_t a = 0; a < acquired_count; a++) {
@@ -18619,6 +22808,11 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 			render_mutex_fair_lock lock(sys);
 			xrt_display_processor_d3d11_clear_local_zone_mask(dp);
 			c->zone_published = false;
+			{
+				// #2218 (#4): the segment DPs too (manager swapped under seg_mutex).
+				std::lock_guard<std::mutex> lk(c->seg_mutex);
+				comp_d3d11_segments_clear_zone_mask(c->segments);
+			}
 			// #1017: never withdraw a panel-wide resource silently — a stale
 			// mask left on the shared DP is invisible otherwise.
 			U_LOG_W("ZONES SVC: wish mask withdrawn from the %s DP (non-zones frame)",
@@ -18700,6 +22894,17 @@ service_update_zone_wish_publish(struct d3d11_service_system *sys, struct d3d11_
 	                                                              mask_w, mask_h, (int32_t)origin.x,
 	                                                              (int32_t)origin.y, w, h, c->zone_publish_seq);
 	if (ok) {
+		// #2218 (#4): a window spanning screens — the segment DPs get the wish
+		// cropped to their screens. Same device as the mask (the manager lives
+		// on seg_device; under the split that is the output device, where the
+		// client's weave DP and its mask already are — the tripwire above).
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			if (c->segments != nullptr && c->seg_device == mask_dev) {
+				comp_d3d11_segments_publish_zone_mask(c->segments, svc_context_for_device(sys, mask_dev), srv,
+				                                      mask_w, mask_h, w, h, c->zone_publish_seq);
+			}
+		}
 		if (!c->zone_published) {
 			// #1017: this said "per-client DP", which does not exist on the
 			// pipeline path and sent the zones wedge hunt looking for a limbo
@@ -19108,6 +23313,41 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 	// unbounded, and this thread must never hold `render_mutex` across it (#925).
 	svc_ensure_client_weave_dp(sys, c);
 
+	// #1810: %TEMP%\workspace_screenshot_trigger for a CLIENT_TEXTURE presenter.
+	// The render thread's direct-path poll sits past the PRESENTER_SELF /
+	// CLIENT_TEXTURE early return in pipeline_default_policy_render, and this
+	// client's weave never reaches multi_compositor_render's compose poll, so the
+	// trigger was dead here — no PNG and no log. Stat it BEFORE taking
+	// render_mutex (4 Hz, the #925 audit rank 5 budget); consume it under the lock
+	// only once a frame was actually woven below.
+	bool ss_armed = false;
+	struct ss_paths
+	{
+		char trigger[MAX_PATH];
+		char prefix[MAX_PATH];
+	};
+	// Every CLIENT_TEXTURE client's IPC thread runs this: a magic static, not
+	// the render thread's lazily-filled char arrays.
+	static const ss_paths s_ss = [] {
+		ss_paths p = {};
+		const char *tmp = getenv("TEMP");
+		if (!tmp) {
+			tmp = "C:\\Temp";
+		}
+		snprintf(p.trigger, sizeof(p.trigger), "%s\\workspace_screenshot_trigger", tmp);
+		snprintf(p.prefix, sizeof(p.prefix), "%s\\workspace_screenshot", tmp);
+		return p;
+	}();
+	{
+		static std::atomic<int64_t> ss_last_poll_ns{0};
+		const int64_t ss_now_ns = (int64_t)os_monotonic_get_ns();
+		int64_t ss_prev_ns = ss_last_poll_ns.load(std::memory_order_relaxed);
+		if (ss_now_ns - ss_prev_ns >= 250LL * 1000000LL &&
+		    ss_last_poll_ns.compare_exchange_strong(ss_prev_ns, ss_now_ns)) {
+			ss_armed = GetFileAttributesA(s_ss.trigger) != INVALID_FILE_ATTRIBUTES;
+		}
+	}
+
 	render_mutex_fair_lock lock(sys);
 
 	// Re-check under the lock: focus can move between the load and here. #1208: we
@@ -19233,6 +23473,21 @@ pipeline_client_texture_weave(struct d3d11_service_system *sys, struct d3d11_ser
 		}
 	}
 
+	// #1810: the screenshot trigger, armed above. Same two files as the render
+	// thread's sites: (1) workspace_screenshot.png = the woven frame this client
+	// is about to present (the scratch the DP wrote, on sys->device — this
+	// presenter kind is split-ineligible), (2) workspace_screenshot_atlas_*.png =
+	// THIS client's pre-weave atlas. Left on disk when nothing was woven, so the
+	// next woven frame takes it rather than writing nothing. Blocking Map —
+	// debug only, explicit trigger only, on this client's own IPC thread.
+	if (ss_armed && wove && DeleteFileA(s_ss.trigger)) {
+		dxr_diag_dump_tex(sys, c->render.transparent_weave_scratch.get(), "workspace_screenshot",
+		                  /*from_out*/ false);
+		struct ipc_capture_result dummy = {};
+		comp_d3d11_service_capture_frame_for_client(&sys->base, &c->base.base, s_ss.prefix,
+		                                            IPC_CAPTURE_FLAG_PROJECTION_ONLY, &dummy);
+	}
+
 	// ADR-029: signal the service->client fence. The client polls it with
 	// GetCompletedValue() and copies the matching ring slice out - THE call that
 	// wedged the render thread in #1017, bounded here to this client's own thread.
@@ -19257,6 +23512,492 @@ svc_read_done_note_drop(struct d3d11_service_compositor *c, const char *why, uin
 	}
 }
 
+/*
+ *
+ * ADR-061: the share tap. A client's composed per-client atlas -> a CPU
+ * side-by-side NV12 frame the stereo-camera manager's source thread picks up.
+ *
+ * Runs on the client's commit, under the shared immediate context, and must never
+ * make the app wait: decimated to the stream rate, a GPU convert + copy into a
+ * 3-slot staging ring, harvested with DO_NOT_WAIT on later commits. No free slot =
+ * this frame is not tapped.
+ *
+ * Pixel shader rather than VideoProcessorBlt: measured about half the submit cost
+ * and a third of the GPU cost on the render adapter, and it needs neither a video
+ * device nor an NV12 render target.
+ *
+ * BT.601 full range (JPEG): the colour contract of the stereo-camera transport, the
+ * one the browser applies to every runtime camera device.
+ *
+ */
+
+static const char *const svc_share_tap_hlsl = R"(
+Texture2D<float4> atlas : register(t0);
+SamplerState lin : register(s0);
+cbuffer C : register(b0) { float2 uv0; float2 uv_scale; float2 uv_min; float2 uv_max; float2 half_texel; float2 pad; };
+struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+V vs(uint i : SV_VertexID) {
+  V o; float2 t = float2((i << 1) & 2, i & 2);
+  o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1); o.uv = t; return o;
+}
+float3 fetch(float2 uv) { return atlas.SampleLevel(lin, clamp(uv, uv_min, uv_max), 0).rgb; }
+// A linear atlas first goes through this into an `_SRGB` target: the hardware
+// applies the encode, never a copy of the curve in a shader (ADR-021 2).
+float4 ps_copy(V i) : SV_Target { return float4(fetch(uv0 + i.uv * uv_scale), 1.0); }
+static const float3 KY = float3(0.299, 0.587, 0.114);
+float ps_y(V i) : SV_Target { return dot(fetch(uv0 + i.uv * uv_scale), KY); }
+float2 ps_uv(V i) : SV_Target {
+  float2 u = uv0 + i.uv * uv_scale, d = half_texel;
+  float3 c = 0.25 * (fetch(u + float2(-d.x, -d.y)) + fetch(u + float2(d.x, -d.y)) + fetch(u + float2(-d.x, d.y)) + fetch(u + float2(d.x, d.y)));
+  float y = dot(c, KY);
+  return float2(128.0 / 255.0 + (c.b - y) / 1.772, 128.0 / 255.0 + (c.r - y) / 1.402);
+}
+)";
+
+struct svc_share_tap_cb
+{
+	float uv0[2], uv_scale[2], uv_min[2], uv_max[2], half_texel[2];
+	float pad[2];
+};
+
+#define SVC_SHARE_TAP_RING 3
+
+struct svc_share_tap
+{
+	//! Guarded by g_svc_share_mutex; nullptr once the compositor is gone.
+	struct d3d11_service_compositor *owner = nullptr;
+	uint32_t eye_w = 0, eye_h = 0;
+	int64_t period_ns = 0;
+
+	// GPU side: commit thread, under immediate_ctx_mutex.
+	wil::com_ptr<ID3D11VertexShader> vs;
+	wil::com_ptr<ID3D11PixelShader> ps_y, ps_uv, ps_copy;
+	wil::com_ptr<ID3D11SamplerState> sampler;
+	//! The encode step for a linear atlas: written through `_SRGB`, read as UNORM.
+	wil::com_ptr<ID3D11Texture2D> enc_tex;
+	wil::com_ptr<ID3D11RenderTargetView> enc_rtv;
+	wil::com_ptr<ID3D11ShaderResourceView> enc_srv;
+	wil::com_ptr<ID3D11Buffer> cb;
+	wil::com_ptr<ID3D11Texture2D> tex_y, tex_uv;
+	wil::com_ptr<ID3D11RenderTargetView> rtv_y, rtv_uv;
+	struct
+	{
+		wil::com_ptr<ID3D11Texture2D> y, uv;
+		bool busy = false;
+		int64_t commit_ns = 0;
+		struct xrt_app_share_frame_info info = {};
+	} slot[SVC_SHARE_TAP_RING];
+	uint32_t write_idx = 0, read_idx = 0;
+	int64_t next_due_ns = 0;
+	struct xrt_app_share_frame_info last_info = {};
+
+	// CPU side: three NV12 buffers. `back` belongs to the commit thread, `front`
+	// to the consumer, `ready` changes hands under @ref mutex.
+	std::mutex mutex;
+	std::condition_variable cv;
+	std::vector<uint8_t> back, ready, front;
+	uint64_t ready_seq = 0, consumed_seq = 0;
+	int64_t ready_commit_ns = 0;
+	struct xrt_app_share_frame_info ready_info = {};
+	bool alive = true;
+
+	// Stats for the detach line (commit thread).
+	uint64_t n_commit = 0, n_submit = 0, n_harvest = 0, n_ring_full = 0;
+	int64_t ns_commit_total = 0, ns_commit_max = 0, ns_harvest_total = 0;
+};
+
+//! Guards every compositor <-> tap link. Never held across GPU work.
+static std::mutex g_svc_share_mutex;
+
+static bool
+svc_share_tap_create_gpu(struct d3d11_service_system *sys, struct svc_share_tap *t)
+{
+	ID3D11Device *dev = sys->device.get();
+	wil::com_ptr<ID3DBlob> b;
+	HRESULT hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "vs", "vs_5_0",
+	                        0, 0, b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->vs.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_y", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_y.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_uv", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_uv.put()))) {
+		return false;
+	}
+	b.reset();
+	hr = D3DCompile(svc_share_tap_hlsl, strlen(svc_share_tap_hlsl), nullptr, nullptr, nullptr, "ps_copy", "ps_5_0", 0, 0,
+	                b.put(), nullptr);
+	if (FAILED(hr) || FAILED(dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, t->ps_copy.put()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC et = {};
+	et.Width = t->eye_w * 2;
+	et.Height = t->eye_h;
+	et.MipLevels = 1;
+	et.ArraySize = 1;
+	et.SampleDesc.Count = 1;
+	et.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	et.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	D3D11_RENDER_TARGET_VIEW_DESC er = {};
+	er.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	er.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+	D3D11_SHADER_RESOURCE_VIEW_DESC es = {};
+	es.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	es.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	es.Texture2D.MipLevels = 1;
+	if (FAILED(dev->CreateTexture2D(&et, nullptr, t->enc_tex.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->enc_tex.get(), &er, t->enc_rtv.put())) ||
+	    FAILED(dev->CreateShaderResourceView(t->enc_tex.get(), &es, t->enc_srv.put()))) {
+		return false;
+	}
+	D3D11_SAMPLER_DESC sd = {};
+	sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+	sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	sd.MaxLOD = D3D11_FLOAT32_MAX;
+	if (FAILED(dev->CreateSamplerState(&sd, t->sampler.put()))) {
+		return false;
+	}
+	D3D11_BUFFER_DESC bd = {};
+	bd.ByteWidth = sizeof(struct svc_share_tap_cb);
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	if (FAILED(dev->CreateBuffer(&bd, nullptr, t->cb.put()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC y = {};
+	y.Width = t->eye_w * 2;
+	y.Height = t->eye_h;
+	y.MipLevels = 1;
+	y.ArraySize = 1;
+	y.SampleDesc.Count = 1;
+	y.Format = DXGI_FORMAT_R8_UNORM;
+	y.BindFlags = D3D11_BIND_RENDER_TARGET;
+	D3D11_TEXTURE2D_DESC uv = y;
+	uv.Width = t->eye_w;
+	uv.Height = t->eye_h / 2;
+	uv.Format = DXGI_FORMAT_R8G8_UNORM;
+	if (FAILED(dev->CreateTexture2D(&y, nullptr, t->tex_y.put())) ||
+	    FAILED(dev->CreateTexture2D(&uv, nullptr, t->tex_uv.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->tex_y.get(), nullptr, t->rtv_y.put())) ||
+	    FAILED(dev->CreateRenderTargetView(t->tex_uv.get(), nullptr, t->rtv_uv.put()))) {
+		return false;
+	}
+	y.BindFlags = uv.BindFlags = 0;
+	y.Usage = uv.Usage = D3D11_USAGE_STAGING;
+	y.CPUAccessFlags = uv.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	for (auto &sl : t->slot) {
+		if (FAILED(dev->CreateTexture2D(&y, nullptr, sl.y.put())) ||
+		    FAILED(dev->CreateTexture2D(&uv, nullptr, sl.uv.put()))) {
+			return false;
+		}
+	}
+	const size_t size = (size_t)t->eye_w * 2 * t->eye_h * 3 / 2;
+	t->back.resize(size);
+	t->ready.resize(size);
+	t->front.resize(size);
+	return true;
+}
+
+//! Read back every finished slot, oldest first; never waits. Caller holds immediate_ctx_mutex.
+static void
+svc_share_tap_harvest(struct d3d11_service_system *sys, struct svc_share_tap *t)
+{
+	const uint32_t full_w = t->eye_w * 2;
+	while (t->slot[t->read_idx].busy) {
+		auto &sl = t->slot[t->read_idx];
+		D3D11_MAPPED_SUBRESOURCE my = {}, muv = {};
+		HRESULT hr = sys->context->Map(sl.y.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &my);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			return;
+		}
+		if (SUCCEEDED(hr)) {
+			HRESULT huv = sys->context->Map(sl.uv.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &muv);
+			if (huv == DXGI_ERROR_WAS_STILL_DRAWING) {
+				sys->context->Unmap(sl.y.get(), 0);
+				return;
+			}
+			if (SUCCEEDED(huv)) {
+				uint8_t *d = t->back.data();
+				for (uint32_t r = 0; r < t->eye_h; r++) {
+					memcpy(d + (size_t)r * full_w, (const uint8_t *)my.pData + (size_t)r * my.RowPitch, full_w);
+				}
+				d += (size_t)full_w * t->eye_h;
+				for (uint32_t r = 0; r < t->eye_h / 2; r++) {
+					memcpy(d + (size_t)r * full_w, (const uint8_t *)muv.pData + (size_t)r * muv.RowPitch, full_w);
+				}
+				sys->context->Unmap(sl.uv.get(), 0);
+				{
+					std::lock_guard<std::mutex> lk(t->mutex);
+					t->back.swap(t->ready);
+					t->ready_seq++;
+					t->ready_commit_ns = sl.commit_ns;
+					t->ready_info = sl.info;
+				}
+				t->cv.notify_all();
+				t->n_harvest++;
+			}
+			sys->context->Unmap(sl.y.get(), 0);
+		}
+		sl.busy = false;
+		t->read_idx = (t->read_idx + 1) % SVC_SHARE_TAP_RING;
+	}
+}
+
+//! One eye of the stream from tile @p view of the atlas.
+static void
+svc_share_tap_draw_eye(struct d3d11_service_system *sys,
+                       struct svc_share_tap *t,
+                       uint32_t eye,
+                       uint32_t view,
+                       uint32_t cols,
+                       uint32_t rows,
+                       uint32_t cw,
+                       uint32_t ch,
+                       uint32_t atlas_w,
+                       uint32_t atlas_h,
+                       bool flip_y,
+                       bool is_linear,
+                       ID3D11ShaderResourceView *atlas_srv,
+                       const struct xrt_app_share_frame_info *info)
+{
+	ID3D11DeviceContext *ctx = sys->context.get();
+	const uint32_t col = view % cols, row = view / cols;
+	const float aw = (float)atlas_w, ah = (float)atlas_h;
+	// Tiles sit at the SLOT stride (atlas / grid), the formula the write side and
+	// service_crop_atlas_for_dp use, not at the content size: content smaller than
+	// its slot leaves empty atlas between the tiles.
+	const float x0 = (float)(col * (atlas_w / cols)), y0 = (float)(row * (atlas_h / rows));
+	struct svc_share_tap_cb cb = {};
+	cb.uv0[0] = x0 / aw;
+	cb.uv0[1] = (y0 + (flip_y ? (float)ch : 0.0f)) / ah;
+	cb.uv_scale[0] = (float)cw / aw;
+	cb.uv_scale[1] = (flip_y ? -1.0f : 1.0f) * (float)ch / ah;
+	cb.uv_min[0] = (x0 + 0.5f) / aw;
+	cb.uv_min[1] = (y0 + 0.5f) / ah;
+	cb.uv_max[0] = (x0 + (float)cw - 0.5f) / aw;
+	cb.uv_max[1] = (y0 + (float)ch - 0.5f) / ah;
+	// Half a stream pixel, in atlas uv: the block one chroma sample averages.
+	cb.half_texel[0] = 0.5f * ((float)cw / aw) / (float)info->content_width;
+	cb.half_texel[1] = 0.5f * ((float)ch / ah) / (float)info->content_height;
+	ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
+
+	const float x = (float)(eye * t->eye_w + (uint32_t)info->content_x), y = (float)info->content_y;
+	const float w = (float)info->content_width, h = (float)info->content_height;
+	D3D11_VIEWPORT vy = {x, y, w, h, 0.0f, 1.0f};
+	ID3D11ShaderResourceView *src = atlas_srv;
+	if (is_linear) {
+		// Encode this eye through the `_SRGB` target, then convert from the result.
+		ID3D11RenderTargetView *enc = t->enc_rtv.get();
+		ID3D11ShaderResourceView *none = nullptr;
+		ctx->PSSetShaderResources(0, 1, &atlas_srv);
+		ctx->OMSetRenderTargets(1, &enc, nullptr);
+		ctx->RSSetViewports(1, &vy);
+		ctx->PSSetShader(t->ps_copy.get(), nullptr, 0);
+		ctx->Draw(3, 0);
+		ID3D11RenderTargetView *null_rtv = nullptr;
+		ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+		ctx->PSSetShaderResources(0, 1, &none);
+		const float sw = (float)(t->eye_w * 2), sh = (float)t->eye_h;
+		cb.uv0[0] = x / sw;
+		cb.uv0[1] = y / sh;
+		cb.uv_scale[0] = w / sw;
+		cb.uv_scale[1] = h / sh;
+		cb.uv_min[0] = (x + 0.5f) / sw;
+		cb.uv_min[1] = (y + 0.5f) / sh;
+		cb.uv_max[0] = (x + w - 0.5f) / sw;
+		cb.uv_max[1] = (y + h - 0.5f) / sh;
+		cb.half_texel[0] = 0.5f / sw;
+		cb.half_texel[1] = 0.5f / sh;
+		ctx->UpdateSubresource(t->cb.get(), 0, nullptr, &cb, 0, 0);
+		src = t->enc_srv.get();
+	}
+	ctx->PSSetShaderResources(0, 1, &src);
+	ID3D11RenderTargetView *rtv = t->rtv_y.get();
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->RSSetViewports(1, &vy);
+	ctx->PSSetShader(t->ps_y.get(), nullptr, 0);
+	ctx->Draw(3, 0);
+	D3D11_VIEWPORT vuv = {x / 2.0f, y / 2.0f, w / 2.0f, h / 2.0f, 0.0f, 1.0f};
+	rtv = t->rtv_uv.get();
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->RSSetViewports(1, &vuv);
+	ctx->PSSetShader(t->ps_uv.get(), nullptr, 0);
+	ctx->Draw(3, 0);
+}
+
+/*!
+ * Convert one view pair into the stream's NV12 and queue its readback (caller holds
+ * immediate_ctx_mutex and checked the write slot is free): the commit tap's pass and an
+ * imported ring's (ADR-061 decision 6).
+ */
+static void
+svc_share_tap_submit(struct d3d11_service_system *sys,
+                     struct svc_share_tap *t,
+                     uint32_t vl,
+                     uint32_t vr,
+                     bool mono,
+                     uint32_t cols,
+                     uint32_t rows,
+                     uint32_t cw,
+                     uint32_t ch,
+                     uint32_t atlas_w,
+                     uint32_t atlas_h,
+                     int format,
+                     bool flip_y,
+                     bool is_linear,
+                     ID3D11ShaderResourceView *srv,
+                     int64_t t0,
+                     float shift_frac)
+{
+	auto &sl = t->slot[t->write_idx];
+	// Fit the view into one eye half, aspect preserved, on chroma-aligned edges.
+	const float fit = fmin((float)t->eye_w / (float)cw, (float)t->eye_h / (float)ch);
+	uint32_t w = (uint32_t)((float)cw * fit + 0.5f) & ~1u, h = (uint32_t)((float)ch * fit + 0.5f) & ~1u;
+	w = w > t->eye_w ? t->eye_w : w;
+	h = h > t->eye_h ? t->eye_h : h;
+	struct xrt_app_share_frame_info info = {};
+	info.content_x = (int32_t)(((t->eye_w - w) / 2) & ~1u);
+	info.content_y = (int32_t)(((t->eye_h - h) / 2) & ~1u);
+	info.content_width = w;
+	info.content_height = h;
+	info.mono = mono ? 1u : 0u;
+	info.zero_disparity_shift_frac = shift_frac; // the app's views are display-referred as packed
+	info.valid = 1;
+	info.commit_time_ns = t0;
+	const struct xrt_app_share_frame_info &li = t->last_info;
+	info.content_generation = li.content_generation;
+	if (li.content_x != info.content_x || li.content_y != info.content_y || li.content_width != w ||
+	    li.content_height != h || li.mono != info.mono) {
+		info.content_generation++;
+	}
+	t->last_info = info;
+
+	ID3D11DeviceContext *ctx = sys->context.get();
+	// Every piece of state this pass reads: the context is shared and nothing
+	// else may be assumed about what a previous draw left bound.
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(t->vs.get(), nullptr, 0);
+	ctx->GSSetShader(nullptr, nullptr, 0);
+	ctx->RSSetState(nullptr);
+	ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+	ctx->OMSetDepthStencilState(nullptr, 0);
+	ID3D11RenderTargetView *null_rtv = nullptr;
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	const FLOAT black_y[4] = {0, 0, 0, 0};
+	const FLOAT black_uv[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0, 0};
+	ctx->ClearRenderTargetView(t->rtv_y.get(), black_y);
+	ctx->ClearRenderTargetView(t->rtv_uv.get(), black_uv);
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ID3D11SamplerState *smp = t->sampler.get();
+	ctx->PSSetSamplers(0, 1, &smp);
+	ID3D11Buffer *cbuf = t->cb.get();
+	ctx->PSSetConstantBuffers(0, 1, &cbuf);
+
+	if (t->n_submit == 0) {
+		U_LOG_W("ADR-061 share tap: first frame: atlas %ux%u fmt %d, content %ux%u, cols %u, views %u (pair %u,%u), "
+		        "eye rect %d,%d %ux%u, flip %d, linear %d",
+		        atlas_w, atlas_h, format, cw, ch, cols, cols * rows, vl, vr, info.content_x, info.content_y, w, h,
+		        (int)flip_y, (int)is_linear);
+	}
+	svc_share_tap_draw_eye(sys, t, 0, vl, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+	svc_share_tap_draw_eye(sys, t, 1, vr, cols, rows, cw, ch, atlas_w, atlas_h, flip_y, is_linear, srv, &info);
+
+	ctx->OMSetRenderTargets(1, &null_rtv, nullptr);
+	ID3D11ShaderResourceView *null_srv = nullptr;
+	ctx->PSSetShaderResources(0, 1, &null_srv);
+	ID3D11Buffer *null_cb = nullptr;
+	ctx->PSSetConstantBuffers(0, 1, &null_cb);
+
+	ctx->CopyResource(sl.y.get(), t->tex_y.get());
+	ctx->CopyResource(sl.uv.get(), t->tex_uv.get());
+	ctx->Flush();
+	sl.busy = true;
+	sl.commit_ns = t0;
+	sl.info = info;
+	t->write_idx = (t->write_idx + 1) % SVC_SHARE_TAP_RING;
+	// Fell behind (the app stalled): restart the schedule, no catching up.
+	t->next_due_ns = t->next_due_ns + t->period_ns < t0 ? t0 + t->period_ns : t->next_due_ns + t->period_ns;
+	t->n_submit++;
+}
+
+/*!
+ * The per-commit tap: the atlas this commit packed is final. Decimate, convert the
+ * pair, queue the readback, pick up finished ones.
+ */
+static void
+svc_share_tap_commit(struct d3d11_service_system *sys,
+                     struct d3d11_service_compositor *c,
+                     uint32_t views,
+                     uint32_t cols,
+                     uint32_t rows,
+                     uint32_t cw,
+                     uint32_t ch)
+{
+	if (!c->share_tap_active.load(std::memory_order_relaxed)) {
+		return;
+	}
+	std::shared_ptr<struct svc_share_tap> tp;
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		tp = c->share_tap;
+	}
+	if (!tp) {
+		return;
+	}
+	struct svc_share_tap *t = tp.get();
+	const int64_t t0 = os_monotonic_get_ns();
+
+	std::lock_guard<std::mutex> atlas_lock(c->atlas_submit_mutex);
+	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+
+	const int64_t th0 = os_monotonic_get_ns();
+	svc_share_tap_harvest(sys, t);
+	t->ns_harvest_total += os_monotonic_get_ns() - th0;
+
+	// Half a commit of slack against a schedule rather than the last submit, so
+	// commit jitter does not cost a frame: a 60 Hz app decimated to 30 keeps every
+	// second frame and the average rate holds.
+	const bool due = t0 >= t->next_due_ns - 8 * 1000 * 1000;
+	auto &sl = t->slot[t->write_idx];
+	ID3D11ShaderResourceView *srv = c->render.atlas_srv.get();
+	if (due && sl.busy) {
+		t->n_ring_full++;
+	}
+	if (t->n_commit == 0) {
+		U_LOG_W("ADR-061 share tap: first commit: srv %d, content %ux%u, grid %ux%u, views %u, %s", srv != nullptr, cw, ch,
+		        cols, rows, views, sys->workspace_mode ? "workspace" : "direct");
+	}
+	if (due && !sl.busy && srv != nullptr && c->render.atlas_texture != nullptr && cw > 0 && ch > 0 && views > 0 &&
+	    cols > 0 && rows > 0) {
+		D3D11_TEXTURE2D_DESC ad = {};
+		c->render.atlas_texture->GetDesc(&ad);
+		uint32_t vl = 0, vr = 0;
+		if (views > 2) {
+			vl = views / 2 - 1;
+			vr = views / 2;
+		} else if (views == 2) {
+			vr = 1;
+		}
+		svc_share_tap_submit(sys, t, vl, vr, views == 1, cols, rows, cw, ch, ad.Width, ad.Height, (int)ad.Format,
+		                     c->atlas_flip_y, !c->atlas_holds_srgb_bytes, srv, t0, 0.0f);
+	}
+
+	const int64_t dt = os_monotonic_get_ns() - t0;
+	t->ns_commit_total += dt;
+	t->n_commit++;
+	if (dt > t->ns_commit_max) {
+		t->ns_commit_max = dt;
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -19264,6 +24005,58 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	struct d3d11_service_system *sys = c->sys;
 
 	std::lock_guard<std::mutex> lock(c->mutex);
+
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). ZERO COST UNLESS
+	// REQUESTED: one bool test for a client that never asked. This commit
+	// consumes the request sent right before it (a request covers one frame);
+	// a commit without one clears the last, so the shell stops lifting.
+	// Both flags are only ever WRITTEN on this client's IPC thread (this one).
+	bool cursor_frame = false;
+	uint64_t cursor_seq = 0;
+	struct ipc_cursor_draw_request cursor_req = {};
+	// Drawn here (a direct client), or lifted by the render thread (a placed
+	// workspace tile, see svc_cursor_client_is_tile).
+	bool cursor_direct = false;
+	if (c->cursor_draw.pending_valid || c->cursor_draw.frame_valid) {
+		cursor_direct = c->cursor_draw.pending_valid && !svc_cursor_client_is_tile(sys, c);
+		struct svc_client_cursor_draw *cd = &c->cursor_draw;
+		std::lock_guard<std::mutex> clk(cd->mutex);
+		cd->frame_valid = cd->pending_valid;
+		if (cd->pending_valid) {
+			cd->pending_valid = false;
+			cd->frame = cd->pending;
+			cd->frame_seq = cd->pending_seq;
+			cursor_frame = true;
+			cursor_seq = cd->frame_seq;
+			cursor_req = cd->frame;
+			// A direct client is answered by THIS commit (its cursor step
+			// overwrites this); any way out before that step drew nothing.
+			// A workspace tile is answered by the render tick instead.
+			if (cursor_direct) {
+				cd->outcome_seq = cursor_seq;
+				cd->outcome_drew = false;
+				cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+			}
+		}
+	}
+	// XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). ZERO COST
+	// UNLESS REQUESTED: one bool test here and one in the projection loop for a
+	// client that never asked. This commit consumes the request sent right
+	// before it; the copy is taken from the first projection layer's views
+	// while this commit holds them (so the cursor sprite never reaches it).
+	bool measure_frame = false;
+	bool measure_done = false;
+	struct u_cursor_measure_request measure_req = {};
+	if (c->cursor_measure.pending_valid) {
+		c->cursor_measure.pending_valid = false;
+		measure_req = c->cursor_measure.pending;
+		measure_frame = true;
+	}
+	// Phase 4: where the base projection layer's views land in the atlas.
+	struct svc_cursor_tile cursor_tiles[XRT_MAX_VIEWS] = {};
+	uint32_t cursor_tile_count = 0;
+	bool cursor_tiles_done = false;
+	bool cursor_routed = false;
 
 	// Phase 5a — per-stage profile of compositor_layer_commit. Stack-local
 	// timestamps; emitted as one [COMMIT_PROFILE_SVC] line at the workspace
@@ -19626,21 +24419,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 						        &disp_left, &disp_top) &&
 						    disp_px_w > 0 && disp_px_h > 0) {
 
-							// Compute base view dims from display pixel info using tile layout
-							uint32_t base_vw = disp_px_w / sys->tile_columns;
-							uint32_t base_vh = disp_px_h / sys->tile_rows;
-
-							// Scale view dims by window/display ratio
-							// This preserves aspect ratio during resize
-							float ratio = fminf(
-							    (float)client_width / (float)disp_px_w,
-							    (float)client_height / (float)disp_px_h);
-							if (ratio > 1.0f) {
-								ratio = 1.0f;  // Don't upscale beyond recommended
-							}
-
-							uint32_t new_view_w = (uint32_t)((float)base_vw * ratio);
-							uint32_t new_view_h = (uint32_t)((float)base_vh * ratio);
+							// Base view dims from display pixel info using tile layout,
+							// scaled by the window/display ratio (preserves aspect ratio
+							// during resize; never upscales beyond recommended). Never 0:
+							// a window under ~2 px used to scale to a 0x0 atlas, whose
+							// create fails and leaves this client with no atlas at all.
+							uint32_t new_view_w = 1;
+							uint32_t new_view_h = 1;
+							const float ratio = u_tiling_compute_window_scaled_view(
+							    disp_px_w, disp_px_h, sys->tile_columns, sys->tile_rows,
+							    client_width, client_height, &new_view_w, &new_view_h);
 							uint32_t new_atlas_w = sys->tile_columns * new_view_w;
 							uint32_t new_atlas_h = sys->tile_rows * new_view_h;
 
@@ -20344,6 +25132,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	// stays false the atlas still holds the LAST good frame, so the recipe must
 	// be held with it (see the `painted_*` block below).
 	bool content_dims_painted = false;
+	c->seg_route_painting = false; // #1883: set by the projection pass when it routes
 
 	// Bridge-relay: read active per-view tile dims pushed by the bridge.
 	// The bridge (as the sample's proxy) owns windowSize × viewScale and
@@ -20548,6 +25337,16 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			proj_view_count = 1;
 		if (proj_view_count > XRT_MAX_VIEWS)
 			proj_view_count = XRT_MAX_VIEWS;
+		// Multi-screen M3: the grid this commit packs stays the mode's; a
+		// routed frame (per-segment views) walks every segment's views, which
+		// the resolver lays into that grid as a mosaic. Unrouted: identical.
+		const uint32_t packed_view_count = proj_view_count;
+		{
+			const uint32_t route_end = service_seg_route_end(c, layer->data.view_count, packed_view_count);
+			if (route_end > proj_view_count) {
+				proj_view_count = route_end;
+			}
+		}
 
 		// #575: remember what this frame actually packed (see eff_view_count
 		// decl). The handoff/crop below derive their grid from this, not the
@@ -20560,7 +25359,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// resolves the same count in practice, and single-projection frames are
 		// untouched either way.)
 		if (projection_layers_painted == 0) {
-			eff_view_count = proj_view_count;
+			eff_view_count = packed_view_count;
 		}
 
 		// Extract per-view swapchains, textures, and image indices
@@ -20570,6 +25369,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		bool view_mutex_acquired[XRT_MAX_VIEWS] = {};
 		D3D11_TEXTURE2D_DESC view_descs[XRT_MAX_VIEWS] = {};
 		bool view_is_srgb[XRT_MAX_VIEWS] = {};
+		// #1769: a passthrough shader blit below sampled an `_SRGB` view
+		// through its decoding SRV (no decode-free copy was possible), so
+		// the atlas holds linear values whatever the format says.
+		bool view_sample_decoded = false;
 		// Phase 1 Task 1.1 — per-view zero-copy eligibility. Default true;
 		// flipped false below by anything that disqualifies the view (the
 		// view required a service-side mutex acquire, or that acquire
@@ -20718,6 +25521,14 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				continue;
 			}
 
+			if (c->commit_sem_stale) {
+				// #2320: the commit semaphore did not complete within its
+				// bounded wait -- the image may still be mid-render. Reuse
+				// the tile's previous composite (frozen, never torn).
+				view_skip_blit[eye] = true;
+				view_zc_eligible[eye] = false;
+				continue;
+			}
 			if (view_scs[eye]->service_created && view_scs[eye]->images[view_img_indices[eye]].keyed_mutex) {
 				// Phase 2 fence path is opt-in per client. The service
 				// always creates a workspace_sync_fence at session-create,
@@ -21094,10 +25905,22 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		else if (sys->workspace_mode) zc_reason = "workspace_mode";
 		else if (color_blocks_zc)
 			zc_reason = "color_needs_encode";
+		// Multi-screen M3: a routed frame's atlas is a mosaic the service
+		// builds; the app's image is never it.
+		else if (proj_view_count != packed_view_count)
+			zc_reason = "segment_routed";
+		// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): the cursor is drawn
+		// into the atlas, never into the app's image.
+		else if (cursor_frame)
+			zc_reason = "cursor";
+		// ADR-061: the share tap reads the per-client atlas, which zero copy skips.
+		else if (c->share_tap_active.load(std::memory_order_relaxed))
+			zc_reason = "share_tap";
 
 		if (!has_ui_layers && !has_window_space_layers && !zones_frame && !has_local_2d &&
-		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode &&
-		    !color_blocks_zc) {
+		    projection_layer_count <= 1 && all_views_zc_eligible && !sys->workspace_mode && !color_blocks_zc &&
+		    proj_view_count == packed_view_count && !cursor_frame &&
+		    !c->share_tap_active.load(std::memory_order_relaxed)) {
 			// Check all views reference the same swapchain image
 			bool all_same = true;
 			for (uint32_t eye = 1; eye < proj_view_count; eye++) {
@@ -21323,6 +26146,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 
+		// #1769: one decode-free copy per source image across this layer's
+		// views (a tiled layer's views all read one image).
+		const uint64_t proj_raw_pass = service_raw_copy_pass_begin();
 
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
 			// Phase 1 Task 1.2 — mutex acquire timed out earlier;
@@ -21339,7 +26165,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// passes can never place the same view differently.
 			struct service_proj_view_blit pvb = {};
 			service_proj_view_blit_resolve(sys, c, layer, eye, &view_descs[eye], bridge_override, active_vw,
-				                       active_vh, &pvb);
+				                       active_vh, packed_view_count, &pvb);
+			if (pvb.skip) {
+				continue; // multi-screen M3: no place for this view in the mosaic
+			}
 			const float src_x = pvb.src_x;
 			const float src_y = pvb.src_y;
 			const float src_w = pvb.src_w;
@@ -21373,6 +26202,21 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// — degrade to the whole-atlas publish rather than under-copy.
 				compose_publish_full = true;
 			}
+			// ADR-046 Phase 4: the cursor of a direct client is drawn into
+			// the base layer's view tiles - exactly the rects painted here.
+			if (cursor_frame && !cursor_tiles_done && eye < XRT_MAX_VIEWS) {
+				// Multi-screen M3: a routed frame's tiles are per-segment
+				// mosaics; the per-view map is for whole tiles (as in-process).
+				cursor_routed = cursor_routed || proj_view_count != packed_view_count;
+				cursor_tiles[eye].ok = true;
+				cursor_tiles[eye].rect[0] = tile_x;
+				cursor_tiles[eye].rect[1] = tile_y;
+				cursor_tiles[eye].rect[2] = needs_scale ? dst_w : src_w;
+				cursor_tiles[eye].rect[3] = needs_scale ? dst_h : src_h;
+				if (eye + 1 > cursor_tile_count) {
+					cursor_tile_count = eye + 1;
+				}
+			}
 
 			// #1591: color-space handling is now IDENTICAL in both modes
 			// (`feedback_srgb_blit_paths`). The per-client atlas holds the
@@ -21390,7 +26234,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			// byte-identical to the shell path.
 			//
 			// The scale shader loses its `workspace_mode` restriction with
-			// it: it is a pure resize (default, non-decoding SRV), and it
+			// it: it is a pure resize (a non-decoding sample, #1769), and it
 			// was previously reachable in non-workspace mode only as a side
 			// effect of the SRGB branch. Without it an oversized
 			// non-workspace source falls to the raw copy, which cannot
@@ -21411,15 +26255,35 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			bool composing = c->render.active_write_rtv != nullptr;
 			bool use_scale_shader = can_shader_blit && (needs_scale || composing);
 
+			// #1769: which view the shader blits below sample. Composing,
+			// the format-honest per-image SRV (above). NOT composing, the
+			// draw is a passthrough into the UNORM atlas RTV and must read
+			// the stored bytes: that per-image SRV is typed in the
+			// swapchain's own format, so for an `_SRGB` source it DECODES —
+			// the "default (non-SRGB) SRV" these branches were written
+			// against does not exist for a typed `_SRGB` image. Sample a
+			// same-family decode-free copy instead (UNORM sources keep
+			// their own, already raw, view).
+			ID3D11ShaderResourceView *proj_src_srv = view_scs[eye]->images[view_img_indices[eye]].srv.get();
+			if (can_shader_blit && !composing && (use_scale_shader || proj_blend != nullptr)) {
+				bool decodes = false;
+				proj_src_srv = service_raw_sample_srv(sys, view_scs[eye], view_img_indices[eye],
+				                                      proj_raw_pass, &decodes);
+				if (decodes) {
+					view_sample_decoded = true;
+				}
+			}
+
 			if (use_scale_shader) {
-				// Oversized client content: scale through the shader using
-				// the default (non-SRGB) SRV so sampling reads raw bytes and
-				// writes them unmodified — keeps the per-client atlas in the
-				// app's own space, matching the raw-copy path that
-				// multi_compositor_render expects. The per-image SRV is already
-				// a Texture2DArray for layered sources (ADR-032, create/import).
+				// Oversized client content (or a composing commit): scale
+				// through the shader. Not composing, `proj_src_srv` reads raw
+				// bytes and writes them unmodified — keeps the per-client
+				// atlas in the app's own space, matching the raw-copy path
+				// that multi_compositor_render expects. Both views are a
+				// Texture2DArray for layered sources (ADR-032, create/import,
+				// #1769's copy).
 				blit_to_atlas_texture(
-				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    sys, &c->render, proj_src_srv, src_x,
 				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
 				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
@@ -21434,7 +26298,7 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 				// with two or more projection layers; the first one, and
 				// every single-projection frame, still takes the copy.
 				blit_to_atlas_texture(
-				    sys, &c->render, view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x,
+				    sys, &c->render, proj_src_srv, src_x,
 				    src_y, src_w, src_h, (float)view_descs[eye].Width, (float)view_descs[eye].Height,
 				    (float)tile_x, (float)tile_y, dst_w, dst_h, false,
 				    /*blend=*/proj_blend, /*rtv_override=*/nullptr,
@@ -21471,6 +26335,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 			}
 		}
 		} // !zero_copy
+		// ADR-046 Phase 4: only the BASE projection layer's tiles carry the cursor.
+		if (cursor_tile_count > 0) {
+			cursor_tiles_done = true;
+		}
 
 		// Track actual content dimensions for DP crop and multi-comp slot read.
 		if (bridge_override) {
@@ -21516,13 +26384,38 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		// Eyes within a projection layer share a swapchain format in practice;
 		// pick view 0.
 		c->atlas_holds_srgb_bytes =
-		    u_color_atlas_holds_encoded(view_is_srgb[0],
+		    u_color_atlas_holds_encoded(view_is_srgb[0] && !view_sample_decoded,
 		                                /*composed_through_srgb_target=*/c->render.active_write_rtv != nullptr,
 		                                u_color_legacy_unorm_encoded());
 
 		// Store content dims on multi-comp slot for multi_compositor_render
 		// (readiness gate + per-slot stride snapshot — see the helper).
 		service_update_slot_content_dims(sys, c, content_view_w, content_view_h);
+
+		// ADR-046 Amendment 3 over IPC: read back finished copies, and copy
+		// this frame's patch out of the first projection layer's two outer
+		// views - before the release below, while this commit still holds them.
+		if (!measure_done && (measure_frame || c->cursor_measure.in_flight > 0)) {
+			measure_done = true;
+			svc_cursor_measure_harvest(sys, c);
+			if (measure_frame && u_cursor_measure_should_sample(&measure_req)) {
+				ID3D11Texture2D *mtex[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+				const struct xrt_sub_image *msub[U_CURSOR_DEPTH_PATCH_VIEWS] = {};
+				bool readable = true;
+				for (uint32_t k = 0; k < U_CURSOR_DEPTH_PATCH_VIEWS; k++) {
+					const uint32_t vi = measure_req.view_index[k];
+					if (vi >= proj_view_count || view_skip_blit[vi] || view_textures[vi] == nullptr) {
+						readable = false;
+						break;
+					}
+					mtex[k] = view_textures[vi];
+					msub[k] = &layer->data.proj.v[vi].sub;
+				}
+				if (readable) {
+					svc_cursor_measure_sample(sys, c, &measure_req, mtex, msub);
+				}
+			}
+		}
 
 		// Release KeyedMutex after reading
 		for (uint32_t eye = 0; eye < proj_view_count; eye++) {
@@ -21742,6 +26635,9 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		c->painted_content_w = content_view_w;
 		c->painted_content_h = content_view_h;
 		c->painted_view_count = eff_view_count;
+		// #1883: and the partition its views were laid out with.
+		comp_segments_content_from_routing(c->seg_route_painting ? &c->seg_route : nullptr,
+		                                   &c->seg_content_painted);
 		// DXR_FRAME_WITNESS: a fresh app frame is now in this client's atlas.
 		// Unconditional (one relaxed increment per painting commit is cheaper
 		// than the env probe that would gate it).
@@ -22170,7 +27066,11 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 					struct service_proj_view_blit pvb = {};
 					service_proj_view_blit_resolve(sys, c, layer, view_index, &pdesc,
-					                               bridge_override, active_vw, active_vh, &pvb);
+					                               bridge_override, active_vw, active_vh,
+					                               ui_view_count, &pvb);
+					if (pvb.skip) {
+						continue; // multi-screen M3: no place in this frame's mosaic
+					}
 					blit_to_atlas_texture(sys, &c->render, psc->images[pimg].srv.get(), pvb.src_x,
 					                      pvb.src_y, pvb.src_w, pvb.src_h, pvb.src_tex_w,
 					                      pvb.src_tex_h, pvb.dst_x, pvb.dst_y, pvb.dst_w, pvb.dst_h,
@@ -22431,6 +27331,27 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 
 	profile_s3 = os_monotonic_get_ns(); // Phase 5a — end of UI-layers block.
 
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): a DIRECT client's
+	// runtime-drawn cursor, drawn last into what this commit painted - after
+	// every layer, before the publish below and so before the display
+	// processor. For a placed workspace tile the render thread lifts the
+	// workspace cursor instead (multi_compositor_render), so nothing is drawn
+	// into the window.
+	if (cursor_direct) {
+		const bool composing = c->render.active_write_rtv != nullptr;
+		ID3D11RenderTargetView *cursor_rtv = composing ? c->render.active_write_rtv : c->render.atlas_rtv.get();
+		if (composing) {
+			// The private compose target: published below under the atlas lock.
+			svc_cursor_draw_direct(sys, c, &cursor_req, cursor_seq, cursor_tiles, cursor_tile_count,
+			                       cursor_routed, cursor_rtv, /*target_decodes*/ true);
+		} else {
+			// Straight into the atlas the render thread crops (#1018).
+			std::lock_guard<std::mutex> atlas_write_lock(c->atlas_submit_mutex);
+			svc_cursor_draw_direct(sys, c, &cursor_req, cursor_seq, cursor_tiles, cursor_tile_count,
+			                       cursor_routed, cursor_rtv, /*target_decodes*/ false);
+		}
+	}
+
 	/*
 	 * #1610 — publish the composed result into the atlas.
 	 *
@@ -22563,6 +27484,30 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		if (content_view_w > 0 && content_view_h > 0) {
 			c->pipe_frame_ready = true;
 		}
+		{
+			// #1883: the partition of what this atlas holds, for the
+			// render thread's per-segment crop.
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			c->pipe_seg_content = c->seg_content_painted;
+		}
+
+		// ADR-061: the atlas is final. Not on a zero-copy frame, which never wrote
+		// it (the first commit after an attach can still be one).
+		c->share_last_commit_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_relaxed);
+		// A frame that packed through another path leaves eff_view_count unset; the
+		// published grid is what the atlas holds then.
+		const uint32_t share_views =
+		    eff_view_count != 0 ? eff_view_count : c->pipe_tile_columns * c->pipe_tile_rows;
+		if (eff_view_count == 0 && !c->share_views_fallback_logged && c->share_tap_active.load(std::memory_order_relaxed)) {
+			c->share_views_fallback_logged = true;
+			U_LOG_W("ADR-061 share tap: frame left the view count unset; using the published %ux%u grid",
+			        c->pipe_tile_columns, c->pipe_tile_rows);
+		}
+		c->share_active_views.store(share_views, std::memory_order_relaxed);
+		if (!use_zero_copy) {
+			svc_share_tap_commit(sys, c, share_views, c->pipe_tile_columns, c->pipe_tile_rows, content_view_w,
+			                     content_view_h);
+		}
 
 		// #1017: a CLIENT_TEXTURE client weaves HERE, on its own IPC thread —
 		// the one presenter kind the render thread must not finish, because
@@ -22618,7 +27563,10 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 		 * client) so we never try to "catch up" by not sleeping at all for a
 		 * burst of frames.
 		 */
-		const int64_t pace_period_ns = (int64_t)(1e9 / (sys->refresh_rate > 0.0f ? sys->refresh_rate : 60.0f));
+		// #2245: the period of the screen the client's window is on (the
+		// primary's, byte for byte, while it is on the primary).
+		const float pace_hz = svc_client_update_screen_hz(sys, c);
+		const int64_t pace_period_ns = (int64_t)(1e9 / (pace_hz > 0.0f ? pace_hz : 60.0f));
 		// DXR_COMMIT_PACE=0 turns the backpressure off (A/B lever, and the
 		// escape hatch if a client turns out to need to run free).
 		static int pace_on = -1;
@@ -23111,12 +28059,156 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	return XRT_SUCCESS;
 }
 
+/*!
+ * #2320 -- the bounded CPU wait budget for a commit semaphore, in ms.
+ *
+ * `DXR_IPC_SEM_WAIT_MS` (0-33; 0 = the semaphore is ignored as before #2320 --
+ * the A/B switch, logged once).
+ * Default: ONE present period of the client's own screen (~16 ms at 60 Hz). It
+ * is larger than `DXR_FENCE_WAIT_MS`'s 4 ms on purpose: what it blocks is THIS
+ * client's own IPC thread for THIS client's own GPU frame -- the D3D12 client's
+ * already-accepted "local blocking" fallback, and where the #1019 commit pacing
+ * already blocks. No other client and no render-thread work waits on it.
+ */
+static int
+svc_commit_sem_wait_ms(const struct d3d11_service_compositor *c)
+{
+	static int env_ms = -2; // -2 = not read yet, -1 = unset
+	if (env_ms == -2) {
+		const char *e = getenv("DXR_IPC_SEM_WAIT_MS");
+		env_ms = (e != nullptr && e[0] != '\0') ? std::max(0, std::min(atoi(e), 33)) : -1;
+	}
+	if (env_ms >= 0) {
+		return env_ms;
+	}
+	const float hz = svc_client_hz(c);
+	int ms = hz > 1.0f ? (int)(1000.0f / hz + 0.5f) : 16;
+	return std::max(1, std::min(ms, 33));
+}
+
+/*!
+ * #2320 -- has the client's GPU reached `value` on its commit semaphore?
+ *
+ * The same bounded-CPU-wait shape as service_fence_reached() (#922: never queue
+ * a GPU Wait on the shared immediate context for a client-promised value; a
+ * client that dies before signalling would jam the weave, every blit and every
+ * other client), on the semaphore's fence instead of workspace_sync_fence. The
+ * verdict is always re-read from GetCompletedValue() after the wait.
+ */
+static bool
+service_commit_sem_reached(struct d3d11_service_compositor *c, ID3D11Fence *fence, uint64_t value, int wait_ms)
+{
+	if (c->fence_wait_event == nullptr) {
+		return fence->GetCompletedValue() >= value;
+	}
+	ResetEvent(c->fence_wait_event);
+	if (FAILED(fence->SetEventOnCompletion(value, c->fence_wait_event))) {
+		return fence->GetCompletedValue() >= value;
+	}
+	WaitForSingleObject(c->fence_wait_event, (DWORD)wait_ms);
+	return fence->GetCompletedValue() >= value;
+}
+
+/*!
+ * #2320 -- honour the commit semaphore of a client that is NOT on the
+ * workspace_sync_fence path (the D3D12 IPC client).
+ *
+ * That client cannot hold the swapchain's keyed mutex, so the legacy
+ * AcquireSync(0, 4 ms) succeeds trivially and orders nothing; until #2320 the
+ * semaphore was dropped too, and the service could sample an image before the
+ * client's GPU work had finished.
+ *
+ * The wait runs HERE, on the client's own IPC thread, with no lock held
+ * (c->mutex is taken inside compositor_layer_commit) -- not as a GPU Wait on
+ * sys->context. A GPU Wait on the shared, in-order immediate context would make
+ * one slow client's frame stall every other client's blit, the compose, the
+ * weave and Present (ADR-035 D3: one client never sets the weave cadence), and
+ * a value that never arrives would be #922 again. Here the worst case is that
+ * THIS client's commit returns a budget later.
+ *
+ * Timeout: the commit's views are marked stale (`c->commit_sem_stale`, read
+ * by the projection loop and service_acquire_source_image): each tile keeps
+ * its previous composite -- frozen, never torn -- exactly what the
+ * workspace_sync_fence path does when service_fence_reached() times out.
+ */
+static void
+svc_commit_sem_wait(struct d3d11_service_compositor *c, struct xrt_compositor_semaphore *xcsem, uint64_t value)
+{
+	c->commit_sem_stale = false;
+	if (xcsem == nullptr || value == 0) {
+		return;
+	}
+	// workspace_sync_fence clients are ordered by #922's path; leave them be.
+	if (c->workspace_sync_fence && c->last_signaled_fence_value.load(std::memory_order_acquire) != 0) {
+		return;
+	}
+	struct d3d11_service_semaphore *sem = d3d11_service_semaphore_from_xrt(xcsem);
+	if (sem->sys != c->sys || !sem->fence) {
+		return;
+	}
+	ID3D11Fence *fence = sem->fence.get();
+	const int wait_ms = svc_commit_sem_wait_ms(c);
+	if (wait_ms == 0) {
+		static bool s_logged_off = false;
+		if (!s_logged_off) {
+			s_logged_off = true;
+			U_LOG_W(
+			    "[FENCE] #2320: DXR_IPC_SEM_WAIT_MS=0 -- commit semaphores IGNORED (pre-#2320 "
+			    "behaviour, A/B only): no ordering for D3D12 IPC clients");
+		}
+		return;
+	}
+
+	if (fence->GetCompletedValue() >= value) {
+		c->commit_sem_complete_in_window++; // fast path: already done, no wait
+	} else {
+		if (!c->commit_sem_wait_logged) {
+			c->commit_sem_wait_logged = true;
+			U_LOG_W(
+			    "[FENCE] client=%p #2320: first commit-semaphore wait armed (value=%llu, bounded "
+			    "CPU wait %d ms on this client's IPC thread; timeout = views stale, tile reused)",
+			    (void *)c, (unsigned long long)value, wait_ms);
+		}
+		if (service_commit_sem_reached(c, fence, value, wait_ms)) {
+			c->commit_sem_reached_in_window++;
+		} else {
+			// Same verdict as an `incomplete` view on the fence path. No #1215
+			// drop-not-defer step is needed: read_done is signalled only with
+			// a workspace_sync_fence value, which this client never ships, so
+			// no app wait_image is gated on a read we are skipping.
+			c->commit_sem_stale = true;
+			c->commit_sem_timeout_in_window++;
+		}
+	}
+
+	int64_t now_ns = os_monotonic_get_ns();
+	if (c->commit_sem_window_start_ns == 0) {
+		c->commit_sem_window_start_ns = now_ns;
+	}
+	int64_t window_ns = now_ns - c->commit_sem_window_start_ns;
+	if (window_ns >= 10LL * 1000000000LL) {
+		U_LOG_W("[FENCE] client=%p commit_sem already_complete=%u waits_reached=%u timed_out=%u window_s=%lld",
+		        (void *)c, c->commit_sem_complete_in_window, c->commit_sem_reached_in_window,
+		        c->commit_sem_timeout_in_window, (long long)(window_ns / 1000000000LL));
+		c->commit_sem_window_start_ns = now_ns;
+		c->commit_sem_complete_in_window = 0;
+		c->commit_sem_reached_in_window = 0;
+		c->commit_sem_timeout_in_window = 0;
+	}
+}
+
 static xrt_result_t
 compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
                                         struct xrt_compositor_semaphore *xcsem,
                                         uint64_t value)
 {
-	return compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	// #2320: BEFORE compositor_layer_commit reads any of this commit's images.
+	svc_commit_sem_wait(c, xcsem, value);
+	xrt_result_t xret = compositor_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+	c->commit_sem_stale = false;
+	return xret;
 }
 
 //! HARDWARE 2D/3D request (#533/#575) — the weave-state signal, decoupled from
@@ -23327,36 +28419,52 @@ service_scan_teardown_survivors(struct d3d11_service_system *sys,
  * the multi-compositor (so the survivor scan below cannot see the dying client),
  * and must not yet have run `fini_client_render_resources` (the DP has to still
  * be alive to take the request).
+ *
+ * #2416: @p c may be NULL, meaning "the workspace controller's connection was
+ * lost" (see @ref comp_d3d11_service_workspace_controller_lost). The workspace
+ * gate below exists because a live controller owns the display mode — but when
+ * the controller dies uncleanly its compositor is torn down BEFORE the IPC layer
+ * deactivates the workspace, so its own teardown pass hit that gate and nothing
+ * ever asked the lens back to 2D. The controller-loss call runs the same scan
+ * once more, after the deactivate, with no dying client left to exclude: the
+ * same survivor rules apply, so the unclean exit lands exactly where the orderly
+ * one (deactivate first, then teardown) already did.
  */
 static void
 service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
 {
-	if (sys == nullptr || panel_dp(sys, c) == nullptr) {
+	if (sys == nullptr) {
 		return;
 	}
-	// Workspace: the controller owns the display mode (a client leaving is
-	// routine there). Bridge: the relay owns it via the HWND path. Use the
-	// authoritative process-global bridge gate, not the per-client one — the
-	// question here is "is a bridge driving the panel", not "was this client
-	// the bridge client".
-	if (sys->workspace_mode || bridge_relay_is_live_authoritative(sys)) {
+	// The decision is comp_failsafe_2d_decide() (comp_failsafe_2d_policy.h) —
+	// pure, shared by both call kinds, and pinned by tests_comp_failsafe_2d_policy.
+	// This function only reads its inputs and acts on the verdict.
+	//
+	// Gates first, before any scan. Workspace: the controller owns the display
+	// mode (a client leaving is routine there). Bridge: the relay owns it via
+	// the HWND path. Use the authoritative process-global bridge gate, not the
+	// per-client one — the question here is "is a bridge driving the panel",
+	// not "was this client the bridge client".
+	struct comp_failsafe_2d_state st = {};
+	st.have_panel_dp = panel_dp(sys, c) != nullptr;
+	st.workspace_mode = sys->workspace_mode;
+	st.bridge_relay_live = st.have_panel_dp && !st.workspace_mode && bridge_relay_is_live_authoritative(sys);
+	st.hardware_display_3d = sys->hardware_display_3d;
+	if (comp_failsafe_2d_gate(&st) != COMP_FAILSAFE_2D_PROCEED) {
 		return;
-	}
-	if (!sys->hardware_display_3d) {
-		return; // already flat — nothing stranded
 	}
 
 	// Does anything left standing still want the lens? A weave present-owner
 	// holds the panel in 3D merely by existing (weave_force_3d_if_needed is
 	// self-healing), so a surviving one would just re-assert 3D on its next
 	// submit; flattening here would only produce a visible flicker.
-	bool this_client_is_weave_owner = c->render.weave_hwnd != nullptr;
-	bool survivor_wants_3d = false;
-	uint32_t survivors = service_scan_teardown_survivors(sys, c, &survivor_wants_3d);
-	if (survivor_wants_3d) {
-		return;
-	}
-	// #939: `survivor_wants_3d` above only says "a weave present-owner
+	st.departing_is_weave_owner = c != nullptr && c->render.weave_hwnd != nullptr;
+	const char *who = c == nullptr                    ? "#2416: workspace controller lost"
+	                  : st.departing_is_weave_owner ? "weave present-owner client leaving"
+	                                                : "last client leaving";
+	st.survivors = service_scan_teardown_survivors(sys, c, &st.weave_owner_survives);
+
+	// #939: `weave_owner_survives` above only says "a weave present-owner
 	// survives". A HOSTED survivor that is presenting in 3D — plain-Chrome
 	// WebXR holding the panel while the DisplayXR Browser exits — wants the
 	// lens just as much, and its standing wish says so (content mode with
@@ -23364,7 +28472,8 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	// one-shot 2D dip at every browser exit beside a live WebXR session; the
 	// focus rule re-arms the survivor's wish a tick later, so nothing here is
 	// stranded by leaving the lens alone.
-	{
+	int wants_3d_slot = -1;
+	if (!st.weave_owner_survives) {
 		struct d3d11_multi_compositor *tmc = sys->multi_comp;
 		struct xrt_device *head = sys->xsysd != nullptr ? sys->xsysd->static_roles.head : nullptr;
 		for (int i = 0; tmc != nullptr && i < D3D11_MULTI_MAX_CLIENTS; i++) {
@@ -23379,20 +28488,39 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 			    (wm >= 0 && head != nullptr && (uint32_t)wm < head->rendering_mode_count &&
 			     head->rendering_modes[wm].hardware_display_3d);
 			if (wants_3d) {
-				U_LOG_W(
-				    "#814 failsafe: %s client leaving, but presenting survivor slot %d ('%s') still "
-				    "wants 3D — leaving the lens alone (#939)",
-				    this_client_is_weave_owner ? "weave present-owner" : "last", i,
-				    other->slot_app_name);
-				return;
+				wants_3d_slot = i;
+				break;
 			}
 		}
 	}
-	// An ordinary client leaving while others are still connected is not
-	// evidence that the panel should go flat — one of those survivors may be
-	// the one that asked for 3D. Only the departure of the weave present-owner
-	// itself, or of the last client on the box, releases the lens.
-	if (!this_client_is_weave_owner && survivors > 0) {
+	st.presenting_survivor_wants_3d = wants_3d_slot >= 0;
+
+	switch (comp_failsafe_2d_decide(&st)) {
+	case COMP_FAILSAFE_2D_SKIP_SURVIVOR_WANTS_3D:
+		U_LOG_W(
+		    "#814 failsafe: %s, but presenting survivor slot %d ('%s') still "
+		    "wants 3D — leaving the lens alone (#939)",
+		    who, wants_3d_slot, sys->multi_comp->clients[wants_3d_slot].compositor->slot_app_name);
+		return;
+	case COMP_FAILSAFE_2D_REQUEST_2D: break;
+	default:
+		// An ordinary client leaving while others are still connected is not
+		// evidence that the panel should go flat — one of those survivors may
+		// be the one that asked for 3D. Only the departure of the weave
+		// present-owner itself, or of the last client on the box, releases the
+		// lens.
+		return;
+	}
+
+	if (c == nullptr) {
+		// #2416: no client to carry the request — the controller's compositor
+		// is already gone. Same hardware-only ADR-028 channel the client path
+		// below ends in (`service_apply_pending_mode` with hw=0 and no content
+		// mode resolves to exactly this call): keep the active rendering mode,
+		// ask for a flat lens.
+		U_LOG_W("%s with the panel in 3D (%u survivor(s)) — requesting hardware 2D", who, st.survivors);
+		(void)service_request_mode_transition(sys, nullptr, UINT32_MAX, /* want_3d */ false,
+		                                      /* skip_dp */ false, "controller_lost");
 		return;
 	}
 
@@ -23404,7 +28532,7 @@ service_failsafe_hardware_2d_on_teardown(struct d3d11_service_system *sys, struc
 	c->pending_content_mode.store(0xFFFFFFFFu, std::memory_order_release);
 	c->pending_hw_3d.store(0, std::memory_order_release);
 	U_LOG_W("#814 failsafe: %s client leaving with the panel in 3D (%u survivor(s)) — requesting hardware 2D",
-	        this_client_is_weave_owner ? "weave present-owner" : "last", survivors);
+	        st.departing_is_weave_owner ? "weave present-owner" : "last", st.survivors);
 	(void)service_apply_pending_mode(sys, c, /* bridge_live */ false, /* as_service */ true,
 	                                 /* holds_render_mutex */ true);
 }
@@ -23416,6 +28544,22 @@ compositor_destroy(struct xrt_compositor *xc)
 	struct d3d11_service_system *sys = c->sys;
 
 	U_LOG_W("Destroying D3D11 service compositor for client");
+
+	// ADR-061: normally detached already (the session teardown calls the manager
+	// first). If not, the tap outlives this compositor and reports it gone.
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (c->share_tap) {
+			c->share_tap->owner = nullptr;
+			{
+				std::lock_guard<std::mutex> tl(c->share_tap->mutex);
+				c->share_tap->alive = false;
+			}
+			c->share_tap->cv.notify_all();
+			c->share_tap.reset();
+			c->share_tap_active.store(false);
+		}
+	}
 
 	// If this was the bridge-relay session, clear the global gate so
 	// subsequent non-bridge WebXR / legacy sessions get normal compositor
@@ -23701,6 +28845,21 @@ compositor_destroy(struct xrt_compositor *xc)
 		c->workspace_sync_fence.reset();
 	}
 
+	// Multi-screen M6: the segment DPs are the render thread's; tear them down
+	// under render_mutex so no weave of this client is in flight.
+	if (c->segments != nullptr || c->seg_outcomp != nullptr || c->weave_segs != nullptr ||
+	    c->weave_seg_outcomp != nullptr) {
+		render_mutex_fair_lock lock(sys);
+		svc_seg_release(c);
+		weave_seg_release(c); // #1884: the present-owner's weave segment DPs
+	}
+	free(c->seg_screens);
+	c->seg_screens = nullptr;
+	free(c->seg_sys_info);
+	c->seg_sys_info = nullptr;
+	free(c->weave_offered_screens);
+	c->weave_offered_screens = nullptr;
+
 	delete c;
 }
 
@@ -23829,6 +28988,1470 @@ comp_d3d11_service_compositor_export_transparent_output_fence(struct xrt_composi
  * texture + fence handback idiom, generalized to a caller INPUT texture + an
  * output sub-rect. The DP does all weaving (ADR-007 / ADR-019).
  */
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — lift-flagged weave rects.
+ *
+ * The weave never waits for the module: each rect's 2D content is SNAPSHOTTED
+ * into its stream's latest-wins mailbox (one blit on this context), and the
+ * stream's LATEST result — one frame (or more) behind — is woven at the rect's
+ * CURRENT position. Geometry is therefore exact and real-time; only the depth
+ * lags. Caller holds render_mutex + immediate_ctx_mutex and the input's keyed
+ * mutex (the same state the surrounding blits run under).
+ *
+ */
+
+/*!
+ * ADR-048: the physical region a lift frame came from — rect @p rect (in the
+ * client window's pixels, @p win_w x @p win_h; NULL = the whole window) of
+ * client @p xc's window, as a centre in display space (metres, +y up) and a
+ * size. Without window metrics (no window, headless connection) the frame is
+ * the panel: centre 0, the display's size, valid = false.
+ */
+static void
+lift_rect_frame(struct d3d11_service_system *sys,
+                struct xrt_compositor *xc,
+                const struct xrt_rect *rect,
+                uint32_t win_w,
+                uint32_t win_h,
+                struct xrt_lift_rect_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->width_m = sys->base.info.display_width_m;
+	out->height_m = sys->base.info.display_height_m;
+	struct xrt_window_metrics wm = {};
+	if (xc != nullptr && xc->destroy == compositor_destroy) {
+		out->eyes_dp_key = d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.load(std::memory_order_relaxed);
+	}
+	if (xc == nullptr || xc->destroy != compositor_destroy ||
+	    !comp_d3d11_service_get_client_app_window_metrics(&sys->base, xc, &wm) || !wm.valid ||
+	    wm.window_width_m <= 0.0f || wm.window_height_m <= 0.0f) {
+		return;
+	}
+	out->center[0] = wm.window_center_offset_x_m;
+	out->center[1] = wm.window_center_offset_y_m;
+	out->center[2] = wm.window_center_offset_z_m;
+	out->width_m = wm.window_width_m;
+	out->height_m = wm.window_height_m;
+	if (rect != nullptr && win_w > 0 && win_h > 0) {
+		// Rect fractions of the window (window pixels, y down) -> metres (y up).
+		const float fx = ((float)rect->offset.w + 0.5f * (float)rect->extent.w) / (float)win_w - 0.5f;
+		const float fy = ((float)rect->offset.h + 0.5f * (float)rect->extent.h) / (float)win_h - 0.5f;
+		out->center[0] += fx * wm.window_width_m;
+		out->center[1] -= fy * wm.window_height_m;
+		out->width_m = (float)rect->extent.w / (float)win_w * wm.window_width_m;
+		out->height_m = (float)rect->extent.h / (float)win_h * wm.window_height_m;
+	}
+	out->valid = true;
+}
+
+static const struct xrt_lift_weave_rect *
+lift_binding_for_rect(const struct xrt_lift_weave_rect *rects, uint32_t count, uint32_t rect_index)
+{
+	for (uint32_t k = 0; k < count; k++) {
+		if (rects[k].rect_index == rect_index) {
+			return &rects[k];
+		}
+	}
+	return nullptr;
+}
+
+//! The stereo pair out of an N-view result: the middle two views.
+static void
+lift_pick_pair(uint32_t views, uint32_t *out_l, uint32_t *out_r)
+{
+	if (views <= 2) {
+		*out_l = 0;
+		*out_r = views == 2 ? 1 : 0;
+		return;
+	}
+	*out_l = views / 2 - 1;
+	*out_r = views / 2;
+}
+
+/*
+ *
+ * ADR-046 Amendment 1 (Phase 3c): the depth-aware cursor on lifted content.
+ *
+ * A lifted rect's views are made here, not by the app, so the service draws
+ * the cursor into them, placed from the conversion's own depth map through the
+ * module's relief mapping. Opt-in per rect (xrt_lift_weave_rect::depth_cursor);
+ * a rect that did not ask costs nothing.
+ *
+ */
+
+//! The system arrow, as drawn at 100 % scale: B = outline, W = fill.
+static const char *const k_lift_cursor_arrow[] = {
+    "B...........", "BB..........", "BWB.........", "BWWB........", "BWWWB.......", "BWWWWB......",
+    "BWWWWWB.....", "BWWWWWWB....", "BWWWWWWWB...", "BWWWWWWWWB..", "BWWWWWWWWWB.", "BWWWWWWBBBBB",
+    "BWWWBWWB....", "BWWBBWWB....", "BWB..BWWB...", "BB...BWWB...", "B.....BWWB..", "......BWWB..",
+    ".......BB...",
+};
+#define SVC_LIFT_CURSOR_SPRITE_W 12u
+#define SVC_LIFT_CURSOR_SPRITE_H 19u
+
+static ID3D11ShaderResourceView *
+svc_lift_cursor_sprite(struct d3d11_service_system *sys)
+{
+	if (sys->lift_cursor_sprite_srv) {
+		return sys->lift_cursor_sprite_srv.get();
+	}
+	if (sys->lift_cursor_sprite_failed) {
+		return nullptr;
+	}
+	uint32_t px[SVC_LIFT_CURSOR_SPRITE_W * SVC_LIFT_CURSOR_SPRITE_H];
+	for (uint32_t y = 0; y < SVC_LIFT_CURSOR_SPRITE_H; y++) {
+		for (uint32_t x = 0; x < SVC_LIFT_CURSOR_SPRITE_W; x++) {
+			const char ch = k_lift_cursor_arrow[y][x];
+			// R8G8B8A8_UNORM, little-endian: 0xAABBGGRR. Straight alpha.
+			px[y * SVC_LIFT_CURSOR_SPRITE_W + x] = ch == 'B' ? 0xFF000000u : ch == 'W' ? 0xFFFFFFFFu : 0u;
+		}
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = SVC_LIFT_CURSOR_SPRITE_W;
+	td.Height = SVC_LIFT_CURSOR_SPRITE_H;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = px;
+	init.SysMemPitch = SVC_LIFT_CURSOR_SPRITE_W * 4;
+	wil::com_ptr<ID3D11Texture2D> tex;
+	HRESULT hr = sys->device->CreateTexture2D(&td, &init, tex.put());
+	if (SUCCEEDED(hr)) {
+		hr = sys->device->CreateShaderResourceView(tex.get(), nullptr, sys->lift_cursor_sprite_srv.put());
+	}
+	if (FAILED(hr)) {
+		U_LOG_E("[lift cursor] sprite texture create failed: 0x%08lx", hr);
+		sys->lift_cursor_sprite_srv.reset();
+		sys->lift_cursor_sprite_failed = true;
+		return nullptr;
+	}
+	return sys->lift_cursor_sprite_srv.get();
+}
+
+//! IEEE 754 half -> float (R16_FLOAT depth maps).
+static float
+svc_half_to_float(uint16_t h)
+{
+	const uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+	uint32_t exp = (h >> 10) & 0x1Fu;
+	uint32_t man = h & 0x3FFu;
+	uint32_t bits;
+	if (exp == 0) {
+		if (man == 0) {
+			bits = sign;
+		} else { // subnormal: normalise
+			exp = 127 - 15 + 1;
+			while ((man & 0x400u) == 0) {
+				man <<= 1;
+				exp--;
+			}
+			bits = sign | (exp << 23) | ((man & 0x3FFu) << 13);
+		}
+	} else if (exp == 31) {
+		bits = sign | 0x7F800000u | (man << 13);
+	} else {
+		bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+	}
+	float f;
+	memcpy(&f, &bits, sizeof(f));
+	return f;
+}
+
+//! The cursor state of @p stream_id on @p c: found, or a free / the least
+//! recently used slot, reset.
+static struct svc_lift_cursor *
+svc_lift_cursor_slot(struct d3d11_service_compositor *c, uint64_t stream_id, uint64_t now_ns)
+{
+	struct svc_lift_cursor *oldest = nullptr;
+	for (auto &lc : c->render.lift_cursor) {
+		if (lc.stream_id == stream_id) {
+			lc.last_used_ns = now_ns;
+			return &lc;
+		}
+		// A free slot wins; otherwise the least recently used one.
+		if (oldest == nullptr || (oldest->stream_id != 0 &&
+		                          (lc.stream_id == 0 || lc.last_used_ns < oldest->last_used_ns))) {
+			oldest = &lc;
+		}
+	}
+	// Keep the staging textures; drop everything else.
+	oldest->stream_id = stream_id;
+	oldest->last_used_ns = now_ns;
+	oldest->filter = {};
+	for (auto &rb : oldest->rb) {
+		rb.pending = false;
+	}
+	oldest->have_sample = false;
+	oldest->sample_has_content = false;
+	oldest->logged = false;
+	return oldest;
+}
+
+//! Read back every finished patch copy of @p lc without waiting; keep the newest.
+static void
+svc_lift_cursor_poll(struct d3d11_service_system *sys, struct svc_lift_cursor *lc, uint64_t now_ns)
+{
+	for (auto &rb : lc->rb) {
+		if (!rb.pending) {
+			continue;
+		}
+		D3D11_MAPPED_SUBRESOURCE m = {};
+		HRESULT hr = sys->context->Map(rb.staging.get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m);
+		if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+			continue;
+		}
+		rb.pending = false;
+		if (FAILED(hr)) {
+			continue;
+		}
+		float samples[SVC_LIFT_CURSOR_PATCH_MAX * SVC_LIFT_CURSOR_PATCH_MAX];
+		uint32_t n = 0;
+		for (uint32_t y = 0; y < rb.h; y++) {
+			const uint8_t *row = static_cast<const uint8_t *>(m.pData) + (size_t)y * m.RowPitch;
+			for (uint32_t x = 0; x < rb.w; x++) {
+				if (rb.format == DXGI_FORMAT_R16_FLOAT) {
+					uint16_t hv;
+					memcpy(&hv, row + 2 * x, sizeof(hv));
+					samples[n++] = svc_half_to_float(hv);
+				} else {
+					memcpy(&samples[n++], row + 4 * x, sizeof(float));
+				}
+			}
+		}
+		sys->context->Unmap(rb.staging.get(), 0);
+		if (rb.seq < lc->sample_seq) {
+			continue; // an older copy finished late
+		}
+		float z = 0.0f;
+		lc->sample_has_content = u_lift_cursor_nearest_z(samples, n, rb.inverse, rb.value_scale, rb.value_offset,
+		                                                 rb.relief_scale, rb.relief_offset, &z);
+		lc->sample_z = z;
+		lc->sample_seq = rb.seq;
+		lc->sample_ns = now_ns;
+		lc->have_sample = true;
+	}
+}
+
+//! Copy the depth texels of the footprint around (@p du, @p dv) — normalised
+//! over the depth map — into a free staging slot. Nothing waits on it.
+static void
+svc_lift_cursor_issue(struct d3d11_service_system *sys,
+                      struct svc_lift_cursor *lc,
+                      const struct d3d11_lift_pin *pin,
+                      float du,
+                      float dv,
+                      float radius_u,
+                      float radius_v)
+{
+	struct svc_lift_cursor_rb *rb = nullptr;
+	for (auto &r : lc->rb) {
+		if (!r.pending) {
+			rb = &r;
+			break;
+		}
+	}
+	if (rb == nullptr) {
+		return; // all in flight: skip this frame
+	}
+	const DXGI_FORMAT fmt = (DXGI_FORMAT)pin->depth_format;
+	if (!rb->staging || rb->format != (uint32_t)fmt) {
+		rb->staging.reset();
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = SVC_LIFT_CURSOR_PATCH_MAX;
+		td.Height = SVC_LIFT_CURSOR_PATCH_MAX;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = fmt;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(sys->device->CreateTexture2D(&td, nullptr, rb->staging.put()))) {
+			rb->staging.reset();
+			return;
+		}
+		rb->format = (uint32_t)fmt;
+	}
+	const float dw = (float)pin->depth_w, dh = (float)pin->depth_h;
+	int32_t x0 = (int32_t)floorf((du - radius_u) * dw), x1 = (int32_t)ceilf((du + radius_u) * dw);
+	int32_t y0 = (int32_t)floorf((dv - radius_v) * dh), y1 = (int32_t)ceilf((dv + radius_v) * dh);
+	// Cap the patch, keeping it centred on the cursor.
+	const int32_t cap = (int32_t)SVC_LIFT_CURSOR_PATCH_MAX;
+	if (x1 - x0 > cap) {
+		const int32_t cx = (x0 + x1) / 2;
+		x0 = cx - cap / 2;
+		x1 = x0 + cap;
+	}
+	if (y1 - y0 > cap) {
+		const int32_t cy = (y0 + y1) / 2;
+		y0 = cy - cap / 2;
+		y1 = y0 + cap;
+	}
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > (int32_t)pin->depth_w ? (int32_t)pin->depth_w : x1;
+	y1 = y1 > (int32_t)pin->depth_h ? (int32_t)pin->depth_h : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	D3D11_BOX box = {(UINT)x0, (UINT)y0, 0, (UINT)x1, (UINT)y1, 1};
+	sys->context->CopySubresourceRegion(rb->staging.get(), 0, 0, 0, 0, pin->depth_tex, 0, &box);
+	rb->pending = true;
+	rb->seq = lc->next_seq++;
+	rb->w = (uint32_t)(x1 - x0);
+	rb->h = (uint32_t)(y1 - y0);
+	rb->inverse = pin->depth_encoding == XRT_DP_LIFT_DEPTH_ENCODING_INVERSE;
+	rb->value_scale = pin->depth_value_scale;
+	rb->value_offset = pin->depth_value_offset;
+	rb->relief_scale = pin->relief_scale;
+	rb->relief_offset = pin->relief_offset;
+}
+
+/*!
+ * Where one atlas view of a lifted rect lives in the render target: window
+ * pixel (x, y) of the rect maps to target pixel (ox + x * sx, oy + y * sy).
+ */
+struct svc_lift_cursor_view
+{
+	float ox, oy;
+	float sx, sy;
+	D3D11_RECT clip;   //!< the rect's region in this view: the cursor never leaves it
+	uint32_t src_view; //!< the result view (and viewpoint) this atlas view shows
+};
+
+/*!
+ * Place and draw the depth cursor on one lifted rect, before the weave.
+ * @p pin is the result just written into the views (still pinned). Returns
+ * true when the cursor was drawn this frame — the caller then reports the
+ * rect, and the app hides its OS cursor over it.
+ */
+enum svc_lift_cursor_reason
+{
+	SVC_LC_DRAWN = 1,
+	SVC_LC_WORKSPACE_CURSOR,
+	SVC_LC_NO_WINDOW,
+	SVC_LC_NO_RECT_OR_VIEWPOINTS,
+	SVC_LC_NO_CURSOR_POS,
+	SVC_LC_NOT_OVER_WINDOW,
+	SVC_LC_NOT_OVER_PICTURE,
+	SVC_LC_NO_RELIEF,
+	SVC_LC_NO_DEPTH_SAMPLE,
+	SVC_LC_BAD_EYES,
+	SVC_LC_PROJECT_FAILED,
+	SVC_LC_NO_SPRITE,
+	SVC_LC_ON_PLANE,
+};
+
+static const char *
+svc_lift_cursor_reason_str(int r)
+{
+	switch (r) {
+	case SVC_LC_DRAWN: return "DRAWN";
+	case SVC_LC_WORKSPACE_CURSOR: return "not drawn: a workspace cursor is shown";
+	case SVC_LC_NO_WINDOW: return "not drawn: no bound weave window";
+	case SVC_LC_NO_RECT_OR_VIEWPOINTS: return "not drawn: empty rect, no viewpoints or no rect size";
+	case SVC_LC_NO_CURSOR_POS: return "not drawn: GetCursorPos failed";
+	case SVC_LC_NOT_OVER_WINDOW: return "not drawn: the cursor is not over the bound window";
+	case SVC_LC_NOT_OVER_PICTURE: return "not drawn: the cursor is not over the lifted picture";
+	case SVC_LC_NO_RELIEF: return "not drawn: no relief mapping (module without a display mapping)";
+	case SVC_LC_NO_DEPTH_SAMPLE: return "not drawn: no recent depth reading yet";
+	case SVC_LC_BAD_EYES: return "not drawn: viewpoints not in front of the screen";
+	case SVC_LC_PROJECT_FAILED: return "not drawn: degenerate placement";
+	case SVC_LC_NO_SPRITE: return "not drawn: no sprite";
+	case SVC_LC_ON_PLANE: return "not drawn: nothing comes out of the screen under it (OS cursor on the plane)";
+	default: return "?";
+	}
+}
+
+static bool
+svc_lift_cursor_draw_impl(struct d3d11_service_system *sys,
+                          struct d3d11_service_compositor *c,
+                          struct d3d11_lift_pin *pin,
+                          const struct xrt_rect &rect,
+                          const struct svc_lift_cursor_view *views,
+                          uint32_t view_count,
+                          ID3D11RenderTargetView *rtv,
+                          float target_w,
+                          float target_h,
+                          int *why)
+{
+	// The workspace controller draws its own cursor; never two (until Phase 4).
+	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
+		*why = SVC_LC_WORKSPACE_CURSOR;
+		return false;
+	}
+	HWND hwnd = c->render.weave_hwnd;
+	if (hwnd == nullptr) {
+		*why = SVC_LC_NO_WINDOW;
+		return false;
+	}
+	if (rect.extent.w <= 0 || rect.extent.h <= 0 || pin->vp_count == 0 || pin->rect_size[0] <= 0.0f ||
+	    pin->rect_size[1] <= 0.0f) {
+		*why = SVC_LC_NO_RECT_OR_VIEWPOINTS;
+		return false;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct svc_lift_cursor *lc = svc_lift_cursor_slot(c, pin->stream_id, now_ns);
+	svc_lift_cursor_poll(sys, lc, now_ns);
+
+	// The OS cursor, in the bound window's client pixels — only when it is over
+	// that window (not another one on top of it).
+	POINT pt;
+	if (!GetCursorPos(&pt)) {
+		*why = SVC_LC_NO_CURSOR_POS;
+		return false;
+	}
+	HWND under = WindowFromPoint(pt);
+	if (under == nullptr || GetAncestor(under, GA_ROOT) != GetAncestor(hwnd, GA_ROOT) || !ScreenToClient(hwnd, &pt)) {
+		*why = SVC_LC_NOT_OVER_WINDOW;
+		return false;
+	}
+	const float fx = ((float)pt.x - (float)rect.offset.w) / (float)rect.extent.w;
+	const float fy = ((float)pt.y - (float)rect.offset.h) / (float)rect.extent.h;
+	const float a0 = pin->active[0], a1 = pin->active[1], a2 = pin->active[2], a3 = pin->active[3];
+	if (fx < a0 || fx >= a2 || fy < a1 || fy >= a3 || a2 <= a0 || a3 <= a1) {
+		*why = SVC_LC_NOT_OVER_PICTURE;
+		return false; // not over the converted picture (outside, or over a letterbox bar)
+	}
+
+	// Sprite size in window pixels: the system arrow at the window's DPI.
+	const UINT dpi = GetDpiForWindow(hwnd);
+	const float scale = dpi > 0 ? (float)dpi / 96.0f : 1.0f;
+	const float spr_w = (float)SVC_LIFT_CURSOR_SPRITE_W * scale, spr_h = (float)SVC_LIFT_CURSOR_SPRITE_H * scale;
+
+	// Phase 3c source: copy the footprint (the sprite + 50 %, ADR-046 §6) of
+	// this result's depth map; it is read back a frame or two later.
+	if (pin->relief_valid && d3d11_lift_pin_depth(pin)) {
+		const float act_w = (a2 - a0) * (float)rect.extent.w, act_h = (a3 - a1) * (float)rect.extent.h;
+		const float du = (fx - a0) / (a2 - a0), dv = (fy - a1) / (a3 - a1);
+		// The arrow hangs below-right of its hotspot: centre the footprint on it.
+		const float cu = du + 0.5f * spr_w / act_w, cv = dv + 0.5f * spr_h / act_h;
+		svc_lift_cursor_issue(sys, lc, pin, cu, cv, 0.75f * spr_w / act_w, 0.75f * spr_h / act_h);
+	}
+	if (!lc->logged) {
+		lc->logged = true;
+		U_LOG_W("[lift cursor] stream %llu: depth cursor requested — depth %s, relief mapping %s, %u viewpoint(s) "
+		        "(ADR-046 Amendment 1)",
+		        (unsigned long long)pin->stream_id, pin->depth_tex != nullptr ? "yes" : "NO",
+		        pin->relief_valid ? "yes" : "NO (module renders without a display mapping)", pin->vp_count);
+	}
+	// No depth reading yet, or none recently (depth stopped): leave the OS cursor.
+	if (!pin->relief_valid) {
+		*why = SVC_LC_NO_RELIEF;
+		return false;
+	}
+	if (!lc->have_sample || now_ns - lc->sample_ns > 500000000ull) {
+		*why = SVC_LC_NO_DEPTH_SAMPLE;
+		return false;
+	}
+
+	float e[3];
+	if (!u_lift_cursor_eye_midpoint(pin->vps, pin->vp_count, e)) {
+		*why = SVC_LC_BAD_EYES;
+		return false;
+	}
+	struct u_cursor_depth_tuning tuning;
+	u_cursor_depth_tuning_defaults(&tuning);
+	float content_d = 0.0f;
+	const bool has_content = lc->sample_has_content && u_lift_cursor_disparity_of_z(e, lc->sample_z, &content_d);
+	// ADR-046 Amendment 2 A, the one cursor policy: never behind the glass
+	// (rise only ahead of content that comes out of it), and on the plane the
+	// caller's own OS cursor is the cursor, so nothing is drawn there.
+	const float target = u_cursor_depth_target(&tuning, has_content, content_d);
+	const float d = u_cursor_depth_filter_step(&lc->filter, &tuning, target, now_ns);
+	if (!u_cursor_depth_should_draw(&tuning, d)) {
+		*why = SVC_LC_ON_PLANE;
+		return false;
+	}
+
+	// The cursor's point on the rect, rect-centre metres (+y up).
+	const float sx = (fx - 0.5f) * pin->rect_size[0], sy = (0.5f - fy) * pin->rect_size[1];
+	float xy[2 * U_LIFT_CURSOR_MAX_VIEWS];
+	const uint32_t nvp = pin->vp_count > U_LIFT_CURSOR_MAX_VIEWS ? U_LIFT_CURSOR_MAX_VIEWS : pin->vp_count;
+	if (!u_lift_cursor_project(e, sx, sy, d, pin->vps, nvp, xy)) {
+		*why = SVC_LC_PROJECT_FAILED;
+		return false;
+	}
+
+	ID3D11ShaderResourceView *sprite = svc_lift_cursor_sprite(sys);
+	if (sprite == nullptr) {
+		*why = SVC_LC_NO_SPRITE;
+		return false;
+	}
+	struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+	uint32_t nq = 0;
+	for (uint32_t i = 0; i < view_count && nq < SVC_CURSOR_MAX_QUADS; i++) {
+		const struct svc_lift_cursor_view *v = &views[i];
+		const uint32_t k = v->src_view < nvp ? v->src_view : nvp - 1;
+		// Rect metres -> window pixels -> target pixels. The hotspot is the
+		// arrow's tip, its top-left texel.
+		const float wx = (float)rect.offset.w + (0.5f + xy[2 * k + 0] / pin->rect_size[0]) * (float)rect.extent.w;
+		const float wy = (float)rect.offset.h + (0.5f - xy[2 * k + 1] / pin->rect_size[1]) * (float)rect.extent.h;
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = v->ox + wx * v->sx;
+		q->y = v->oy + wy * v->sy;
+		q->w = spr_w * v->sx;
+		q->h = spr_h * v->sy;
+		q->clip = v->clip;
+	}
+	// ADR-046 Amendment 2 B.7: soften the lifted cursor against crosstalk. The
+	// ghost is the largest neighbouring-view hotspot distance, in window (=
+	// panel) px; the blur cap follows the drawn sprite. (0 px, 1.0) - which a
+	// drawn lift cursor never is, it is off the glass - would be the crisp draw.
+	float ghost_px = 0.0f;
+	for (uint32_t k = 0; k + 1 < nvp; k++) {
+		const float gx = (xy[2 * (k + 1) + 0] - xy[2 * k + 0]) / pin->rect_size[0] * (float)rect.extent.w;
+		const float gy = (xy[2 * (k + 1) + 1] - xy[2 * k + 1]) / pin->rect_size[1] * (float)rect.extent.h;
+		const float g = sqrtf(gx * gx + gy * gy);
+		if (std::isfinite(g) && g > ghost_px) {
+			ghost_px = g;
+		}
+	}
+	const struct u_cursor_soften soften = u_cursor_draw_soften_sized(d, ghost_px, spr_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = false; // the arrow's texels are opaque or clear: either convention
+	style.shared_shaders = false; // this pass's colour model, as the crisp draw
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && spr_w > 0.0f && spr_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / spr_w;
+		style.radius_uv[1] = soften.blur_px / spr_h;
+	}
+	svc_draw_cursor_quads(sys, rtv, target_w, target_h, sprite, SVC_LIFT_CURSOR_SPRITE_W, SVC_LIFT_CURSOR_SPRITE_H,
+	                      quads, nq, /*tint*/ nullptr, /*convert_srgb*/ false, &style);
+	*why = SVC_LC_DRAWN;
+	return true;
+}
+
+//! svc_lift_cursor_draw_impl + one WARN whenever the outcome changes (never per frame).
+static bool
+svc_lift_cursor_draw(struct d3d11_service_system *sys,
+                     struct d3d11_service_compositor *c,
+                     struct d3d11_lift_pin *pin,
+                     const struct xrt_rect &rect,
+                     const struct svc_lift_cursor_view *views,
+                     uint32_t view_count,
+                     ID3D11RenderTargetView *rtv,
+                     float target_w,
+                     float target_h)
+{
+	int why = 0;
+	const bool drawn = svc_lift_cursor_draw_impl(sys, c, pin, rect, views, view_count, rtv, target_w, target_h, &why);
+	if (why != c->render.lift_cursor_reason) {
+		c->render.lift_cursor_reason = why;
+		U_LOG_W("[lift cursor] stream %llu: %s", (unsigned long long)pin->stream_id,
+		        svc_lift_cursor_reason_str(why));
+	}
+	return drawn;
+}
+
+/*
+ *
+ * ADR-046 Amendment 4 (XR_DXR_cursor_depth v8): the weave-rect cursor.
+ *
+ * The generalisation of the lifted-rect cursor above to ANY woven rect: the
+ * depth source is the weave caller's on-screen disparity (the web page's,
+ * through the browser) instead of a conversion's depth map. The pointer is
+ * read HERE, inside the submit (GetCursorPos -> the bound window -> the rect),
+ * not from the page; the placement is u_cursor_depth's one policy with the
+ * HYBRID anchor in the weave frame (u_cursor_weave_step); the look is the
+ * caller's sprite (an HCURSOR rasterised by comp_cursor_look, a texture, the
+ * default look or nothing); it is drawn by svc_draw_cursor_quads with the B.7
+ * softening into the service's scratch or crop, never into the caller's input.
+ *
+ * Zero cost unless requested (ADR-046 section 0): every function here returns
+ * at once for a submit that staged no request.
+ *
+ * Lifted rects that asked for the v6 cursor keep Amendment 1's drawer and its
+ * arrow until W3 (Decision 5); the pick below takes them into account so one
+ * window never shows two runtime cursors.
+ *
+ */
+
+enum svc_weave_cursor_reason
+{
+	SVC_WC_DRAWN = 1,
+	SVC_WC_DRAWN_HANDING_BACK,
+	SVC_WC_WORKSPACE_CURSOR,
+	SVC_WC_NO_WINDOW,
+	SVC_WC_NO_CURSOR_POS,
+	SVC_WC_NOT_OVER_WINDOW,
+	SVC_WC_NOT_OVER_A_REQUESTED_RECT,
+	SVC_WC_LIFTED_RECT,
+	SVC_WC_NO_DEPTH,
+	SVC_WC_FLAT_2D,
+	SVC_WC_NO_DISPLAY_INFO,
+	SVC_WC_NO_EYES,
+	SVC_WC_SPRITE_NONE,
+	SVC_WC_NO_SPRITE,
+	SVC_WC_NO_PIPELINE,
+	SVC_WC_FORCED_REFUSE,
+	SVC_WC_PLACEMENT_FAILED,
+	SVC_WC_ON_PLANE,
+	SVC_WC_NO_TILES,
+	SVC_WC_LEGACY_LAYOUT,
+};
+
+static const char *
+svc_weave_cursor_reason_str(int r)
+{
+	switch (r) {
+	case SVC_WC_DRAWN: return "DRAWN";
+	case SVC_WC_DRAWN_HANDING_BACK: return "drawn, reported NOT drawn (handing back to the OS cursor)";
+	case SVC_WC_WORKSPACE_CURSOR: return "not drawn: a workspace cursor is shown";
+	case SVC_WC_NO_WINDOW: return "not drawn: no bound weave window";
+	case SVC_WC_NO_CURSOR_POS: return "not drawn: GetCursorPos failed";
+	case SVC_WC_NOT_OVER_WINDOW: return "not drawn: the pointer is not over the bound window";
+	case SVC_WC_NOT_OVER_A_REQUESTED_RECT: return "not drawn: the pointer is over no rect with a depth";
+	case SVC_WC_LIFTED_RECT: return "not drawn here: the pointer is over a lifted rect (Amendment 1's cursor)";
+	case SVC_WC_NO_DEPTH: return "not drawn: no fresh depth for the hovered rect";
+	case SVC_WC_FLAT_2D: return "not drawn: the panel is in 2D";
+	case SVC_WC_NO_DISPLAY_INFO: return "not drawn: no window metrics / pixel pitch";
+	case SVC_WC_NO_EYES: return "not drawn: no valid eye pair from the display processor";
+	case SVC_WC_SPRITE_NONE: return "not drawn: the page hides its cursor (sprite NONE)";
+	case SVC_WC_NO_SPRITE: return "not drawn: no sprite could be built";
+	case SVC_WC_NO_PIPELINE: return "not drawn: cursor shaders unavailable";
+	case SVC_WC_FORCED_REFUSE: return "not drawn: DXR_CURSOR_DRAW_REFUSE";
+	case SVC_WC_PLACEMENT_FAILED: return "not drawn: degenerate placement";
+	case SVC_WC_ON_PLANE: return "not drawn: nothing comes out of the screen under it (OS cursor on the plane)";
+	case SVC_WC_NO_TILES: return "not drawn: the sprite falls outside the rect in every view";
+	case SVC_WC_LEGACY_LAYOUT: return "not drawn: the legacy single-rect layout has no cursor";
+	default: return "?";
+	}
+}
+
+static bool
+svc_format_is_srgb(DXGI_FORMAT f)
+{
+	return f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
+//! (Re)create the held sprite's texture from tightly packed premultiplied RGBA8.
+static bool
+svc_weave_cursor_upload_rgba(struct d3d11_service_system *sys,
+                             struct d3d11_client_render_resources *r,
+                             const uint8_t *rgba,
+                             uint32_t w,
+                             uint32_t h)
+{
+	r->wc_sprite_srv.reset();
+	r->wc_sprite_srv_srgb.reset();
+	r->wc_sprite_tex.reset();
+	r->wc_sprite_w = 0;
+	r->wc_sprite_h = 0;
+	if (rgba == nullptr || w == 0 || h == 0) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = rgba;
+	init.SysMemPitch = w * 4;
+	if (FAILED(sys->device->CreateTexture2D(&td, &init, r->wc_sprite_tex.put()))) {
+		r->wc_sprite_tex.reset();
+		return false;
+	}
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	HRESULT hr = sys->device->CreateShaderResourceView(r->wc_sprite_tex.get(), &sd, r->wc_sprite_srv.put());
+	if (SUCCEEDED(hr)) {
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = sys->device->CreateShaderResourceView(r->wc_sprite_tex.get(), &sd, r->wc_sprite_srv_srgb.put());
+	}
+	if (FAILED(hr)) {
+		r->wc_sprite_srv.reset();
+		r->wc_sprite_srv_srgb.reset();
+		r->wc_sprite_tex.reset();
+		return false;
+	}
+	r->wc_sprite_w = w;
+	r->wc_sprite_h = h;
+	return true;
+}
+
+/*!
+ * The texture carrier: open the caller's shared texture, copy it into a texture
+ * the service owns (so nothing keeps the caller's resource open), close the
+ * handle. Under render_mutex + immediate_ctx_mutex (the submit's locks).
+ */
+static bool
+svc_weave_cursor_import_texture(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r)
+{
+	HANDLE h = r->wc_tex_handle;
+	const bool is_dxgi = r->wc_tex_is_dxgi;
+	const struct xrt_weave_cursor_sprite_texture info = r->wc_tex_info;
+	r->wc_tex_handle = nullptr;
+	if (h == nullptr) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Texture2D> src;
+	HRESULT hr = is_dxgi ? sys->device->OpenSharedResource(h, IID_PPV_ARGS(src.put()))
+	                     : sys->device->OpenSharedResource1(h, IID_PPV_ARGS(src.put()));
+	weave_close_cached(h, is_dxgi);
+	if (FAILED(hr) || !src) {
+		U_LOG_W("[weave cursor] sprite texture: OpenSharedResource(%s) failed: 0x%08lx", is_dxgi ? "DXGI" : "NT",
+		        hr);
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC sdsc = {};
+	src->GetDesc(&sdsc);
+	DXGI_FORMAT tl;
+	DXGI_FORMAT unorm;
+	DXGI_FORMAT srgb;
+	switch (sdsc.Format) {
+	case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+	case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+		tl = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+		unorm = DXGI_FORMAT_R8G8B8A8_UNORM;
+		srgb = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		break;
+	case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+		tl = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+		unorm = DXGI_FORMAT_B8G8R8A8_UNORM;
+		srgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+		break;
+	default: U_LOG_W("[weave cursor] sprite texture: format %u is not RGBA8 / BGRA8", (unsigned)sdsc.Format); return false;
+	}
+	const uint32_t w = info.width < sdsc.Width ? info.width : sdsc.Width;
+	const uint32_t hh = info.height < sdsc.Height ? info.height : sdsc.Height;
+	if (w == 0 || hh == 0 || w > 256 || hh > 256) {
+		return false;
+	}
+	wil::com_ptr<ID3D11Texture2D> dst;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = hh;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = tl;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	if (FAILED(sys->device->CreateTexture2D(&td, nullptr, dst.put()))) {
+		return false;
+	}
+	wil::com_ptr<IDXGIKeyedMutex> km = src.try_query<IDXGIKeyedMutex>();
+	if (km) {
+		HRESULT ah = km->AcquireSync(0, 4);
+		if (FAILED(ah) || ah == static_cast<HRESULT>(WAIT_TIMEOUT)) {
+			U_LOG_W("[weave cursor] sprite texture: AcquireSync timed out - keeping the last look");
+			return false;
+		}
+	}
+	D3D11_BOX box = {0, 0, 0, w, hh, 1};
+	sys->context->CopySubresourceRegion(dst.get(), 0, 0, 0, 0, src.get(), 0, &box);
+	if (km) {
+		km->ReleaseSync(0);
+	}
+	wil::com_ptr<ID3D11ShaderResourceView> srv, srv_srgb;
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+	sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+	sd.Texture2D.MipLevels = 1;
+	sd.Format = unorm;
+	hr = sys->device->CreateShaderResourceView(dst.get(), &sd, srv.put());
+	if (SUCCEEDED(hr)) {
+		sd.Format = srgb;
+		hr = sys->device->CreateShaderResourceView(dst.get(), &sd, srv_srgb.put());
+	}
+	if (FAILED(hr)) {
+		return false;
+	}
+	r->wc_sprite_tex = dst;
+	r->wc_sprite_srv = srv;
+	r->wc_sprite_srv_srgb = srv_srgb;
+	r->wc_sprite_w = w;
+	r->wc_sprite_h = hh;
+	r->wc_sprite_hot_x = info.hot_x;
+	r->wc_sprite_hot_y = info.hot_y;
+	r->wc_sprite_size_m = info.size_m;
+	U_LOG_W("[weave cursor] sprite: caller texture %ux%u (generation %llu, hotspot %.1f,%.1f)", w, hh,
+	        (unsigned long long)info.generation, info.hot_x, info.hot_y);
+	return true;
+}
+
+//! The sprite one weave-rect cursor draw uses (views AddRef'd).
+struct svc_weave_cursor_sprite
+{
+	wil::com_ptr<ID3D11ShaderResourceView> srv;      //!< non-decoding
+	wil::com_ptr<ID3D11ShaderResourceView> srv_srgb; //!< decoding
+	uint32_t w, h;   //!< texels
+	float hot_u, hot_v;
+	float height_px; //!< drawn height in window (= panel) px at the glass
+	bool nothing;    //!< sprite NONE: draw nothing
+};
+
+/*!
+ * Resolve the request's sprite against the held one, loading a new carrier
+ * when its generation is new. @p dpi_scale is the bound window's DPI / 96;
+ * @p m_per_px the panel pitch. Updates the held generation (the state's
+ * spriteGeneration). False if no sprite at all could be produced.
+ */
+static bool
+svc_weave_cursor_sprite_get(struct d3d11_service_system *sys,
+                            struct d3d11_client_render_resources *r,
+                            const struct xrt_weave_cursor_request &req,
+                            float dpi_scale,
+                            float m_per_px,
+                            struct svc_weave_cursor_sprite *out)
+{
+	*out = {};
+	enum u_cursor_weave_sprite_action act =
+	    u_cursor_weave_sprite_resolve(req.sprite_kind, req.sprite_generation, r->wc_sprite_gen);
+	if (act == U_CURSOR_WEAVE_SPRITE_LOAD_OS_CURSOR) {
+		bool ok = comp_cursor_look_from_os_cursor(&r->wc_look, req.os_cursor, dpi_scale);
+		if (ok && (r->wc_look.generation != r->wc_look_uploaded || !r->wc_sprite_tex ||
+		           r->wc_sprite_kind != U_CURSOR_WEAVE_SPRITE_OS_CURSOR)) {
+			// The held texture may be another carrier's: upload the raster.
+			ok = svc_weave_cursor_upload_rgba(sys, r, r->wc_look.rgba, r->wc_look.w, r->wc_look.h);
+		}
+		if (ok) {
+			r->wc_look_uploaded = r->wc_look.generation;
+			r->wc_sprite_gen = req.sprite_generation;
+			r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_OS_CURSOR;
+			r->wc_sprite_os_cursor = req.os_cursor;
+			r->wc_sprite_hot_x = r->wc_look.hot_u * (float)r->wc_look.w;
+			r->wc_sprite_hot_y = r->wc_look.hot_v * (float)r->wc_look.h;
+			r->wc_sprite_size_m = req.size_m;
+			act = U_CURSOR_WEAVE_SPRITE_USE_HELD;
+		} else {
+			// A dead or unreadable handle: keep the last look, never a wrong one.
+			act = r->wc_sprite_tex ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+		}
+	} else if (act == U_CURSOR_WEAVE_SPRITE_LOAD_TEXTURE) {
+		if (r->wc_tex_handle != nullptr && r->wc_tex_info.generation == req.sprite_generation &&
+		    svc_weave_cursor_import_texture(sys, r)) {
+			r->wc_sprite_gen = req.sprite_generation;
+			r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_TEXTURE;
+			r->wc_sprite_os_cursor = 0;
+			if (req.size_m > 0.0f) {
+				r->wc_sprite_size_m = req.size_m;
+			}
+			act = U_CURSOR_WEAVE_SPRITE_USE_HELD;
+		} else {
+			act = r->wc_sprite_tex ? U_CURSOR_WEAVE_SPRITE_USE_HELD : U_CURSOR_WEAVE_SPRITE_USE_DEFAULT;
+		}
+	} else if (act == U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING) {
+		r->wc_sprite_gen = req.sprite_generation;
+		r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_NONE;
+	} else if (act == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT && req.sprite_kind == U_CURSOR_WEAVE_SPRITE_DEFAULT) {
+		r->wc_sprite_gen = req.sprite_generation;
+		r->wc_sprite_kind = U_CURSOR_WEAVE_SPRITE_DEFAULT;
+		r->wc_sprite_size_m = req.size_m;
+	}
+
+	if (act == U_CURSOR_WEAVE_SPRITE_USE_HELD) {
+		switch (r->wc_sprite_kind) {
+		case U_CURSOR_WEAVE_SPRITE_NONE: act = U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING; break;
+		case U_CURSOR_WEAVE_SPRITE_DEFAULT: act = U_CURSOR_WEAVE_SPRITE_USE_DEFAULT; break;
+		case U_CURSOR_WEAVE_SPRITE_OS_CURSOR:
+			// Re-rasterise when the window's DPI changed (cheap when it did not).
+			if (comp_cursor_look_from_os_cursor(&r->wc_look, r->wc_sprite_os_cursor, dpi_scale) &&
+			    r->wc_look.generation != r->wc_look_uploaded &&
+			    svc_weave_cursor_upload_rgba(sys, r, r->wc_look.rgba, r->wc_look.w, r->wc_look.h)) {
+				r->wc_look_uploaded = r->wc_look.generation;
+				r->wc_sprite_hot_x = r->wc_look.hot_u * (float)r->wc_look.w;
+				r->wc_sprite_hot_y = r->wc_look.hot_v * (float)r->wc_look.h;
+			}
+			break;
+		default: break;
+		}
+	}
+
+	if (act == U_CURSOR_WEAVE_SPRITE_DRAW_NOTHING) {
+		out->nothing = true;
+		return true;
+	}
+	if (act == U_CURSOR_WEAVE_SPRITE_USE_DEFAULT || !r->wc_sprite_srv || r->wc_sprite_w == 0 || r->wc_sprite_h == 0) {
+		struct svc_cursor_look_ref look = {};
+		if (!svc_cursor_look_get(sys, dpi_scale, &look)) {
+			return false;
+		}
+		out->srv = look.srv;
+		out->srv_srgb = look.srv_srgb;
+		out->w = look.w;
+		out->h = look.h;
+		out->hot_u = look.hot_u;
+		out->hot_v = look.hot_v;
+		const float size_m = r->wc_sprite_kind == U_CURSOR_WEAVE_SPRITE_DEFAULT ? r->wc_sprite_size_m : 0.0f;
+		out->height_px = size_m > 0.0f && m_per_px > 0.0f ? size_m / m_per_px : look.height_pt * dpi_scale;
+		return out->height_px > 0.0f;
+	}
+	out->srv = r->wc_sprite_srv;
+	out->srv_srgb = r->wc_sprite_srv_srgb;
+	out->w = r->wc_sprite_w;
+	out->h = r->wc_sprite_h;
+	out->hot_u = r->wc_sprite_hot_x / (float)r->wc_sprite_w;
+	out->hot_v = r->wc_sprite_hot_y / (float)r->wc_sprite_h;
+	// One image px is one panel px at the glass (the OS cursor raster is
+	// already at the window's DPI); sizeMeters overrides.
+	out->height_px = r->wc_sprite_size_m > 0.0f && m_per_px > 0.0f ? r->wc_sprite_size_m / m_per_px
+	                                                                : (float)r->wc_sprite_h;
+	return out->height_px > 0.0f;
+}
+
+/*!
+ * Draw the weave-rect cursor into @p rtv (the batch SBS scratch, @p layout
+ * NULL: two tiles of the window side by side; or the v6 crop, @p layout set),
+ * before the weave. Fills c->render.wc_out. @p lift_rect_mask: rect indices
+ * a lifted rect's own (v6) cursor owns.
+ */
+static int
+svc_weave_cursor_draw_impl(struct d3d11_service_system *sys,
+                           struct d3d11_service_compositor *c,
+                           struct xrt_display_processor_d3d11 *dp,
+                           const struct xrt_weave_cursor_request &req,
+                           const struct xrt_rect *rects,
+                           uint32_t rect_count,
+                           const struct xrt_weave_atlas_layout *layout,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           uint32_t lift_rect_mask,
+                           ID3D11RenderTargetView *rtv,
+                           float target_w,
+                           float target_h)
+{
+	struct d3d11_client_render_resources *r = &c->render;
+	const uint64_t now_ns = os_monotonic_get_ns();
+	if (rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		rect_count = XRT_WEAVE_CURSOR_MAX_RECTS;
+	}
+
+	// This submit's depths -> the 500 ms memo; every rect with a fresh depth is eligible.
+	struct u_cursor_weave_rect wr[XRT_WEAVE_CURSOR_MAX_RECTS];
+	for (uint32_t i = 0; i < rect_count; i++) {
+		wr[i] = {rects[i].offset.w, rects[i].offset.h, rects[i].extent.w, rects[i].extent.h};
+	}
+	for (uint32_t i = 0; i < req.rect_count && i < XRT_WEAVE_CURSOR_MAX_RECTS; i++) {
+		const struct xrt_weave_cursor_rect &e = req.rects[i];
+		if (e.rect_index < rect_count) {
+			u_cursor_weave_memo_put(&r->wc_memo[e.rect_index], e.rect_index, &wr[e.rect_index],
+			                        e.has_content != 0, e.disparity_px, now_ns);
+		}
+	}
+	uint32_t caller_mask = 0;
+	for (uint32_t i = 0; i < rect_count; i++) {
+		bool has = false;
+		float px = 0.0f;
+		if (u_cursor_weave_memo_get(&r->wc_memo[i], i, &wr[i], now_ns, &has, &px)) {
+			caller_mask |= 1u << i;
+		}
+	}
+
+	// Window DPI and pitch first: the sprite is resolved on every request, so
+	// the reported generation is right even on a frame that draws nothing.
+	HWND hwnd = r->weave_hwnd;
+	if (hwnd == nullptr) {
+		return SVC_WC_NO_WINDOW;
+	}
+	UINT dpi = GetDpiForWindow(hwnd);
+	const float dpi_scale = dpi > 0 ? (float)dpi / 96.0f : 1.0f;
+	const uint32_t disp_px_h = sys->base.info.display_pixel_height;
+	const float disp_h_m = sys->base.info.display_height_m;
+	const float m_per_px = (disp_px_h > 0 && disp_h_m > 0.0f) ? disp_h_m / (float)disp_px_h : 0.0f;
+	struct svc_weave_cursor_sprite spr;
+	const bool have_sprite = svc_weave_cursor_sprite_get(sys, r, req, dpi_scale, m_per_px, &spr);
+	r->wc_out.sprite_generation = r->wc_sprite_gen;
+
+	if (layout == nullptr && rects == nullptr) {
+		return SVC_WC_LEGACY_LAYOUT;
+	}
+	// The workspace controller draws its own cursor; never two.
+	if (sys->cursor_visible && sys->cursor_xsc != nullptr) {
+		return SVC_WC_WORKSPACE_CURSOR;
+	}
+	// The live pointer, in the bound window's client pixels - only over that window.
+	POINT pt;
+	if (!GetCursorPos(&pt)) {
+		return SVC_WC_NO_CURSOR_POS;
+	}
+	HWND under = WindowFromPoint(pt);
+	if (under == nullptr || GetAncestor(under, GA_ROOT) != GetAncestor(hwnd, GA_ROOT) || !ScreenToClient(hwnd, &pt)) {
+		return SVC_WC_NOT_OVER_WINDOW;
+	}
+	const float px = (float)pt.x + 0.5f, py = (float)pt.y + 0.5f;
+	const int32_t pick = u_cursor_weave_pick_rect(wr, rect_count, caller_mask | lift_rect_mask, px, py);
+	const enum u_cursor_weave_source src = u_cursor_weave_source_for(pick, caller_mask, lift_rect_mask);
+	if (src == U_CURSOR_WEAVE_SOURCE_LIFT) {
+		return SVC_WC_LIFTED_RECT;
+	}
+	if (src != U_CURSOR_WEAVE_SOURCE_CALLER) {
+		return SVC_WC_NOT_OVER_A_REQUESTED_RECT;
+	}
+	bool has_content = false;
+	float disparity_px = 0.0f;
+	if (!u_cursor_weave_memo_get(&r->wc_memo[pick], (uint32_t)pick, &wr[pick], now_ns, &has_content,
+	                             &disparity_px)) {
+		return SVC_WC_NO_DEPTH;
+	}
+	if (!sys->hardware_display_3d) {
+		return SVC_WC_FLAT_2D; // the views are shown flat: the OS cursor is right
+	}
+
+	// The weave frame: the bound window's centre, display axes, metres.
+	struct xrt_lift_rect_frame frame;
+	lift_rect_frame(sys, &c->base.base, nullptr, win_w, win_h, &frame);
+	if (!frame.valid || !(frame.width_m > 0.0f) || !(frame.height_m > 0.0f) || !(m_per_px > 0.0f)) {
+		return SVC_WC_NO_DISPLAY_INFO;
+	}
+	struct xrt_eye_positions eyes = {};
+	if (!xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &eyes) || !eyes.valid || eyes.count < 2) {
+		return SVC_WC_NO_EYES;
+	}
+	const uint32_t view_count = layout != nullptr ? layout->view_count : 2u;
+	if (view_count < 2 || view_count > SVC_CURSOR_MAX_QUADS || view_count > XRT_MAX_VIEWS) {
+		return SVC_WC_NO_TILES;
+	}
+	float eye_xyz[3 * 8];
+	const uint32_t ec = eyes.count > 8 ? 8 : eyes.count;
+	for (uint32_t i = 0; i < ec; i++) {
+		eye_xyz[3 * i + 0] = eyes.eyes[i].x;
+		eye_xyz[3 * i + 1] = eyes.eyes[i].y;
+		eye_xyz[3 * i + 2] = eyes.eyes[i].z;
+	}
+	float vps[3 * XRT_MAX_VIEWS];
+	if (!u_cursor_weave_viewpoints(eye_xyz, ec, view_count, frame.center, vps)) {
+		return SVC_WC_NO_EYES;
+	}
+	float content_d = 0.0f;
+	if (has_content &&
+	    !u_cursor_weave_px_to_baselines(disparity_px, m_per_px, u_cursor_weave_baseline(vps, view_count), &content_d)) {
+		return SVC_WC_NO_EYES;
+	}
+
+	struct u_cursor_depth_tuning tuning;
+	u_cursor_depth_tuning_defaults(&tuning);
+	struct u_cursor_weave_input in = {};
+	in.viewpoints = vps;
+	in.view_count = view_count;
+	in.u = px / (float)win_w;
+	in.v = py / (float)win_h;
+	in.sx = (in.u - 0.5f) * frame.width_m;
+	in.sy = (0.5f - in.v) * frame.height_m;
+	in.rect_index = (uint32_t)pick;
+	in.rect_w = wr[pick].w;
+	in.rect_h = wr[pick].h;
+	in.has_content = has_content;
+	in.content_d = content_d;
+	in.now_ns = now_ns;
+	struct u_cursor_weave_output out;
+	if (!u_cursor_weave_step(&r->wc_state, &tuning, &in, &out)) {
+		return SVC_WC_PLACEMENT_FAILED;
+	}
+	if (!out.draw) {
+		return SVC_WC_ON_PLANE;
+	}
+	if (!have_sprite) {
+		return SVC_WC_NO_SPRITE;
+	}
+	if (spr.nothing) {
+		return SVC_WC_SPRITE_NONE;
+	}
+	struct u_cursor_draw_request probe = {}; // the verification hook only reads the env
+	if (comp_cursor_draw_debug_refuse(&probe)) {
+		return SVC_WC_FORCED_REFUSE;
+	}
+
+	// Per view: the hotspot on the plane -> window px -> the view's tile.
+	const float spr_h = spr.height_px;
+	const float spr_w = spr_h * (float)spr.w / (float)spr.h;
+	const float hot_x = spr.hot_u * spr_w, hot_y = spr.hot_v * spr_h;
+	const struct xrt_rect &rc = rects[pick];
+	int32_t cx0 = rc.offset.w < 0 ? 0 : rc.offset.w, cy0 = rc.offset.h < 0 ? 0 : rc.offset.h;
+	int32_t cx1 = rc.offset.w + rc.extent.w, cy1 = rc.offset.h + rc.extent.h;
+	cx1 = cx1 > (int32_t)win_w ? (int32_t)win_w : cx1;
+	cy1 = cy1 > (int32_t)win_h ? (int32_t)win_h : cy1;
+	if (cx1 <= cx0 || cy1 <= cy0) {
+		return SVC_WC_NO_TILES;
+	}
+	float hot_px[2 * XRT_MAX_VIEWS];
+	struct svc_cursor_quad quads[SVC_CURSOR_MAX_QUADS];
+	uint32_t nq = 0;
+	for (uint32_t v = 0; v < view_count; v++) {
+		const float wx = (out.xy[2 * v + 0] / frame.width_m + 0.5f) * (float)win_w;
+		const float wy = (0.5f - out.xy[2 * v + 1] / frame.height_m) * (float)win_h;
+		hot_px[2 * v + 0] = wx;
+		hot_px[2 * v + 1] = wy;
+		float ox, oy, sx, sy;
+		if (layout != nullptr) {
+			ox = (float)((v % layout->tile_columns) * layout->content_view_w);
+			oy = (float)((v / layout->tile_columns) * layout->content_view_h);
+			sx = (float)layout->content_view_w / (float)win_w;
+			sy = (float)layout->content_view_h / (float)win_h;
+		} else {
+			ox = (float)(v * win_w);
+			oy = 0.0f;
+			sx = 1.0f;
+			sy = 1.0f;
+		}
+		struct svc_cursor_quad *q = &quads[nq++];
+		q->x = ox + (wx - hot_x) * sx;
+		q->y = oy + (wy - hot_y) * sy;
+		q->w = spr_w * sx;
+		q->h = spr_h * sy;
+		q->clip.left = (LONG)floorf(ox + (float)cx0 * sx);
+		q->clip.top = (LONG)floorf(oy + (float)cy0 * sy);
+		q->clip.right = (LONG)ceilf(ox + (float)cx1 * sx);
+		q->clip.bottom = (LONG)ceilf(oy + (float)cy1 * sy);
+	}
+	struct u_cursor_weave_rect clip = {cx0, cy0, cx1 - cx0, cy1 - cy0};
+	struct u_cursor_weave_rect bounds;
+	if (!u_cursor_weave_sprite_bounds(hot_px, view_count, spr_w, spr_h, hot_x, hot_y, &clip, &bounds)) {
+		return SVC_WC_NO_TILES;
+	}
+	if (!svc_cursor_shaders_ensure(sys)) {
+		return SVC_WC_NO_PIPELINE;
+	}
+
+	// B.7: the ghost is the largest neighbouring-view hotspot distance (window =
+	// panel px); the blur cap follows the drawn sprite.
+	float ghost_px = 0.0f;
+	for (uint32_t k = 0; k + 1 < view_count; k++) {
+		const float gx = hot_px[2 * (k + 1)] - hot_px[2 * k], gy = hot_px[2 * (k + 1) + 1] - hot_px[2 * k + 1];
+		const float g = sqrtf(gx * gx + gy * gy);
+		if (std::isfinite(g) && g > ghost_px) {
+			ghost_px = g;
+		}
+	}
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(out.disparity, ghost_px, spr_h, comp_cursor_soften_params());
+	struct svc_cursor_style style = {};
+	style.premultiplied = true; // every carrier is premultiplied (comp_cursor_look, the v8 texture contract)
+	style.shared_shaders = true;
+	style.alpha = soften.alpha;
+	if (soften.blur_px > 0.0f && spr_w > 0.0f && spr_h > 0.0f) {
+		style.radius_uv[0] = soften.blur_px / spr_w;
+		style.radius_uv[1] = soften.blur_px / spr_h;
+	}
+	// Colour (ADR-044): an _SRGB scratch decodes on write, so sample decoded;
+	// an encoded (UNORM) scratch takes the stored bytes as they are.
+	D3D11_RENDER_TARGET_VIEW_DESC rd = {};
+	rtv->GetDesc(&rd);
+	ID3D11ShaderResourceView *srv = svc_format_is_srgb(rd.Format) ? spr.srv_srgb.get() : spr.srv.get();
+	svc_draw_cursor_quads(sys, rtv, target_w, target_h, srv, spr.w, spr.h, quads, nq, /*tint*/ nullptr,
+	                      /*convert_srgb*/ false, &style);
+
+	if (!out.report_drawn) {
+		return SVC_WC_DRAWN_HANDING_BACK;
+	}
+	r->wc_out.drawn_rect_mask = 1u << (uint32_t)pick;
+	r->wc_out.bounds_x = bounds.x;
+	r->wc_out.bounds_y = bounds.y;
+	r->wc_out.bounds_w = bounds.w;
+	r->wc_out.bounds_h = bounds.h;
+	return SVC_WC_DRAWN;
+}
+
+//! svc_weave_cursor_draw_impl + one WARN whenever the outcome changes (never per frame).
+static void
+svc_weave_cursor_draw(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct xrt_display_processor_d3d11 *dp,
+                      const struct xrt_weave_cursor_request &req,
+                      const struct xrt_rect *rects,
+                      uint32_t rect_count,
+                      const struct xrt_weave_atlas_layout *layout,
+                      uint32_t win_w,
+                      uint32_t win_h,
+                      uint32_t lift_rect_mask,
+                      ID3D11RenderTargetView *rtv,
+                      float target_w,
+                      float target_h)
+{
+	const int why = rtv == nullptr ? (int)SVC_WC_NO_TILES
+	                               : svc_weave_cursor_draw_impl(sys, c, dp, req, rects, rect_count, layout, win_w,
+	                                                            win_h, lift_rect_mask, rtv, target_w, target_h);
+	if (why != c->render.wc_reason) {
+		c->render.wc_reason = why;
+		U_LOG_W("[weave cursor] '%s': %s (sprite generation %llu, ADR-046 Amendment 4)", c->slot_app_name,
+		        svc_weave_cursor_reason_str(why), (unsigned long long)c->render.wc_sprite_gen);
+	}
+}
+
+//! The rect indices whose lifted rect asked for Amendment 1's own cursor.
+static uint32_t
+svc_weave_cursor_lift_mask(const struct xrt_lift_weave_rect *lift_rects, uint32_t lift_count)
+{
+	uint32_t m = 0;
+	for (uint32_t k = 0; k < lift_count; k++) {
+		if (lift_rects[k].depth_cursor && lift_rects[k].rect_index < XRT_WEAVE_CURSOR_MAX_RECTS) {
+			m |= 1u << lift_rects[k].rect_index;
+		}
+	}
+	return m;
+}
+
+/*!
+ * The converter's viewpoints follow the viewer only through the eyes snapshot
+ * the conversion core reads (G7: every eye query this service answers is
+ * published there). A present-owner that converts a video asks for no eyes
+ * itself, so the snapshot went stale (2 s) and the policy fell back to the
+ * fixed nominal viewer: no look-around, where the old in-DP lift read the
+ * tracker on every frame. Query, and so publish, the weaving client's eyes on
+ * every lifted weave. The DP answers from its cached eye pair. Caller holds
+ * render_mutex (recursive).
+ */
+static void
+lift_refresh_eyes(struct d3d11_service_system *sys, struct d3d11_service_compositor *c)
+{
+	struct xrt_eye_positions eyes = {};
+	(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(&sys->base, &c->base.base, &eyes);
+}
+
+/*!
+ * Batch (v3) layout: rect @p rect is window-sized-input pixels holding a 2D
+ * frame. Snapshot it, then blit the stream's latest pair into the left / right
+ * tiles of the SBS scratch at the rect's position (or the 2D frame into both,
+ * FLAT, until the first result). Returns false when @p rect_index is not lifted
+ * (the caller then blits it as ordinary squeezed SBS).
+ */
+static bool
+lift_weave_rect_batch(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct d3d11_lift *lift,
+                      uint64_t owner,
+                      const struct xrt_lift_weave_rect *bindings,
+                      uint32_t binding_count,
+                      uint32_t rect_index,
+                      ID3D11ShaderResourceView *in_srv,
+                      uint32_t in_w,
+                      uint32_t in_h,
+                      const struct xrt_rect &rect,
+                      uint32_t win_w,
+                      uint32_t win_h)
+{
+	const struct xrt_lift_weave_rect *b = lift_binding_for_rect(bindings, binding_count, rect_index);
+	if (b == nullptr) {
+		return false;
+	}
+	// Clip to the input (xrt_offset fields are named w/h).
+	int32_t x0 = rect.offset.w < 0 ? 0 : rect.offset.w;
+	int32_t y0 = rect.offset.h < 0 ? 0 : rect.offset.h;
+	int32_t x1 = rect.offset.w + rect.extent.w;
+	int32_t y1 = rect.offset.h + rect.extent.h;
+	x1 = x1 > (int32_t)in_w ? (int32_t)in_w : x1;
+	y1 = y1 > (int32_t)in_h ? (int32_t)in_h : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return true; // nothing visible to lift; nothing to weave either
+	}
+	uint64_t frame_id = 0;
+	lift_refresh_eyes(sys, c);
+	struct xrt_lift_rect_frame frame;
+	lift_rect_frame(sys, &c->base.base, &rect, win_w, win_h, &frame);
+	d3d11_lift_rect_match_views(lift, owner, b->stream_id, 2); // the batch layout weaves a pair
+	(void)d3d11_lift_submit_srv_locked(lift, owner, b->stream_id, in_srv, in_w, in_h, (uint32_t)x0, (uint32_t)y0,
+	                                   (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), (int64_t)os_monotonic_get_ns(),
+	                                   b->has_params ? &b->params : nullptr,
+	                                   b->viewpoint_floats > 0 ? b->viewpoints : nullptr, b->viewpoint_floats,
+	                                   b->has_view_control ? &b->view_control : nullptr,
+	                                   b->rig.type != XRT_LIFT_RIG_NONE ? &b->rig : nullptr, &frame, &frame_id);
+
+	const float rx = (float)rect.offset.w, ry = (float)rect.offset.h;
+	const float rw = (float)rect.extent.w, rh = (float)rect.extent.h;
+	ID3D11RenderTargetView *rtv = c->render.weave_sbs_rtv.get();
+	const float atw = (float)(win_w * 2), ath = (float)win_h;
+
+	struct d3d11_lift_pin pin = {};
+	if (d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) && pin.view_count >= 1) {
+		uint32_t vl = 0, vr = 0;
+		lift_pick_pair(pin.view_count, &vl, &vr);
+		const float vw = (float)pin.width / (float)pin.view_count;
+		// Letterbox: the result covers only the ACTIVE part of the rect; the
+		// bars (subtitles in them included) are the 2D input, FLAT — the same
+		// pixels at the same place in both views, i.e. on the screen plane.
+		const float ax = rx + pin.active[0] * rw, ay = ry + pin.active[1] * rh;
+		const float aw = (pin.active[2] - pin.active[0]) * rw, ah = (pin.active[3] - pin.active[1]) * rh;
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vl, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, ax, ay, aw, ah, /*is_srgb*/ false,
+		                      /*blend*/ nullptr, rtv, atw, ath);
+		blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)vr, 0.0f, vw, (float)pin.height,
+		                      (float)pin.width, (float)pin.height, (float)win_w + ax, ay, aw, ah,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+		// The bars: the 2D input, FLAT, tiling the rect exactly around the active
+		// area — no overlap, so the woven picture meets them pixel-exact (the
+		// profile is per row, so the active area holds no bar rows to hide).
+		const float bar[4][4] = {
+		    {rx, ry, rw, ay - ry},                    // top
+		    {rx, ay + ah, rw, (ry + rh) - (ay + ah)}, // bottom
+		    {rx, ay, ax - rx, ah},                    // left
+		    {ax + aw, ay, (rx + rw) - (ax + aw), ah}, // right
+		};
+		for (int k = 0; k < 4; k++) {
+			const float *s = bar[k];
+			if (s[2] < 0.5f || s[3] < 0.5f) {
+				continue; // no bar on this edge
+			}
+			for (int eye = 0; eye < 2; eye++) {
+				blit_to_atlas_texture(sys, &c->render, in_srv, s[0], s[1], s[2], s[3], (float)in_w, (float)in_h,
+				                      (float)(eye * win_w) + s[0], s[1], s[2], s[3], /*is_srgb*/ false,
+				                      /*blend*/ nullptr, rtv, atw, ath);
+			}
+		}
+		// ADR-046 Amendment 1: the depth cursor, into both tiles of the SBS scratch.
+		if (b->depth_cursor) {
+			struct svc_lift_cursor_view cv[2];
+			for (uint32_t eye = 0; eye < 2; eye++) {
+				cv[eye].ox = (float)(eye * win_w);
+				cv[eye].oy = 0.0f;
+				cv[eye].sx = 1.0f;
+				cv[eye].sy = 1.0f;
+				cv[eye].clip.left = (LONG)(eye * win_w) + (LONG)x0;
+				cv[eye].clip.top = (LONG)y0;
+				cv[eye].clip.right = (LONG)(eye * win_w) + (LONG)x1;
+				cv[eye].clip.bottom = (LONG)y1;
+				cv[eye].src_view = eye == 0 ? vl : vr;
+			}
+			if (svc_lift_cursor_draw(sys, c, &pin, rect, cv, 2, rtv, atw, ath)) {
+				c->render.lift_cursor_mask |= 1u << (uint32_t)(b - bindings);
+			}
+		}
+		d3d11_lift_unpin(&pin);
+	} else {
+		// No result yet: weave it FLAT — the same 2D frame in both views.
+		blit_to_atlas_texture(sys, &c->render, in_srv, rx, ry, rw, rh, (float)in_w, (float)in_h, rx, ry, rw, rh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+		blit_to_atlas_texture(sys, &c->render, in_srv, rx, ry, rw, rh, (float)in_w, (float)in_h,
+		                      (float)win_w + rx, ry, rw, rh, /*is_srgb*/ false, /*blend*/ nullptr, rtv, atw, ath);
+	}
+	return true;
+}
+
+/*!
+ * v6 N-view layout: the crop (@c weave_crop_tex) holds the caller's packed
+ * atlas. For each lifted rect: snapshot its region of TILE 0 into the stream,
+ * then overwrite that region of every tile with the matching view of the
+ * stream's latest result. Until the first result the tiles stay as the caller
+ * drew them (a caller draws the 2D frame into every tile, i.e. flat).
+ */
+static void
+lift_weave_rects_nview(struct d3d11_service_system *sys,
+                       struct d3d11_service_compositor *c,
+                       struct d3d11_lift *lift,
+                       uint64_t owner,
+                       const struct xrt_lift_weave_rect *bindings,
+                       uint32_t binding_count,
+                       const struct xrt_rect *rects,
+                       uint32_t rect_count,
+                       const struct xrt_weave_atlas_layout *layout,
+                       uint32_t win_w,
+                       uint32_t win_h)
+{
+	if (rects == nullptr || win_w == 0 || win_h == 0) {
+		return;
+	}
+	const uint32_t cvw = layout->content_view_w, cvh = layout->content_view_h;
+	const float sx = (float)cvw / (float)win_w, sy = (float)cvh / (float)win_h;
+	const uint32_t packed_w = layout->tile_columns * cvw, packed_h = layout->tile_rows * cvh;
+	ID3D11ShaderResourceView *crop_srv = c->render.weave_crop_srv.get();
+	ID3D11RenderTargetView *crop_rtv = c->render.weave_crop_rtv.get();
+
+	lift_refresh_eyes(sys, c);
+	for (uint32_t k = 0; k < binding_count; k++) {
+		const struct xrt_lift_weave_rect *b = &bindings[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect &r = rects[b->rect_index];
+		// Tile-0 region, clipped to tile 0.
+		float fx0 = (float)r.offset.w * sx, fy0 = (float)r.offset.h * sy;
+		float fx1 = fx0 + (float)r.extent.w * sx, fy1 = fy0 + (float)r.extent.h * sy;
+		fx0 = fx0 < 0.0f ? 0.0f : fx0;
+		fy0 = fy0 < 0.0f ? 0.0f : fy0;
+		fx1 = fx1 > (float)cvw ? (float)cvw : fx1;
+		fy1 = fy1 > (float)cvh ? (float)cvh : fy1;
+		if (fx1 - fx0 < 1.0f || fy1 - fy0 < 1.0f) {
+			continue;
+		}
+		const uint32_t x0 = (uint32_t)fx0, y0 = (uint32_t)fy0;
+		const uint32_t w = (uint32_t)(fx1 - fx0), h = (uint32_t)(fy1 - fy0);
+		uint64_t frame_id = 0;
+		struct xrt_lift_rect_frame frame;
+		lift_rect_frame(sys, &c->base.base, &r, win_w, win_h, &frame);
+		// Spec 4 viewCount 0: the stream follows the active mode's views.
+		d3d11_lift_rect_match_views(lift, owner, b->stream_id,
+		                            layout->view_count != 0 ? layout->view_count
+		                                                    : layout->tile_columns * layout->tile_rows);
+		(void)d3d11_lift_submit_srv_locked(
+		    lift, owner, b->stream_id, crop_srv, packed_w, packed_h, x0, y0, w, h,
+		    (int64_t)os_monotonic_get_ns(), b->has_params ? &b->params : nullptr,
+		    b->viewpoint_floats > 0 ? b->viewpoints : nullptr, b->viewpoint_floats,
+		    b->has_view_control ? &b->view_control : nullptr,
+		    b->rig.type != XRT_LIFT_RIG_NONE ? &b->rig : nullptr, &frame, &frame_id);
+
+		struct d3d11_lift_pin pin = {};
+		if (!d3d11_lift_pin_latest(lift, owner, b->stream_id, &pin) || pin.view_count == 0) {
+			continue;
+		}
+		const float vw = (float)pin.width / (float)pin.view_count;
+		// Letterbox: the result covers only the ACTIVE part of the rect; the
+		// tiles already hold the caller's flat 2D frame in the bars.
+		const float ax = (float)x0 + pin.active[0] * (float)w, ay = (float)y0 + pin.active[1] * (float)h;
+		const float aw = (pin.active[2] - pin.active[0]) * (float)w;
+		const float ah = (pin.active[3] - pin.active[1]) * (float)h;
+		for (uint32_t v = 0; v < layout->view_count; v++) {
+			// Map the atlas view onto the result's views (equal counts: 1:1).
+			uint32_t src_v = v;
+			if (pin.view_count != layout->view_count) {
+				src_v = layout->view_count > 1
+				            ? (uint32_t)((float)v * (float)(pin.view_count - 1) / (float)(layout->view_count - 1) +
+				                         0.5f)
+				            : pin.view_count / 2;
+			}
+			const float dx = (float)((v % layout->tile_columns) * cvw) + ax;
+			const float dy = (float)((v / layout->tile_columns) * cvh) + ay;
+			blit_to_atlas_texture(sys, &c->render, pin.srv, vw * (float)src_v, 0.0f, vw, (float)pin.height,
+			                      (float)pin.width, (float)pin.height, dx, dy, aw, ah,
+			                      /*is_srgb*/ false, /*blend*/ nullptr, crop_rtv, (float)packed_w,
+			                      (float)packed_h);
+		}
+		// ADR-046 Amendment 1: the depth cursor, into every tile's copy of the rect.
+		if (b->depth_cursor && layout->view_count <= SVC_CURSOR_MAX_QUADS) {
+			struct svc_lift_cursor_view cv[SVC_CURSOR_MAX_QUADS];
+			for (uint32_t v = 0; v < layout->view_count; v++) {
+				const float tx = (float)((v % layout->tile_columns) * cvw);
+				const float ty = (float)((v / layout->tile_columns) * cvh);
+				cv[v].ox = tx;
+				cv[v].oy = ty;
+				cv[v].sx = sx;
+				cv[v].sy = sy;
+				cv[v].clip.left = (LONG)(tx + (float)x0);
+				cv[v].clip.top = (LONG)(ty + (float)y0);
+				cv[v].clip.right = (LONG)(tx + (float)(x0 + w));
+				cv[v].clip.bottom = (LONG)(ty + (float)(y0 + h));
+				uint32_t src_v = v;
+				if (pin.view_count != layout->view_count) {
+					src_v = layout->view_count > 1
+					            ? (uint32_t)((float)v * (float)(pin.view_count - 1) /
+					                             (float)(layout->view_count - 1) +
+					                         0.5f)
+					            : pin.view_count / 2;
+				}
+				cv[v].src_view = src_v;
+			}
+			if (svc_lift_cursor_draw(sys, c, &pin, r, cv, layout->view_count, crop_rtv, (float)packed_w,
+			                         (float)packed_h)) {
+				c->render.lift_cursor_mask |= 1u << k;
+			}
+		}
+		d3d11_lift_unpin(&pin);
+	}
+}
+
 
 //! (Re)allocate the server-owned weaved-output texture + RTV (+ the persistent
 //! fence on first use) sized to @p w × @p h. Caller holds sys->render_mutex.
@@ -24313,7 +30936,102 @@ service_weave_publish_wish(struct d3d11_service_system *sys,
  * rendering-mode request drain uses (store the state, then apply it under the
  * lock; nothing here waits on the vendor beyond one publish).
  */
-extern "C" bool
+extern "C" void
+comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->render.weave_overlay_unchanged_next = overlay_unchanged;
+}
+
+extern "C" void
+comp_d3d11_service_weave_set_capture_tag(struct xrt_compositor *xc, const char *tag)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// The trigger convention (u_capture_intent.h) names the process WITHOUT a
+	// trailing ".exe" ("displayxr_atlas_trigger.chrome"); the IPC-side basename
+	// keeps it ("chrome.exe"), so strip it here.
+	char tmp[sizeof(c->render.weave_capture_tag)];
+	snprintf(tmp, sizeof(tmp), "%s", tag != nullptr ? tag : "");
+	const size_t n = strlen(tmp);
+	if (n > 4 && _stricmp(tmp + n - 4, ".exe") == 0) {
+		tmp[n - 4] = '\0';
+	}
+	memcpy(c->render.weave_capture_tag, tmp, sizeof(tmp));
+}
+
+uint32_t
+comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc)
+{
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	return c != nullptr ? c->render.lift_cursor_mask : 0u;
+}
+
+void
+comp_d3d11_service_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy || req == nullptr ||
+	    req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	c->render.wc_req_next = *req;
+	c->render.wc_req_next_valid = true;
+}
+
+void
+comp_d3d11_service_weave_set_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                   xrt_graphics_buffer_handle_t handle,
+                                                   bool is_dxgi,
+                                                   const struct xrt_weave_cursor_sprite_texture *info)
+{
+	HANDLE h = (HANDLE)handle;
+	if (xc == nullptr || xc->destroy != compositor_destroy || info == nullptr) {
+		weave_close_cached(h, is_dxgi);
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// Latest wins: an unconsumed older carrier is dropped (imported by the
+	// next submit whose request names this generation).
+	if (c->render.wc_tex_handle != nullptr) {
+		weave_close_cached(c->render.wc_tex_handle, c->render.wc_tex_is_dxgi);
+	}
+	c->render.wc_tex_handle = h;
+	c->render.wc_tex_is_dxgi = is_dxgi;
+	c->render.wc_tex_info = *info;
+}
+
+void
+comp_d3d11_service_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	if (out_state == nullptr) {
+		return;
+	}
+	*out_state = {};
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	*out_state = c->render.wc_out;
+}
+
+void
+comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// The wire is untrusted: anything outside [0,1] (incl. NaN) means "default".
+	c->render.weave_overlay_filter_strength_next = (strength >= 0.0f && strength <= 1.0f) ? strength : -1.0f;
+}
+
+bool
 comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  uint32_t rect_count,
                                                  const struct xrt_rect *screen_rects)
@@ -24550,7 +31268,790 @@ dxr_diag_dump_tex(struct d3d11_service_system *sys, ID3D11Texture2D *tex, const 
  *    present-owner weaves into its own handback texture but does not get to
  *    move the panel.
  */
-extern "C" bool
+extern "C" /*
+ * Weave import caches: a legacy DXGI shared handle is a stable global value, but
+ * an NT handle reaches the service DUPLICATED per submit — a new value every
+ * frame for the same texture. Keying the cache on the value re-opened the texture
+ * and made a new SRV every frame (and leaked the duplicate), which also defeats
+ * any DP-side reuse keyed on the SRV (the SR cached 2D prefilter). So NT handles
+ * are compared as kernel objects, exactly like d3d11_lift.cpp's import cache:
+ * on a match the per-frame duplicate is closed and the cached import kept; on a
+ * miss the new handle is adopted and the previous cached one closed.
+ */
+static bool
+weave_same_kernel_object(HANDLE a, HANDLE b)
+{
+	typedef BOOL(WINAPI * pfn_t)(HANDLE, HANDLE);
+	static pfn_t fn = []() -> pfn_t {
+		HMODULE m = GetModuleHandleA("kernelbase.dll");
+		return m != nullptr ? (pfn_t)(void *)GetProcAddress(m, "CompareObjectHandles") : nullptr;
+	}();
+	if (fn == nullptr || a == nullptr || b == nullptr) {
+		return false;
+	}
+	return fn(a, b) != FALSE;
+}
+
+//! True when @p h names the texture already imported as @p cached (see above).
+static bool
+weave_import_matches(HANDLE cached, bool cached_is_dxgi, HANDLE h, bool is_dxgi)
+{
+	if (cached == nullptr || cached_is_dxgi != is_dxgi) {
+		return false;
+	}
+	return cached == h || (!is_dxgi && weave_same_kernel_object(cached, h));
+}
+
+//! Close a handle the cache owned (NT only; a legacy DXGI handle is not ours).
+static void
+weave_close_cached(HANDLE h, bool is_dxgi)
+{
+	if (h != nullptr && h != INVALID_HANDLE_VALUE && !is_dxgi) {
+		CloseHandle(h);
+	}
+}
+
+/*
+ * DXR_WEAVE_GPU_TIMING=1 — per-stage cost of the present-owner weave (ADR-027
+ * Amendment perf A/B: iGPU vs dGPU, compose on/off; "2D under the lens" P0
+ * instrumentation). Diagnostic only, off by default; env read once.
+ *
+ * GPU: six timestamps per submit bracket the stages —
+ *   BEGIN | #1058 output clear | CLEARED | ingest (v6 crop copy + lift, or the
+ *   batch SBS scratch clear + per-rect blits; nothing on v6 zero-copy / legacy)
+ *   | PRE_WEAVE | set_overlay_2d + process_atlas (the DP's weave, incl. any
+ *   in-weave 2D compose and its alpha gate) | POST_WEAVE | runtime post-weave
+ *   overlay blit (fallback) | POST_FALLBACK | wish publish + diag epilogue | END
+ * Non-blocking: a query set still in flight when its ring slot comes round
+ * again is dropped, never waited on (this runs under render_mutex).
+ *
+ * CPU: wall time of the render_mutex and immediate_ctx_mutex waits, the input
+ * and overlay keyed-mutex acquires, and the whole synchronous submit (entry to
+ * return, incl. the fence signal + flush).
+ *
+ * One WARN line per client every 5 s (never per frame).
+ */
+enum weave_timing_ts
+{
+	WEAVE_TS_BEGIN = 0,
+	WEAVE_TS_CLEARED,
+	WEAVE_TS_PRE_WEAVE,
+	WEAVE_TS_POST_WEAVE,
+	WEAVE_TS_POST_FALLBACK,
+	WEAVE_TS_END,
+	WEAVE_TS_COUNT,
+};
+enum weave_timing_gpu_stage
+{
+	WEAVE_GPU_CLEAR_1058 = 0, //!< frames that cleared the output only
+	WEAVE_GPU_INPUT_COPY,     //!< v6 crop path only (copy + lift)
+	WEAVE_GPU_SBS,            //!< batch path only (scratch clear + blits)
+	WEAVE_GPU_WEAVE,          //!< set_overlay_2d + process_atlas
+	WEAVE_GPU_FALLBACK,       //!< frames whose overlay took the runtime blit only
+	WEAVE_GPU_EPILOGUE,       //!< wish publish + diag, before the fence signal
+	WEAVE_GPU_TOTAL,          //!< BEGIN..END
+	WEAVE_GPU_STAGE_COUNT,
+};
+enum weave_timing_cpu_stage
+{
+	WEAVE_CPU_RENDER_MUTEX = 0,
+	WEAVE_CPU_CTX_MUTEX,
+	WEAVE_CPU_IN_ACQUIRE,
+	WEAVE_CPU_OV_ACQUIRE, //!< submits that carried an overlay only
+	WEAVE_CPU_SUBMIT,
+	WEAVE_CPU_STAGE_COUNT,
+};
+enum weave_timing_path
+{
+	WEAVE_PATH_V6_ZERO_COPY = 0,
+	WEAVE_PATH_V6_CROP,
+	WEAVE_PATH_BATCH,
+	WEAVE_PATH_LEGACY,
+	WEAVE_PATH_COUNT,
+};
+enum weave_timing_route
+{
+	WEAVE_OV_NONE = 0, //!< no overlay this submit
+	WEAVE_OV_DP,       //!< the DP composited it inside the weave
+	WEAVE_OV_FALLBACK, //!< the runtime's post-weave blit composited it
+	WEAVE_OV_COUNT,
+};
+static_assert(WEAVE_TS_COUNT == d3d11_client_render_resources::kWeaveTs, "timestamp count");
+static_assert(WEAVE_GPU_STAGE_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_gpu_stage), "gpu stages");
+static_assert(WEAVE_CPU_STAGE_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_stage), "cpu stages");
+static_assert(WEAVE_PATH_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_path_n), "paths");
+static_assert(WEAVE_OV_COUNT == ARRAY_SIZE(d3d11_client_render_resources::weave_cpu_route_n), "routes");
+
+//! weave_gpu_route[] packs the route in bits 0-1 and "output cleared" in bit 2.
+#define WEAVE_GPU_FLAG_CLEARED 0x4u
+
+static bool
+weave_gpu_timing_enabled(void)
+{
+	static int s_on = -1;
+	if (s_on < 0) {
+		const char *v = getenv("DXR_WEAVE_GPU_TIMING");
+		s_on = (v != nullptr && v[0] == '1') ? 1 : 0;
+		if (s_on == 1) {
+			U_LOG_W(
+			    "DXR_WEAVE_GPU_TIMING=1: logging present-owner weave stage timing (GPU + CPU) every 5 s");
+		}
+	}
+	return s_on == 1;
+}
+
+static void
+weave_timing_stat_add(d3d11_client_render_resources::weave_timing_stat &s, double v)
+{
+	s.sum += v;
+	if (v > s.max) {
+		s.max = v;
+	}
+	s.n++;
+}
+
+static double
+weave_timing_stat_avg(const d3d11_client_render_resources::weave_timing_stat &s)
+{
+	return s.n > 0 ? s.sum / (double)s.n : 0.0;
+}
+
+static void
+weave_gpu_timing_collect(struct d3d11_service_system *sys, struct d3d11_client_render_resources *r, uint32_t slot)
+{
+	if (!r->weave_gpu_pending[slot]) {
+		return;
+	}
+	D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj = {};
+	UINT64 t[WEAVE_TS_COUNT] = {};
+	ID3D11DeviceContext *ctx = sys->context.get();
+	if (ctx->GetData(r->weave_gpu_disjoint[slot].get(), &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) {
+		return; // still in flight — keep it pending
+	}
+	for (int i = 0; i < WEAVE_TS_COUNT; i++) {
+		if (ctx->GetData(r->weave_gpu_ts[slot][i].get(), &t[i], sizeof(t[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) !=
+		    S_OK) {
+			return;
+		}
+	}
+	r->weave_gpu_pending[slot] = false;
+	if (dj.Disjoint || dj.Frequency == 0) {
+		r->weave_gpu_n_disjoint++;
+		return;
+	}
+	const double to_ms = 1000.0 / (double)dj.Frequency;
+	auto span = [&](int a, int b) { return t[b] >= t[a] ? (double)(t[b] - t[a]) * to_ms : 0.0; };
+	const uint8_t path = r->weave_gpu_path[slot];
+	const uint8_t route = r->weave_gpu_route[slot] & 0x3u;
+	if ((r->weave_gpu_route[slot] & WEAVE_GPU_FLAG_CLEARED) != 0) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_CLEAR_1058], span(WEAVE_TS_BEGIN, WEAVE_TS_CLEARED));
+	}
+	if (path == WEAVE_PATH_V6_CROP) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_INPUT_COPY],
+		                      span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
+	} else if (path == WEAVE_PATH_BATCH) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_SBS], span(WEAVE_TS_CLEARED, WEAVE_TS_PRE_WEAVE));
+	}
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_WEAVE], span(WEAVE_TS_PRE_WEAVE, WEAVE_TS_POST_WEAVE));
+	if (route == WEAVE_OV_FALLBACK) {
+		weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_FALLBACK],
+		                      span(WEAVE_TS_POST_WEAVE, WEAVE_TS_POST_FALLBACK));
+	}
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_EPILOGUE], span(WEAVE_TS_POST_FALLBACK, WEAVE_TS_END));
+	weave_timing_stat_add(r->weave_gpu_stage[WEAVE_GPU_TOTAL], span(WEAVE_TS_BEGIN, WEAVE_TS_END));
+	r->weave_gpu_n++;
+}
+
+/*!
+ * One submit's GPU timestamp set. RAII: a submit that bails out after begin()
+ * closes the disjoint query and discards the set (never read back). Declare it
+ * AFTER the immediate_ctx_mutex guard so every End() runs under that lock.
+ */
+struct weave_gpu_frame
+{
+	struct d3d11_service_system *sys = nullptr;
+	struct d3d11_client_render_resources *r = nullptr;
+	uint32_t slot = UINT32_MAX;
+	bool ended = false;
+
+	void
+	begin(struct d3d11_service_system *s, struct d3d11_client_render_resources *res)
+	{
+		if (!weave_gpu_timing_enabled()) {
+			return;
+		}
+		sys = s;
+		r = res;
+		for (uint32_t i = 0; i < d3d11_client_render_resources::kWeaveGpuRing; i++) {
+			weave_gpu_timing_collect(sys, r, i);
+		}
+		const uint32_t sl = r->weave_gpu_head;
+		r->weave_gpu_head = (sl + 1) % d3d11_client_render_resources::kWeaveGpuRing;
+		if (!r->weave_gpu_disjoint[sl]) {
+			D3D11_QUERY_DESC qd = {D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+			if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_disjoint[sl].put()))) {
+				return;
+			}
+			qd.Query = D3D11_QUERY_TIMESTAMP;
+			for (uint32_t i = 0; i < WEAVE_TS_COUNT; i++) {
+				if (FAILED(sys->device->CreateQuery(&qd, r->weave_gpu_ts[sl][i].put()))) {
+					r->weave_gpu_disjoint[sl].reset();
+					return;
+				}
+			}
+		}
+		r->weave_gpu_pending[sl] = false; // a slot still in flight is dropped, not waited on
+		sys->context->Begin(r->weave_gpu_disjoint[sl].get());
+		sys->context->End(r->weave_gpu_ts[sl][WEAVE_TS_BEGIN].get());
+		slot = sl;
+	}
+
+	void
+	stamp(int i)
+	{
+		if (slot != UINT32_MAX && !ended) {
+			sys->context->End(r->weave_gpu_ts[slot][i].get());
+		}
+	}
+
+	void
+	end(uint8_t path, uint8_t route, bool cleared)
+	{
+		if (slot == UINT32_MAX || ended) {
+			return;
+		}
+		sys->context->End(r->weave_gpu_ts[slot][WEAVE_TS_END].get());
+		sys->context->End(r->weave_gpu_disjoint[slot].get());
+		r->weave_gpu_pending[slot] = true;
+		r->weave_gpu_path[slot] = path;
+		r->weave_gpu_route[slot] = (uint8_t)(route | (cleared ? WEAVE_GPU_FLAG_CLEARED : 0u));
+		ended = true;
+	}
+
+	~weave_gpu_frame()
+	{
+		if (slot != UINT32_MAX && !ended) {
+			sys->context->End(r->weave_gpu_disjoint[slot].get()); // discarded: stays not-pending
+		}
+	}
+};
+
+/*!
+ * Fold one ACCEPTED submit's CPU times + route into the window, and log the
+ * window once every 5 s. @p cpu_ms is indexed by WEAVE_CPU_*; a negative
+ * entry is "not applicable this submit" (no overlay -> no ov_acquire).
+ */
+static void
+weave_timing_account(struct d3d11_service_system *sys,
+                     struct d3d11_client_render_resources *r,
+                     const double cpu_ms[WEAVE_CPU_STAGE_COUNT],
+                     uint8_t path,
+                     uint8_t route,
+                     bool ov_unchanged,
+                     uint32_t win_w,
+                     uint32_t win_h)
+{
+	if (!weave_gpu_timing_enabled()) {
+		return;
+	}
+	for (int i = 0; i < WEAVE_CPU_STAGE_COUNT; i++) {
+		if (cpu_ms[i] >= 0.0) {
+			weave_timing_stat_add(r->weave_cpu_stage[i], cpu_ms[i]);
+		}
+	}
+	r->weave_cpu_n++;
+	r->weave_cpu_path_n[path]++;
+	r->weave_cpu_route_n[route]++;
+	if (route != WEAVE_OV_NONE && ov_unchanged) {
+		r->weave_cpu_ov_unchanged++;
+	}
+
+	const int64_t now = (int64_t)os_monotonic_get_ns();
+	if (r->weave_gpu_last_log_ns == 0) {
+		r->weave_gpu_last_log_ns = now; // open the first window
+		return;
+	}
+	const int64_t window_ns = now - r->weave_gpu_last_log_ns;
+	if (window_ns < 5LL * 1000 * 1000 * 1000) {
+		return;
+	}
+	r->weave_gpu_last_log_ns = now;
+
+	DXGI_ADAPTER_DESC ad = {};
+	wil::com_ptr<IDXGIDevice> dxgi_dev;
+	wil::com_ptr<IDXGIAdapter> adapter;
+	if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+	    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put()))) {
+		adapter->GetDesc(&ad);
+	}
+	const auto &cs = r->weave_cpu_stage;
+	const auto &gs = r->weave_gpu_stage;
+	U_LOG_W(
+	    "weave timing [%ls] %ux%u %.1fs: submits=%u refused=%u paths(v6zc=%u v6crop=%u batch=%u legacy=%u) "
+	    "overlay(dp=%u fallback=%u none=%u unchanged=%u) | CPU ms avg/max: submit %.3f/%.3f "
+	    "render_mutex %.3f/%.3f ctx_mutex %.3f/%.3f in_acquire %.3f/%.3f ov_acquire %.3f/%.3f | "
+	    "GPU ms avg/max n=%u disjoint=%u: clear1058 %.3f/%.3f (n=%u) input_copy %.3f/%.3f (n=%u) "
+	    "sbs_clear_blit %.3f/%.3f (n=%u) weave %.3f/%.3f fallback_blit %.3f/%.3f (n=%u) "
+	    "epilogue %.3f/%.3f total %.3f/%.3f",
+	    ad.Description, win_w, win_h, (double)window_ns / 1e9, r->weave_cpu_n, r->weave_cpu_refused,
+	    r->weave_cpu_path_n[WEAVE_PATH_V6_ZERO_COPY], r->weave_cpu_path_n[WEAVE_PATH_V6_CROP],
+	    r->weave_cpu_path_n[WEAVE_PATH_BATCH], r->weave_cpu_path_n[WEAVE_PATH_LEGACY],
+	    r->weave_cpu_route_n[WEAVE_OV_DP], r->weave_cpu_route_n[WEAVE_OV_FALLBACK],
+	    r->weave_cpu_route_n[WEAVE_OV_NONE], r->weave_cpu_ov_unchanged, weave_timing_stat_avg(cs[WEAVE_CPU_SUBMIT]),
+	    cs[WEAVE_CPU_SUBMIT].max, weave_timing_stat_avg(cs[WEAVE_CPU_RENDER_MUTEX]), cs[WEAVE_CPU_RENDER_MUTEX].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_CTX_MUTEX]), cs[WEAVE_CPU_CTX_MUTEX].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_IN_ACQUIRE]), cs[WEAVE_CPU_IN_ACQUIRE].max,
+	    weave_timing_stat_avg(cs[WEAVE_CPU_OV_ACQUIRE]), cs[WEAVE_CPU_OV_ACQUIRE].max, r->weave_gpu_n,
+	    r->weave_gpu_n_disjoint, weave_timing_stat_avg(gs[WEAVE_GPU_CLEAR_1058]), gs[WEAVE_GPU_CLEAR_1058].max,
+	    gs[WEAVE_GPU_CLEAR_1058].n, weave_timing_stat_avg(gs[WEAVE_GPU_INPUT_COPY]), gs[WEAVE_GPU_INPUT_COPY].max,
+	    gs[WEAVE_GPU_INPUT_COPY].n, weave_timing_stat_avg(gs[WEAVE_GPU_SBS]), gs[WEAVE_GPU_SBS].max,
+	    gs[WEAVE_GPU_SBS].n, weave_timing_stat_avg(gs[WEAVE_GPU_WEAVE]), gs[WEAVE_GPU_WEAVE].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_FALLBACK]), gs[WEAVE_GPU_FALLBACK].max, gs[WEAVE_GPU_FALLBACK].n,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_EPILOGUE]), gs[WEAVE_GPU_EPILOGUE].max,
+	    weave_timing_stat_avg(gs[WEAVE_GPU_TOTAL]), gs[WEAVE_GPU_TOTAL].max);
+
+	memset(r->weave_gpu_stage, 0, sizeof(r->weave_gpu_stage));
+	memset(r->weave_cpu_stage, 0, sizeof(r->weave_cpu_stage));
+	memset(r->weave_cpu_path_n, 0, sizeof(r->weave_cpu_path_n));
+	memset(r->weave_cpu_route_n, 0, sizeof(r->weave_cpu_route_n));
+	r->weave_gpu_n = 0;
+	r->weave_gpu_n_disjoint = 0;
+	r->weave_cpu_n = 0;
+	r->weave_cpu_refused = 0;
+	r->weave_cpu_ov_unchanged = 0;
+}
+
+/*
+ *
+ * Multi-screen M6 for a present-owner (#1884, ADR-047 Amendment 4): an
+ * XR_DXR_weave caller's bound window that spans monitors is woven per screen,
+ * each screen's part by that screen's display processor, into the one woven
+ * handback texture; every screen's eyes go back to the caller.
+ *
+ */
+
+//! Drop the present-owner's weave segment manager. Holding render_mutex (no
+//! weave or snap of this client is in flight).
+static void
+weave_seg_release(struct d3d11_service_compositor *c)
+{
+	comp_d3d11_segments_destroy(&c->weave_segs);
+	comp_d3d11_outcomp_destroy(&c->weave_seg_outcomp);
+	c->weave_seg_device = nullptr;
+	std::lock_guard<std::mutex> lk(c->seg_mutex);
+	struct xrt_segment_metrics none;
+	memset(&none, 0, sizeof(none)); // memcmp'd by the publish: padding too
+	(void)comp_segments_publish(&c->weave_seg_pub, &none);
+	c->weave_seg_out = c->weave_seg_pub;
+}
+
+/*!
+ * One metric update of the present-owner's weave segments: (re)build the
+ * manager from the opt-in screen list when it changed (or the render device
+ * did), recompute the table for the bound window, run the DP lifecycle.
+ *
+ * The manager lives on `sys->device` — the device the woven handback and the
+ * #1172 ingest DP live on, i.e. the device this weave writes. (The direct
+ * pipeline's manager is on the OUTPUT device for the same reason: a segment
+ * DP is made where its target is.)
+ *
+ * Holding render_mutex and immediate_ctx_mutex.
+ *
+ * @return true when this submit must be woven per segment; @p out_win then
+ *         holds the window's client area in desktop px.
+ */
+static bool
+weave_seg_update(struct d3d11_service_system *sys,
+                 struct d3d11_service_compositor *c,
+                 HWND wnd,
+                 uint32_t win_w,
+                 uint32_t win_h,
+                 struct comp_seg_rect *out_win)
+{
+	ID3D11Device *dev = sys->device.get();
+	ID3D11DeviceContext *ctx = sys->context.get();
+	bool rebuild = false;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if (c->seg_screens == nullptr) {
+			return false; // never enabled: the single-DP weave, untouched
+		}
+		rebuild = c->weave_seg_rebuild || c->weave_seg_device != dev;
+	}
+	if (rebuild) {
+		weave_seg_release(c);
+		struct comp_d3d11_segments *ns = comp_d3d11_segments_create(dev);
+		bool enabled = false;
+		{
+			std::lock_guard<std::mutex> lk(c->seg_mutex);
+			if (ns != nullptr) {
+				comp_d3d11_segments_set_screens(ns, c->seg_screens, c->seg_sys_info,
+				                                c->seg_pinned_display_id);
+				enabled = comp_d3d11_segments_enabled(ns);
+			}
+			c->weave_seg_rebuild = false;
+		}
+		c->weave_segs = ns;
+		if (comp_d3d11_outcomp_create(dev, ctx, &c->weave_seg_outcomp) != XRT_SUCCESS) {
+			c->weave_seg_outcomp = nullptr; // segments that cannot weave then stay transparent, not flat 2D
+		}
+		c->weave_seg_device = dev; // tried once per device / list, never per frame
+		if (enabled) {
+			// Lifecycle (once per manager).
+			U_LOG_W(
+			    "segments: present-owner %p (pid %ld) — a bound window spanning monitors is woven "
+			    "per screen by weave_submit; segment DPs on the render device %p, per-screen eyes "
+			    "out (XR_DXR_weave v19, #1884)",
+			    (void *)c, c->client_pid, (void *)dev);
+		}
+	}
+	if (c->weave_segs == nullptr || !comp_d3d11_segments_enabled(c->weave_segs)) {
+		return false;
+	}
+	struct comp_seg_rect win = {};
+	if (!svc_seg_window_rect(wnd, &win) || win.w != win_w || win.h != win_h) {
+		return false; // no live window, or a resize in flight: weave this frame whole
+	}
+	const struct comp_seg_rect canvas = {0, 0, win.w, win.h};
+	const uint32_t mode_index =
+	    (sys->xdev != nullptr && sys->xdev->hmd != nullptr) ? sys->xdev->hmd->active_rendering_mode_index : 0;
+	const bool split = comp_d3d11_segments_update(c->weave_segs, &win, &canvas, ctx, mode_index);
+	// Every segment DP follows the panel's 2D/3D state on the screens the
+	// window covers, 2D on one it left (#2247); the client's weave DP on the
+	// primary keeps the panel's state (the multi-client union is a follow-up).
+	comp_d3d11_segments_set_display_mode(c->weave_segs, sys->hardware_display_3d);
+	*out_win = win;
+	return split;
+}
+
+/*!
+ * Weave a segmented submit: the window-canvas atlas @p src_srv (views
+ * @p view_w x @p view_h, @p cols x @p rows) cropped per segment and woven by
+ * each screen's DP into the handback, scissored to its segment; flat 2D where
+ * a segment cannot be woven. @p dp (the client's weave DP) weaves the primary
+ * screen's segment.
+ *
+ * The v4 overlay is NOT handed to a DP here: it is window-sized and a DP
+ * composites it over its whole target, which no segment DP covers. The
+ * runtime's post-weave blit composites it instead (ov_in_dp stays false), the
+ * pre-ADR-027-Amendment fallback every DP without the slot already gets.
+ *
+ * Holding render_mutex and immediate_ctx_mutex.
+ */
+static void
+weave_seg_record(struct d3d11_service_system *sys,
+                 struct d3d11_service_compositor *c,
+                 struct xrt_display_processor_d3d11 *dp,
+                 ID3D11ShaderResourceView *src_srv,
+                 uint32_t view_w,
+                 uint32_t view_h,
+                 uint32_t cols,
+                 uint32_t rows,
+                 uint32_t win_w,
+                 uint32_t win_h)
+{
+	ID3D11DeviceContext *ctx = sys->context.get();
+	// Stateless slot: say "no overlay this frame" so the primary DP does not
+	// keep compositing a previous frame's layer over its segment.
+	(void)xrt_display_processor_d3d11_set_overlay_2d(dp, ctx, nullptr, 0, 0, XRT_ATLAS_ENCODING_ENCODED, false);
+
+	struct comp_d3d11_segments_frame sf = {};
+	sf.context = ctx;
+	sf.src_srv = src_srv;
+	sf.view_width = view_w;
+	sf.view_height = view_h;
+	sf.tile_columns = cols;
+	sf.tile_rows = rows;
+	sf.src_format = (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM; // as the single-DP weave declares it
+	sf.target_rtv = c->render.weave_output_rtv.get();
+	sf.target_width = win_w;
+	sf.target_height = win_h;
+	sf.canvas.x = 0;
+	sf.canvas.y = 0;
+	sf.canvas.w = win_w;
+	sf.canvas.h = win_h;
+	// The present-owner composites the handback over its own window: alpha
+	// carries the 2D-vs-3D split, so the background is transparent and the
+	// client presents (pipeline_dp_set_transparency(..., client_presents=true)
+	// for the session's DP).
+	sf.transparent_background = true;
+	sf.client_presents = true;
+	sf.atlas_encoding = (int)service_single_client_atlas_encoding(c);
+	sf.primary_dp = dp;
+	sf.outcomp = c->weave_seg_outcomp;
+	comp_d3d11_segments_record(c->weave_segs, &sf);
+
+	// Leave exactly the state the single-DP weave leaves: the handback bound,
+	// full-target viewport and scissor.
+	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
+	ctx->OMSetRenderTargets(1, rtvs, nullptr);
+	D3D11_VIEWPORT vp = {};
+	vp.Width = (float)win_w;
+	vp.Height = (float)win_h;
+	vp.MaxDepth = 1.0f;
+	ctx->RSSetViewports(1, &vp);
+	D3D11_RECT sc = {0, 0, (LONG)win_w, (LONG)win_h};
+	ctx->RSSetScissorRects(1, &sc);
+}
+
+/*!
+ * Publish what this submit's weave did, for `weave_get_segments`: the table
+ * (count 0 = woven by one DP) with every segment's eyes — the primary's from
+ * @p primary_eyes (what the submit returns as its base eyes), the others
+ * predicted now from their segment DPs. The generation moves on a geometry
+ * change only (the eyes are not part of what is compared).
+ *
+ * Holding render_mutex.
+ */
+static void
+weave_seg_publish(struct d3d11_service_compositor *c,
+                  bool split,
+                  const struct comp_seg_rect *win,
+                  const struct xrt_eye_positions *primary_eyes)
+{
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m)); // memcmp'd by the publish: padding too
+	if (split && c->weave_segs != nullptr) {
+		const struct comp_seg_rect canvas = {0, 0, win->w, win->h};
+		(void)comp_d3d11_segments_get_metrics(c->weave_segs, win, &canvas, /*primary_has_dp*/ true, &m);
+	}
+	struct xrt_segment_metrics out;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		(void)comp_segments_publish(&c->weave_seg_pub, &m);
+		out = c->weave_seg_pub;
+	}
+	for (uint32_t k = 0; k < out.count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out.seg[k];
+		if (s->is_primary) {
+			s->have_eyes = primary_eyes != nullptr && primary_eyes->valid;
+			if (s->have_eyes) {
+				s->eyes = *primary_eyes;
+			}
+		} else {
+			s->have_eyes = comp_d3d11_segments_get_eyes(c->weave_segs, s->screen_id, &s->eyes);
+		}
+	}
+	std::lock_guard<std::mutex> lk(c->seg_mutex);
+	c->weave_seg_out = out;
+	c->weave_seg_out_ns = (int64_t)os_monotonic_get_ns();
+}
+
+/*!
+ * The session whose windowless weave DP weaves @p c's window, for a drag snap.
+ *
+ * ADR-060 R2 moved a present-owner's weave off the panel DP onto its own
+ * windowless DP. A present-owner can hold two sessions on one window: the
+ * browser's GPU process weaves, and its browser process only snaps, from the
+ * window's message loop. The lens and viewing distance a snap needs live on the
+ * weaver that weaves, so the snap session has to find that one. The panel DP
+ * has not woven this window and can only decline.
+ *
+ * Returns @p c itself when it weaves windowless, the sibling on the same window
+ * that does, or NULL when the window is not woven windowless (the panel DP's
+ * job, as before R2).
+ *
+ * Holding render_mutex.
+ */
+static struct d3d11_service_compositor *
+svc_weave_snap_owner(struct d3d11_service_compositor *c)
+{
+	if (c->render.weave_dp_windowless && c->render.weave_dp != nullptr) {
+		return c;
+	}
+	HWND wnd = c->render.weave_hwnd;
+	struct d3d11_multi_compositor *mc = c->sys->multi_comp;
+	if (wnd == nullptr || mc == nullptr) {
+		return nullptr;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		struct d3d11_service_compositor *o = mc->clients[i].compositor;
+		if (o != nullptr && o != c && o->render.weave_hwnd == wnd && o->render.weave_dp_windowless &&
+		    o->render.weave_dp != nullptr) {
+			return o;
+		}
+	}
+	return nullptr;
+}
+
+/*!
+ * The display processor whose lattice a drag snap of the present-owner's
+ * window uses (#1884): the majority screen's segment DP at the PROPOSED
+ * position, with the handle owner's hysteresis — NULL for the primary screen
+ * (the caller's own snap path) or when the window is not segmented.
+ *
+ * @p target_x / @p target_y position the window FRAME (WM_WINDOWPOSCHANGING);
+ * the screens split the CLIENT area, so the frame-to-client offset of the
+ * window as it stands now is carried to the target.
+ *
+ * Holding render_mutex.
+ */
+static struct xrt_display_processor_d3d11 *
+weave_seg_snap_dp(struct d3d11_service_compositor *c, int32_t target_x, int32_t target_y)
+{
+	if (c->weave_segs == nullptr || !comp_d3d11_segments_enabled(c->weave_segs)) {
+		return nullptr;
+	}
+	HWND wnd = c->render.weave_hwnd;
+	struct comp_seg_rect client = {};
+	RECT wr = {};
+	if (!svc_seg_window_rect(wnd, &client) || !GetWindowRect(wnd, &wr)) {
+		return nullptr;
+	}
+	struct comp_seg_rect at = {};
+	at.x = target_x + (client.x - wr.left);
+	at.y = target_y + (client.y - wr.top);
+	at.w = client.w;
+	at.h = client.h;
+	return comp_d3d11_segments_snap_dp(c->weave_segs, &at, os_monotonic_get_ns(), nullptr);
+}
+
+/*
+ * #2289: file-trigger capture for the present-owner (XR_DXR_weave) route — the
+ * Windows twin of the POSIX weave engines' #2207 trigger. The route never
+ * presents, so the two %TEMP%\workspace_screenshot sites (which sit just before
+ * a Present) never see it. Same names as u_capture_intent.h, read in the
+ * SERVICE's %TEMP%, per-client variants (the client's executable basename)
+ * checked before the global ones:
+ *
+ *   displayxr_atlas_trigger[.<exe>]             -> displayxr_atlas[.<exe>].input.png  (the caller's
+ *                                                  submitted buffer; best effort, read after the weave
+ *                                                  released its keyed-mutex hold)
+ *                                                  displayxr_atlas[.<exe>].png        (the DP input: the
+ *                                                  crop / batch atlas with the lifted rects written in)
+ *                                                  displayxr_atlas[.<exe>].woven.png  (the output handed
+ *                                                  back to the caller, overlay fallback included)
+ *   displayxr_atlas_trigger[.<exe>].projection  -> displayxr_atlas[.<exe>].projection.png (DP input only)
+ *
+ * Alpha is written as submitted (dxr_diag_dump_tex). Cost on the hot path: up
+ * to four GetFileAttributes per submit; the readbacks run only on a submit
+ * that consumed a trigger. One WARN per capture names the files.
+ */
+static bool
+svc_weave_capture_poll(const char *tag, bool *projection_only, char *stem, size_t stem_cap)
+{
+	const char *tmp = getenv("TEMP");
+	if (tmp == nullptr || tmp[0] == '\0') {
+		return false;
+	}
+	const bool have_tag = tag != nullptr && tag[0] != '\0';
+	struct cand
+	{
+		bool per_exe;
+		bool proj;
+	};
+	const cand order[] = {{true, true}, {true, false}, {false, true}, {false, false}};
+	for (const cand &k : order) {
+		if (k.per_exe && !have_tag) {
+			continue;
+		}
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s\\displayxr_atlas_trigger%s%s%s", tmp, k.per_exe ? "." : "",
+		         k.per_exe ? tag : "", k.proj ? ".projection" : "");
+		if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+			continue;
+		}
+		DeleteFileA(path);
+		snprintf(stem, stem_cap, "displayxr_atlas%s%s", k.per_exe ? "." : "", k.per_exe ? tag : "");
+		*projection_only = k.proj;
+		return true;
+	}
+	return false;
+}
+
+//! #2289: dump the texture behind an SRV (the DP input of whichever weave path ran).
+static void
+svc_weave_capture_dump_srv(struct d3d11_service_system *sys, ID3D11ShaderResourceView *srv, const char *name)
+{
+	if (srv == nullptr) {
+		return;
+	}
+	ID3D11Resource *res = nullptr;
+	srv->GetResource(&res);
+	if (res == nullptr) {
+		return;
+	}
+	ID3D11Texture2D *tex = nullptr;
+	if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex)) && tex != nullptr) {
+		dxr_diag_dump_tex(sys, tex, name);
+		tex->Release();
+	}
+	res->Release();
+}
+
+/*!
+ * How far a weave tile's edge pixels reach into the SBS atlas around the tile when a 2D layer
+ * is composited in the weave. A lens-period box is a few window pixels (about 4 at the edge on
+ * the 8K Leia panel) and anything wider only costs fill, because the opaque page covers it.
+ */
+#define WEAVE_TILE_EDGE_UNDERLAY_PX 16.0f
+
+/*!
+ * Extend one view's tile outward in the SBS atlas by repeating its edge pixels.
+ *
+ * The page layer has an alpha-0 hole where the tile is, and a DP that band-limits that layer for
+ * its lens (ADR-027 Amendment) softens the hole's edge, so coverage falls below 1 just OUTSIDE
+ * the tile. The DP blends layer + (1 - coverage) * woven there, and without this the woven side
+ * is the atlas's cleared (0,0,0,0): every windowed tile gets a dark line around it, at any page
+ * colour, scaling with the filter strength. With the tile's own colour underneath the blend stays
+ * continuous; everywhere the page is opaque this margin is covered and never seen.
+ *
+ * Call before ANY tile is drawn, so a neighbouring tile overwrites the margin. Corners come from
+ * the left and right strips, stretched over the extra rows.
+ *
+ * @param src_x,src_y,src_w,src_h The view's pixels in the caller's input (half the rect's width).
+ * @param tile_x                  Where this view's tile starts in the atlas (0, or win_w).
+ * @param rx,ry,rw,rh             The rect in window pixels, as the tile itself is drawn.
+ */
+static void
+weave_extend_tile_edges(struct d3d11_service_system *sys,
+                        struct d3d11_client_render_resources *res,
+                        ID3D11ShaderResourceView *src_srv,
+                        float src_x,
+                        float src_y,
+                        float src_w,
+                        float src_h,
+                        float src_tex_w,
+                        float src_tex_h,
+                        float tile_x,
+                        float rx,
+                        float ry,
+                        float rw,
+                        float rh,
+                        float win_w,
+                        float win_h,
+                        ID3D11RenderTargetView *rtv)
+{
+	// A span this narrow reads one texel centre with the linear sampler: a clamp, with no bleed
+	// from whatever the input holds beyond the rect.
+	const float texel = 0.01f;
+	const float near_edge = 0.5f - texel / 2.0f;
+	const float far_edge = 1.0f - near_edge;
+
+	// Clamped to this view's own tile: the atlas holds both views side by side.
+	const float left = (rx - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? rx - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float right =
+	    (rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX < win_w) ? rx + rw + WEAVE_TILE_EDGE_UNDERLAY_PX : win_w;
+	const float top = (ry - WEAVE_TILE_EDGE_UNDERLAY_PX > 0.0f) ? ry - WEAVE_TILE_EDGE_UNDERLAY_PX : 0.0f;
+	const float bottom =
+	    (ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX < win_h) ? ry + rh + WEAVE_TILE_EDGE_UNDERLAY_PX : win_h;
+	const float atlas_w = win_w * 2.0f;
+
+	const auto strip = [&](float sx, float sy, float sw, float sh, float dx, float dy, float dw, float dh) {
+		if (dw <= 0.0f || dh <= 0.0f) {
+			return;
+		}
+		blit_to_atlas_texture(sys, res, src_srv, sx, sy, sw, sh, src_tex_w, src_tex_h, tile_x + dx, dy, dw, dh,
+		                      /*is_srgb*/ false, /*blend*/ nullptr, rtv, atlas_w, win_h);
+	};
+
+	strip(src_x + near_edge, src_y, texel, src_h, left, top, rx - left, bottom - top);
+	strip(src_x + src_w - far_edge, src_y, texel, src_h, rx + rw, top, right - (rx + rw), bottom - top);
+	strip(src_x, src_y + near_edge, src_w, texel, rx, top, rw, ry - top);
+	strip(src_x, src_y + src_h - far_edge, src_w, texel, rx, ry + rh, rw, bottom - (ry + rh));
+}
+
+bool
 comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                xrt_graphics_buffer_handle_t in_handle,
                                bool in_is_dxgi,
@@ -24573,6 +32074,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes)
 {
+	// DXR_WEAVE_GPU_TIMING: CPU wall time of the whole synchronous submit.
+	const int64_t t_entry_ns = (int64_t)os_monotonic_get_ns();
 	// v4 Phase 1 composites the whole premul atlas; per-rect scoping is a future hint.
 	(void)overlay_rect_count;
 	(void)overlay_rects;
@@ -24603,9 +32106,60 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		return false;
 	}
 	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// XR_DXR_weave v14: consumed FIRST, so no exit path below can leave a stale
+	// "unchanged" for the next submit (per submit, no latch).
+	const bool ov_unchanged = c->render.weave_overlay_unchanged_next;
+	c->render.weave_overlay_unchanged_next = false;
+	const float ov_filter_strength = c->render.weave_overlay_filter_strength_next;
+	c->render.weave_overlay_filter_strength_next = -1.0f;
 	struct d3d11_service_system *sys = c->sys;
 	if (sys == nullptr) {
 		return false;
+	}
+	// Weave-idle release: stamp BEFORE any exit, so a submit that fails because
+	// its DP was just released still wakes the render thread's rebind.
+	c->weave_last_submit_ns.store((int64_t)os_monotonic_get_ns(), std::memory_order_release);
+
+	// XR_DXR_lift (ADR-042): take this submit's lift-flagged rects NOW, so every
+	// exit path below consumes them (a set is valid for exactly one submit).
+	struct xrt_lift_weave_rect lift_rects[XRT_LIFT_WEAVE_RECTS_MAX];
+	uint32_t lift_count = c->render.lift_rect_count;
+	const uint64_t lift_owner = c->render.lift_owner;
+	if (lift_count > XRT_LIFT_WEAVE_RECTS_MAX) {
+		lift_count = XRT_LIFT_WEAVE_RECTS_MAX;
+	}
+	if (lift_count > 0) {
+		memcpy(lift_rects, c->render.lift_rects, lift_count * sizeof(lift_rects[0]));
+	}
+	c->render.lift_rect_count = 0;
+	c->render.lift_cursor_mask = 0;
+	struct d3d11_lift *lift = lift_count > 0 ? sys->lift : nullptr;
+
+	// XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): this submit's weave-rect
+	// cursor request, consumed NOW like the lift rects (valid for one submit).
+	// No request: no cursor work, and the held sprite goes after 1 s idle.
+	const bool wc_have = c->render.wc_req_next_valid;
+	struct xrt_weave_cursor_request wc_req = {};
+	c->render.wc_req_next_valid = false;
+	c->render.wc_out = {};
+	{
+		const uint64_t wc_now_ns = os_monotonic_get_ns();
+		if (wc_have) {
+			wc_req = c->render.wc_req_next;
+			c->render.wc_last_req_ns = wc_now_ns;
+		} else if ((c->render.wc_sprite_gen != 0 || c->render.wc_sprite_tex || c->render.wc_tex_handle != nullptr) &&
+		           u_cursor_weave_sprite_idle(c->render.wc_last_req_ns, wc_now_ns)) {
+			svc_weave_cursor_release_sprite(&c->render);
+			if (c->render.wc_tex_handle != nullptr) {
+				weave_close_cached(c->render.wc_tex_handle, c->render.wc_tex_is_dxgi);
+				c->render.wc_tex_handle = nullptr;
+			}
+			c->render.wc_state = {};
+			U_LOG_W("[weave cursor] '%s': no request for 1 s - sprite released", c->slot_app_name);
+		}
+	}
+	if (lift == nullptr) {
+		lift_count = 0;
 	}
 
 	// #625: choose the display processor that performs the weave. A standalone
@@ -24661,7 +32215,22 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// between the read and the lock, and the weave then called through a freed
 	// vtable — the `weave_submit -> process_atlas -> 0x0` crash. The graveyard
 	// makes that survivable; resolving under the lock makes it impossible.
+	const int64_t t_pre_render_lock_ns = (int64_t)os_monotonic_get_ns();
 	render_mutex_fair_lock lock(sys);
+	const int64_t t_post_render_lock_ns = (int64_t)os_monotonic_get_ns();
+	// DXR_WEAVE_GPU_TIMING: counts a submit that returns false from here on
+	// (under render_mutex, which guards the per-client timing state).
+	struct weave_refused_counter
+	{
+		struct d3d11_client_render_resources *r;
+		bool accepted;
+		~weave_refused_counter()
+		{
+			if (!accepted && weave_gpu_timing_enabled()) {
+				r->weave_cpu_refused++;
+			}
+		}
+	} refused_counter{&c->render, false};
 
 	// #964 (D-4): on the pipeline path there is exactly ONE display processor
 	// per panel and the present-owner drives it like everyone else — never a
@@ -24817,19 +32386,33 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// the shared immediate context (input blits, the vendor weave, its
 	// post-weave alpha gate, the epilogue). Another client's lock-free commit
 	// blits must not interleave — see immediate_ctx_mutex.
+	const int64_t t_pre_ctx_lock_ns = (int64_t)os_monotonic_get_ns();
 	std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+	const int64_t t_post_ctx_lock_ns = (int64_t)os_monotonic_get_ns();
+	// DXR_WEAVE_GPU_TIMING GPU stage stamps; AFTER ctx_lock so its RAII close
+	// on an early return still runs under the immediate-context lock.
+	weave_gpu_frame gpu_frame;
+	uint8_t timing_path = WEAVE_PATH_LEGACY;
+	double ov_acquire_ms = -1.0; // < 0: no overlay this submit
 
 	if (!weave_ensure_output(c, win_w, win_h)) {
 		return false;
 	}
 
 	// Import the caller's pre-weave SBS input texture (NT or legacy DXGI
-	// handle) — cached by handle value: the caller reuses ONE shared input
-	// across frames, so open + SRV happen only when the handle changes
-	// (input re-created on resize), not per submit.
+	// handle) — cached by TEXTURE identity (see weave_import_matches): the
+	// caller reuses ONE shared input across frames, so open + SRV happen only
+	// when the texture changes (input re-created on resize), not per submit.
 	HRESULT hr;
-	if (c->render.weave_input_handle_cached != in || c->render.weave_input_cached_is_dxgi != in_is_dxgi ||
-	    !c->render.weave_input_tex || !c->render.weave_input_srv) {
+	if (c->render.weave_input_tex && c->render.weave_input_srv &&
+	    weave_import_matches(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi, in,
+	                         in_is_dxgi)) {
+		if (in != c->render.weave_input_handle_cached) {
+			weave_close_cached(in, in_is_dxgi); // this submit's duplicate of the cached texture
+		}
+		in = c->render.weave_input_handle_cached; // stable identity for #1058's frame boundary
+	} else {
+		weave_close_cached(c->render.weave_input_handle_cached, c->render.weave_input_cached_is_dxgi);
 		c->render.weave_input_handle_cached = nullptr;
 		c->render.weave_input_km.reset();
 		c->render.weave_input_srv.reset();
@@ -24874,6 +32457,14 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	D3D11_TEXTURE2D_DESC idesc = {};
 	in_tex->GetDesc(&idesc);
+
+	// #2289: present-owner capture trigger, decided once per submit; the
+	// dumps run after the weave (see svc_weave_capture_poll).
+	char cap_stem[96] = {0};
+	bool cap_projection_only = false;
+	const bool cap_armed = svc_weave_capture_poll(c->render.weave_capture_tag, &cap_projection_only, cap_stem,
+	                                              sizeof(cap_stem));
+	ID3D11ShaderResourceView *cap_dp_srv = nullptr; // the DP input of the path that ran
 
 	// DIAGNOSTIC ONLY (browser#73). Armed by creating
 	// %TEMP%\dxr_weave_dump_trigger; consumed (deleted) by the first submit that
@@ -24930,6 +32521,129 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	}
 	int64_t t_post_acquire_ns = os_monotonic_get_ns();
 
+	/*
+	 * v4 overlay atlas (browser#18) — imported and acquired BEFORE the weave
+	 * (ADR-027 Amendment, "2D under the lens").
+	 *
+	 * Flat 2D composited after the weave as plain pixels aliases through the
+	 * lens: each eye samples a different panel column of it. A display
+	 * processor that owns the lens phase can filter the layer per subpixel, but
+	 * only INSIDE the weave — so the overlay is handed to it via set_overlay_2d
+	 * immediately before process_atlas, and key 0 is held until the weave has
+	 * sampled it. When the DP declines (returns false) the post-weave runtime
+	 * blit below composites it exactly as before. Cached by handle like the
+	 * SBS input.
+	 *
+	 * An overlay that cannot be read this frame (import failed, or the 4 ms
+	 * acquire missed — #925 S1: held under render_mutex) REFUSES the submit,
+	 * like a missed input acquire, and does so here: before the output clear,
+	 * so the previous woven frame survives intact. A caller treats an accepted
+	 * submit that chained an overlay as "the runtime composited it" and stands
+	 * its own paint down; under a whole-page overlay (tiles as alpha-0 holes) a
+	 * frame accepted WITHOUT it would show no page at all for a frame. Refused,
+	 * the caller keeps presenting its last frame and retries.
+	 */
+	struct weave_overlay_hold
+	{
+		IDXGIKeyedMutex *km = nullptr;
+		void
+		release()
+		{
+			if (km != nullptr) {
+				km->ReleaseSync(0);
+				km = nullptr;
+			}
+		}
+		~weave_overlay_hold()
+		{
+			release();
+		}
+	} ov_hold;
+	ID3D11ShaderResourceView *ov_srv = nullptr;
+	uint32_t ov_w = 0;
+	uint32_t ov_h = 0;
+	HANDLE ov = (HANDLE)overlay_handle;
+	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
+		// Same texture-identity cache as the input: a STABLE SRV across frames is
+		// what lets the DP reuse its prefilter of an unchanged layer (v14).
+		if (c->render.weave_overlay_tex && c->render.weave_overlay_srv &&
+		    weave_import_matches(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi,
+		                         ov, overlay_is_dxgi)) {
+			if (ov != c->render.weave_overlay_handle_cached) {
+				weave_close_cached(ov, overlay_is_dxgi);
+			}
+		} else {
+			weave_close_cached(c->render.weave_overlay_handle_cached, c->render.weave_overlay_cached_is_dxgi);
+			c->render.weave_overlay_handle_cached = nullptr;
+			c->render.weave_overlay_km.reset();
+			c->render.weave_overlay_srv.reset();
+			c->render.weave_overlay_tex.reset();
+
+			if (overlay_is_dxgi) {
+				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			} else {
+				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
+			}
+			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
+				D3D11_TEXTURE2D_DESC odesc = {};
+				c->render.weave_overlay_tex->GetDesc(&odesc);
+				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+				sd.Format = odesc.Format;
+				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+				sd.Texture2D.MipLevels = 1;
+				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
+				                                           c->render.weave_overlay_srv.put());
+				if (SUCCEEDED(hr)) {
+					(void)c->render.weave_overlay_tex->QueryInterface(
+					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
+					c->render.weave_overlay_handle_cached = ov;
+					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
+					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
+					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
+				} else {
+					c->render.weave_overlay_srv.reset();
+					c->render.weave_overlay_tex.reset();
+				}
+			} else {
+				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
+				        overlay_is_dxgi ? "DXGI" : "NT", hr);
+				c->render.weave_overlay_tex.reset();
+			}
+		}
+
+		bool ov_ok = false;
+		if (c->render.weave_overlay_srv) {
+			D3D11_TEXTURE2D_DESC odesc = {};
+			c->render.weave_overlay_tex->GetDesc(&odesc);
+			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
+			ov_ok = (ov_km == nullptr);
+			ov_acquire_ms = 0.0; // no keyed mutex: nothing to wait on
+			if (ov_km != nullptr) {
+				const int64_t t_ov_acq_ns = (int64_t)os_monotonic_get_ns();
+				HRESULT ah = ov_km->AcquireSync(0, 4);
+				ov_acquire_ms = (double)((int64_t)os_monotonic_get_ns() - t_ov_acq_ns) / 1e6;
+				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
+					ov_hold.km = ov_km;
+					ov_ok = true;
+				} else {
+					U_LOG_W("#625 weave v4: overlay AcquireSync failed/timed out: 0x%08lx — submit refused",
+					        ah);
+				}
+			}
+			if (ov_ok) {
+				ov_srv = c->render.weave_overlay_srv.get();
+				ov_w = odesc.Width;
+				ov_h = odesc.Height;
+			}
+		}
+		if (!ov_ok) {
+			if (acquired && in_km) {
+				in_km->ReleaseSync(0);
+			}
+			return false;
+		}
+	}
+
 	ID3D11RenderTargetView *rtvs[] = {c->render.weave_output_rtv.get()};
 	const bool nview = (layout != nullptr && layout->view_count > 0);
 
@@ -24978,6 +32692,20 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	 *     bounded trail instead of an unbounded one.
 	 */
 	const bool legacy_single_rect = (!nview && rect_count == 0);
+
+	// #1884 (ADR-047 Amendment 4): a bound window across a seam is woven per
+	// screen. Batch and v6 only — both weave the WHOLE window as one canvas,
+	// which is what the segment table cuts; the legacy branch weaves one
+	// element-sized canvas per call and stays single-DP. A client that never
+	// enabled segments (every single-screen box) returns false here before
+	// anything else, so its submit is the single-DP one, byte for byte.
+	struct comp_seg_rect seg_win = {};
+	const bool seg_split = !legacy_single_rect && weave_seg_update(sys, c, wnd, win_w, win_h, &seg_win);
+	// ADR-060 R2: a windowless weave DP takes its phase from the origin the
+	// service reads now — every weave site below (v6, batch, legacy, and the
+	// primary segment of a split weave, whose canvas offset adds to it).
+	c->render.weave_origin_pending = false;
+	svc_weave_push_present_origin(c, dp, wnd);
 	bool clear_output = weave_frame_first;
 	if (weave_frame_first) {
 		c->render.weave_saw_frame_first = true;
@@ -24996,10 +32724,33 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 		c->render.weave_gen_inputs[c->render.weave_gen_count++] = in;
 	}
-	if (clear_output && c->render.weave_output_rtv) {
+	gpu_frame.begin(sys, &c->render);
+	const bool output_cleared = clear_output && c->render.weave_output_rtv;
+	if (output_cleared) {
 		const float out_transparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 		sys->context->ClearRenderTargetView(c->render.weave_output_rtv.get(), out_transparent);
 	}
+	gpu_frame.stamp(WEAVE_TS_CLEARED);
+
+	// Hand the overlay to the DP for the next process_atlas. Only on the
+	// full-window-canvas paths (v6, batch): the layer is window-sized and the
+	// DP composites it over the whole weave target, which the legacy
+	// single-rect path (canvas = one element) does not cover — that path keeps
+	// the post-weave blit. A layer that is not exactly window-sized (a resize
+	// in flight) also stays on the blit, which scales. Called on every weave,
+	// with NULL when there is no overlay this frame (stateless contract).
+	bool ov_in_dp = false;
+	auto hand_overlay_to_dp = [&]() {
+		const bool fits = (ov_srv != nullptr && ov_w == win_w && ov_h == win_h);
+		if (fits) {
+			// v15: per frame, before the layer itself (the slot is stateless).
+			xrt_display_processor_d3d11_set_overlay_2d_filter_strength(dp, ov_filter_strength);
+		}
+		ov_in_dp = xrt_display_processor_d3d11_set_overlay_2d(dp, sys->context.get(), fits ? ov_srv : nullptr,
+		                                                      fits ? ov_w : 0, fits ? ov_h : 0,
+		                                                      XRT_ATLAS_ENCODING_ENCODED, fits && ov_unchanged) &&
+		           fits;
+	};
 
 	if (nview) {
 		// Spec-v6 N-view atlas (#774): the caller already packed the atlas the
@@ -25035,10 +32786,20 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// atlas to fill the ACTIVE mode's atlas exactly. With a swapchain sized
 		// at the max over all modes, only the worst-case-achieving mode
 		// qualifies, and only at fullscreen (ADR-030).
-		const bool zero_copy = (packed_w == idesc.Width && packed_h == idesc.Height);
+		//
+		// XR_DXR_lift (ADR-042): a frame with lift-flagged rects writes lifted
+		// views INTO the atlas, which must never be the caller's own texture —
+		// so it always takes the crop.
+		//
+		// XR_DXR_cursor_depth v8: a cursor frame never zero-copies either (the
+		// cursor is drawn into the crop, never into the caller's texture).
+		const bool zero_copy =
+		    (packed_w == idesc.Width && packed_h == idesc.Height) && lift_count == 0 && !wc_have;
+		timing_path = zero_copy ? WEAVE_PATH_V6_ZERO_COPY : WEAVE_PATH_V6_CROP;
 		if (!zero_copy) {
 			if (!c->render.weave_crop_tex || c->render.weave_crop_w != packed_w ||
 			    c->render.weave_crop_h != packed_h || c->render.weave_crop_format != idesc.Format) {
+				c->render.weave_crop_rtv.reset();
 				c->render.weave_crop_srv.reset();
 				c->render.weave_crop_tex.reset();
 
@@ -25050,12 +32811,21 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 				cd.Format = idesc.Format;
 				cd.SampleDesc.Count = 1;
 				cd.Usage = D3D11_USAGE_DEFAULT;
-				cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+				// RENDER_TARGET too: XR_DXR_lift writes lifted views into it.
+				cd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
 				hr = sys->device->CreateTexture2D(&cd, nullptr, c->render.weave_crop_tex.put());
 				if (SUCCEEDED(hr)) {
 					hr = sys->device->CreateShaderResourceView(c->render.weave_crop_tex.get(),
 					                                           nullptr,
 					                                           c->render.weave_crop_srv.put());
+				}
+				if (SUCCEEDED(hr)) {
+					// Non-fatal: without it only lifted rects are skipped.
+					if (FAILED(sys->device->CreateRenderTargetView(c->render.weave_crop_tex.get(),
+					                                               nullptr,
+					                                               c->render.weave_crop_rtv.put()))) {
+						c->render.weave_crop_rtv.reset();
+					}
 				}
 				if (FAILED(hr)) {
 					U_LOG_E("#625 weave v6: crop texture %ux%u create failed: 0x%08lx", packed_w,
@@ -25083,6 +32853,20 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			sys->context->CopySubresourceRegion(c->render.weave_crop_tex.get(), 0, 0, 0, 0, in_tex, 0,
 			                                    &box);
 			dp_srv = c->render.weave_crop_srv.get();
+
+			// XR_DXR_lift (ADR-042): lift-flagged rects — snapshot tile 0's
+			// region into each stream, then overwrite that region of EVERY
+			// tile with the stream's latest view set.
+			if (lift_count > 0 && c->render.weave_crop_rtv) {
+				lift_weave_rects_nview(sys, c, lift, lift_owner, lift_rects, lift_count, rects, rect_count,
+				                       layout, win_w, win_h);
+			}
+			// XR_DXR_cursor_depth v8: the weave-rect cursor, into every tile of the crop.
+			if (wc_have) {
+				svc_weave_cursor_draw(sys, c, dp, wc_req, rects, rect_count, layout, win_w, win_h,
+				                      svc_weave_cursor_lift_mask(lift_rects, lift_count),
+				                      c->render.weave_crop_rtv.get(), (float)packed_w, (float)packed_h);
+			}
 		}
 
 		// Keyed-mutex release must straddle the DP read, NOT precede it. On the
@@ -25111,11 +32895,19 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
-		                                          /*view_w*/ cvw, /*view_h*/ cvh,
-		                                          layout->tile_columns, layout->tile_rows,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
-		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		cap_dp_srv = dp_srv;
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
+		if (seg_split) {
+			weave_seg_record(sys, c, dp, dp_srv, cvw, cvh, layout->tile_columns, layout->tile_rows, win_w,
+			                 win_h);
+		} else {
+			hand_overlay_to_dp();
+			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), dp_srv,
+			                                          /*view_w*/ cvw, /*view_h*/ cvh, layout->tile_columns,
+			                                          layout->tile_rows, DXGI_FORMAT_R8G8B8A8_UNORM, win_w,
+			                                          win_h,
+			                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		}
 		// #625 present-owner: a real panel-DP weave, driven by the client's own
 		// synchronous submit. It presents the woven texture itself, so this
 		// contributes to present/s with no matching panel flip (see header note).
@@ -25155,6 +32947,12 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		// page scrolls. Do not "optimise" that clear away for this branch.
 		uint32_t view_w = idesc.Width / 2;
 		uint32_t view_h = idesc.Height;
+		if (wc_have) {
+			// Resolves the sprite (so the state's generation is right) and logs
+			// that this layout has no cursor; draws nothing.
+			svc_weave_cursor_draw(sys, c, dp, wc_req, nullptr, 0, nullptr, win_w, win_h, 0, rtvs[0],
+			                      (float)win_w, (float)win_h);
+		}
 
 		// #1058 one-shot per client: this is the DEGRADED path — one weave()
 		// per element per frame (the SR predictor wants one per frame) and a
@@ -25176,6 +32974,8 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
+		cap_dp_srv = in_srv;
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
 		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), in_srv,
 		                                          view_w, view_h, /*tile_columns*/ 2, /*tile_rows*/ 1,
 		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h, rect_x, rect_y,
@@ -25186,6 +32986,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			in_km->ReleaseSync(0);
 		}
 	} else {
+		timing_path = WEAVE_PATH_BATCH;
 		// Spec-v3 batch: the input is window-sized with each rect's SBS
 		// content at that rect's own window position. The SR weaver's design
 		// contract is ONE weave() per frame — per-rect weave calls at N× the
@@ -25269,12 +33070,43 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 		const float src_tw = (float)idesc.Width;
 		const float src_th = (float)idesc.Height;
+		// Under a 2D layer the DP softens each tile's hole edge: give that edge the tile's own
+		// colour to blend with, not the cleared atlas. All margins first, so tiles overwrite them.
+		if (ov_srv != nullptr) {
+			for (uint32_t i = 0; i < rect_count; i++) {
+				const float rw = (float)rects[i].extent.w;
+				const float rh = (float)rects[i].extent.h;
+				const float rx = (float)rects[i].offset.w;
+				const float ry = (float)rects[i].offset.h;
+				bool lifted = false; // a lift-flagged rect holds 2D, not SBS, and draws from its stream
+				for (uint32_t k = 0; k < lift_count; k++) {
+					lifted = lifted || lift_rects[k].rect_index == i;
+				}
+				if (rw <= 0.0f || rh <= 0.0f || lifted) {
+					continue;
+				}
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx, ry, rw / 2.0f, rh, src_tw, src_th,
+				                        0.0f, rx, ry, rw, rh, (float)win_w, (float)win_h,
+				                        c->render.weave_sbs_rtv.get());
+				weave_extend_tile_edges(sys, &c->render, in_srv, rx + rw / 2.0f, ry, rw / 2.0f, rh, src_tw,
+				                        src_th, (float)win_w, rx, ry, rw, rh, (float)win_w,
+				                        (float)win_h, c->render.weave_sbs_rtv.get());
+			}
+		}
 		for (uint32_t i = 0; i < rect_count; i++) {
 			const float rw = (float)rects[i].extent.w;
 			const float rh = (float)rects[i].extent.h;
 			const float rx = (float)rects[i].offset.w; // xrt_offset fields are named w/h
 			const float ry = (float)rects[i].offset.h;
 			if (rw <= 0.0f || rh <= 0.0f) {
+				continue;
+			}
+			// XR_DXR_lift (ADR-042): a lift-flagged rect holds 2D, not SBS.
+			// Snapshot it into its stream and weave the stream's latest
+			// stereo pair here, at the rect's CURRENT position.
+			if (lift_count > 0 && lift_weave_rect_batch(sys, c, lift, lift_owner, lift_rects, lift_count, i,
+			                                            in_srv, idesc.Width, idesc.Height, rects[i], win_w,
+			                                            win_h)) {
 				continue;
 			}
 			// Left view: the rect's left half -> the left tile, at the
@@ -25287,6 +33119,13 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			                      src_th, (float)win_w + rx, ry, rw, rh, /*is_srgb*/ false,
 			                      /*blend*/ nullptr, c->render.weave_sbs_rtv.get(),
 			                      (float)(win_w * 2), (float)win_h);
+		}
+		// XR_DXR_cursor_depth v8: the weave-rect cursor, into both tiles, on top
+		// of every rect (it is clipped to the hovered one).
+		if (wc_have) {
+			svc_weave_cursor_draw(sys, c, dp, wc_req, rects, rect_count, nullptr, win_w, win_h,
+			                      svc_weave_cursor_lift_mask(lift_rects, lift_count),
+			                      c->render.weave_sbs_rtv.get(), (float)(win_w * 2), (float)win_h);
 		}
 
 		if (acquired && in_km) {
@@ -25310,11 +33149,19 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		sys->context->RSSetViewports(1, &weave_vp);
 		D3D11_RECT weave_scissor = {0, 0, (LONG)win_w, (LONG)win_h};
 		sys->context->RSSetScissorRects(1, &weave_scissor);
-		xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
-		                                          /*view_w*/ win_w, /*view_h*/ win_h,
-		                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
-		                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
-		                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		cap_dp_srv = c->render.weave_sbs_srv.get();
+		gpu_frame.stamp(WEAVE_TS_PRE_WEAVE);
+		if (seg_split) {
+			weave_seg_record(sys, c, dp, c->render.weave_sbs_srv.get(), win_w, win_h, /*cols*/ 2,
+			                 /*rows*/ 1, win_w, win_h);
+		} else {
+			hand_overlay_to_dp();
+			xrt_display_processor_d3d11_process_atlas(dp, sys->context.get(), c->render.weave_sbs_srv.get(),
+			                                          /*view_w*/ win_w, /*view_h*/ win_h,
+			                                          /*tile_columns*/ 2, /*tile_rows*/ 1,
+			                                          DXGI_FORMAT_R8G8B8A8_UNORM, win_w, win_h,
+			                                          /*canvas_offset*/ 0, 0, win_w, win_h);
+		}
 		g_frame_witness_service.count_weave(/*repaint*/ false, sys->hardware_display_3d);
 
 		// Batch phase split (throttled): blits (shared input -> SBS atlas,
@@ -25331,85 +33178,54 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 		}
 	}
 
-	// v4 overlay atlas (browser#18): composite the caller's window-sized
-	// premultiplied-alpha 2D atlas OVER the woven output (premul "over":
-	// out = overlay + (1 - overlay.a)*out), so crisp 2D lands on top of the
-	// interlaced 3D at screen depth. The overlay is NOT woven — it is drawn
-	// after process_atlas onto the same output RTV. Reuses the runtime's blit
-	// pipeline + premul blend; no DP call. Cached by handle like the SBS input.
-	HANDLE ov = (HANDLE)overlay_handle;
-	if (ov != nullptr && ov != INVALID_HANDLE_VALUE) {
-		if (c->render.weave_overlay_handle_cached != ov ||
-		    c->render.weave_overlay_cached_is_dxgi != overlay_is_dxgi || !c->render.weave_overlay_tex ||
-		    !c->render.weave_overlay_srv) {
-			c->render.weave_overlay_handle_cached = nullptr;
-			c->render.weave_overlay_km.reset();
-			c->render.weave_overlay_srv.reset();
-			c->render.weave_overlay_tex.reset();
+	gpu_frame.stamp(WEAVE_TS_POST_WEAVE);
 
-			if (overlay_is_dxgi) {
-				hr = sys->device->OpenSharedResource(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			} else {
-				hr = sys->device->OpenSharedResource1(ov, IID_PPV_ARGS(c->render.weave_overlay_tex.put()));
-			}
-			if (SUCCEEDED(hr) && c->render.weave_overlay_tex) {
-				D3D11_TEXTURE2D_DESC odesc = {};
-				c->render.weave_overlay_tex->GetDesc(&odesc);
-				D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
-				sd.Format = odesc.Format;
-				sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-				sd.Texture2D.MipLevels = 1;
-				hr = sys->device->CreateShaderResourceView(c->render.weave_overlay_tex.get(), &sd,
-				                                           c->render.weave_overlay_srv.put());
-				if (SUCCEEDED(hr)) {
-					(void)c->render.weave_overlay_tex->QueryInterface(
-					    IID_PPV_ARGS(c->render.weave_overlay_km.put()));
-					c->render.weave_overlay_handle_cached = ov;
-					c->render.weave_overlay_cached_is_dxgi = overlay_is_dxgi;
-					U_LOG_W("#625 weave v4: overlay import cached (handle=%p %s, %ux%u)", ov,
-					        overlay_is_dxgi ? "DXGI" : "NT", odesc.Width, odesc.Height);
-				} else {
-					c->render.weave_overlay_srv.reset();
-					c->render.weave_overlay_tex.reset();
-				}
-			} else {
-				U_LOG_E("#625 weave v4: overlay OpenSharedResource(%s) failed: 0x%08lx",
-				        overlay_is_dxgi ? "DXGI" : "NT", hr);
-				c->render.weave_overlay_tex.reset();
-			}
-		}
+	// v4 overlay atlas (browser#18), FALLBACK leg: composite the caller's
+	// window-sized premultiplied-alpha 2D atlas OVER the woven output (premul
+	// "over": out = overlay + (1 - overlay.a)*out) with the runtime's own blit,
+	// whenever the display processor did not take it into the weave above
+	// (ADR-027 Amendment — no slot, a vendor runtime without the capability, a
+	// size mismatch, or the legacy single-rect path). The atlas is transparent
+	// (alpha 0) everywhere except the 2D regions, so a single whole-window
+	// composite is correct regardless of overlay_rect_count (a future scope
+	// hint, not a correctness input).
+	if (ov_srv != nullptr && !ov_in_dp) {
+		blit_to_atlas_texture(sys, &c->render, ov_srv, 0.0f, 0.0f, (float)ov_w, (float)ov_h, (float)ov_w,
+		                      (float)ov_h, 0.0f, 0.0f, (float)win_w, (float)win_h, /*is_srgb*/ false,
+		                      sys->blend_premul.get(), c->render.weave_output_rtv.get(), (float)win_w,
+		                      (float)win_h);
+	}
+	ov_hold.release();
+	gpu_frame.stamp(WEAVE_TS_POST_FALLBACK);
 
-		if (c->render.weave_overlay_srv && c->render.weave_output_rtv) {
-			D3D11_TEXTURE2D_DESC odesc = {};
-			c->render.weave_overlay_tex->GetDesc(&odesc);
-			IDXGIKeyedMutex *ov_km = c->render.weave_overlay_km.get();
-			bool ov_acquired = false;
-			if (ov_km) {
-				// #925 S1: 4 ms, same rationale as the input acquire above
-				// (held under render_mutex; skip-and-retry beats a 1 s
-				// global stall). Miss = this frame composes without the
-				// overlay, which the next frame corrects.
-				HRESULT ah = ov_km->AcquireSync(0, 4);
-				if (SUCCEEDED(ah) && ah != static_cast<HRESULT>(WAIT_TIMEOUT)) {
-					ov_acquired = true;
-				}
-			}
-			if (!ov_km || ov_acquired) {
-				// One full-window premultiplied "over" blit: the atlas is
-				// transparent (alpha 0) everywhere except the 2D regions, so a
-				// single whole-window composite is correct regardless of
-				// overlay_rect_count (a future scope hint, not a correctness input).
-				blit_to_atlas_texture(sys, &c->render, c->render.weave_overlay_srv.get(),
-				                      0.0f, 0.0f, (float)odesc.Width, (float)odesc.Height,
-				                      (float)odesc.Width, (float)odesc.Height, 0.0f, 0.0f,
-				                      (float)win_w, (float)win_h, /*is_srgb*/ false,
-				                      sys->blend_premul.get(), c->render.weave_output_rtv.get(),
-				                      (float)win_w, (float)win_h);
-			}
-			if (ov_acquired && ov_km) {
-				ov_km->ReleaseSync(0);
-			}
+	// #2289: the present-owner capture, after the weave and the overlay
+	// fallback so the woven file is what the caller is about to present.
+	if (cap_armed) {
+		char nm[160];
+		if (cap_projection_only) {
+			snprintf(nm, sizeof(nm), "%s.projection", cap_stem);
+			svc_weave_capture_dump_srv(sys, cap_dp_srv, nm);
+			U_LOG_W("#2289 weave capture (projection only): %%TEMP%%\\%s.png (client '%s')", nm,
+			        c->render.weave_capture_tag);
+		} else {
+			snprintf(nm, sizeof(nm), "%s.input", cap_stem);
+			dxr_diag_dump_tex(sys, in_tex, nm);
+			svc_weave_capture_dump_srv(sys, cap_dp_srv, cap_stem);
+			snprintf(nm, sizeof(nm), "%s.woven", cap_stem);
+			dxr_diag_dump_tex(sys, c->render.weave_output_texture.get(), nm);
+			U_LOG_W("#2289 weave capture: %%TEMP%%\\%s{.input,,.woven}.png (client '%s', %ux%u)", cap_stem,
+			        c->render.weave_capture_tag, win_w, win_h);
 		}
+	}
+	const uint8_t timing_route = ov_srv == nullptr ? WEAVE_OV_NONE : (ov_in_dp ? WEAVE_OV_DP : WEAVE_OV_FALLBACK);
+	// Route log: first overlay frame and every change only (never per frame).
+	if (ov_srv != nullptr &&
+	    (!c->render.weave_overlay_route_logged || ov_in_dp != c->render.weave_overlay_in_dp)) {
+		c->render.weave_overlay_route_logged = true;
+		c->render.weave_overlay_in_dp = ov_in_dp;
+		U_LOG_W("weave v4 overlay %ux%u (win %ux%u): composited by the %s — ADR-027 Amendment", ov_w, ov_h,
+		        win_w, win_h,
+		        ov_in_dp ? "DISPLAY PROCESSOR inside the weave" : "runtime post-weave blit (fallback)");
 	}
 
 	int64_t t_post_weave_ns = os_monotonic_get_ns();
@@ -25453,6 +33269,7 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 
 	// Signal the fence and flush so the GPU work + signal are submitted (there is
 	// no Present to flush this standalone path), then the caller's Wait completes.
+	gpu_frame.end(timing_path, timing_route, output_cleared);
 	c->render.weave_fence_value++;
 	sys->context->Signal(c->render.weave_fence.get(), c->render.weave_fence_value);
 	sys->context->Flush();
@@ -25471,6 +33288,18 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 	// itself is DP-internal — this is the only eye flow, and it's OUT.
 	if (out_eyes != nullptr) {
 		xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes);
+	}
+	// #1884: and what this weave did per screen, with every screen's eyes,
+	// for the caller's XrWeaveOutputRectPartsDXR (weave_get_segments). A
+	// client that never enabled segments has nothing to publish.
+	if (seg_split || c->weave_segs != nullptr) {
+		struct xrt_eye_positions primary_eyes = {};
+		if (out_eyes != nullptr) {
+			primary_eyes = *out_eyes;
+		} else if (seg_split) {
+			xrt_display_processor_d3d11_get_predicted_eye_positions(dp, &primary_eyes);
+		}
+		weave_seg_publish(c, seg_split, &seg_win, &primary_eyes);
 	}
 
 	/* #964: a present-owner never commits a projection layer, so nothing else
@@ -25507,6 +33336,51 @@ comp_d3d11_service_weave_submit(struct xrt_compositor *xc,
 			        (double)(t_end_ns - t_post_weave_ns) / 1e6);
 		}
 	}
+
+	// DXR_WEAVE_GPU_TIMING (no-op when off): fold this accepted submit in;
+	// logs once per 5 s.
+	refused_counter.accepted = true;
+	{
+		double cpu_ms[WEAVE_CPU_STAGE_COUNT];
+		cpu_ms[WEAVE_CPU_RENDER_MUTEX] = (double)(t_post_render_lock_ns - t_pre_render_lock_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_CTX_MUTEX] = (double)(t_post_ctx_lock_ns - t_pre_ctx_lock_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_IN_ACQUIRE] = (double)(t_post_acquire_ns - t_pre_acquire_ns) / 1e6;
+		cpu_ms[WEAVE_CPU_OV_ACQUIRE] = ov_acquire_ms;
+		cpu_ms[WEAVE_CPU_SUBMIT] = (double)((int64_t)os_monotonic_get_ns() - t_entry_ns) / 1e6;
+		weave_timing_account(sys, &c->render, cpu_ms, timing_path, timing_route, ov_unchanged, win_w, win_h);
+	}
+	// ADR-060 R3: latch the origin this accepted weave used (none for a
+	// window-bound DP: valid false, serial 0, exactly the pre-R3 reply).
+	c->render.weave_woven_valid = c->render.weave_origin_pending;
+	if (c->render.weave_origin_pending) {
+		c->render.weave_woven_x = c->render.weave_origin_pending_x;
+		c->render.weave_woven_y = c->render.weave_origin_pending_y;
+		c->render.weave_woven_serial = ++c->render.weave_woven_next;
+	} else {
+		c->render.weave_woven_serial = 0;
+	}
+	return true;
+}
+
+bool
+comp_d3d11_service_weave_get_woven_origin(struct xrt_compositor *xc,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          uint64_t *out_serial)
+{
+	*out_x = 0;
+	*out_y = 0;
+	*out_serial = 0;
+	if (xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (!c->render.weave_woven_valid) {
+		return false;
+	}
+	*out_x = c->render.weave_woven_x;
+	*out_y = c->render.weave_woven_y;
+	*out_serial = c->render.weave_woven_serial;
 	return true;
 }
 
@@ -25587,6 +33461,33 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	// weaver's. While this client is focused the panel DP is bound to its own
 	// weave_hwnd, so the snap is against the right window.
 	struct xrt_display_processor_d3d11 *sdp = panel_dp(c->sys, c);
+
+	// ADR-060 R2: a windowless weave DP is what actually weaves this window, on
+	// this session or on a sibling session bound to the same window, so that
+	// weaver answers. The panel DP has no viewing distance for it and declines,
+	// which leaves the window on raw drag positions (visible 3D judder).
+	struct d3d11_service_compositor *owner = svc_weave_snap_owner(c);
+	if (owner != nullptr) {
+		sdp = owner->render.weave_dp;
+	}
+
+	// #1884 (ADR-047 Amendment 4): a present-owner whose window is woven per
+	// screen snaps to the lattice of the screen holding the majority of the
+	// window at the proposed position (the handle owner's hysteresis, so a
+	// drag across the seam does not flip lattices under the cursor). That
+	// screen's segment DP answers; a DP without snap support falls back to the
+	// panel DP below, which is the pre-#1884 answer.
+	struct d3d11_service_compositor *seg_owner = owner != nullptr ? owner : c;
+	struct xrt_display_processor_d3d11 *seg_dp = weave_seg_snap_dp(seg_owner, target_x, target_y);
+	if (seg_dp != nullptr) {
+		int32_t gx = target_x, gy = target_y;
+		if (xrt_display_processor_d3d11_snap_window_rect(seg_dp, origin_x, origin_y, target_x, target_y, &gx,
+		                                                 &gy)) {
+			*out_x = gx;
+			*out_y = gy;
+			return true;
+		}
+	}
 	if (sdp == nullptr) {
 		return false;
 	}
@@ -25597,6 +33498,149 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
 	}
 	*out_x = sx;
 	*out_y = sy;
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
+	*out = c->weave_seg_out;
+	return out->count > 0;
+}
+
+extern "C" uint32_t
+comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy) {
+		return 0;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf
+	return c->weave_seg_out.count <= XRT_MAX_SEGMENTS ? c->weave_seg_out.count : 0;
+}
+
+extern "C" bool
+comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
+                                         struct xrt_compositor *xc,
+                                         const struct xrt_rect *zone,
+                                         uint32_t live_w,
+                                         uint32_t live_h,
+                                         struct xrt_segment_metrics *out,
+                                         uint32_t *out_index)
+{
+	if (out == nullptr || out_index == nullptr || zone == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	*out_index = 0;
+	if (xsysc == nullptr || xc == nullptr || xc->destroy != compositor_destroy ||
+	    !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *self = d3d11_service_compositor_from_xrt(xc);
+
+	// The window this client's locates are framed against — the same
+	// precedence as comp_d3d11_service_get_client_app_window_metrics.
+	HWND hwnd = self->render.weave_hwnd;
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = self->app_hwnd;
+	}
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		hwnd = self->render.hwnd;
+	}
+	if (hwnd == nullptr || !IsWindow(hwnd)) {
+		return false;
+	}
+
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	struct d3d11_service_compositor *src = nullptr;
+	int64_t src_ns = 0;
+	// This client's own weaves first; then any present-owner weaving the SAME
+	// window. The DisplayXR Browser locates from one session (its browser
+	// process) and weaves from another (its GPU process), both bound to its
+	// top-level window, so the table its element locates need is the GPU
+	// session's.
+	auto consider = [&](struct d3d11_service_compositor *cand) {
+		if (cand == nullptr || cand->render.weave_hwnd != hwnd) {
+			return;
+		}
+		std::lock_guard<std::mutex> lk(cand->seg_mutex); // leaf
+		if (cand->weave_seg_out.count == 0 || cand->weave_seg_out.count > XRT_MAX_SEGMENTS ||
+		    now_ns - cand->weave_seg_out_ns > SVC_SEG_PUB_FRESH_NS) {
+			return; // one display processor, or no weave of this window lately
+		}
+		if (src == nullptr || cand->weave_seg_out_ns > src_ns) {
+			src = cand;
+			src_ns = cand->weave_seg_out_ns;
+			*out = cand->weave_seg_out;
+		}
+	};
+
+	// Pass 1, clients_mutex only: is this window woven per screen at all, and
+	// is the element on a non-primary screen of it? A window on one screen
+	// (every window on a single-screen box) and an element on the primary
+	// answer here, without ever waiting on the render thread's lock.
+	{
+		// Lifetime: a compositor found in all_clients under clients_mutex
+		// stays whole (compositor_destroy leaves the list first).
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		consider(self);
+		if (src == nullptr) {
+			for (struct d3d11_service_compositor *other : sys->all_clients) {
+				if (other != self) {
+					consider(other);
+				}
+			}
+		}
+	}
+	if (src == nullptr) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+
+	// The element's screen, by the table's geometry (u_weave_zone_screen_segment):
+	// a straddling element, one on the primary, a resize in flight -> none.
+	const int32_t k = u_weave_zone_screen_segment(out, zone, live_w, live_h);
+	if (k < 0) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	*out_index = (uint32_t)k;
+
+	// Pass 2, only for an element on a non-primary screen: that screen's eyes
+	// predicted NOW from its segment DP, like the session's own eyes are for
+	// its locate (the table's own, as of that weave, when the DP cannot
+	// answer). `weave_segs` is swapped by weave_submit under render_mutex, so
+	// that comes first (render_mutex -> clients_mutex is the only order), and
+	// the source is looked up again: it may have left in between.
+	render_mutex_fair_lock render_lock(sys);
+	std::lock_guard<std::mutex> reg(sys->clients_mutex);
+	bool still_here = false;
+	for (struct d3d11_service_compositor *cand : sys->all_clients) {
+		if (cand == src) {
+			still_here = true;
+			break;
+		}
+	}
+	if (still_here && src->weave_segs != nullptr) {
+		struct xrt_segment_metric *g = &out->seg[k];
+		struct xrt_eye_positions eyes;
+		memset(&eyes, 0, sizeof(eyes));
+		if (comp_d3d11_segments_get_eyes(src->weave_segs, g->screen_id, &eyes) && eyes.valid) {
+			g->eyes = eyes;
+			g->have_eyes = true;
+		}
+	}
 	return true;
 }
 
@@ -26001,6 +34045,22 @@ system_create_native_compositor(struct xrt_system_compositor *xsysc,
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM);
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
 	c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(DXGI_FORMAT_R16G16B16A16_FLOAT);
+	// #1956: depth formats, AFTER colour (first-format pickers keep colour),
+	// and only those this device can actually allocate as an NT-handle-shared
+	// typeless depth image — otherwise an app would enumerate a format that
+	// xrCreateSwapchain then fails. XR_KHR_composition_layer_depth needs these
+	// over IPC exactly as it does in-process.
+	for (size_t i = 0; i < D3D11_SERVICE_DEPTH_FORMAT_COUNT; i++) {
+		const DXGI_FORMAT df = d3d11_service_depth_formats[i];
+		if (d3d11_service_depth_format_shareable(sys->device.get(), df)) {
+			c->base.base.info.formats[format_count++] = d3d_dxgi_format_to_vk(df);
+		} else {
+			U_LOG_W(
+			    "D3D11 service compositor: depth format DXGI %u cannot be shared cross-process on "
+			    "this device - not advertised (#1956)",
+			    (unsigned)df);
+		}
+	}
 	c->base.base.info.format_count = format_count;
 
 	// Log the formats being reported
@@ -26047,11 +34107,18 @@ system_set_workspace_view_rig(struct xrt_system_compositor *xsysc, const struct 
 }
 
 static void
+svc_lift_destroy(struct d3d11_service_system *sys);
+
+static void
 system_destroy(struct xrt_system_compositor *xsysc)
 {
 	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
 
 	U_LOG_I("Destroying D3D11 service system compositor");
+
+	// XR_DXR_lift (ADR-042): first — the lift thread calls back into this
+	// system for eyes, and owns a DP + device of its own.
+	svc_lift_destroy(sys);
 
 	/*
 	 * #918: stop the bridge BEFORE the multi-compositor goes, and before either
@@ -26067,6 +34134,7 @@ system_destroy(struct xrt_system_compositor *xsysc)
 
 	// Clean up multi-compositor
 	if (sys->multi_comp != nullptr) {
+		svc_ws_presenters_destroy_all(sys, sys->multi_comp, "multi-compositor teardown"); // ADR-052
 		multi_compositor_destroy(sys->multi_comp);
 		sys->multi_comp = nullptr;
 	}
@@ -26136,6 +34204,18 @@ system_destroy(struct xrt_system_compositor *xsysc)
 	// NOTE: Per-client display processors are cleaned up in fini_client_render_resources()
 	// when each client disconnects. System has no display processor anymore.
 
+	// XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4).
+	sys->cursor_look_srv.reset();
+	sys->cursor_look_srv_srgb.reset();
+	sys->cursor_look_tex.reset();
+	comp_cursor_look_fini(&sys->cursor_look);
+	sys->cursor_cb_quad.reset();
+	sys->cursor_cb_soften.reset();
+	sys->cursor_ps.reset();
+	sys->cursor_ps_soft.reset();
+	sys->cursor_ps_soft_lin.reset();
+	sys->cursor_vs.reset();
+
 	// Clean up layer rendering resources
 	sys->depth_test_enabled.reset();
 	sys->depth_disabled.reset();
@@ -26190,13 +34270,18 @@ extern "C" xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
                                  struct u_system *usys,
+                                 int32_t panel_screen_left,
+                                 int32_t panel_screen_top,
                                  struct xrt_system_compositor **out_xsysc)
 {
-	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p usys=%p)", (void *)xsysd, (void *)usys);
+	U_LOG_W("Creating D3D11 service system compositor (xsysd=%p usys=%p, plug-in panel origin %d,%d)",
+	        (void *)xsysd, (void *)usys, (int)panel_screen_left, (int)panel_screen_top);
 
 	// Allocate system compositor
 	struct d3d11_service_system *sys = new d3d11_service_system();
 	std::memset(&sys->base, 0, sizeof(sys->base));
+	sys->create_panel_left = panel_screen_left;
+	sys->create_panel_top = panel_screen_top;
 
 	sys->xdev = xdev;
 	sys->usys = usys;
@@ -26271,19 +34356,17 @@ comp_d3d11_service_create_system(struct xrt_device *xdev,
 	{
 		/*
 		 * Panel rect. Only `DXR_D3D_FORCE_GPU=scanout` reads it. The extent
-		 * comes from the device; the ORIGIN is still the pre-DP zero (the real
-		 * one arrives with the first display processor, which needs a window,
-		 * which needs a client), and 0,0 + MONITOR_DEFAULTTONEAREST resolves to
-		 * the primary monitor — which is the monitor the service's DP is
-		 * created for. Same reasoning and same limitation as
-		 * service_split_stage_a(), deliberately spelled the same way.
+		 * comes from the device; the ORIGIN is the one the plug-in reported,
+		 * handed in by the instance because `base.info`'s is still zero here.
+		 * Same reasoning as service_split_stage_a(), deliberately spelled the
+		 * same way.
 		 */
 		const uint32_t panel_w = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].w_pixels : 0;
 		const uint32_t panel_h = (xdev != nullptr && xdev->hmd != nullptr) ? xdev->hmd->screens[0].h_pixels : 0;
 
-		xrt::auxiliary::d3d::RenderAdapterChoice ingest = xrt::auxiliary::d3d::getRenderAdapter(
-		    sys->base.info.display_screen_left, sys->base.info.display_screen_top, panel_w, panel_h,
-		    D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
+		xrt::auxiliary::d3d::RenderAdapterChoice ingest =
+		    xrt::auxiliary::d3d::getRenderAdapter(sys->create_panel_left, sys->create_panel_top, panel_w,
+		                                          panel_h, D3D_FEATURE_LEVEL_11_0, U_LOGGING_INFO);
 
 		/*
 		 * Assert §2's answer against the preference this site used to hardcode
@@ -26603,6 +34686,27 @@ comp_d3d11_service_is_d3d11_service(struct xrt_system_compositor *xsysc)
  * subsequent call into the DP against compositor_destroy's teardown (#363
  * use-after-free).
  */
+/*!
+ * True while any connected client is weave-idle released (#2582), i.e. it has
+ * no display processor on purpose. Caller MUST hold sys->render_mutex (the
+ * flag is written by the render thread under it).
+ */
+static bool
+svc_any_client_weave_idle_released(struct d3d11_service_system *sys)
+{
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (mc == nullptr) {
+		return false;
+	}
+	for (int i = 0; i < D3D11_MULTI_MAX_CLIENTS; i++) {
+		const struct d3d11_multi_client_slot *slot = &mc->clients[i];
+		if (slot->active && slot->compositor != nullptr && slot->compositor->weave_idle_released) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static struct xrt_display_processor_d3d11 *
 resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compositor *xc)
 {
@@ -26636,6 +34740,174 @@ resolve_eye_display_processor(struct d3d11_service_system *sys, struct xrt_compo
 	}
 }
 
+/*
+ * G7 (ADR-053, #2003): the conversion side never pulls eyes (that took
+ * render_mutex once per conversion). Every eye query this service answers
+ * publishes the result instead: into the conversion core's snapshot of the
+ * DP that answered (roadmap §5.2: one snapshot per DP, keyed by the DP's
+ * address), and notes the time in the lift module, whose producers refresh a
+ * stale snapshot first (d3d11_lift_publish_eyes).
+ */
+static std::mutex g_conv_eyes_mtx;
+static void (*g_conv_eyes_fn)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes) = nullptr;
+static void (*g_conv_eyes_retire_fn)(void *ud, uint64_t dp_key) = nullptr;
+static void *g_conv_eyes_ud = nullptr;
+
+extern "C" void
+comp_d3d11_service_set_conv_eyes_sink(void (*publish)(void *ud, uint64_t dp_key, const struct xrt_eye_positions *eyes),
+                                      void (*retire)(void *ud, uint64_t dp_key),
+                                      void *ud)
+{
+	std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+	g_conv_eyes_fn = publish;
+	g_conv_eyes_retire_fn = retire;
+	g_conv_eyes_ud = ud;
+}
+
+static uint64_t
+svc_conv_eyes_key(const struct xrt_display_processor_d3d11 *dp)
+{
+	return (uint64_t)(uintptr_t)dp;
+}
+
+/*
+ * N6 Part 1 (ADR-054 §4.1, #2144): one u_eye_history ring per display
+ * processor this service asks for eyes. Every answer published below (the
+ * per-client locate queries AND the render thread's per-frame viewer publish
+ * in multi_compositor_render) is pushed into the answering DP's ring, keyed
+ * by the time it was asked. It is read (clamped) only when a DP's own
+ * target-time slot fails; a DP without the slot keeps its "latest" answer. A small fixed table, not a map: a DP
+ * destroyed without a retire (a panel DP swap) just ages out of its slot,
+ * the least-recently-fed slot is reused, and a lost ring only costs the
+ * fallback to the "latest" answer.
+ */
+#define SVC_EYE_RING_SLOTS 16
+
+struct svc_eye_ring_slot
+{
+	uint64_t dp_key;      //!< 0 = free
+	int64_t last_push_ns; //!< LRU for reuse
+	bool inited;
+	struct u_eye_history hist;
+};
+
+static std::mutex g_eye_ring_mtx; // guards the slot table, not the samples
+static struct svc_eye_ring_slot g_eye_rings[SVC_EYE_RING_SLOTS];
+
+//! The ring for @p key; with @p create, claims a free / least-recent slot.
+static struct u_eye_history *
+svc_eye_ring_find(uint64_t key, bool create, int64_t now_ns)
+{
+	if (key == 0) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> g(g_eye_ring_mtx);
+	struct svc_eye_ring_slot *victim = nullptr;
+	for (uint32_t i = 0; i < SVC_EYE_RING_SLOTS; i++) {
+		struct svc_eye_ring_slot *s = &g_eye_rings[i];
+		if (s->dp_key == key) {
+			if (create) {
+				s->last_push_ns = now_ns;
+			}
+			return &s->hist;
+		}
+		// A free slot beats any used one; among used, the least recently fed.
+		if (s->dp_key == 0) {
+			if (victim == nullptr || victim->dp_key != 0) {
+				victim = s;
+			}
+		} else if (victim == nullptr || (victim->dp_key != 0 && s->last_push_ns < victim->last_push_ns)) {
+			victim = s;
+		}
+	}
+	if (!create || victim == nullptr) {
+		return nullptr;
+	}
+	if (!victim->inited) {
+		u_eye_history_init(&victim->hist);
+		victim->inited = true;
+	} else {
+		u_eye_history_clear(&victim->hist);
+	}
+	victim->dp_key = key;
+	victim->last_push_ns = now_ns;
+	return &victim->hist;
+}
+
+static void
+svc_eye_ring_push(uint64_t key, const struct xrt_eye_positions *eyes)
+{
+	if (eyes == nullptr || !eyes->valid) {
+		return;
+	}
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/true, now_ns);
+	if (h != nullptr) {
+		u_eye_history_push(h, eyes, now_ns);
+	}
+}
+
+//! A destroyed DP's ring is emptied and its slot freed.
+static void
+svc_eye_ring_retire(uint64_t key)
+{
+	if (key == 0) {
+		return;
+	}
+	std::lock_guard<std::mutex> g(g_eye_ring_mtx);
+	for (uint32_t i = 0; i < SVC_EYE_RING_SLOTS; i++) {
+		if (g_eye_rings[i].dp_key == key) {
+			u_eye_history_clear(&g_eye_rings[i].hist);
+			g_eye_rings[i].dp_key = 0;
+			g_eye_rings[i].last_push_ns = 0;
+		}
+	}
+}
+
+static void
+svc_publish_eyes(struct d3d11_service_system *sys,
+                 const struct xrt_display_processor_d3d11 *dp,
+                 const struct xrt_eye_positions *eyes)
+{
+	// sys->lift is set once (lift_create_mutex) and destroyed first in
+	// system_destroy, after every client is gone: a plain read is enough here.
+	struct d3d11_lift *l = sys->lift;
+	if (l != nullptr) {
+		d3d11_lift_publish_eyes(l, eyes);
+	}
+	// N6 Part 1 (#2144): every published answer feeds the answering DP's ring.
+	svc_eye_ring_push(svc_conv_eyes_key(dp), eyes);
+	void (*fn)(void *, uint64_t, const struct xrt_eye_positions *);
+	void *ud;
+	{
+		std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+		fn = g_conv_eyes_fn;
+		ud = g_conv_eyes_ud;
+	}
+	if (fn != nullptr) {
+		fn(ud, svc_conv_eyes_key(dp), eyes);
+	}
+}
+
+//! A client's DP is about to be destroyed: streams bound to it go stale.
+static void
+svc_conv_eyes_retire(const struct xrt_display_processor_d3d11 *dp)
+{
+	void (*fn)(void *, uint64_t);
+	void *ud;
+	{
+		std::lock_guard<std::mutex> g(g_conv_eyes_mtx);
+		fn = g_conv_eyes_retire_fn;
+		ud = g_conv_eyes_ud;
+	}
+	if (fn != nullptr && dp != nullptr) {
+		fn(ud, svc_conv_eyes_key(dp));
+	}
+	if (dp != nullptr) {
+		svc_eye_ring_retire(svc_conv_eyes_key(dp)); // N6 Part 1 (#2144)
+	}
+}
+
 bool
 comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system_compositor *xsysc,
                                                                 struct xrt_compositor *xc,
@@ -26663,9 +34935,26 @@ comp_d3d11_service_get_predicted_eye_positions_full_for_client(struct xrt_system
 
 	if (dp != nullptr) {
 		U_ZERO(out_eyes);
+		if (xc != nullptr && xc->destroy == compositor_destroy) {
+			d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.store(svc_conv_eyes_key(dp),
+			                                                            std::memory_order_relaxed);
+		}
 		if (xrt_display_processor_d3d11_get_predicted_eye_positions(dp, out_eyes)) {
+			svc_publish_eyes(sys, dp, out_eyes);
 			return true;
 		}
+	}
+
+	// Expected, not exceptional, while a weave present-owner is weave-idle
+	// released (#2582): its DPs are gone on purpose, and the browser asks for
+	// eyes just before the first submit that rebuilds them. INFO, and it does
+	// not consume the one-shot WARN below, which stays for the real case.
+	if (svc_any_client_weave_idle_released(sys)) {
+		U_LOG_I(
+		    "comp_d3d11_service_get_predicted_eye_positions: no display processor while weave-idle "
+		    "released (caller_xc=%p)",
+		    (void *)xc);
+		return false;
 	}
 
 	// Log if no DP could be resolved at all. Note this is now a genuinely
@@ -26688,6 +34977,91 @@ comp_d3d11_service_get_predicted_eye_positions_full(struct xrt_system_compositor
                                                      struct xrt_eye_positions *out_eyes)
 {
 	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, /*xc=*/nullptr, out_eyes);
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_system_compositor *xsysc,
+                                                                  struct xrt_compositor *xc,
+                                                                  int64_t target_ns,
+                                                                  struct xrt_eye_positions *out_eyes)
+{
+	// target 0 = "latest" (the pre-N6 wire meaning, and any caller without a
+	// display time).
+	if (target_ns <= 0) {
+		return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, out_eyes);
+	}
+	if (xsysc == NULL || out_eyes == NULL) {
+		return false;
+	}
+
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (already vendor-predicted; sampling it again at the target
+	// would double the horizon). Only a DP that HAS the slot gets display-time
+	// sampling; if that slot fails, the DP's ring is read at the target
+	// CLAMPED to its newest sample (never extrapolated).
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	uint64_t key = 0;
+	bool has = false;
+	{
+		// Same lock + DP resolution as the "latest" query (#363, #625).
+		render_mutex_fair_lock render_lock(sys);
+		struct xrt_display_processor_d3d11 *dp = resolve_eye_display_processor(sys, xc);
+		has = dp != nullptr && xrt_display_processor_d3d11_has_eye_positions_at(dp);
+		if (has) {
+			key = svc_conv_eyes_key(dp);
+			U_ZERO(out_eyes);
+			if (xc != nullptr && xc->destroy == compositor_destroy) {
+				d3d11_service_compositor_from_xrt(xc)->conv_eyes_key.store(key,
+				                                                           std::memory_order_relaxed);
+			}
+			static bool logged_slot = false;
+			if (!logged_slot) {
+				logged_slot = true;
+				U_LOG_W(
+				    "N6: eyes at a target time from the DP's get_eye_positions_at slot "
+				    "(target = now %+.1f ms)",
+				    (double)(target_ns - (int64_t)os_monotonic_get_ns()) / 1e6);
+			}
+			if (xrt_display_processor_d3d11_get_eye_positions_at(dp, target_ns, out_eyes) &&
+			    out_eyes->valid) {
+				return true;
+			}
+		}
+	}
+	if (has) {
+		struct u_eye_history *h = svc_eye_ring_find(key, /*create=*/false, 0);
+		if (h != nullptr && u_eye_history_get_clamped(h, target_ns, out_eyes) != U_EYE_HISTORY_RESULT_EMPTY) {
+			return out_eyes->valid;
+		}
+	}
+	// No slot (or nothing in the ring): the DP's own "latest" answer,
+	// unchanged — which also feeds the ring.
+	return comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, out_eyes);
+}
+
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client_at(struct xrt_system_compositor *xsysc,
+                                                             struct xrt_compositor *xc,
+                                                             int64_t target_ns,
+                                                             struct xrt_vec3 *out_left,
+                                                             struct xrt_vec3 *out_right)
+{
+	if (out_left == NULL || out_right == NULL) {
+		return false;
+	}
+	struct xrt_eye_positions eyes;
+	if (!comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(xsysc, xc, target_ns, &eyes) ||
+	    !eyes.valid) {
+		return false;
+	}
+	out_left->x = eyes.eyes[0].x;
+	out_left->y = eyes.eyes[0].y;
+	out_left->z = eyes.eyes[0].z;
+	out_right->x = eyes.eyes[1].x;
+	out_right->y = eyes.eyes[1].y;
+	out_right->z = eyes.eyes[1].z;
+	return true;
 }
 
 bool
@@ -26738,6 +35112,16 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
                                  uint32_t flags,
                                  struct ipc_capture_result *out_result)
 {
+	return comp_d3d11_service_capture_frame_for_client(xsysc, /*xc=*/nullptr, path_prefix, flags, out_result);
+}
+
+bool
+comp_d3d11_service_capture_frame_for_client(struct xrt_system_compositor *xsysc,
+                                            struct xrt_compositor *xc,
+                                            const char *path_prefix,
+                                            uint32_t flags,
+                                            struct ipc_capture_result *out_result)
+{
 	if (xsysc == nullptr || path_prefix == nullptr || out_result == nullptr || flags == 0) {
 		return false;
 	}
@@ -26775,7 +35159,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	uint32_t dp_content_h = 0;
 	if (flags & IPC_CAPTURE_FLAG_PROJECTION_ONLY) {
 		std::lock_guard<std::mutex> alock(sys->active_compositor_mutex);
-		struct d3d11_service_compositor *ac = sys->active_compositor;
+		// #1810: a named client captures ITSELF; NULL keeps the historical
+		// "whichever compositor rendered last" source (debug trigger, controller).
+		struct d3d11_service_compositor *ac =
+		    xc != nullptr ? d3d11_service_compositor_from_xrt(xc) : sys->active_compositor;
 		if (ac != nullptr) {
 			// Prefer the content-sized crop atlas — the actual DP input, tightly
 			// packed to (tile_columns·view_w)×(tile_rows·view_h) — so the PNG
@@ -26887,8 +35274,10 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		// PNG doesn't render fully transparent/black (issue #425).
 		// DXR_ATLAS_CAPTURE_RAW_ALPHA=1 opts out: the atlas's true alpha is the
 		// only way to test compose-under / opaque-cover alpha (see
-		// u_image_capture_raw_alpha()).
-		if (!u_image_capture_raw_alpha()) {
+		// u_image_capture_raw_alpha()). #1810: an IPC client's own
+		// DXR_ATLAS_CAPTURE_RAW_ALPHA arrives as IPC_CAPTURE_FLAG_RAW_ALPHA,
+		// because this process reads the SERVICE's environment, not the client's.
+		if (!u_image_capture_raw_alpha() && (flags & IPC_CAPTURE_FLAG_RAW_ALPHA) == 0) {
 			u_image_force_opaque_rgba8(buf.data(), used_w, used_h, (size_t)used_w * 4u);
 		}
 		// Encode the atlas geometry into the suffix so consumers don't re-derive
@@ -26921,7 +35310,7 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 	out_result->display_height_m = sys->base.info.display_height_m;
 
 	struct xrt_vec3 le = {0, 0, 0}, re = {0, 0, 0};
-	if (comp_d3d11_service_get_predicted_eye_positions(xsysc, &le, &re)) {
+	if (comp_d3d11_service_get_predicted_eye_positions_for_client(xsysc, xc, &le, &re)) {
 		out_result->eye_left_m[0] = le.x;
 		out_result->eye_left_m[1] = le.y;
 		out_result->eye_left_m[2] = le.z;
@@ -26930,8 +35319,8 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
 		out_result->eye_right_m[2] = re.z;
 	}
 
-	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x used=%ux%u (atlas=%ux%u) eye=%ux%u",
-	        path_prefix, flags, views_written, used_w, used_h, atlas_w, atlas_h, eye_w, eye_h);
+	U_LOG_W("capture_frame: prefix=%s flags=0x%x written=0x%x used=%ux%u (atlas=%ux%u) eye=%ux%u client=%p",
+	        path_prefix, flags, views_written, used_w, used_h, atlas_w, atlas_h, eye_w, eye_h, (void *)xc);
 
 	return views_written != 0;
 }
@@ -27172,6 +35561,9 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
 
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	float half_px_x = (float)disp_px_w / 2.0f;
+	float half_px_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&half_px_x, &half_px_y, &px_per_m_x, &px_per_m_y); // ADR-052: a presenter's pass
 
 	float wx = slot->window_pose.position.x;
 	float wy = slot->window_pose.position.y;
@@ -27195,8 +35587,8 @@ slot_pose_to_pixel_rect_for_eye(const struct d3d11_service_system *sys,
 	int32_t w_px = (int32_t)(w_m * px_per_m_x + 0.5f);
 	int32_t h_px = (int32_t)(h_m * px_per_m_y + 0.5f);
 
-	float center_px_x = (float)disp_px_w / 2.0f + wx * px_per_m_x;
-	float center_px_y = (float)disp_px_h / 2.0f - wy * px_per_m_y;
+	float center_px_x = half_px_x + wx * px_per_m_x;
+	float center_px_y = half_px_y - wy * px_per_m_y;
 
 	*out_x = (int32_t)(center_px_x - (float)w_px / 2.0f + 0.5f);
 	*out_y = (int32_t)(center_px_y - (float)h_px / 2.0f + 0.5f);
@@ -27257,6 +35649,13 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 	}
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	// project_point_for_eye centres on frame/2: in a presenter's pass the frame
+	// is twice the primary's centre in its pixels (ADR-052).
+	float frame_half_x = (float)disp_px_w / 2.0f;
+	float frame_half_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&frame_half_x, &frame_half_y, &px_per_m_x, &px_per_m_y);
+	const float frame_w = frame_half_x * 2.0f;
+	const float frame_h = frame_half_y * 2.0f;
 
 	float hw = slot->window_width_m / 2.0f;
 	float hh = slot->window_height_m / 2.0f;
@@ -27287,11 +35686,8 @@ compute_projected_quad_corners(const struct d3d11_service_system *sys,
 		out_w[i] = depth;
 
 		float dpx, dpy;
-		project_point_for_eye(world.x, world.y, world.z,
-		                      eye_x, eye_y, eye_z,
-		                      (float)disp_px_w, (float)disp_px_h,
-		                      px_per_m_x, px_per_m_y,
-		                      &dpx, &dpy);
+		project_point_for_eye(world.x, world.y, world.z, eye_x, eye_y, eye_z, frame_w, frame_h, px_per_m_x,
+		                      px_per_m_y, &dpx, &dpy);
 
 		float frac_x = dpx / (float)ca_w;
 		float frac_y = dpy / (float)ca_h;
@@ -27329,6 +35725,11 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
 	}
 	float px_per_m_x = (float)disp_px_w / disp_w_m;
 	float px_per_m_y = (float)disp_px_h / disp_h_m;
+	float frame_half_x = (float)disp_px_w / 2.0f;
+	float frame_half_y = (float)disp_px_h / 2.0f;
+	svc_ws_pass_frame(&frame_half_x, &frame_half_y, &px_per_m_x, &px_per_m_y); // ADR-052
+	const float frame_w = frame_half_x * 2.0f;
+	const float frame_h = frame_half_y * 2.0f;
 
 	// 4 corners in window-local space: TL, BL, TR, BR
 	struct xrt_vec3 local[4] = {
@@ -27351,11 +35752,8 @@ project_local_rect_for_eye(const struct d3d11_service_system *sys,
 		if (out_w) out_w[i] = depth;
 
 		float dpx, dpy;
-		project_point_for_eye(world.x, world.y, world.z,
-		                      eye_x, eye_y, eye_z,
-		                      (float)disp_px_w, (float)disp_px_h,
-		                      px_per_m_x, px_per_m_y,
-		                      &dpx, &dpy);
+		project_point_for_eye(world.x, world.y, world.z, eye_x, eye_y, eye_z, frame_w, frame_h, px_per_m_x,
+		                      px_per_m_y, &dpx, &dpy);
 
 		float frac_x = dpx / (float)ca_w;
 		float frac_y = dpy / (float)ca_h;
@@ -27798,6 +36196,1109 @@ comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *x
 	return true;
 }
 
+/*
+ *
+ * The workspace on N screens (ADR-052, XR_DXR_spatial_workspace v25).
+ *
+ * The IPC server owns the screen registry handle (its instance) and calls in
+ * here with the list; everything below runs on IPC threads and touches only
+ * the `ws_screens_*` fields (leaf mutex) or enqueues an S3 command.
+ *
+ */
+
+/*!
+ * Whether this build presents the workspace on more than one screen (ADR-052
+ * D1). The kill switches (`DXR_SEGMENTS=0`, `DXR_WORKSPACE_SCREENS=single`)
+ * still build the set single-screen.
+ */
+static bool
+svc_ws_multi_presenter_supported(void)
+{
+	return true; // ADR-052 D1: the secondary presenters are in (svc_ws_presenters_*)
+}
+
+static enum comp_ws_policy
+svc_ws_policy(void)
+{
+	if (!svc_ws_multi_presenter_supported()) {
+		return COMP_WS_POLICY_SINGLE;
+	}
+	return comp_ws_policy_from_env(getenv("DXR_SEGMENTS"), getenv("DXR_WORKSPACE_SCREENS"));
+}
+
+//! Bit i: screen i of @p list has a registry claim that can make a D3D11 DP for it.
+static uint32_t
+svc_ws_dp_capable_mask(struct d3d11_service_system *sys, const struct xrt_screen_list *list)
+{
+	uint32_t mask = 0;
+	const struct xrt_dp_factory_registry *reg = &sys->base.info.dp_registry;
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && i < 32; i++) {
+		for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+			const struct xrt_dp_registry_entry *en = &reg->entries[e];
+			if (en->monitor_id != list->screens[i].id) {
+				continue;
+			}
+			if (en->dp_factory_d3d11 != nullptr && xrt_plugin_iface_has_create_dp_d3d11_for_screen(
+			                                           (const struct xrt_plugin_iface *)en->owning_iface)) {
+				mask |= 1u << i;
+			}
+			break;
+		}
+	}
+	return mask;
+}
+
+void
+comp_d3d11_service_workspace_update_screens(struct xrt_system_compositor *xsysc,
+                                            const struct xrt_screen_list *list,
+                                            bool activation)
+{
+	if (xsysc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	struct comp_ws_screen_set set;
+	comp_ws_screens_build(list, svc_ws_dp_capable_mask(sys, list), svc_ws_policy(), &set);
+
+	bool changed = false;
+	bool wake = false;
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (activation) {
+			// A (new) controller starts un-opted-in: it gets SCREENS_CHANGED
+			// only once it has enumerated.
+			sys->ws_screens_optin = false;
+		}
+		changed = !comp_ws_screens_equal(&sys->ws_screens, &set);
+		if (changed) {
+			sys->ws_screens = set;
+			sys->ws_screen_list = *list; // the presenters' screen bindings come from it
+			sys->ws_screens_generation++;
+		}
+		gen = sys->ws_screens_generation;
+		wake = changed && sys->ws_screens_optin;
+	}
+	if (!changed) {
+		return;
+	}
+
+	// Once per topology change (lifecycle).
+	char ids[256] = {0};
+	for (uint32_t i = 0; i < set.count; i++) {
+		size_t used = strlen(ids);
+		snprintf(ids + used, sizeof(ids) - used, "%s0x%llx%s%s", used > 0 ? ", " : "",
+		         (unsigned long long)set.screens[i].id,
+		         (set.screens[i].flags & COMP_WS_SCREEN_PRIMARY) != 0 ? "*" : "",
+		         (set.screens[i].flags & COMP_WS_SCREEN_PRESENTER) != 0
+		             ? "(P)"
+		             : ((set.screens[i].flags & COMP_WS_SCREEN_3D) != 0 ? "(3D)" : "(2D)"));
+	}
+	U_LOG_W("workspace screens: generation %u — %u screen(s), %u presenter(s): %s", gen, set.count,
+	        comp_ws_screens_presenter_count(&set), ids);
+
+	if (wake && sys->workspace_wakeup_event != nullptr) {
+		SetEvent((HANDLE)sys->workspace_wakeup_event); // the controller drains SCREENS_CHANGED
+	}
+}
+
+bool
+comp_d3d11_service_workspace_get_screens(struct xrt_system_compositor *xsysc,
+                                         bool opt_in,
+                                         struct ipc_workspace_screen_list *out)
+{
+	if (xsysc == nullptr || out == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	struct comp_ws_screen_set set;
+	uint32_t gen = 0;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		set = sys->ws_screens;
+		gen = sys->ws_screens_generation;
+		if (opt_in) {
+			sys->ws_screens_optin = true;
+			sys->ws_screens_gen_emitted = gen; // the controller is looking at it now
+		}
+	}
+
+	// The presenters' live mode: one rendering mode per service (ADR-052 D5),
+	// so every presenter reports the head's.
+	if (sys->xdev != nullptr && sys->xdev->hmd != nullptr) {
+		const uint32_t idx = sys->xdev->hmd->active_rendering_mode_index;
+		for (uint32_t i = 0; i < set.count && i < COMP_WS_MAX_SCREENS; i++) {
+			struct comp_ws_screen *p = &set.screens[i];
+			if ((p->flags & COMP_WS_SCREEN_PRESENTER) == 0) {
+				continue;
+			}
+			p->mode_index = idx;
+			if (idx < sys->xdev->rendering_mode_count) {
+				p->view_count = sys->xdev->rendering_modes[idx].view_count;
+				p->hardware_3d = sys->xdev->rendering_modes[idx].hardware_display_3d;
+			}
+		}
+	}
+	comp_ws_screens_to_ipc(&set, gen, out);
+	return true;
+}
+
+//! Resolve the anchor screen and map a placement into the primary's space. Caller holds ws_screens_mutex.
+static xrt_result_t
+svc_ws_placement_to_primary(struct d3d11_service_system *sys,
+                            const struct ipc_workspace_window_placement *in,
+                            struct xrt_pose *out_pose,
+                            float *out_w,
+                            float *out_h,
+                            uint64_t *out_anchor)
+{
+	*out_pose = in->pose;
+	*out_w = in->width_m;
+	*out_h = in->height_m;
+	*out_anchor = 0;
+	if (in->screen_id == 0) {
+		return XRT_SUCCESS;
+	}
+	const struct comp_ws_screen *from = comp_ws_screens_find(&sys->ws_screens, in->screen_id);
+	const struct comp_ws_screen *prim = comp_ws_screens_find(&sys->ws_screens, 0);
+	if (from == nullptr || prim == nullptr) {
+		return XRT_ERROR_INPUT_UNSUPPORTED; // not a workspace screen
+	}
+	if (from == prim) {
+		return XRT_SUCCESS; // the primary, named by id: same as 0
+	}
+	if (!comp_ws_map_pose(from, prim, &in->pose, in->width_m, in->height_m, out_pose, out_w, out_h)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	*out_anchor = from->id;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_d3d11_service_workspace_set_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  const struct ipc_workspace_window_placement *placement)
+{
+	if (xsysc == nullptr || placement == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (!sys->workspace_mode || sys->multi_comp == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (xc == nullptr && (slot_index < 0 || slot_index >= D3D11_MULTI_MAX_CLIENTS)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ws_command cmd = {};
+	xrt_result_t xret;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		xret =
+		    svc_ws_placement_to_primary(sys, placement, &cmd.pose, &cmd.width_m, &cmd.height_m, &cmd.screen_id);
+	}
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+
+	// Same floor as set_client_window_pose (in the primary's metres).
+	const float min_dim = 0.02f;
+	if (cmd.width_m < min_dim) {
+		cmd.width_m = min_dim;
+	}
+	if (cmd.height_m < min_dim) {
+		cmd.height_m = min_dim;
+	}
+
+	// #925 S3: enqueue, exactly like the pose setters (success on enqueue).
+	if (xc != nullptr) {
+		cmd.type = WS_CMD_SET_POSE_XC;
+		cmd.xc = d3d11_service_compositor_from_xrt(xc);
+	} else {
+		cmd.type = WS_CMD_SET_POSE_SLOT;
+		cmd.slot = slot_index;
+	}
+	service_ws_cmd_submit(sys, &cmd);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+comp_d3d11_service_workspace_get_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  struct ipc_workspace_window_placement *out)
+{
+	if (xsysc == nullptr || out == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	if (!sys->workspace_mode || mc == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct xrt_pose pose;
+	float w = 0.0f, h = 0.0f;
+	uint64_t anchor = 0;
+	{
+		render_mutex_fair_lock lock(sys);
+		int slot = xc != nullptr ? multi_comp_find_slot(mc, d3d11_service_compositor_from_xrt(xc)) : slot_index;
+		if (slot < 0 || slot >= D3D11_MULTI_MAX_CLIENTS || !mc->clients[slot].active) {
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		pose = mc->clients[slot].window_pose;
+		w = mc->clients[slot].window_width_m;
+		h = mc->clients[slot].window_height_m;
+		anchor = mc->clients[slot].window_screen_id;
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->pose = pose;
+	out->width_m = w;
+	out->height_m = h;
+	std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+	const struct comp_ws_screen *prim = comp_ws_screens_find(&sys->ws_screens, 0);
+	const struct comp_ws_screen *to = anchor != 0 ? comp_ws_screens_find(&sys->ws_screens, anchor) : nullptr;
+	if (to != nullptr && prim != nullptr && to != prim &&
+	    comp_ws_map_pose(prim, to, &pose, w, h, &out->pose, &out->width_m, &out->height_m)) {
+		out->screen_id = to->id;
+	} else {
+		// Anchored on the primary, or the anchor screen is gone: the window
+		// stays where it is, in the primary's space.
+		out->screen_id = prim != nullptr ? prim->id : 0;
+	}
+	return XRT_SUCCESS;
+}
+
+void
+comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, struct xrt_status_workspace *ws)
+{
+	if (xsysc == nullptr || ws == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct comp_ws_screen_set set;
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		set = sys->ws_screens;
+	}
+	// Lock-free read of the panel DP pointer, like every other status reader:
+	// only "is there one" is used.
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	const bool primary_woven = mc != nullptr && mc->display_processor != nullptr;
+	ws->screen_count = 0;
+	for (uint32_t i = 0; i < set.count && ws->screen_count < XRT_STATUS_WORKSPACE_MAX_SCREENS; i++) {
+		const struct comp_ws_screen *s = &set.screens[i];
+		if ((s->flags & COMP_WS_SCREEN_PRESENTER) == 0) {
+			continue;
+		}
+		struct xrt_status_workspace_screen *o = &ws->screens[ws->screen_count++];
+		o->id = s->id;
+		o->primary = (s->flags & COMP_WS_SCREEN_PRIMARY) != 0;
+		o->woven = o->primary ? primary_woven : svc_ws_presenter_is_woven(mc, s->id);
+	}
+}
+
+
+/*
+ *
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3). The IPC server is the
+ * caller: it owns the screen registry handle (the server's instance) and the
+ * client's connection; everything below runs on that client's IPC thread.
+ *
+ */
+
+void
+comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              const struct xrt_screen_list *list,
+                                              uint64_t pinned_display_id)
+{
+	if (xsysc == nullptr || xc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == nullptr || info_copy == nullptr) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	// The registry (iface + instance per screen) as it stands now — a copy,
+	// like the in-process compositor takes, so a later refresh of the live
+	// info cannot tear what the render thread builds the manager from.
+	*info_copy = sys->base.info;
+
+	{
+		// The render thread rebuilds the manager from this on its next weave
+		// of this client — never here (the manager is the render thread's).
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		free(c->seg_screens);
+		c->seg_screens = copy;
+		free(c->seg_sys_info);
+		c->seg_sys_info = info_copy;
+		c->seg_pinned_display_id = pinned_display_id;
+		c->seg_rebuild = true;
+		c->weave_seg_rebuild = true; // #1884: the present-owner's weave manager too
+		// ...and nothing may frame views from the old table meanwhile.
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none));
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+	// Once per session (lifecycle).
+	U_LOG_W(
+	    "segments: IPC client %p (pid %ld) enabled segments — %u screen(s) in the registry, pinned display "
+	    "0x%016llx",
+	    (void *)c, c->client_pid, list->count, (unsigned long long)pinned_display_id);
+}
+
+void
+comp_d3d11_service_weave_offer_screens(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       const struct xrt_screen_list *list)
+{
+	if (xsysc == nullptr || xc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (copy == nullptr) {
+		return;
+	}
+	*copy = *list;
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		free(c->weave_offered_screens);
+		c->weave_offered_screens = copy;
+	}
+	// A rebind to a new window of a client already weaving windowless.
+	svc_weave_activate_offered_screens(sys, c);
+}
+
+//! The screen of @p list with id @p id, or nullptr.
+static const struct xrt_screen *
+svc_seg_find_screen(const struct xrt_screen_list *list, uint64_t id)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+		if (list->screens[i].id == id) {
+			return &list->screens[i];
+		}
+	}
+	return nullptr;
+}
+
+/*!
+ * #2218 (#9): did a screen move, resize or change role between two registry
+ * reads? Everything the segment table is computed from (desktop rect, device
+ * mode, the system-default flag) — the claimant is compared separately.
+ */
+static bool
+svc_seg_screen_geometry_differs(const struct xrt_screen *a, const struct xrt_screen *b)
+{
+	return a->desktop_left != b->desktop_left || a->desktop_top != b->desktop_top ||
+	       a->desktop_width != b->desktop_width || a->desktop_height != b->desktop_height ||
+	       a->native_width != b->native_width || a->native_height != b->native_height || a->flags != b->flags;
+}
+
+//! The registry entry of @p reg for monitor @p id, or nullptr.
+static struct xrt_dp_registry_entry *
+svc_seg_find_entry(struct xrt_dp_factory_registry *reg, uint64_t id)
+{
+	for (uint32_t i = 0; i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {
+		if (reg->entries[i].monitor_id == id) {
+			return &reg->entries[i];
+		}
+	}
+	return nullptr;
+}
+
+void
+comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list)
+{
+	if (xsysc == nullptr || list == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+
+	// #2245: a display change (a rate-only mode change included) re-reads
+	// every monitor's refresh rate on next use.
+	svc_screen_rates_invalidate();
+
+	// Lifetime: a compositor found in all_clients under clients_mutex stays
+	// whole (compositor_destroy leaves the list first). seg_mutex is a leaf.
+	std::lock_guard<std::mutex> reg_lock(sys->clients_mutex);
+	for (struct d3d11_service_compositor *c : sys->all_clients) {
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		const struct xrt_screen_list *old = c->seg_screens;
+		if (old == nullptr || c->seg_sys_info == nullptr) {
+			continue; // segments never enabled for this client
+		}
+
+		// The session's primary screen: its DP is the session's own.
+		uint64_t primary_id = 0;
+		for (uint32_t i = 0; i < old->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			if ((old->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+				primary_id = old->screens[i].id;
+				break;
+			}
+		}
+
+		bool changed = false;
+		// #2218 (#9): a screen that LEFT the registry (unplugged) — its segment
+		// DP must go, and the table must stop cutting the window at its edge.
+		for (uint32_t i = 0; i < old->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			const struct xrt_screen *os = &old->screens[i];
+			if (svc_seg_find_screen(list, os->id) != nullptr) {
+				continue;
+			}
+			U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx ('%s') left the registry — "
+			        "segment table rebuilt%s",
+			        (void *)c, c->client_pid, (unsigned long long)os->id, os->plugin_id,
+			        os->id == primary_id ? " (its primary screen: the session's own DP stays)" : "");
+			changed = true;
+		}
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			const struct xrt_screen *ns = &list->screens[i];
+			const struct xrt_screen *os = svc_seg_find_screen(old, ns->id);
+			if (os == nullptr) {
+				// #2218 (#9): a screen that JOINED (plugged in) — reachable by
+				// the window from now on; the lifecycle makes its DP on demand.
+				U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx ('%s', %ux%u at %d,%d) joined "
+				        "the registry — segment table rebuilt",
+				        (void *)c, c->client_pid, (unsigned long long)ns->id, ns->plugin_id,
+				        ns->desktop_width, ns->desktop_height, ns->desktop_left, ns->desktop_top);
+				changed = true;
+				continue;
+			}
+			if (strcmp(os->plugin_id, ns->plugin_id) == 0) {
+				// #2218 (#9): same claimant — did it move, resize or change
+				// role? The table is cut from these rects.
+				if (svc_seg_screen_geometry_differs(os, ns)) {
+					U_LOG_W("segments: IPC client %p (pid %ld) — screen 0x%016llx moved/resized "
+					        "(%ux%u at %d,%d -> %ux%u at %d,%d, flags 0x%x -> 0x%x) — segment table rebuilt",
+					        (void *)c, c->client_pid, (unsigned long long)ns->id, os->desktop_width,
+					        os->desktop_height, os->desktop_left, os->desktop_top, ns->desktop_width,
+					        ns->desktop_height, ns->desktop_left, ns->desktop_top, os->flags, ns->flags);
+					changed = true;
+				}
+				continue;
+			}
+			if (ns->id == primary_id) {
+				U_LOG_W(
+				    "segments: IPC client %p (pid %ld) — its primary screen 0x%016llx is now claimed "
+				    "by '%s' (was '%s'); the session's own DP never swaps live — applies to the next "
+				    "session",
+				    (void *)c, c->client_pid, (unsigned long long)ns->id, ns->plugin_id, os->plugin_id);
+				continue;
+			}
+			U_LOG_W("segments: screen 0x%016llx now claimed by '%s' (was '%s') — segment DP recreated",
+			        (unsigned long long)ns->id, ns->plugin_id, os->plugin_id);
+			changed = true;
+		}
+		if (!changed) {
+			continue;
+		}
+
+		struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+		struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		if (copy == nullptr || info_copy == nullptr) {
+			free(copy);
+			free(info_copy);
+			continue;
+		}
+		*copy = *list;
+		*info_copy = sys->base.info;
+		// The primary screen keeps what its session started with.
+		if (primary_id != 0) {
+			const struct xrt_screen *os = svc_seg_find_screen(old, primary_id);
+			struct xrt_dp_registry_entry *oe =
+			    svc_seg_find_entry(&c->seg_sys_info->dp_registry, primary_id);
+			struct xrt_dp_registry_entry *ne = svc_seg_find_entry(&info_copy->dp_registry, primary_id);
+			for (uint32_t i = 0; i < copy->count && i < XRT_SCREEN_LIST_MAX && os != nullptr; i++) {
+				if (copy->screens[i].id == primary_id) {
+					snprintf(copy->screens[i].plugin_id, sizeof(copy->screens[i].plugin_id), "%s",
+					         os->plugin_id);
+					copy->screens[i].confidence = os->confidence;
+				}
+			}
+			if (oe != nullptr && ne != nullptr) {
+				*ne = *oe;
+			}
+		}
+		free(c->seg_screens);
+		c->seg_screens = copy;
+		free(c->seg_sys_info);
+		c->seg_sys_info = info_copy;
+		// The render thread rebuilds the manager on its next weave of this
+		// client: the old segment DPs are released, and the lifecycle makes
+		// each again from its screen's (new) registry entry.
+		c->seg_rebuild = true;
+		c->weave_seg_rebuild = true; // #1884: the present-owner's weave manager too
+		struct xrt_segment_metrics none;
+		memset(&none, 0, sizeof(none));
+		(void)comp_segments_publish(&c->seg_pub, &none);
+	}
+}
+
+/*
+ *
+ * ADR-052 D2 — per-screen views of a workspace tile.
+ *
+ * A placed tile is drawn by every presenter its footprint overlaps; its views
+ * are framed from the screen it is on. Built on demand at the client's
+ * xrLocateViews (its own IPC thread) from the slot's placement and the
+ * workspace screen set; nothing here runs on a one-presenter workspace, so a
+ * single-screen box (and every non-workspace client) takes today's path.
+ *
+ */
+
+/*!
+ * Frame workspace tile @p c: its placement (the primary's display space), the
+ * screen set and the window -> presenter split. False when @p c is not a placed
+ * tile of a workspace that presents on more than one screen — every caller then
+ * keeps today's primary path. The slot is read the way
+ * comp_d3d11_service_get_client_window_metrics reads it.
+ */
+static bool
+svc_ws_client_framing(struct d3d11_service_system *sys,
+                      struct d3d11_service_compositor *c,
+                      struct comp_ws_screen_set *set,
+                      struct xrt_pose *pose,
+                      float *w_m,
+                      float *h_m,
+                      struct comp_ws_view_framing *f)
+{
+	if (!sys->workspace_mode || sys->multi_comp == nullptr || c == nullptr) {
+		return false;
+	}
+	struct d3d11_multi_compositor *mc = sys->multi_comp;
+	const int idx = multi_comp_find_slot(mc, c);
+	if (idx < 0 || !mc->clients[idx].placed) {
+		return false;
+	}
+	{
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (comp_ws_screens_presenter_count(&sys->ws_screens) < 2) {
+			return false; // one presenter: the primary frames everything, as before
+		}
+		*set = sys->ws_screens;
+	}
+	*pose = mc->clients[idx].window_pose;
+	*w_m = mc->clients[idx].window_width_m;
+	*h_m = mc->clients[idx].window_height_m;
+	return comp_ws_frame_window(set, pose, *w_m, *h_m, XRT_MAX_SEGMENTS, f);
+}
+
+/*!
+ * Screen @p id's secondary presenter DP's predicted eyes, in THAT screen's
+ * display space. False when the screen has no live presenter, its presenter
+ * has no DP, or the DP gives no answer. The presenter array is read under
+ * `ws_presenters_lock` (a presenter is unpublished there before it is
+ * destroyed); the DP query is the cached, thread-safe one the segment DPs
+ * answer from IPC threads too (comp_d3d11_segments_get_eyes).
+ */
+static bool
+svc_ws_presenter_own_eyes(struct d3d11_multi_compositor *mc, uint64_t id, struct xrt_eye_positions *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (mc == nullptr) {
+		return false;
+	}
+	bool ok = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->screen_id == id) {
+			ok = p->dp != nullptr && xrt_display_processor_d3d11_get_predicted_eye_positions(p->dp, out) &&
+			     out->valid && out->count > 0;
+			break;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	if (!ok) {
+		memset(out, 0, sizeof(*out));
+	}
+	return ok;
+}
+
+bool
+comp_d3d11_service_get_client_workspace_view_frame(struct xrt_system_compositor *xsysc,
+                                                   struct xrt_compositor *xc,
+                                                   struct xrt_window_metrics *out_wm,
+                                                   struct xrt_eye_positions *out_eyes,
+                                                   struct xrt_vec3 *out_nominal)
+{
+	if (xsysc == nullptr || xc == nullptr || out_wm == nullptr || out_eyes == nullptr || out_nominal == nullptr ||
+	    !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct comp_ws_screen_set set;
+	struct comp_ws_view_framing f;
+	struct xrt_pose pose = {};
+	float w_m = 0.0f, h_m = 0.0f;
+	if (!svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
+		return false; // not a tile of a multi-presenter workspace: untouched
+	}
+	const struct comp_ws_screen *s =
+	    f.frame_screen_index < set.count ? &set.screens[f.frame_screen_index] : nullptr;
+	const uint64_t key = (f.off_primary && s != nullptr) ? s->id : 0;
+	bool ok = false;
+	if (key != 0 && comp_ws_window_metrics(&set, s, &pose, w_m, h_m, out_wm)) {
+		// That screen's tracker; without an answer its nominal viewer, a
+		// nominal IPD apart (svc_ws_presenter_eyes' fallback), so the window
+		// is never framed from another screen's eyes.
+		if (!svc_ws_presenter_own_eyes(sys->multi_comp, s->id, out_eyes)) {
+			const float vz = s->nominal_viewer_m[2] > 0.01f ? s->nominal_viewer_m[2] : 0.6f;
+			memset(out_eyes, 0, sizeof(*out_eyes));
+			out_eyes->count = 2;
+			out_eyes->eyes[0] = {s->nominal_viewer_m[0] - 0.032f, s->nominal_viewer_m[1], vz};
+			out_eyes->eyes[1] = {s->nominal_viewer_m[0] + 0.032f, s->nominal_viewer_m[1], vz};
+			out_eyes->valid = true;
+			out_eyes->is_tracking = false;
+		}
+		*out_nominal = {s->nominal_viewer_m[0], s->nominal_viewer_m[1], s->nominal_viewer_m[2]};
+		ok = true;
+	}
+
+	// Lifecycle, change-only (the window changed screens): the rig's proof
+	// that a window on another screen is framed from that screen's viewer.
+	if (key != c->ws_frame_logged) {
+		c->ws_frame_logged = key;
+		if (ok) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window %s screen 0x%016llx: views from that "
+			    "screen's eyes (%s, %u) and geometry (%.4fx%.4f m canvas at %.4f,%.4f,%.4f m) "
+			    "(ADR-052 D2)",
+			    (void *)c, c->client_pid, f.part_count == 1 ? "wholly on" : "mostly on",
+			    (unsigned long long)s->id, out_eyes->is_tracking ? "tracked" : "untracked/nominal",
+			    out_eyes->count, out_wm->window_width_m, out_wm->window_height_m,
+			    out_wm->window_center_offset_x_m, out_wm->window_center_offset_y_m,
+			    out_wm->window_center_offset_z_m);
+		} else {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window on the primary screen: the primary's eyes "
+			    "and geometry (ADR-052 D2)",
+			    (void *)c, c->client_pid);
+		}
+	}
+	return ok;
+}
+
+/*!
+ * ADR-052 D2: the per-segment table of workspace tile @p c when its window
+ * straddles presenters — one segment per part, each with its screen's eyes
+ * (the panel DP's for the primary part, the presenter DP's for the others).
+ * The client's state tracker reads it exactly as it reads the direct
+ * pipeline's (oxr_session_locate_views): a multiview client renders one view
+ * set per screen and routes them back (compositor_set_view_routing, the commit
+ * paints the mosaic — each part's views in its part of every tile, so every
+ * presenter's compose samples the views framed for it); any other client
+ * frames one view set from the majority screen.
+ *
+ * @return true with a table; false (count 0) when @p c is not a workspace
+ *         tile of a multi-presenter workspace (@p handled false — the caller
+ *         keeps the direct pipeline's table) or does not straddle.
+ */
+static bool
+svc_ws_client_segment_table(struct xrt_system_compositor *xsysc,
+                            struct xrt_compositor *xc,
+                            struct xrt_segment_metrics *out,
+                            bool *handled)
+{
+	*handled = false;
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	struct comp_ws_screen_set set;
+	struct comp_ws_view_framing f;
+	struct xrt_pose pose = {};
+	float w_m = 0.0f, h_m = 0.0f;
+	if (!svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
+		return false;
+	}
+	*handled = true; // a workspace tile: the direct pipeline's table never applies
+
+	struct xrt_segment_metrics m;
+	(void)comp_ws_segment_table(&set, &f, pose.position.z, &m);
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		(void)comp_segments_publish(&c->ws_seg_pub, &m); // eyes are zero here: geometry changes only
+		m.generation = c->ws_seg_pub.generation;
+	}
+
+	// Change-only (the set of screens it straddles, not every drag pixel).
+	uint64_t key = 0;
+	if (f.part_count >= 2) {
+		key = ((uint64_t)f.part_count << 56) ^ ((uint64_t)(f.per_segment ? 1 : 0) << 55);
+		for (uint32_t k = 0; k < f.part_count && k < COMP_SEGMENTS_MAX; k++) {
+			key ^= f.parts[k].screen_id * (k + 1u);
+		}
+	}
+	if (key != c->ws_table_logged) {
+		c->ws_table_logged = key;
+		if (m.count >= 2) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window straddles %u presenters: per-segment "
+			    "table [0] 0x%016llx %dx%d px, [1] 0x%016llx %dx%d px (a multiview client renders one "
+			    "view set per screen; any other frames from the majority, 0x%016llx) (ADR-052 D2)",
+			    (void *)c, c->client_pid, m.count, (unsigned long long)m.seg[0].screen_id,
+			    m.seg[0].window_rect.extent.w, m.seg[0].window_rect.extent.h,
+			    (unsigned long long)m.seg[1].screen_id, m.seg[1].window_rect.extent.w,
+			    m.seg[1].window_rect.extent.h, (unsigned long long)f.parts[f.majority].screen_id);
+		} else if (f.part_count >= 2) {
+			U_LOG_W(
+			    "workspace views: client %p (pid %ld) — window straddles %u presenters but is %s: one "
+			    "view set from the majority screen 0x%016llx (ADR-052 D2)",
+			    (void *)c, c->client_pid, f.part_count,
+			    f.part_count > XRT_MAX_SEGMENTS ? "on more screens than view sets" : "tilted",
+			    (unsigned long long)f.parts[f.majority].screen_id);
+		}
+	}
+	if (m.count == 0) {
+		return false;
+	}
+
+	// Eyes: never under seg_mutex (the primary's query takes render_mutex).
+	for (uint32_t k = 0; k < m.count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &m.seg[k];
+		struct xrt_eye_positions eyes;
+		memset(&eyes, 0, sizeof(eyes));
+		if (s->is_primary) {
+			s->have_eyes =
+			    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes) &&
+			    eyes.valid;
+		} else {
+			s->have_eyes = svc_ws_presenter_own_eyes(sys->multi_comp, s->screen_id, &eyes);
+		}
+		if (s->have_eyes) {
+			s->eyes = eyes; // else the client frames that part from the screen's nominal viewer
+		}
+	}
+	*out = m;
+	return true;
+}
+
+bool
+comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_segment_metrics *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xsysc == nullptr || xc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	{
+		// ADR-052 D2: a workspace tile's table comes from its placement.
+		bool handled = false;
+		const bool have = svc_ws_client_segment_table(xsysc, xc, out, &handled);
+		if (handled) {
+			return have;
+		}
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	{
+		// Leaf: the table plus every SECONDARY screen's eyes, predicted now
+		// from its segment DP (comp_d3d11_segments_get_eyes is safe against
+		// the weave creating or destroying segment DPs; the manager itself is
+		// only swapped under this lock).
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		if ((int64_t)os_monotonic_get_ns() - c->seg_pub_ns > SVC_SEG_PUB_FRESH_NS) {
+			return false; // not the direct presenter right now: one view set
+		}
+		*out = c->seg_pub;
+		for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+			struct xrt_segment_metric *s = &out->seg[k];
+			if (!s->is_primary) {
+				s->have_eyes = comp_d3d11_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+			}
+		}
+	}
+	// The PRIMARY screen's eyes are the panel DP's — the same query
+	// compositor_get_predicted_eye_positions answers, which takes
+	// render_mutex. Taken AFTER seg_mutex is released: the render thread holds
+	// render_mutex when it takes seg_mutex, so the two never nest here.
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			struct xrt_eye_positions eyes;
+			memset(&eyes, 0, sizeof(eyes));
+			s->have_eyes =
+			    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes) &&
+			    eyes.valid;
+			if (s->have_eyes) {
+				s->eyes = eyes;
+			}
+		}
+	}
+	return out->count > 0;
+}
+
+/*!
+ * ADR-047 Amendment 7: note screen @p screen_id's DP answer @p eyes into @p t
+ * (util/u_tracking_any.h: each screen counts once).
+ */
+static void
+svc_other_tracking_note(struct u_tracking_others *t, uint64_t screen_id, const struct xrt_eye_positions *eyes)
+{
+	u_tracking_others_note(t, screen_id, u_tracking_dp_viewer_present(eyes));
+}
+
+/*!
+ * ADR-047 Amendment 7: note every secondary workspace presenter's DP. The
+ * presenter ids are copied under ws_presenters_lock, then each DP is asked
+ * through svc_ws_presenter_own_eyes (which re-finds it under the lock).
+ */
+static void
+svc_other_tracking_ws_presenters(struct d3d11_multi_compositor *mc, struct u_tracking_others *t)
+{
+	if (mc == nullptr) {
+		return;
+	}
+	uint64_t ids[COMP_WS_MAX_SCREENS] = {0};
+	uint32_t n = 0;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < mc->ws_presenter_count && i < COMP_WS_MAX_SCREENS; i++) {
+		if (mc->ws_presenters[i] != nullptr) {
+			ids[n++] = mc->ws_presenters[i]->screen_id;
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_eye_positions eyes;
+		if (svc_ws_presenter_own_eyes(mc, ids[i], &eyes)) {
+			svc_other_tracking_note(t, ids[i], &eyes);
+		}
+	}
+}
+
+//! A client's direct-pipeline and present-owner segment DPs off the primary.
+//! Caller holds clients_mutex, or is @p c's own IPC thread.
+static void
+svc_other_tracking_client_segments(struct d3d11_service_compositor *c, int64_t now_ns, struct u_tracking_others *t)
+{
+	std::lock_guard<std::mutex> lk(c->seg_mutex); // leaf (clients_mutex -> seg_mutex is the existing order)
+	// The direct pipeline: segment DPs predicted now (comp_d3d11_segments_get_eyes
+	// is safe against the weave; the manager is only swapped under seg_mutex).
+	if (c->segments != nullptr && c->seg_pub.count > 0 && c->seg_pub.count <= XRT_MAX_SEGMENTS &&
+	    now_ns - c->seg_pub_ns <= SVC_SEG_PUB_FRESH_NS) {
+		for (uint32_t k = 0; k < c->seg_pub.count; k++) {
+			const struct xrt_segment_metric *s = &c->seg_pub.seg[k];
+			if (s->is_primary || !s->has_dp) {
+				continue;
+			}
+			struct xrt_eye_positions eyes;
+			memset(&eyes, 0, sizeof(eyes));
+			if (comp_d3d11_segments_get_eyes(c->segments, s->screen_id, &eyes) && eyes.valid) {
+				svc_other_tracking_note(t, s->screen_id, &eyes);
+			}
+		}
+	}
+	// The present-owner's weave: its eyes as the last submit predicted them
+	// (weave_segs itself is swapped under render_mutex, which is not taken here).
+	if (c->weave_seg_out.count > 0 && c->weave_seg_out.count <= XRT_MAX_SEGMENTS &&
+	    now_ns - c->weave_seg_out_ns <= SVC_SEG_PUB_FRESH_NS) {
+		for (uint32_t k = 0; k < c->weave_seg_out.count; k++) {
+			const struct xrt_segment_metric *s = &c->weave_seg_out.seg[k];
+			if (!s->is_primary && s->have_eyes && s->eyes.valid) {
+				svc_other_tracking_note(t, s->screen_id, &s->eyes);
+			}
+		}
+	}
+}
+
+bool
+comp_d3d11_service_get_other_screens_tracking(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              uint32_t *out_count,
+                                              uint64_t *out_tracked_screen)
+{
+	if (out_count != nullptr) {
+		*out_count = 0;
+	}
+	if (out_tracked_screen != nullptr) {
+		*out_tracked_screen = 0;
+	}
+	if (xsysc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+	struct u_tracking_others t;
+	memset(&t, 0, sizeof(t));
+
+	if (xc != nullptr) {
+		struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+		// A placed tile of a multi-presenter workspace: EVERY secondary
+		// presenter, not only those its footprint touches. The workspace is
+		// one experience across its screens — a viewer seen by any of its
+		// panels keeps every tile tracked (David, two-panel rig 2026-10-11:
+		// a tile on the laptop panel dropped to untracked the moment the
+		// laptop camera was blocked, with his face in front of the DS1).
+		// Eyes are untouched: a tile's views stay its own screen's.
+		struct comp_ws_screen_set set;
+		struct comp_ws_view_framing f;
+		struct xrt_pose pose = {};
+		float w_m = 0.0f, h_m = 0.0f;
+		if (svc_ws_client_framing(sys, c, &set, &pose, &w_m, &h_m, &f)) {
+			svc_other_tracking_ws_presenters(sys->multi_comp, &t);
+		}
+		// Its own direct / present-owner segments. Lifetime: the caller is
+		// this client's own IPC thread, so @p c is alive.
+		svc_other_tracking_client_segments(c, now_ns, &t);
+	} else {
+		// Every secondary workspace presenter...
+		if (sys->workspace_mode) {
+			svc_other_tracking_ws_presenters(sys->multi_comp, &t);
+		}
+		// ...and every client's live segment DPs. A compositor found in
+		// all_clients under clients_mutex stays whole (destroy leaves the
+		// list first).
+		std::lock_guard<std::mutex> reg(sys->clients_mutex);
+		for (struct d3d11_service_compositor *c : sys->all_clients) {
+			if (c != nullptr) {
+				svc_other_tracking_client_segments(c, now_ns, &t);
+			}
+		}
+	}
+
+	if (out_count != nullptr) {
+		*out_count = t.count;
+	}
+	if (out_tracked_screen != nullptr) {
+		*out_tracked_screen = t.tracked_screen;
+	}
+	return t.tracked_screen != 0;
+}
+
+void
+comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_segment_view_routing *routing)
+{
+	if (xsysc == nullptr || xc == nullptr || routing == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	// This client's IPC thread is the only reader (its next layer_commit):
+	// one connection, handled in order, so no lock.
+	c->seg_route = *routing;
+	if (c->seg_route.count > XRT_MAX_SEGMENTS) {
+		memset(&c->seg_route, 0, sizeof(c->seg_route)); // never index past the arrays
+	}
+}
+
+void
+comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
+                                           const struct ipc_cursor_draw_request *req,
+                                           struct ipc_cursor_draw_outcome *out)
+{
+	if (out != nullptr) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (xc == nullptr || req == nullptr || out == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct svc_client_cursor_draw *cd = &c->cursor_draw;
+	std::lock_guard<std::mutex> lk(cd->mutex);
+
+	if (cd->pending_valid) {
+		// The last request was never consumed: no commit followed it (or the
+		// commit returned before its cursor step). Not drawn.
+		cd->outcome_seq = cd->pending_seq;
+		cd->outcome_drew = false;
+		cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+	} else if (cd->frame_valid && cd->frame_seq > cd->outcome_seq + SVC_CURSOR_OUTCOME_MAX_LAG) {
+		// Consumed, but nothing has decided about the last few frames (under
+		// the shell no render tick looked at this client): not drawn.
+		cd->outcome_seq = cd->frame_seq;
+		cd->outcome_drew = false;
+		cd->outcome_reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		if (!cd->warned_lag) {
+			cd->warned_lag = true;
+			U_LOG_W("[cursor_draw] client %p: no render pass answered its cursor requests - reporting not drawn "
+			        "(willDraw = false; one-time notice)",
+			        (void *)c);
+		}
+	}
+	if (cd->outcome_seq != 0) {
+		out->answered = 1;
+		out->drew = cd->outcome_drew ? 1 : 0;
+		out->reason = cd->outcome_reason;
+	}
+
+	cd->pending = *req;
+	if (cd->pending.view_count > XRT_MAX_VIEWS) {
+		cd->pending.view_count = XRT_MAX_VIEWS; // never index past the arrays
+	}
+	cd->pending_seq = ++cd->next_seq;
+	cd->pending_valid = true;
+	if (!cd->announced) {
+		cd->announced = true;
+		U_LOG_W("[cursor_draw] client %p: runtime-drawn cursor requested over IPC - the service draws it "
+		        "(ADR-046 Phase 4, one-time notice)",
+		        (void *)c);
+	}
+}
+
+void
+comp_d3d11_service_set_cursor_measure_request(struct xrt_compositor *xc,
+                                              const struct ipc_cursor_measure_request *req,
+                                              struct ipc_cursor_measure_result *out)
+{
+	if (out != nullptr) {
+		memset(out, 0, sizeof(*out));
+	}
+	if (xc == nullptr || req == nullptr || out == nullptr) {
+		return;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	struct svc_client_cursor_measure *cm = &c->cursor_measure;
+
+	// The commit that follows on this same IPC thread consumes it.
+	struct u_cursor_measure_request r = {};
+	r.requested = true;
+	r.tag = req->tag;
+	r.u = req->u;
+	r.v = req->v;
+	r.height = req->height;
+	r.view_index[0] = req->view_index[0];
+	r.view_index[1] = req->view_index[1];
+	cm->pending = r;
+	cm->pending_valid = true;
+
+	struct u_cursor_measure_result res;
+	{
+		std::lock_guard<std::mutex> rl(cm->result_mutex);
+		res = cm->result;
+	}
+	if (res.valid) {
+		out->tag = res.tag;
+		out->valid = 1;
+		out->confident = res.confident ? 1 : 0;
+		out->disparity_px = res.disparity_px;
+		out->sub_w = res.sub_w;
+		out->ncc = res.ncc;
+		out->matched = res.matched;
+		out->lr_rejected = res.lr_rejected;
+		out->reused = res.reused ? 1 : 0;
+	}
+}
+
 void
 comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid)
 {
@@ -27808,6 +37309,284 @@ comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid
 	if (c != nullptr) {
 		c->client_pid = pid;
 	}
+}
+
+bool
+comp_d3d11_service_share_query(struct xrt_compositor *xc,
+                               struct xrt_app_share_source_info *io_info,
+                               int64_t *out_last_commit_ns)
+{
+	if (xc == nullptr) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c == nullptr) {
+		return false;
+	}
+	const uint32_t views = c->share_active_views.load(std::memory_order_relaxed);
+	io_info->content_eye_width = c->pipe_content_w;
+	io_info->content_eye_height = c->pipe_content_h;
+	if (views > 0) {
+		io_info->active_view_count = views;
+	}
+	io_info->zero_disparity_shift_frac = 0.0f;
+	io_info->encoding_is_linear = c->atlas_holds_srgb_bytes ? 0u : 1u;
+	HWND hwnd = c->app_hwnd != nullptr ? (HWND)c->app_hwnd : (HWND)c->render.hwnd;
+	RECT r = {};
+	if (hwnd != nullptr && GetWindowRect(hwnd, &r)) {
+		io_info->window_x = r.left;
+		io_info->window_y = r.top;
+		io_info->window_width = (uint32_t)(r.right - r.left);
+		io_info->window_height = (uint32_t)(r.bottom - r.top);
+	}
+	*out_last_commit_ns = c->share_last_commit_ns.load(std::memory_order_relaxed);
+	return true;
+}
+
+xrt_result_t
+comp_d3d11_service_share_attach(struct xrt_compositor *xc, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap)
+{
+	if (xc == nullptr || eye_w < 16 || eye_h < 16 || (eye_w & 1) != 0 || (eye_h & 1) != 0 || fps <= 0.0f) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c == nullptr) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	auto tp = std::make_shared<struct svc_share_tap>();
+	tp->eye_w = eye_w;
+	tp->eye_h = eye_h;
+	tp->period_ns = (int64_t)(1e9f / fps);
+	if (!svc_share_tap_create_gpu(c->sys, tp.get())) {
+		U_LOG_W("ADR-061 share tap: GPU resources failed");
+		return XRT_ERROR_ALLOCATION;
+	}
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (c->share_tap) {
+			U_LOG_W("ADR-061 share tap: client already tapped");
+			return XRT_ERROR_IPC_FAILURE;
+		}
+		tp->owner = c;
+		c->share_tap = tp;
+		c->share_tap_active.store(true);
+	}
+	U_LOG_W("ADR-061 share tap: attached client pid %ld, %ux%u per eye, at most %.1f fps", c->client_pid, eye_w, eye_h,
+	        (double)fps);
+	*out_tap = new std::shared_ptr<struct svc_share_tap>(std::move(tp));
+	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_d3d11_service_share_wait_frame(void *tap,
+                                    int64_t timeout_ns,
+                                    struct xrt_plugin_stereo_camera_frame *out_frame,
+                                    struct xrt_app_share_frame_info *out_info)
+{
+	struct svc_share_tap *t = static_cast<std::shared_ptr<struct svc_share_tap> *>(tap)->get();
+	std::unique_lock<std::mutex> lk(t->mutex);
+	const bool woke = t->cv.wait_for(lk, std::chrono::nanoseconds(timeout_ns),
+	                                 [&] { return !t->alive || t->ready_seq != t->consumed_seq; });
+	if (!t->alive) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	if (!woke) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT;
+	}
+	t->front.swap(t->ready);
+	t->consumed_seq = t->ready_seq;
+	const uint32_t full_w = t->eye_w * 2;
+	out_frame->sequence = t->consumed_seq;
+	out_frame->time_ns = t->ready_commit_ns;
+	out_frame->time_is_exposure = false;
+	out_frame->width = full_w;
+	out_frame->height = t->eye_h;
+	out_frame->format = XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12;
+	out_frame->planes[0] = t->front.data();
+	out_frame->planes[1] = t->front.data() + (size_t)full_w * t->eye_h;
+	out_frame->pitches[0] = full_w;
+	out_frame->pitches[1] = full_w;
+	*out_info = t->ready_info;
+	return XRT_PLUGIN_STEREO_CAMERA_WAIT_OK;
+}
+
+void
+comp_d3d11_service_share_detach(void *tap)
+{
+	auto *handle = static_cast<std::shared_ptr<struct svc_share_tap> *>(tap);
+	struct svc_share_tap *t = handle->get();
+	{
+		std::lock_guard<std::mutex> lk(g_svc_share_mutex);
+		if (t->owner != nullptr) {
+			t->owner->share_tap_active.store(false);
+			t->owner->share_tap.reset();
+			t->owner = nullptr;
+		}
+	}
+	// A commit still inside svc_share_tap_commit holds its own reference, so the
+	// last release may be there.
+	const double n = t->n_commit > 0 ? (double)t->n_commit : 1.0;
+	U_LOG_W("ADR-061 share tap: detached. %llu commits, %llu frames queued, %llu delivered, %llu skipped (ring full); "
+	        "cost per commit avg %.3f ms, max %.3f ms (harvest avg %.3f ms)",
+	        (unsigned long long)t->n_commit, (unsigned long long)t->n_submit, (unsigned long long)t->n_harvest,
+	        (unsigned long long)t->n_ring_full, (double)t->ns_commit_total / n * 1e-6, (double)t->ns_commit_max * 1e-6,
+	        (double)t->ns_harvest_total / n * 1e-6);
+	delete handle;
+}
+
+//! ADR-061 arm 2: an in-process app's ring, opened on the service device.
+struct svc_share_import
+{
+	struct d3d11_service_system *sys = nullptr;
+	struct xrt_share_link_ring_desc desc = {};
+	wil::com_ptr<ID3D11Texture2D> tex[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11ShaderResourceView> srv[XRT_SHARE_LINK_RING_SLOTS];
+	wil::com_ptr<ID3D11Fence> fence;
+	wil::com_ptr<ID3D11DeviceContext4> ctx4;
+	std::shared_ptr<struct svc_share_tap> tap;
+	uint64_t n_frames = 0, n_ring_full = 0, n_ok = 0;
+};
+
+bool
+comp_d3d11_service_share_link_adapter_luid(struct xrt_system_compositor *xsysc, uint8_t out_luid[XRT_LUID_SIZE])
+{
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || !sys->base.info.client_d3d_deviceLUID_valid) {
+		return false;
+	}
+	std::memcpy(out_luid, sys->base.info.client_d3d_deviceLUID.data, XRT_LUID_SIZE);
+	return true;
+}
+
+xrt_result_t
+comp_d3d11_service_share_link_import(struct xrt_system_compositor *xsysc,
+                                     const struct xrt_share_link_ring_desc *desc,
+                                     const xrt_graphics_buffer_handle_t *textures,
+                                     uint32_t texture_count,
+                                     xrt_graphics_sync_handle_t fence,
+                                     uint32_t eye_w,
+                                     uint32_t eye_h,
+                                     void **out_import)
+{
+	// Every handle is ours from here, whatever happens.
+	struct handles_closer
+	{
+		const xrt_graphics_buffer_handle_t *t;
+		uint32_t n;
+		xrt_graphics_sync_handle_t f;
+		~handles_closer()
+		{
+			for (uint32_t i = 0; i < n; i++) {
+				if (t[i] != nullptr && t[i] != INVALID_HANDLE_VALUE) {
+					CloseHandle(t[i]);
+				}
+			}
+			if (f != nullptr && f != INVALID_HANDLE_VALUE) {
+				CloseHandle(f);
+			}
+		}
+	} closer{textures, texture_count, fence};
+
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || desc == nullptr || out_import == nullptr || texture_count != XRT_SHARE_LINK_RING_SLOTS ||
+	    desc->slot_count != XRT_SHARE_LINK_RING_SLOTS || desc->content_width == 0 || desc->content_height == 0 ||
+	    desc->slot_width < desc->content_width * 2 || desc->slot_height < desc->content_height || eye_w < 16 ||
+	    eye_h < 16 || (eye_w & 1) != 0 || (eye_h & 1) != 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	wil::com_ptr<ID3D11Device1> dev1;
+	if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev1.put())))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	auto imp = std::make_unique<struct svc_share_import>();
+	imp->sys = sys;
+	imp->desc = *desc;
+	for (uint32_t i = 0; i < XRT_SHARE_LINK_RING_SLOTS; i++) {
+		HRESULT hr = dev1->OpenSharedResource1(textures[i], IID_PPV_ARGS(imp->tex[i].put()));
+		if (SUCCEEDED(hr)) {
+			hr = sys->device->CreateShaderResourceView(imp->tex[i].get(), nullptr, imp->srv[i].put());
+		}
+		if (FAILED(hr)) {
+			U_LOG_W("ADR-061 share link: slot %u of ring %u will not open (0x%08lx): is it on this adapter?", i,
+			        desc->generation, (unsigned long)hr);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	if (fence != nullptr && fence != INVALID_HANDLE_VALUE) {
+		wil::com_ptr<ID3D11Device5> dev5;
+		if (FAILED(sys->device->QueryInterface(IID_PPV_ARGS(dev5.put()))) ||
+		    FAILED(dev5->OpenSharedFence(fence, IID_PPV_ARGS(imp->fence.put()))) ||
+		    FAILED(sys->context->QueryInterface(IID_PPV_ARGS(imp->ctx4.put())))) {
+			U_LOG_W("ADR-061 share link: the fence of ring %u will not open", desc->generation);
+			return XRT_ERROR_IPC_FAILURE;
+		}
+	}
+	auto tp = std::make_shared<struct svc_share_tap>();
+	tp->eye_w = eye_w;
+	tp->eye_h = eye_h;
+	if (!svc_share_tap_create_gpu(sys, tp.get())) {
+		U_LOG_W("ADR-061 share link: GPU resources failed");
+		return XRT_ERROR_ALLOCATION;
+	}
+	imp->tap = std::move(tp);
+	*out_import = imp.release();
+	return XRT_SUCCESS;
+}
+
+uint32_t
+comp_d3d11_service_share_link_convert(void *import,
+                                      const struct xrt_share_link_frame *frame,
+                                      struct xrt_plugin_stereo_camera_frame *out_frame,
+                                      struct xrt_app_share_frame_info *out_info)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	struct svc_share_tap *t = imp->tap.get();
+	struct d3d11_service_system *sys = imp->sys;
+	if (frame->slot >= XRT_SHARE_LINK_RING_SLOTS) {
+		return XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR;
+	}
+	const uint32_t cw = frame->content_width != 0 ? frame->content_width : imp->desc.content_width;
+	const uint32_t ch = frame->content_width != 0 ? frame->content_height : imp->desc.content_height;
+	{
+		std::lock_guard<std::mutex> ctx_lock(sys->immediate_ctx_mutex);
+		svc_share_tap_harvest(sys, t);
+		if (t->slot[t->write_idx].busy) {
+			imp->n_ring_full++;
+		} else {
+			if (imp->fence && imp->ctx4 && frame->fence_value != 0) {
+				imp->ctx4->Wait(imp->fence.get(), frame->fence_value);
+			}
+			// The two halves as a 2x1 atlas. A mono frame reads the left half twice.
+			svc_share_tap_submit(sys, t, 0, frame->mono != 0 ? 0 : 1, frame->mono != 0, 2, 1, cw, ch,
+			                     imp->desc.slot_width, imp->desc.slot_height, (int)imp->desc.format,
+			                     imp->desc.flip_y != 0, imp->desc.encoding_is_linear != 0,
+			                     imp->srv[frame->slot].get(), frame->commit_ns, frame->zero_disparity_shift_frac);
+			imp->n_frames++;
+		}
+	}
+	const uint32_t w = comp_d3d11_service_share_wait_frame(&imp->tap, 0, out_frame, out_info);
+	if (w == XRT_PLUGIN_STEREO_CAMERA_WAIT_OK) {
+		imp->n_ok++;
+	}
+	return w;
+}
+
+void
+comp_d3d11_service_share_link_unimport(void *import)
+{
+	struct svc_share_import *imp = static_cast<struct svc_share_import *>(import);
+	if (imp == nullptr) {
+		return;
+	}
+	U_LOG_W("ADR-061 share link: ring %u closed: %llu frames queued, %llu delivered, %llu skipped (ring full)",
+	        imp->desc.generation, (unsigned long long)imp->n_frames, (unsigned long long)imp->n_ok,
+	        (unsigned long long)imp->n_ring_full);
+	{
+		// The tap's GPU objects were last used under this lock.
+		std::lock_guard<std::mutex> ctx_lock(imp->sys->immediate_ctx_mutex);
+		imp->tap.reset();
+	}
+	delete imp;
 }
 
 bool
@@ -27983,6 +37762,9 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 
 	struct workspace_public_event_raw raw[IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX];
 	uint32_t got = comp_d3d11_window_consume_workspace_public_events(mc->window, raw, want);
+	// ADR-052: the secondary presenters' windows feed the same queue, their
+	// cursor positions moved into workspace pixels.
+	got += svc_ws_presenters_consume_events(mc, raw, got, want - got);
 
 	// Phase 2.K: even when the WndProc-side ring is empty, FRAME_TICK and
 	// FOCUS_CHANGED events still need to drain — controllers pace their
@@ -28196,6 +37978,24 @@ comp_d3d11_service_workspace_drain_input_events(struct xrt_system_compositor *xs
 		cs->announce_connected = false;
 	}
 
+	// spec_version 25 (ADR-052): SCREENS_CHANGED, at most one per drain, when
+	// the screen set moved past the generation the controller last saw. Only
+	// for a controller that opted in by enumerating — a pre-v25 controller
+	// never sees the new event type.
+	if (out_batch->count < IPC_WORKSPACE_INPUT_EVENT_BATCH_MAX) {
+		std::lock_guard<std::mutex> lk(sys->ws_screens_mutex);
+		if (sys->ws_screens_optin && sys->ws_screens_generation != sys->ws_screens_gen_emitted) {
+			struct ipc_workspace_input_event *ev = &out_batch->events[out_batch->count];
+			memset(ev, 0, sizeof(*ev));
+			ev->event_type = IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED;
+			ev->timestamp_ms = (uint32_t)GetTickCount();
+			ev->u.screens_changed.generation = sys->ws_screens_generation;
+			ev->u.screens_changed.screen_count = sys->ws_screens.count;
+			sys->ws_screens_gen_emitted = sys->ws_screens_generation;
+			out_batch->count++;
+		}
+	}
+
 	// FRAME_TICK: one per displayed frame since the last drain, capped at
 	// remaining batch capacity. If the controller drains faster than one
 	// frame this is a no-op; if it falls behind we cap and the timestamp on
@@ -28274,7 +38074,8 @@ comp_d3d11_service_workspace_pointer_capture_set(struct xrt_system_compositor *x
 		// special-case lifecycle ordering.
 		return true;
 	}
-	comp_d3d11_window_set_workspace_pointer_capture(mc->window, enabled, button);
+	// ADR-052: grabbed by the presenter window the press went down on.
+	svc_ws_pointer_capture_set(mc, enabled, button);
 	return true;
 }
 
@@ -28608,6 +38409,19 @@ comp_d3d11_service_workspace_set_reserved_keys(struct xrt_system_compositor *xsy
 		mods[i] = table->keys[i].modifiers;
 	}
 	comp_d3d11_window_set_reserved_keys(mc->window, vks, mods, count);
+	// ADR-052: every presenter window forwards keys the same way.
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	mc->ws_reserved_set = true;
+	mc->ws_reserved_count = count;
+	memcpy(mc->ws_reserved_vks, vks, sizeof(vks[0]) * count);
+	memcpy(mc->ws_reserved_mods, mods, sizeof(mods[0]) * count);
+	for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		if (p != nullptr && p->window != nullptr) {
+			comp_d3d11_window_set_reserved_keys(p->window, vks, mods, count);
+		}
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
 	return XRT_SUCCESS;
 }
 
@@ -28623,6 +38437,24 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
                                           float pivot_x, float pivot_y,
                                           float size_w_m, float size_h_m,
                                           bool visible, bool stereo_sbs)
+{
+	return comp_d3d11_service_workspace_set_overlay_on_screen(xsysc, overlay_id, xsc, anchor_x, anchor_y, pivot_x,
+	                                                          pivot_y, size_w_m, size_h_m, visible, stereo_sbs, 0);
+}
+
+// spec_version 26 (ADR-052 Amendment 2): the same, on screen @p screen_id (0 =
+// the primary). Which presenter draws it is resolved per frame in the compose
+// pass (comp_ws_overlay_screen), so a screen that disappears falls back to the
+// primary and one that comes back gets its overlay back with no new call.
+extern "C" xrt_result_t
+comp_d3d11_service_workspace_set_overlay_on_screen(struct xrt_system_compositor *xsysc,
+                                                    uint32_t overlay_id,
+                                                    struct xrt_swapchain *xsc,
+                                                    float anchor_x, float anchor_y,
+                                                    float pivot_x, float pivot_y,
+                                                    float size_w_m, float size_h_m,
+                                                    bool visible, bool stereo_sbs,
+                                                    uint64_t screen_id)
 {
 	if (xsysc == nullptr) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -28646,8 +38478,15 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
 		return XRT_SUCCESS;
 	}
 
+	const bool is_new = sys->overlays.find(overlay_id) == sys->overlays.end();
 	overlay_slot &slot = sys->overlays[overlay_id];
+	if (is_new ? screen_id != 0 : slot.screen_id != screen_id) {
+		// Lifecycle (an overlay placed on / moved to another screen), not per frame.
+		U_LOG_W("workspace overlay %u: on screen 0x%016llx%s", overlay_id, (unsigned long long)screen_id,
+		        screen_id == 0 ? " (the primary)" : "");
+	}
 	slot.xsc = xsc; // borrowed; controller owns lifetime
+	slot.screen_id = screen_id;
 	slot.stereo_sbs = stereo_sbs;
 	slot.anchor_x = anchor_x;
 	slot.anchor_y = anchor_y;
@@ -28743,7 +38582,7 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 		return;
 	}
 	// If the WndProc already delivered the DOWN to this HWND, don't double it.
-	if ((HWND)comp_d3d11_window_get_last_pointer_down_target(mc->window) == target) {
+	if ((HWND)svc_ws_last_pointer_down_target(mc) == target) {
 		return;
 	}
 
@@ -28796,6 +38635,77 @@ synthesize_focus_click_down(struct d3d11_multi_compositor *mc, int slot)
 	LPARAM lp = MAKELPARAM(app_x, app_y);
 	PostMessage(click_target, WM_MOUSEMOVE, 0, lp);
 	PostMessage(click_target, WM_LBUTTONDOWN, MK_LBUTTON, lp);
+
+	// The DOWN is now owed an UP. The real one is forwarded only if the cursor
+	// is over this window's forward rect at release — not if the window moved
+	// meanwhile (a taskbar restore grows it out of the dock point under the
+	// cursor), the release lands on another presenter, or focus moves on.
+	// svc_ws_synth_press_settle pairs it on every drain.
+	HWND owed =
+	    (HWND)comp_ws_synth_press_note_down(&mc->ws_synth_press, click_target, 1, GetTickCount(), app_x, app_y);
+	mc->ws_synth_press_owner = target;
+	if (owed != nullptr && IsWindow(owed)) {
+		PostMessage(owed, WM_LBUTTONUP, 0, 0);
+	}
+}
+
+//! Did a presenter window forward a real UP of @p button to @p target at or after @p since_ms?
+static bool
+svc_ws_up_forwarded_since(struct d3d11_multi_compositor *mc, void *target, uint32_t button, uint32_t since_ms)
+{
+	auto check = [&](struct comp_d3d11_window *w) {
+		uint32_t b = 0, t = 0;
+		void *up = comp_d3d11_window_get_last_pointer_up(w, &b, &t);
+		return up != nullptr && up == target && b == button && (int32_t)(t - since_ms) >= 0;
+	};
+	if (check(mc->window)) {
+		return true;
+	}
+	bool found = false;
+	AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+	for (uint32_t i = 0; !found && i < mc->ws_presenter_count; i++) {
+		struct svc_ws_presenter *p = mc->ws_presenters[i];
+		found = p != nullptr && p->window != nullptr && check(p->window);
+	}
+	ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
+	return found;
+}
+
+/*!
+ * Pair a pending synthetic DOWN with its UP (comp_ws_synth_press): post the UP
+ * once the button is up without a real UP having reached the app, or as soon
+ * as forwarding moved to another window. Every drain, render thread.
+ */
+static void
+svc_ws_synth_press_settle(struct d3d11_multi_compositor *mc)
+{
+	if (mc == nullptr || mc->ws_synth_press.target == nullptr) {
+		return;
+	}
+	struct comp_ws_synth_press *sp = &mc->ws_synth_press;
+	const int vk = sp->button == 2 ? VK_RBUTTON : (sp->button == 3 ? VK_MBUTTON : VK_LBUTTON);
+	const bool held = (GetAsyncKeyState(vk) & 0x8000) != 0;
+	const bool up_fwd = svc_ws_up_forwarded_since(mc, sp->target, sp->button, sp->timestamp_ms);
+
+	// The window forwarding goes to now (update_input_forward's rule). The
+	// press target may be a child control of the focused app: same window.
+	HWND focus = nullptr;
+	const int fs = mc->focused_slot;
+	if (fs >= 0 && fs < D3D11_MULTI_MAX_CLIENTS && mc->clients[fs].active && !mc->clients[fs].modal_open) {
+		focus = mc->clients[fs].app_hwnd;
+	}
+	void *focus_target = (focus != nullptr && focus == mc->ws_synth_press_owner) ? sp->target : (void *)focus;
+
+	const int32_t x = sp->x, y = sp->y;
+	const uint32_t button = sp->button;
+	HWND owed = (HWND)comp_ws_synth_press_settle(sp, held, up_fwd, focus_target);
+	if (owed == nullptr || !IsWindow(owed)) {
+		return;
+	}
+	const UINT msg = button == 2 ? WM_RBUTTONUP : (button == 3 ? WM_MBUTTONUP : WM_LBUTTONUP);
+	PostMessage(owed, msg, 0, MAKELPARAM(x, y));
+	U_LOG_I("Workspace: paired a synthetic button-%u DOWN with an UP (hwnd=%p, %s)", button, (void *)owed,
+	        held ? "focus moved" : "released off the window");
 }
 
 /*
@@ -28838,6 +38748,7 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		mc->clients[slot].window_pose = cmd->pose;
 		mc->clients[slot].window_width_m = cmd->width_m;
 		mc->clients[slot].window_height_m = cmd->height_m;
+		mc->clients[slot].window_screen_id = cmd->screen_id; // ADR-052: 0 = primary
 		// ADR-018 (#304): first set_pose marks the client placed; the runtime
 		// starts compositing it from here (gated with first-frame-committed).
 		mc->clients[slot].placed = true;
@@ -28871,6 +38782,7 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		mc->clients[slot].window_pose = cmd->pose;
 		mc->clients[slot].window_width_m = cmd->width_m;
 		mc->clients[slot].window_height_m = cmd->height_m;
+		mc->clients[slot].window_screen_id = cmd->screen_id; // ADR-052: 0 = primary
 		// ADR-018 (#304): slot-addressed path serves both capture clients
 		// and OpenXR clients posed by 1000+slot.
 		mc->clients[slot].placed = true;
@@ -28977,6 +38889,17 @@ service_ws_cmd_apply(struct d3d11_service_system *sys, const struct ws_command *
 		if (mc->window != nullptr) {
 			comp_d3d11_window_set_input_suppress(mc->window, cmd->flag);
 		}
+		// ADR-052 Amendment 2: the grab covers every presenter window, so a
+		// modal overlay on another screen (a launcher opened there) owns the
+		// clicks made on it instead of having them forwarded to the focused app.
+		AcquireSRWLockExclusive(&mc->ws_presenters_lock);
+		for (uint32_t i = 0; i < mc->ws_presenter_count; i++) {
+			struct svc_ws_presenter *p = mc->ws_presenters[i];
+			if (p != nullptr && p->window != nullptr) {
+				comp_d3d11_window_set_input_suppress(p->window, cmd->flag);
+			}
+		}
+		ReleaseSRWLockExclusive(&mc->ws_presenters_lock);
 		sys->input_grabbed = cmd->flag; // cursor render reads this to pin to z=0
 		U_LOG_W("Workspace: input grab %s", cmd->flag ? "on" : "off");
 		return;
@@ -29052,6 +38975,80 @@ comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc)
 		return XRT_DP_BACKEND_STATE_OK;
 	}
 	return d3d11_service_system_from_xrt(xsysc)->dp_backend_state.load(std::memory_order_relaxed);
+}
+
+extern "C" void
+comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct comp_d3d11_render_diag *out)
+{
+	if (out == nullptr) {
+		return;
+	}
+	*out = {};
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::mutex> lk(sys->render_diag_last_mutex);
+	*out = sys->render_diag_last;
+}
+
+extern "C" bool
+comp_d3d11_service_get_client_status(struct xrt_system_compositor *xsysc,
+                                     struct xrt_compositor *xc,
+                                     struct comp_d3d11_client_status *out)
+{
+	if (out == nullptr) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xsysc == nullptr || xc == nullptr || !comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return false;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+
+	// Lifetime: compositor_destroy leaves all_clients (under clients_mutex)
+	// before it frees anything, so holding clients_mutex across the whole read
+	// keeps a compositor found in it whole. Lock order render_mutex ->
+	// clients_mutex (the only order); the reads below re-enter render_mutex
+	// (recursive, already ours) and take seg_mutex (a leaf). Nothing they call
+	// takes clients_mutex.
+	render_mutex_fair_lock render_lock(sys);
+	std::lock_guard<std::mutex> reg(sys->clients_mutex);
+	bool found = false;
+	for (struct d3d11_service_compositor *other : sys->all_clients) {
+		if (other == c) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		return false;
+	}
+	out->live = true;
+
+	switch (c->presenter) {
+	case PRESENTER_APP_HWND: out->presenter = XRT_STATUS_PRESENTER_APP_HWND; break;
+	case PRESENTER_CLIENT_TEXTURE: out->presenter = XRT_STATUS_PRESENTER_CLIENT_TEXTURE; break;
+	case PRESENTER_SERVICE_WINDOW: out->presenter = XRT_STATUS_PRESENTER_SERVICE_WINDOW; break;
+	case PRESENTER_SELF: out->presenter = XRT_STATUS_PRESENTER_SELF; break;
+	default: out->presenter = XRT_STATUS_PRESENTER_NONE; break;
+	}
+
+	struct xrt_eye_positions eyes;
+	memset(&eyes, 0, sizeof(eyes));
+	if (c->presenter != PRESENTER_NONE &&
+	    comp_d3d11_service_get_predicted_eye_positions_full_for_client(xsysc, xc, &eyes)) {
+		out->eyes_answered = true;
+		out->is_tracking = eyes.valid && eyes.is_tracking;
+	}
+	(void)comp_d3d11_service_get_client_window_metrics(xsysc, xc, &out->window);
+	(void)comp_d3d11_service_get_client_segment_metrics(xsysc, xc, &out->segments);
+	{
+		std::lock_guard<std::mutex> lk(c->seg_mutex);
+		out->owner_screen = comp_d3d11_segments_get_owner(c->segments);
+	}
+	return true;
 }
 
 extern "C" bool
@@ -29713,7 +39710,7 @@ comp_d3d11_service_get_capture_client_info(struct xrt_system_compositor *xsysc,
  *
  * Activate used to flag only slot members (`pending_workspace_reentry` on
  * `mc->clients[]`), so a client that was standalone at that moment — a forced-
- * IPC app started before Ctrl+Space — was never told: its commits took the
+ * IPC app started before the launch hotkey — was never told: its commits took the
  * workspace early-return before process_atlas/Present (dark) while its per-
  * client DP stayed alive on the panel (a second weaver).
  *
@@ -29909,7 +39906,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 		return true;
 	}
 
-	// If workspace was suspended (deactivated via Ctrl+Space), resume it:
+	// If workspace was suspended (deactivated via the launch hotkey), resume it:
 	// show window, recreate DP, restart render thread.
 	if (sys->multi_comp != nullptr && sys->multi_comp->suspended) {
 		struct d3d11_multi_compositor *mc = sys->multi_comp;
@@ -29992,6 +39989,7 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 			pipeline_dp_forget_beliefs(mc); // #1319
 		}
 		mc->back_buffer_rtv.reset();
+		mc->combined_atlas_rtv_srgb.reset();
 		mc->combined_atlas_rtv.reset();
 		mc->combined_atlas_srv.reset();
 		mc->combined_atlas.reset();
@@ -30028,6 +40026,19 @@ comp_d3d11_service_ensure_workspace_window(struct xrt_system_compositor *xsysc)
 
 	U_LOG_W("Workspace: window created for empty workspace (ready for Ctrl+O)");
 	return true;
+}
+
+void
+comp_d3d11_service_workspace_controller_lost(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == nullptr) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	// The failsafe drives the panel DP and walks the slot table: render_mutex,
+	// as at its teardown call sites (clients_mutex nests inside it).
+	render_mutex_fair_lock lock(sys);
+	service_failsafe_hardware_2d_on_teardown(sys, nullptr);
 }
 
 void
@@ -30080,7 +40091,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 			// An app that presents into its OWN window needs that window back
 			// — including (#1014) a hosted client whose window WE created and
 			// parked at activate. Restoring them is what makes shell death or
-			// Ctrl+Space leave every client reachable instead of stranded.
+			// the launch hotkey leave every client reachable instead of stranded.
 			if (slot->compositor != nullptr && (slot->compositor->presenter == PRESENTER_APP_HWND ||
 			                                    slot->compositor->presenter == PRESENTER_CLIENT_TEXTURE)) {
 				HWND show = slot->app_hwnd;
@@ -30095,7 +40106,7 @@ comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc)
 
 		// The default rule re-picks on the next render tick.
 		mc->focused_slot = -1;
-		// #964 Phase A: the controller is gone (Ctrl+Space, or it disconnected
+		// #964 Phase A: the controller is gone (launch hotkey, or it disconnected
 		// mid-override) — the default policy owns the panel again, so drop the
 		// override and let pipeline_pick_focus start from a clean debounce.
 		mc->foreground_override_slot.store(-1, std::memory_order_release);
@@ -30352,4 +40363,306 @@ comp_d3d11_service_poll_mcp_capture(struct xrt_system_compositor *xsysc)
 		}
 	}
 	mcp_capture_complete(&sys->mcp_capture, ok);
+}
+
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — system-level entry points. Thin: resolve the system,
+ * create the lift module on first use, forward to d3d11_lift.cpp. None of these
+ * takes render_mutex; the ones that touch the shared immediate context take
+ * immediate_ctx_mutex inside d3d11_lift for one copy / blit only.
+ *
+ */
+
+/*!
+ * G5: the plug-in's factory pair, re-read at every activation attempt. The
+ * fallback is the SAME plug-in's ordinary D3D11 factory (the scalar
+ * dp_factory_d3d11, filled together with dp_factory_d3d11_lift from one
+ * plug-in by fill_dp_factories_from_plugin) — never the per-monitor registry
+ * entry, which may be another plug-in's (roadmap conversion-providers.md §10).
+ */
+static bool
+svc_lift_resolve(void *ud, void **out_lift, void **out_fallback)
+{
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt((struct xrt_system_compositor *)ud);
+	*out_lift = sys->base.info.dp_factory_d3d11_lift;
+	*out_fallback = sys->base.info.dp_factory_d3d11;
+	return *out_lift != nullptr || *out_fallback != nullptr;
+}
+
+//! G7, producer side: a submit refreshes stale eyes (publishes as a side effect).
+static void
+svc_lift_eyes_refresh(void *ud)
+{
+	struct xrt_eye_positions eyes = {};
+	(void)comp_d3d11_service_get_predicted_eye_positions_full((struct xrt_system_compositor *)ud, &eyes);
+}
+
+static struct d3d11_lift *
+svc_lift(struct xrt_system_compositor *xsysc)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return nullptr;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	if (sys == nullptr || sys->device == nullptr || sys->context == nullptr) {
+		return nullptr;
+	}
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	if (sys->lift == nullptr) {
+		void *lift_factory = nullptr, *fallback = nullptr;
+		(void)svc_lift_resolve((void *)xsysc, &lift_factory, &fallback);
+		sys->lift = d3d11_lift_create(sys->device.get(), sys->context.get(), &sys->immediate_ctx_mutex,
+		                              svc_lift_resolve, (void *)xsysc);
+		if (sys->lift != nullptr) {
+			d3d11_lift_set_eyes_refresh(sys->lift, svc_lift_eyes_refresh, (void *)xsysc);
+		}
+		U_LOG_W(
+		    "[lift] lift module created (lift-only factory %s, fallback factory %s, both from the active "
+		    "plug-in; re-resolved at every activation)",
+		    lift_factory != nullptr ? "present" : "absent", fallback != nullptr ? "present" : "absent");
+	}
+	return sys->lift;
+}
+
+/*
+ *
+ * ADR-053 P1a (#2003): the conversion core's D3D11 glue + the dp-lift backend
+ * (comp_d3d11_service_conv.h). Thin: the lift module owns both.
+ *
+ */
+
+static xrt_result_t
+conv_io_import_input(void *ud,
+                     uint64_t stream_id,
+                     xrt_graphics_buffer_handle_t handle,
+                     bool is_dxgi,
+                     uint32_t w,
+                     uint32_t h,
+                     const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_import_input((struct d3d11_lift *)ud, stream_id, (HANDLE)handle, is_dxgi, w, h, slot);
+}
+
+static uint64_t
+conv_io_input_content_key(void *ud, uint64_t stream_id, const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_input_content_key((struct d3d11_lift *)ud, stream_id, slot);
+}
+
+static xrt_result_t
+conv_io_import_input_cpu(void *ud,
+                         uint64_t stream_id,
+                         xrt_graphics_buffer_handle_t handle,
+                         bool is_dxgi,
+                         uint32_t w,
+                         uint32_t h,
+                         uint8_t **out_pixels)
+{
+	return d3d11_lift_glue_import_input_cpu((struct d3d11_lift *)ud, stream_id, (HANDLE)handle, is_dxgi, w, h,
+	                                        out_pixels);
+}
+
+static void
+conv_io_release_input(void *ud, xrt_graphics_buffer_handle_t handle, bool is_dxgi)
+{
+	(void)ud;
+	d3d11_lift_glue_release_input((HANDLE)handle, is_dxgi);
+}
+
+static xrt_result_t
+conv_io_publish(void *ud, uint64_t stream_id, const struct conv_result *res, struct comp_d3d11_conv_published *out)
+{
+	struct d3d11_lift_published p = {};
+	const xrt_result_t r = d3d11_lift_glue_publish((struct d3d11_lift *)ud, stream_id, res, &p);
+	out->fence_value = p.fence_value;
+	out->width = p.width;
+	out->height = p.height;
+	out->format = p.format;
+	out->realloc = p.realloc;
+	out->depth_width = p.depth_width;
+	out->depth_height = p.depth_height;
+	out->depth_format = p.depth_format;
+	out->depth_realloc = p.depth_realloc;
+	return r;
+}
+
+static bool
+conv_io_export_output(void *ud,
+                      uint64_t stream_id,
+                      bool depth,
+                      xrt_graphics_buffer_handle_t *out_handle,
+                      uint32_t *out_w,
+                      uint32_t *out_h,
+                      uint32_t *out_format)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_output((struct d3d11_lift *)ud, stream_id, depth, &h, out_w, out_h, out_format)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
+	return true;
+}
+
+static bool
+conv_io_export_fence(void *ud, uint64_t stream_id, xrt_graphics_sync_handle_t *out_handle)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_fence((struct d3d11_lift *)ud, stream_id, &h)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_sync_handle_t)h;
+	return true;
+}
+
+static void
+conv_io_stream_gone(void *ud, uint64_t stream_id)
+{
+	d3d11_lift_glue_stream_gone((struct d3d11_lift *)ud, stream_id);
+}
+
+static xrt_result_t
+conv_io_import_input_ex(void *ud,
+                        uint64_t stream_id,
+                        const struct conv_input_import *in,
+                        const struct conv_submit_slot *slot)
+{
+	return d3d11_lift_glue_import_input_ex((struct d3d11_lift *)ud, stream_id, in, slot);
+}
+
+static bool
+conv_io_export_cpu(void *ud,
+                   uint64_t stream_id,
+                   bool copy,
+                   xrt_graphics_buffer_handle_t *out_handle,
+                   uint32_t *out_w,
+                   uint32_t *out_h,
+                   uint32_t *out_format,
+                   uint64_t *out_bytes,
+                   bool *out_realloc)
+{
+	HANDLE h = nullptr;
+	if (!d3d11_lift_glue_export_cpu((struct d3d11_lift *)ud, stream_id, copy, &h, out_w, out_h, out_format,
+	                                out_bytes, out_realloc)) {
+		return false;
+	}
+	*out_handle = (xrt_graphics_buffer_handle_t)h;
+	return true;
+}
+
+extern "C" bool
+comp_d3d11_service_conv_glue(struct xrt_system_compositor *xsysc, struct comp_d3d11_conv_glue *out)
+{
+	memset(out, 0, sizeof(*out));
+	struct d3d11_lift *l = svc_lift(xsysc);
+	if (l == nullptr) {
+		return false;
+	}
+	d3d11_lift_glue_alloc_ops(l, &out->alloc);
+	d3d11_lift_glue_gpu_ops(l, &out->viewsyn, &out->readback);
+	d3d11_lift_get_dp_backend(l, &out->dp_lift);
+	out->import_input = conv_io_import_input;
+	out->import_input_cpu = conv_io_import_input_cpu;
+	out->input_content_key = conv_io_input_content_key;
+	out->release_input = conv_io_release_input;
+	out->publish_result = conv_io_publish;
+	out->export_output = conv_io_export_output;
+	out->export_fence = conv_io_export_fence;
+	out->stream_gone = conv_io_stream_gone;
+	out->import_input_ex = conv_io_import_input_ex;
+	out->export_cpu = conv_io_export_cpu;
+	out->io_ud = l;
+	out->nominal_z_m = d3d11_service_system_from_xrt(xsysc)->base.info.nominal_viewer_z_m;
+	// The lift device (the allocator's) lives on the service device's adapter.
+	{
+		wil::com_ptr<IDXGIDevice> dxgi_dev;
+		wil::com_ptr<IDXGIAdapter> adapter;
+		DXGI_ADAPTER_DESC desc = {};
+		struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+		if (SUCCEEDED(sys->device->QueryInterface(IID_PPV_ARGS(dxgi_dev.put()))) &&
+		    SUCCEEDED(dxgi_dev->GetAdapter(adapter.put())) && SUCCEEDED(adapter->GetDesc(&desc))) {
+			out->adapter_luid = (uint64_t)(uint32_t)desc.AdapterLuid.HighPart << 32 | desc.AdapterLuid.LowPart;
+		}
+	}
+	return true;
+}
+
+extern "C" void
+comp_d3d11_service_conv_rect_frame(struct xrt_system_compositor *xsysc,
+                                   struct xrt_compositor *xc,
+                                   struct xrt_lift_rect_frame *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	lift_rect_frame(d3d11_service_system_from_xrt(xsysc), xc, nullptr, 0, 0, out);
+}
+
+extern "C" void
+comp_d3d11_service_conv_set_bridge(struct xrt_system_compositor *xsysc, const struct comp_d3d11_conv_bridge *bridge)
+{
+	if (!comp_d3d11_service_is_d3d11_service(xsysc)) {
+		return;
+	}
+	struct d3d11_service_system *sys = d3d11_service_system_from_xrt(xsysc);
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	if (sys->lift == nullptr) {
+		return;
+	}
+	if (bridge == nullptr) {
+		d3d11_lift_set_core_bridge(sys->lift, nullptr);
+		return;
+	}
+	struct d3d11_lift_core_bridge b = {};
+	b.core = bridge->core;
+	b.resolve = bridge->resolve;
+	b.match_weave = bridge->match_weave;
+	b.ud = bridge->ud;
+	d3d11_lift_set_core_bridge(sys->lift, &b);
+}
+
+//! Called first thing in system_destroy: joins the lift thread and closes the
+//! glue (whose producers call back into the system for eyes) before anything
+//! they use goes away.
+static void
+svc_lift_destroy(struct d3d11_service_system *sys)
+{
+	std::lock_guard<std::mutex> g(sys->lift_create_mutex);
+	d3d11_lift_destroy(&sys->lift);
+}
+
+extern "C" bool
+comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
+                                        uint64_t owner,
+                                        uint32_t count,
+                                        const struct xrt_lift_weave_rect *rects)
+{
+	if (xc == nullptr || xc->destroy != compositor_destroy || count > XRT_LIFT_WEAVE_RECTS_MAX ||
+	    (count > 0 && rects == nullptr)) {
+		return false;
+	}
+	struct d3d11_service_compositor *c = d3d11_service_compositor_from_xrt(xc);
+	if (c->sys == nullptr) {
+		return false;
+	}
+	if (count > 0) {
+		// Create the module HERE (outside every weave lock), never inside the
+		// submit that consumes these rects.
+		if (svc_lift(&c->sys->base) == nullptr) {
+			return false;
+		}
+		// Only this owner's live SBS / NVIEW streams can be woven.
+		for (uint32_t i = 0; i < count; i++) {
+			uint32_t mode = d3d11_lift_stream_mode(c->sys->lift, owner, rects[i].stream_id);
+			if (mode != XRT_DP_LIFT_MODE_SBS && mode != XRT_DP_LIFT_MODE_NVIEW) {
+				return false;
+			}
+		}
+		memcpy(c->render.lift_rects, rects, count * sizeof(rects[0]));
+	}
+	c->render.lift_owner = owner;
+	c->render.lift_rect_count = count;
+	return true;
 }

@@ -26,6 +26,7 @@ add_library(
 	oxr_conformance.c
 	oxr_chain.h
 	oxr_display_zones.c
+	oxr_texture_target.c
 	oxr_dpad.c
 	oxr_event.c
 	oxr_extension_support.h
@@ -41,6 +42,8 @@ add_library(
 	oxr_local_3d_zone.c
 	oxr_logger.c
 	oxr_logger.h
+	oxr_mcp_app_result.c
+	oxr_mcp_app_result.h
 	oxr_mcp_app_tools.c
 	oxr_mcp_tools.c
 	oxr_mcp_tools.h
@@ -49,6 +52,7 @@ add_library(
 	oxr_plugin_stub.c
 	oxr_pretty_print.c
 	oxr_pretty_print.h
+	oxr_segment_views.c
 	oxr_session.c
 	oxr_session_window_binding.h
 	oxr_session_frame_end.c
@@ -60,8 +64,20 @@ add_library(
 	oxr_views_change.c
 	oxr_views_change.h
 	oxr_weave.c
+	oxr_conv.c
+	oxr_conv_gpu.h
+	oxr_conv_gpu_d3d.c
+	oxr_service_link.c
+	oxr_service_link.h
+	oxr_conv_map.h
+	oxr_lift_rules.h
+	oxr_stereo_camera.c
+	oxr_desktop_control.c
+	oxr_input_providers.c
+	oxr_input_providers_rule.h
 	oxr_workspace.c
 	oxr_workspace_modal_win32.c
+	oxr_workspace_window_linux.c
 	oxr_workspace_file_dialog.c
 	oxr_xdev.c
 	${CMAKE_CURRENT_BINARY_DIR}/oxr_bindings/b_oxr_generated_bindings.c
@@ -75,6 +91,12 @@ target_include_directories(st_oxr PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 if(XRT_HAVE_VULKAN)
 	target_sources(st_oxr PRIVATE oxr_session_gfx_vk.c oxr_swapchain_vk.c oxr_vulkan.c)
 	target_link_libraries(st_oxr PUBLIC aux_vk)
+endif()
+
+# XR_DXR_desktop_control (ADR-056): the common safety layer + this OS's backend,
+# linked into the runtime only (every operation runs in the app's process).
+if(TARGET aux_desktop)
+	target_link_libraries(st_oxr PRIVATE aux_desktop)
 endif()
 
 if(XRT_HAVE_OPENGL OR XRT_HAVE_OPENGLES)
@@ -186,6 +208,9 @@ if(ANDROID)
 endif()
 
 if(XRT_HAVE_LINUX AND NOT ANDROID)
+	# oxr_workspace_window_linux.c resolves the app's libX11 with dlopen.
+	target_link_libraries(st_oxr PRIVATE ${CMAKE_DL_LIBS})
+
 	# VK native compositor on desktop Linux (in-process, XCB present path;
 	# comp_vk_native only exists when XRT_HAVE_XCB). Phase 1 landed the
 	# compositor library; this arm makes oxr actually select it in-process

@@ -85,13 +85,32 @@ Four consequences for this skill:
   tag to date (0.1.26 … 0.1.31) points straight at its content commit; `preview-0.1.31`
   (2026-09-08) was cut this way deliberately. If `main` has moved past the built commit (docs
   landed), the tag still goes on the built commit — it is fine for it to sit behind `main`.
+- **AND THOSE BUILDS MUST CARRY THE VERSION STAMP: dispatch the Windows AND Android lanes
+  with `-f browser_version=X.Y.Z`.** The stamp (UA-CH release version, `build-info.json`
+  `browser_version`) is baked at BUILD time; a lane dispatched without it builds `0.0.0-dev`,
+  and the publish's "Assert the Windows build's UA-CH release stamp matches the tag" step
+  refuses the run with `stamped browser_version=0.0.0-dev but the tag is 1.7.1`, skipping sign
+  + publish. Re-dispatching the publish with the same run ids fails the same way; only a
+  rebuild fixes it. The Linux lane's input is `deb_version=X.Y.Z` (the publish asserts the
+  .deb's `Version` == `X.Y.Z-1`; without it the lane stamps `X.Y.Z+N.g<sha>` from git
+  describe and "Locate the assets" refuses it).
+  Hit for real on v1.7.1 (2026-10-09): three green dev-stamped lanes, one more hour of box
+  time. Full pre-tag recipe for the browser:
+  ```bash
+  SHA=$(git rev-parse origin/main)   # the commit you are about to tag
+  gh workflow run build-box.yml         -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
+  gh workflow run build-box-android.yml -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f browser_version=X.Y.Z
+  gh workflow run build-box-linux.yml   -R DisplayXR/displayxr-browser-pvt --ref main -f patch_ref=$SHA -f lifecycle_only=false -f deb_version=X.Y.Z   # after android frees the builder
+  ```
 - **THE TAG TRIGGER WORKS, BUT ONLY IF A BUILD RAN AT THE COMMIT YOU TAG. Arrange that
   before you tag.** The publish resolves which build to ship by matching a successful
   `build-box*.yml` run against the tagged commit, and the build lanes take their source
   as a `patch_ref` **input** — so a build dispatched `--ref main` with
   `patch_ref=<something else>` does **not** match, on purpose. The release procedure is
-  therefore: dispatch BOTH lanes with `--ref` at the commit you are about to tag, let
-  them finish, then tag. Proven on `preview-0.1.26`: both lanes dispatched at
+  therefore: dispatch EVERY lane the release should carry (Windows + Android, and Linux for
+  the `.deb` — the publish only attaches one if a Linux build ran at the tagged commit) with
+  `--ref` at the commit you are about to tag, let them finish, then tag. (v1.7.2 did all three
+  this way: `android=headsha windows=headsha`, Linux matched too, no fallback.) Proven on `preview-0.1.26`: both lanes dispatched at
   `60382687b3ab`, the tag run then resolved `android=headsha windows=headsha` with no
   fallback and no manual dispatch. Skip that ordering and you get the `preview-0.1.25`
   outcome — the tag run fails at *Resolve the build runs for this commit* and you publish
@@ -102,24 +121,40 @@ Four consequences for this skill:
   artifact now carries a provenance stamp the publish asserts against the tag, and an
   unstamped artifact chosen by recency is refused precisely because nothing ties it to
   the tag.
-- **THE UPDATE FEED IS NOT UPDATED BY THIS FLOW — a green release is NOT a shipped
-  release.** `feed/feed.json` in the **public** repo is published to
-  `https://updates.displayxr.org`, and that URL is compiled into every browser already
-  installed. Only the older `pipeline.yml` promote path writes it;
-  `publish-browser-releases.yml` does not. So a release cut through this skill is
-  invisible to every existing user until the feed moves. This is not hypothetical: as of
-  2026-09-04 the feed still advertises `0.1.23` (last commit 2026-08-28) while `0.1.24`,
-  `0.1.25` and `0.1.26` have all shipped. **Do not report a browser release as complete
-  on the strength of the GitHub release alone** — check the feed and say plainly if it is
-  stale:
+- **THE UPDATE FEED IS PART OF THE PUBLISH LANE — but a green release is still not a
+  shipped one until you have seen the live feed.** `feed/feed.json` in the **public** repo
+  is served at `https://updates.displayxr.org/feed.json`, the URL every installed browser's
+  start-page banner reads, so a release the feed does not name is offered to nobody. Since
+  browser-pvt#229, `publish-browser-releases.yml`'s LAST step ("Publish the update feed",
+  `scripts/publish-feed.sh`) moves every platform the release carries (.exe → `latest` +
+  `platforms.windows`, .apk → `platforms.android`, .deb → `platforms.linux`) and fails the
+  run unless the live endpoint serves the new version — on a direct tag from this skill
+  exactly as on a `promote.yml` release. (Before #229 only `promote.yml` wrote it, and
+  1.0.9 through 1.2.2 — all tagged through this skill — had to be fed by hand. If the tagged
+  commit predates #229 there is no `scripts/publish-feed.sh` in it and that old rule still
+  applies.) It never
+  moves a platform backwards, so re-publishing an old tag leaves the feed alone.
+  Still **check the live feed before reporting** — it is the one thing users see:
   ```bash
-  FEED=$(curl -s https://updates.displayxr.org/feed.json | jq -r '.latest.version')
   # Strip whatever prefix the tag carries ($TAG_PREFIX is `v`; historical browser
   # tags were `preview-`) — the feed's `version` is bare X.Y.Z either way.
   REL_VER="${NEW_TAG#preview-}"; REL_VER="${REL_VER#v}"
-  echo "update feed advertises $FEED; this release is $REL_VER"
-  [ "$FEED" = "$REL_VER" ] || echo "FEED IS STALE — existing installs will NOT be offered this release."
+  curl -fsS https://updates.displayxr.org/feed.json \
+    | jq -r '"latest(win) \(.latest.version)", (.platforms // {} | to_entries[] | "\(.key) \(.value.version)")' \
+    | while read -r P FV; do
+        [ "$FV" = "$REL_VER" ] && echo "feed $P: $FV" || echo "feed $P: $FV — STALE (this release is $REL_VER)"
+      done
   ```
+  A platform the release has no asset for legitimately stays on its old version. If the
+  feed step failed (Pages slow, token), the release and the pin are already out — re-run
+  the publish with `gh workflow run publish-browser-releases.yml -R "$REPO" --ref main
+  -f tag="$NEW_TAG"` (it redoes the whole lane — re-signs, re-uploads with `--clobber`,
+  re-dispatches the pin bump — all idempotent, then moves the feed), or
+  preview it locally with `DRY_RUN=1 V=$REL_VER CHROMIUM=<pin> bash scripts/publish-feed.sh`
+  in a browser-pvt checkout. **Security flag:** a direct tag has no pipeline release plan,
+  so the feed says `security: false` (routine blue banner). For a security release cut
+  this way, publish with `-f security=true` on that dispatch so installs get the red
+  urgent banner.
 - **Signing moves INTO the publish workflow, so Phase 3.5 is skipped — do not
   "fix" this by adding browser to the Phase 3.5 dispatch.** The browser is signed;
   it is just signed one step earlier than every other component. Its Windows
@@ -385,6 +420,104 @@ truth — so this skill only names the component + ref, not build commands. Set
 `DXR_SIGN_REPO` in your env to sign (unset → unsigned); point it elsewhere to swap
 signers. Contract: `docs/specs/runtime/release-signing.md`.
 
+### Parallel releases contend for ONE signing runner — identity rules (read first)
+
+**Never identify "our" signing run as the newest one.** Every component release (and the
+runtime's `/release`, and the browser's publish lane) dispatches onto the **same** signing
+provider, whose `build-signed-release.yml` and `sign-artifact` each serialise on a single
+concurrency group that keeps only **one waiting run** — so a new dispatch from any parallel
+release **cancels** whichever run is still waiting. On 2026-10-11 five demo releases ran in
+parallel: gauss's dispatch was cancelled within 2 s by the next component's, and the old
+lookup ("newest `workflow_dispatch` run created after `$SINCE`") resolved gauss to
+**mediaplayer's** run; the `*Setup-*.exe` download glob then matched mediaplayer's installer
+and `--clobber` would have published it on the gauss release. Only a manual look at the
+downloaded file name stopped it. The rules below are why the lookup is written this way:
+1. **Track the run `gh workflow run` prints** (recent `gh` prints the new run's URL). Only if
+   nothing was printed, fall back to a run created since the dispatch that **provably** carries
+   our marker — the provider exposes no inputs and a bare `display_title`, so the marker is
+   the job's first step name, `Checkout <repo> @ <ref>` (build-signed-release), or the
+   `release_tag` echoed in the completed run's log (sign-artifact).
+2. **`cancelled` = displaced, not failed.** Wait until the workflow has no run that is not
+   `completed`, then re-dispatch **once** and track the new run. Never fall back to "newest".
+3. **Assert artifact identity before any upload**: exactly `<Name>Setup-<version>.exe` in the
+   artifact, carrying `<version>` inside it (or, for `sign-artifact`, the returned file is the
+   payload we sent plus a signature). Anything else → ship unsigned and flag it.
+
+Define these once; Steps 3.5.0 and 3.5.3 source them. The Bash tool does not keep shell
+functions between calls, so they are saved to a file (`$WORK` is the Phase 1 temp dir):
+```bash
+cat > "$WORK/sign_helpers.sh" <<'SIGN_HELPERS'
+# ── Signing-run identity helpers ────────────────────────────────────────────
+# sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
+sign_dispatch() {
+  local wf="$1" marker="$2" since out id cand st; shift 2
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
+  # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
+  id=$(printf '%s\n' "$out" | sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p' | head -1)
+  # 2) Fallback ONLY when nothing was printed: a run created since $since that
+  #    PROVABLY carries our marker — in its job step names (build-signed-release's
+  #    first step is "Checkout <repo> @ <ref>") or, once completed, in its log
+  #    (sign-artifact's log echoes the release_tag). NEVER the bare newest run:
+  #    under parallel releases that is another component's. A run that has not
+  #    started yet shows neither, so keep polling (<= 40 min).
+  if [ -z "$id" ]; then
+    for _ in $(seq 1 160); do
+      while read -r cand st; do
+        [ -n "$cand" ] || continue
+        if gh api "repos/$SIGN_REPO/actions/runs/$cand/jobs" --jq '.jobs[].steps[].name' 2>/dev/null | grep -qF -- "$marker" \
+           || { [ "$st" = completed ] && gh run view "$cand" -R "$SIGN_REPO" --log 2>/dev/null | grep -qF -- "$marker"; }; then
+          id="$cand"; break 2
+        fi
+      done <<RUNS
+$(gh run list -R "$SIGN_REPO" --workflow "$wf" --event workflow_dispatch --limit 20 \
+    --json databaseId,createdAt,status \
+    --jq "[.[]|select(.createdAt>=\"$since\")]|.[]|\"\(.databaseId) \(.status)\"")
+RUNS
+      sleep 15
+    done
+  fi
+  SIGN_RUN="$id"
+}
+
+# sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
+# the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
+sign_track() {
+  local wf="$1" marker="$2" attempt; shift 2
+  SIGN_RUN=""; SIGN_CONCL=""
+  for attempt in 1 2; do
+    sign_dispatch "$wf" "$marker" "$@"
+    [ -n "$SIGN_RUN" ] || { SIGN_CONCL=unlocated; return 1; }
+    echo "tracking $wf run $SIGN_RUN (attempt $attempt)"
+    until [ "$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json status --jq .status 2>/dev/null)" = completed ]; do sleep 30; done
+    SIGN_CONCL=$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json conclusion --jq .conclusion)
+    [ "$SIGN_CONCL" = cancelled ] && [ "$attempt" = 1 ] || break
+    echo "run $SIGN_RUN was CANCELLED (another release's dispatch displaced it) — waiting for $wf to go idle, then re-dispatching once"
+    while [ "$(gh run list -R "$SIGN_REPO" --workflow "$wf" --limit 20 --json status \
+                --jq '[.[]|select(.status!="completed")]|length')" != 0 ]; do sleep 30; done
+    sleep $((RANDOM % 30))   # de-synchronise agents that idle-waited together
+  done
+  [ "$SIGN_CONCL" = success ]
+}
+
+# exe_has_version <file> <X.Y.Z> — the bare version occurs in the file (NSIS VERSIONINFO
+# is UTF-16LE; macOS `strings` has no -el, hence python).
+exe_has_version() {
+  python3 -I -c 'import sys,re
+d=open(sys.argv[1],"rb").read(); v=sys.argv[2]
+pat=r"(?<![0-9.])"+re.escape(v)+r"(?![0-9])"
+hit=re.search(pat,d.decode("utf-16-le","ignore")) or re.search(pat,d[1:].decode("utf-16-le","ignore")) or re.search(pat.encode(),d)
+sys.exit(0 if hit else 1)' "$1" "$2"; }
+
+# signed_is_our_payload <signed> <original> — <signed> is <original> plus an Authenticode
+# signature (signing rewrites only PE-header fields in the first 1 KiB and appends).
+signed_is_our_payload() {
+  python3 -I -c 'import sys
+s=open(sys.argv[1],"rb").read(); o=open(sys.argv[2],"rb").read()
+sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "$1" "$2"; }
+SIGN_HELPERS
+```
+
 ### Step 3.5.0: Unity — sign the prebuilt DLL via `sign-artifact`, then re-inject
 
 Unity is NOT an installer: it ships a prebuilt **`displayxr_unity.dll`** in both
@@ -407,6 +540,7 @@ version>`; it detects the existing release and signs it in place.
 ```bash
 if [ "$COMPONENT" = unity ]; then
   SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
+  . "$WORK/sign_helpers.sh"      # sign_track / signed_is_our_payload (identity rules above)
   VER="${NEW_TAG#v}"
 
   # Fail-closed Authenticode check on one file: prints the Status and succeeds
@@ -416,11 +550,45 @@ if [ "$COMPONENT" = unity ]; then
   # "count the non-Valid ones" test then prints 0 with exit 0 -- a false
   # "signed" (bit displayxr-unreal's /release on v0.9.3). Count the positive
   # answer, never the absence of failures, and never swallow stderr.
+  # No PowerShell (Linux/macOS release box): osslsigncode gives the same
+  # fail-closed answer — "Signature verification: ok" on the chain + timestamp,
+  # and the signer must be Leia. (unity v2.25.2 was released from a Linux box and
+  # shipped unsigned for an hour because this helper only knew PowerShell.)
   verify_authenticode_file() {
-    local f="$1" ps out
-    if command -v pwsh >/dev/null 2>&1; then ps=pwsh
-    elif command -v powershell >/dev/null 2>&1; then ps=powershell
-    else echo "no-powershell"; return 1; fi
+    local f="$1" ps="" out
+    # PowerShell only on Windows (git-bash: cygpath present). Homebrew pwsh on a
+    # Mac has no Get-AuthenticodeSignature and no cygpath, so it must fall to
+    # osslsigncode instead of failing every verify.
+    if command -v cygpath >/dev/null 2>&1; then
+      if command -v pwsh >/dev/null 2>&1; then ps=pwsh
+      elif command -v powershell >/dev/null 2>&1; then ps=powershell; fi
+    fi
+    if [ -n "$ps" ]; then :
+    elif command -v osslsigncode >/dev/null 2>&1; then
+      # CA bundle path is per-OS: Debian/Ubuntu, RHEL, macOS (system / Homebrew).
+      # A missing -CAfile fails every verify, so a macOS release box reported a
+      # good signature as unsigned (unity v2.27.0) until this probed for one.
+      local ca=""
+      for c in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt \
+               /etc/ssl/cert.pem /opt/homebrew/etc/ca-certificates/cert.pem /usr/local/etc/ca-certificates/cert.pem; do
+        [ -s "$c" ] && { ca="$c"; break; }
+      done
+      [ -n "$ca" ] || { echo "osslsigncode: no CA bundle found"; return 1; }
+      # osslsigncode fetches the certificates' CRLs itself, with no timeout: on a
+      # slow or VPN'd link it hung for 10+ min (unity v2.28.0). Bound it at 90 s
+      # (perl alarm: macOS has no `timeout`); if it times out, verify chain +
+      # signature + timestamp with -ignore-crl and say revocation wasn't checked.
+      # The signing runner has already fail-closed-verified the same file online.
+      out=$(perl -e 'alarm 90; exec @ARGV' osslsigncode verify -in "$f" -CAfile "$ca" 2>&1); local rc=$?
+      if [ "$rc" = 142 ] && osslsigncode --help 2>&1 | grep -q -- '-ignore-crl'; then
+        out=$(perl -e 'alarm 90; exec @ARGV' osslsigncode verify -in "$f" -CAfile "$ca" -ignore-crl 2>&1)
+        if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then
+          echo "Valid (CRL fetch timed out; revocation not checked here)"; return 0
+        fi
+      fi
+      if grep -q '^Signature verification: ok' <<<"$out" && grep -q 'Subject: CN=Leia' <<<"$out"; then echo "Valid"; return 0; fi
+      echo "osslsigncode: $(grep -E -m1 'Failed|error|Error' <<<"$out" || echo not-valid)"; return 1
+    else echo "no-powershell-no-osslsigncode (apt install osslsigncode)"; return 1; fi
     out=$("$ps" -NoProfile -Command "\$ErrorActionPreference='Stop'; (Get-AuthenticodeSignature '$(cygpath -w "$f")').Status" 2>&1 | tr -d '\r' | tail -1)
     echo "$out"; [ "$out" = "Valid" ]
   }
@@ -456,7 +624,9 @@ if [ "$COMPONENT" = unity ]; then
     D=$(mktemp -d)
     gh release download "$NEW_TAG" -R "$REPO" -p "$TGZ" -D "$D"       # the just-released .tgz
     mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
-    PKGDIR=$(ls -d "$D"/x/com.displayxr.unity-* | head -1)
+    # Glob-and-test, never `ls` (an `ls -F` alias appends `/` here and `*` on executables).
+    PKGDIR=""
+    for d in "$D"/x/com.displayxr.unity-*; do [ -d "$d" ] && { PKGDIR="$d"; break; }; done
     DLL="$PKGDIR/$DLL_REL"
     if [ ! -f "$DLL" ]; then
       echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."
@@ -475,17 +645,14 @@ if [ "$COMPONENT" = unity ]; then
       SIGN_TAG="sign-unity-$(date +%s)-$$"
       gh release create "$SIGN_TAG" -R "$SIGN_REPO" --prerelease --title "$SIGN_TAG" \
          --notes "temp unity-signing payload (auto-deleted)" "$D/unsigned.zip"
-      SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$SIGN_TAG"
-      RID=""
-      for _ in $(seq 1 20); do
-        RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
-                --limit 8 --json databaseId,createdAt \
-                --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-        [ -n "$RID" ] && break; sleep 4
-      done
+      # Identity-tracked dispatch (rules above): printed URL, else a run whose log echoes
+      # $SIGN_TAG; a displaced (cancelled) run is re-dispatched once.
       SIGNED_DLL=""
-      if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+      if sign_track sign-artifact "$SIGN_TAG" -f release_tag="$SIGN_TAG"; then
+        RID="$SIGN_RUN"
+        # Clear the download dirs first: a stale signed.zip left in $D/out (e.g. when $D is a
+        # reused scratch folder) makes unzip extract the WRONG file and the identity check refuse it.
+        rm -rf "$D/out" "$D/signed"
         gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
         # portable unzip (git-bash on Windows has no `unzip`).
         if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
@@ -493,6 +660,12 @@ if [ "$COMPONENT" = unity ]; then
         # Never parse `ls` (an -F alias appends `*` and the suffixed path silently fails
         # downstream — bit installer-release on bundle v2.0.15). Test the path directly.
         SIGNED_DLL="$D/signed/displayxr_unity.dll"; [ -f "$SIGNED_DLL" ] || SIGNED_DLL=""
+        # Identity: the returned DLL must be OUR payload plus a signature, not another job's file.
+        if [ -n "$SIGNED_DLL" ] && ! signed_is_our_payload "$SIGNED_DLL" "$D/in/displayxr_unity.dll"; then
+          echo "REFUSING: sign-artifact run $RID returned a displayxr_unity.dll that is not our payload + signature."; SIGNED_DLL=""
+        fi
+      else
+        echo "sign-artifact run ${SIGN_RUN:-<none>} ended '$SIGN_CONCL'."
       fi
       gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 
@@ -507,7 +680,16 @@ if [ "$COMPONENT" = unity ]; then
       else
         # Channel 1 — repack the .tgz with the signed DLL, re-upload over the asset.
         cp "$SIGNED_DLL" "$DLL"
-        ( cd "$D/x" && tar czf "$D/$TGZ" "$(basename "$PKGDIR")" )
+        # COPYFILE_DISABLE + --no-mac-metadata: macOS bsdtar otherwise adds a `._<name>`
+        # AppleDouble entry for EVERY file (v2.33.0 shipped 297 of them; Unity imports
+        # `._*.meta` / `._*.so` from a tarball install as junk assets). macOS `tar tzf`
+        # HIDES those entries, so count with Python's tarfile and refuse a dirty pack.
+        find "$D/x" -name '._*' -delete
+        ( cd "$D/x" && if tar --version 2>/dev/null | grep -q bsdtar; then
+            COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "$D/$TGZ" "$(basename "$PKGDIR")"
+          else tar czf "$D/$TGZ" "$(basename "$PKGDIR")"; fi )
+        AD=$(python3 -I -c 'import tarfile,sys;print(sum("/._" in n or n.startswith("._") for n in tarfile.open(sys.argv[1]).getnames()))' "$D/$TGZ")
+        [ "$AD" = 0 ] || { echo "REFUSING: repacked $TGZ has $AD AppleDouble (._*) entries"; exit 1; }
         gh release upload "$NEW_TAG" "$D/$TGZ" --clobber -R "$REPO"
         # Channel 2 — put the signed DLL on the `upm` branch + move its version tag.
         # Uses the Phase-1 clone (cwd = the repo). CI already force-pushed `upm`
@@ -595,24 +777,31 @@ esac
 ### Step 3.5.3: Dispatch the runner build, wait, fetch + replace the asset (only if SIGNED=yes)
 
 ```bash
-if [ "$SIGNED" = yes ]; then
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run build-signed-release.yml -R "$SIGN_REPO" \
-     -f component="$COMP" -f repo="$REPO" -f ref="$NEW_TAG"
+. "$WORK/sign_helpers.sh"   # sign_track / exe_has_version (identity rules at the top of Phase 3.5)
+# Expected installer basename per component — the artifact must hold EXACTLY this file.
+case "$COMP" in
+  leia-plugin) INST=DisplayXRLeiaSRSetup ;;
+  mcp)         INST=DisplayXRMCPSetup ;;
+  gauss)       INST=DisplayXRGaussianSplatSetup ;;
+  modelviewer) INST=DisplayXRModelViewerSetup ;;
+  mediaplayer) INST=DisplayXRMediaPlayerSetup ;;
+  avatar)      INST=DisplayXRAvatarSetup ;;
+  earthview)   INST=DisplayXREarthViewSetup ;;
+  shell)       INST=DisplayXRShellSetup ;;
+  *)           INST="" ;;
+esac
+VER="${NEW_TAG#"$TAG_PREFIX"}"
+WANT_EXE="${INST}-${VER}.exe"
+[ -n "$INST" ] || { echo "No expected installer name for $COMP — add it to the map; ship unsigned"; SIGNED=no; }
 
-  SIGN_RUN=""
-  for _ in $(seq 1 20); do
-    SIGN_RUN=$(gh run list -R "$SIGN_REPO" --workflow build-signed-release.yml \
-                --event workflow_dispatch --limit 8 --json databaseId,createdAt \
-                --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-    [ -n "$SIGN_RUN" ] && break; sleep 5
-  done
-  [ -n "$SIGN_RUN" ] || { echo "Could not locate the signing run — ship unsigned"; SIGNED=no; }
-fi
-
 if [ "$SIGNED" = yes ]; then
-  gh run watch "$SIGN_RUN" -R "$SIGN_REPO" --interval 30 --exit-status \
-    || { echo "Signing run failed — ship unsigned CI asset, flag in report"; SIGNED=no; }
+  # Identity-tracked (rules at the top of Phase 3.5) — NEVER "newest run since $SINCE".
+  if sign_track build-signed-release.yml "Checkout $REPO @ $NEW_TAG" \
+       -f component="$COMP" -f repo="$REPO" -f ref="$NEW_TAG"; then
+    echo "signing run $SIGN_RUN succeeded"
+  else
+    echo "Signing run ${SIGN_RUN:-<none>} ended '$SIGN_CONCL' — ship unsigned CI asset, flag in report"; SIGNED=no
+  fi
 fi
 
 if [ "$SIGNED" = yes ]; then
@@ -621,9 +810,19 @@ if [ "$SIGNED" = yes ]; then
   # filename, so `$(ls ...)` yields `...Setup-2.1.0.0.exe*` and every later use
   # of the path silently fails. (Documented from bundle v2.0.15; hit AGAIN on
   # shell v2.1.0 — this line was the last `ls` left in the skill.)
+  #
+  # Identity, not a glob: a `*Setup-*.exe` glob matches ANY component's installer, which is
+  # exactly how the 2026-10-11 lookup would have shipped mediaplayer's exe on gauss. Require
+  # EXACTLY $WANT_EXE (no other .exe) and the bare version inside it.
+  GOT_EXES=$(cd _signed 2>/dev/null && for f in *.exe; do [ -f "$f" ] && echo "$f"; done)
   SIGNED_EXE=""
-  for f in _signed/*Setup-*.exe; do [ -f "$f" ] && { SIGNED_EXE="$f"; break; }; done
-  [ -n "$SIGNED_EXE" ] || { echo "No signed installer in the artifact — ship unsigned"; SIGNED=no; }
+  if [ "$GOT_EXES" != "$WANT_EXE" ]; then
+    echo "REFUSING: artifact of run $SIGN_RUN holds [${GOT_EXES//$'\n'/, }], expected exactly $WANT_EXE — another component's run? ship unsigned"; SIGNED=no
+  elif ! exe_has_version "_signed/$WANT_EXE" "$VER"; then
+    echo "REFUSING: _signed/$WANT_EXE does not carry version $VER — ship unsigned"; SIGNED=no
+  else
+    SIGNED_EXE="_signed/$WANT_EXE"
+  fi
 fi
 
 if [ "$SIGNED" = yes ]; then
@@ -910,8 +1109,10 @@ rm -rf "$WORK"
 
 **browser — the report must state the update-feed status.** "Published successfully" is
 false-in-effect for the browser if the feed did not move: the GitHub release exists and
-no existing install will ever be offered it. Include the feed line from the "Browser is
-special" check above, and if it is stale say so in the summary rather than in a footnote.
+no existing install will ever be offered it. The publish lane now moves and live-checks
+the feed itself (browser-pvt#229), but include the per-platform feed lines from the
+"Browser is special" check above anyway, and if any is stale say so in the summary rather
+than in a footnote.
 
 ```
 Release $NEW_TAG published successfully!

@@ -18,7 +18,8 @@
     "runtime_tag_pins.<repo>.tracks.<track>": {
       "bump_when": [
         "The track's repin POLICY -- data, not workflow logic. Required; no default.",
-        "  abi      -- repin when XRT_PLUGIN_API_VERSION_CURRENT changed between the pinned tag and the new tag.",
+        "  abi      -- repin when XRT_PLUGIN_API_VERSION_CURRENT changed between the pinned tag and the new tag",
+        "              (or, with abi_headers, when any listed plug-in ABI major changed).",
         "  features -- repin when the FEATURE SURFACE changed in the track's feature headers: an XRT_*_HAS_*",
         "              feature macro added/removed/redefined, a vtable (function-pointer) slot added/removed/",
         "              re-signed, or the plug-in ABI. Superset of abi. Catches ADR-020's append-only slot +",
@@ -27,6 +28,7 @@
         "Both automatic policies skip a release that would only raise the pin (and so the plug-in's runtime",
         "floor) for no gain, and never move a pin backwards."
       ],
+      "abi_headers": "Optional, abi policy only: the plug-in ABI headers the track is gated on (keys of scripts/check_plugin_abi.py ABI_HEADERS: xrt_plugin.h, xrt_input_plugin.h, xrt_conversion_plugin.h). Default: xrt_plugin.h alone. List xrt_conversion_plugin.h for a repo that ships a conversion provider (ADR-053), so a conversion-ABI major bump repins it.",
       "feature_headers": "Optional, features policy only: the runtime headers whose surface this track compiles against. Defaults to feature_surface.headers. Narrow it to what the track's build actually compiles, or a slot in an API the track never builds raises its floor for nothing.",
       "locations": "EVERY file the track's tag appears in. Written in ONE commit -- see atomicity note below.",
       "locations[].kind": "cmake_set  -> matches set(<key> \"<tag>\"   |  yaml_env -> matches <key>: <tag>"
@@ -66,12 +68,15 @@
     ],
     "headers": [
       "src/xrt/include/xrt/xrt_plugin.h",
+      "src/xrt/include/xrt/xrt_component_settings.h",
       "src/xrt/include/xrt/xrt_display_processor.h",
       "src/xrt/include/xrt/xrt_display_processor_d3d11.h",
       "src/xrt/include/xrt/xrt_display_processor_d3d12.h",
       "src/xrt/include/xrt/xrt_display_processor_gl.h",
       "src/xrt/include/xrt/xrt_display_processor_metal.h",
-      "src/xrt/include/xrt/xrt_display_processor_vk.h"
+      "src/xrt/include/xrt/xrt_display_processor_vk.h",
+      "src/xrt/include/xrt/xrt_dp_lift.h",
+      "src/xrt/include/xrt/xrt_conversion_plugin.h"
     ]
   },
 
@@ -80,7 +85,18 @@
       "role": "Leia SR display-processor plug-in (first vendor integration)",
       "tracks": {
         "windows": {
-          "bump_when": "abi",
+          "bump_when": "features",
+          "reason": "The Windows plug-in guards new code on DP feature macros (XRT_DP_D3D11_HAS_*, XRT_DP_D3D12_HAS_*, ...), and ADR-020 appends a slot + macro WITHOUT bumping the plug-in ABI -- so the abi gate is blind to the change this track needs. Real case: runtime v2.25.2 appended set_overlay_2d (XRT_DP_D3D11_HAS_OVERLAY_2D, #1814) at ABI 5; at the then-pin v2.24.0 the plug-in's SR weaver 2D-compose forward compiled out and was repinned by hand (leia-plugin#295) -- the Linux track's #264 story again. Feature headers are every DP variant the Windows build compiles (D3D11, D3D12, GL, VK) plus xrt_dp_lift.h, the lift contract the D3D11 DP implements (its XRT_DP_LIFT_HAS_* macros gate plug-in code too; v2.31.0 shipped XRT_DP_LIFT_HAS_VIEWPOINT_POLICY there and the gate skipped the repin, leia-plugin#317). Still gated, not tag-chasing: the installer's MIN_RUNTIME_VERSION follows this pin, so it moves only when the plug-in-facing feature surface did.",
+          "feature_headers": [
+            "src/xrt/include/xrt/xrt_plugin.h",
+            "src/xrt/include/xrt/xrt_component_settings.h",
+            "src/xrt/include/xrt/xrt_display_processor.h",
+            "src/xrt/include/xrt/xrt_display_processor_d3d11.h",
+            "src/xrt/include/xrt/xrt_display_processor_d3d12.h",
+            "src/xrt/include/xrt/xrt_display_processor_gl.h",
+            "src/xrt/include/xrt/xrt_display_processor_vk.h",
+            "src/xrt/include/xrt/xrt_dp_lift.h"
+          ],
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" },
             { "file": ".github/workflows/build-windows.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
@@ -99,12 +115,26 @@
           "reason": "The Linux plug-in guards new code on DP feature macros, and ADR-020 appends a slot + macro WITHOUT bumping the plug-in ABI -- so the abi gate is blind to exactly the change this track needs. Real case: leia-plugin#264 guards on XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE, first shipped in runtime v2.21.1 at ABI 5; at the then-pin v2.18.0 that code compiled out silently and had to be repinned by hand (leia-plugin#265). Feature headers are the Vulkan-only set: the Linux build compiles the VK display processor and nothing else.",
           "feature_headers": [
             "src/xrt/include/xrt/xrt_plugin.h",
+            "src/xrt/include/xrt/xrt_component_settings.h",
             "src/xrt/include/xrt/xrt_display_processor.h",
             "src/xrt/include/xrt/xrt_display_processor_vk.h"
           ],
           "locations": [
             { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG_LINUX" },
             { "file": ".github/workflows/build-linux.yml", "kind": "yaml_env", "key": "RUNTIME_REF" }
+          ]
+        }
+      }
+    },
+    "displayxr-conversion-open": {
+      "role": "Open-model conversion provider (ADR-053 P4): ships from its own repo like a vendor plug-in, built against the conversion-provider ABI only",
+      "tracks": {
+        "windows": {
+          "bump_when": "abi",
+          "abi_headers": ["src/xrt/include/xrt/xrt_conversion_plugin.h"],
+          "reason": "The repo vendors include/xrt/xrt_conversion_plugin.h, xrt_results.h and xrt_conv_wire.h verbatim and compiles against no runtime source, so the pin is metadata: the runtime tag the vendored headers match (a set(DXR_RUNTIME_GIT_TAG ...) literal in CMakeLists.txt). Gated on the conversion-provider ABI major alone, not on feature macros: the provider reads and writes every struct within its struct_size, so an append-only addition needs no repin. A repin PR must re-vendor the headers from the new tag in the same change; the bump only rewrites the literal.",
+          "locations": [
+            { "file": "CMakeLists.txt", "kind": "cmake_set", "key": "DXR_RUNTIME_GIT_TAG" }
           ]
         }
       }
@@ -158,8 +188,7 @@
   ],
 
   "excluded": {
-    "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029).",
-    "displayxr-runtime/.gitlab-ci/windows/monado_deps_build.ps1": "Inert Monado-era leftover carrying a stale LunarG URL. Not on any active CI path -- excluded so the canary does not report a failure nothing can act on."
+    "displayxr-runtime": "No LunarG step -- Vulkan comes from vcpkg (vulkan-headers + vulkan-loader + glslang[tools]) at a pinned commit. Immutable pins cannot rot; this is the pattern the others should migrate to (runtime#1029)."
   },
 
   "consumer_floors": {
@@ -259,7 +288,7 @@
         "unreadable and the audit reports it rather than passing silently."
       ],
       "declared_floor": { "file": "installer/DisplayXRBrowserInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" },
-      "requires": { "weave": 8 },
+      "requires": { "weave": 8, "lift": 4 },
       "behavioural_floor": {
         "min_runtime": "v2.16.3",
         "commit": "9399479b49e7e7817d4ea732d8a59d197a2c5693",
@@ -272,6 +301,10 @@
         "series against Chromium, so XR_DXR_weave.h exists only after the patches",
         "are applied. Re-derive with:",
         "  git grep -h '^+#define XR_DXR_weave_SPEC_VERSION' main -- patches | sort -u | tail -1",
+        "  git grep -h '^+#define XR_DXR_lift_SPEC_VERSION' main -- patches | sort -u | tail -1",
+        "lift: 4 is what browser-pvt#291 vendors (ADR-053: the browser carries no",
+        "converter; the runtime converts). v2.45.0 is the first tag shipping lift",
+        "spec 4 (v2.44.1 has 3), which is the floor #291's installer declares.",
         "The audit cross-checks this number against requires_anchor's prose and",
         "emits a note (not a finding) when it cannot confirm it there."
       ]
@@ -302,10 +335,10 @@
         "on every run -- it is the detector for the drift the pin itself creates."
       ],
       "spec_sources": [
-        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_spatial_workspace.h" },
-        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_display_info.h" },
-        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_workspace_file_dialog.h" },
-        { "repo": "displayxr-extensions", "ref": "v2.16.37", "path": "include/openxr/XR_DXR_win32_window_binding.h" }
+        { "repo": "displayxr-extensions", "ref": "v2.36.0", "path": "include/openxr/XR_DXR_spatial_workspace.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.36.0", "path": "include/openxr/XR_DXR_display_info.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.36.0", "path": "include/openxr/XR_DXR_workspace_file_dialog.h" },
+        { "repo": "displayxr-extensions", "ref": "v2.36.0", "path": "include/openxr/XR_DXR_win32_window_binding.h" }
       ],
       "pin_sync": { "file": ".github/workflows/build-shell.yml", "regex": "DXR_EXTENSIONS_REF:\\s*(\\S+)" },
       "declared_floor": { "file": "installer/DisplayXRShellInstaller.nsi", "kind": "nsis_define", "key": "MIN_RUNTIME_VERSION" }

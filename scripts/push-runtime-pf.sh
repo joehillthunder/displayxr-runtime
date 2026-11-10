@@ -20,6 +20,29 @@
 #      instead of on some future restart.
 set -euo pipefail
 
+# Opt-in: --browser-dir <dir> kills only the chrome.exe processes whose image is
+# under <dir> (the DisplayXR Browser's install dir) instead of EVERY chrome.exe —
+# for a shared box where someone's ordinary Chrome must survive a push. Without
+# it the behaviour is unchanged.
+BROWSER_DIR=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --browser-dir) BROWSER_DIR="$2"; shift 2 ;;
+    *) echo "ERROR: unknown argument: $1 (only --browser-dir <dir>)" >&2; exit 2 ;;
+  esac
+done
+
+# Kill chrome.exe processes running from under $1 (a Windows or POSIX path) only.
+kill_browser_under() {
+  local win
+  win="$(cygpath -w "$1" 2>/dev/null || printf '%s' "$1")"
+  win="${win%\\}"
+  case "$win" in *"'"*) echo "ERROR: --browser-dir must not contain a quote: $win" >&2; exit 2 ;; esac
+  powershell.exe -NoProfile -Command \
+    "Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { \$_.Path -and \$_.Path.StartsWith('$win\\', [StringComparison]::OrdinalIgnoreCase) } | Stop-Process -Force" \
+    >/dev/null 2>&1 || true
+}
+
 PKG="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_package/bin"
 PF="/c/Program Files/DisplayXR/Runtime"
 [ -f "$PKG/DisplayXRClient.dll" ] || { echo "ERROR: $PKG has no runtime build (run scripts/build_windows.bat build first)" >&2; exit 1; }
@@ -30,7 +53,13 @@ tag_of() { grep -aoE "v[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-g[0-9a-f]+|v[0-9]+\.[0-9]+\
 echo "== build tag in _package: $(tag_of "$PKG/DisplayXRClient.dll")"
 
 # 2. Kill client processes that hold DisplayXRClient.dll (NOT the service).
-for exe in chrome.exe cube_handle_d3d11_win.exe cube_hosted_d3d11_win.exe \
+if [ -n "$BROWSER_DIR" ]; then
+  kill_browser_under "$BROWSER_DIR"
+  echo "== closed only the browser under $BROWSER_DIR (--browser-dir); other Chrome windows untouched"
+else
+  taskkill //F //IM chrome.exe >/dev/null 2>&1 || true
+fi
+for exe in cube_handle_d3d11_win.exe cube_hosted_d3d11_win.exe \
            cube_handle_d3d12_win.exe cube_handle_gl_win.exe cube_handle_vk_win.exe \
            displayxr-shell.exe; do
   taskkill //F //IM "$exe" >/dev/null 2>&1 || true
@@ -80,6 +109,28 @@ for f in "$PKG"/plugins/*.dll; do
 done
 echo "== refreshed $refreshed already-installed plug-in DLL(s) under plugins/"
 
+# 3c. ADR-054 N4b: the provenance gate. Dev builds are unsigned, so allowlist the
+# SHA-256 of every plug-in DLL now under PF\plugins (value name = hex digest under
+# HKLM\Software\DisplayXR\Trust\Allowlist). The gate ENFORCES by default on
+# Windows (PR B): an unlisted dev DLL is refused, and the installed service is
+# restarted ELEVATED by installers, where the DXR_ALLOW_DEV_PLUGIN_PATHS override
+# is deliberately not honoured — so without these rows a pushed dev build has no
+# DP. Best-effort: needs an elevated shell, like the Version write below.
+allowed=0
+for f in "$PF"/plugins/*.dll; do
+  [ -f "$f" ] || continue
+  hex="$(sha256sum "$f" 2>/dev/null | awk '{print tolower($1)}')"
+  [ ${#hex} -eq 64 ] || continue
+  if reg add 'HKLM\Software\DisplayXR\Trust\Allowlist' //v "$hex" //t REG_SZ //d "push-runtime-pf.sh $(basename "$f")" //f //reg:64 >/dev/null 2>&1; then
+    allowed=$((allowed+1))
+  fi
+done
+if [ "$allowed" -gt 0 ]; then
+  echo "== allowlisted $allowed plug-in DLL digest(s) under HKLM\\Software\\DisplayXR\\Trust\\Allowlist (ADR-054 N4b)"
+else
+  echo "WARN: could not allowlist plug-in digests (not elevated?) — the enforcing gate will REFUSE the pushed plug-ins (ADR-054 N4b); re-run elevated or run scripts\\register_dev_plugin.bat" >&2
+fi
+
 # Keep the installed MCP adapter in place (voice resolves it CWD-relative from
 # the Runtime dir; the file must EXIST there but must be the MCP\bin build).
 if [ -f "/c/Program Files/DisplayXR/MCP/bin/displayxr-mcp.exe" ]; then
@@ -93,10 +144,26 @@ ST="$(tag_of "$PF/displayxr-service.exe")"
 echo "== PF client=$CT service=$ST"
 [ -n "$CT" ] && [ "$CT" = "$ST" ] || { echo "ERROR: client/service tag mismatch after copy — DO NOT leave it like this" >&2; exit 1; }
 
+# 4b. Make the registry tell the truth about what is now in Program Files. Version-gated
+#     installers read HKLM\Software\DisplayXR\Runtime\Version, not the binaries: the Leia
+#     plug-in installer refuses (exit 5, "runtime too old") and the browser installer may chain
+#     a runtime "upgrade" when the registry still names the previously INSTALLED release even
+#     though a newer dev build sits in PF. Seen 2026-10-08: a v2.28-based push left Version=2.26.0
+#     and leia v2.11.0's installer aborted. A real installer rewrites this value on its next run.
+NEWVER="$(printf '%s' "$CT" | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
+if printf '%s' "$NEWVER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  OLDVER="$(reg query 'HKLM\Software\DisplayXR\Runtime' //v Version //reg:64 2>/dev/null | awk '/Version/{print $3}')"
+  if [ "$OLDVER" != "$NEWVER" ]; then
+    reg add 'HKLM\Software\DisplayXR\Runtime' //v Version //t REG_SZ //d "$NEWVER" //f //reg:64 >/dev/null 2>&1 \
+      && echo "== registry Runtime\\Version: ${OLDVER:-<none>} -> $NEWVER (version-gated installers now see the pushed build)" \
+      || echo "WARN: could not update HKLM Runtime\Version (${OLDVER:-<none>}, build is $NEWVER) — run elevated, or version-gated installers (Leia plug-in exit 5) will see the old version" >&2
+  fi
+fi
+
 # 5. Restart the service so any residual mismatch surfaces immediately.
 taskkill //F //IM displayxr-service.exe >/dev/null 2>&1 || true
 sleep 1
-explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe"
+explorer.exe "C:\\Program Files\\DisplayXR\\Runtime\\displayxr-service.exe" || true  # explorer.exe exits non-zero on success; set -e would abort
 sleep 3
 tasklist //FI "IMAGENAME eq displayxr-service.exe" 2>/dev/null | grep -qi displayxr-service.exe \
   && echo "== service restarted (non-elevated), versions consistent: $CT" \

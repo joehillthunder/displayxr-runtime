@@ -30,22 +30,29 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
+#include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
+#include "lift_cpu_probe.h" // --lift: XR_DXR_lift spec 4 over CPU images (POSIX v1)
 #include <openxr/XR_DXR_spatial_workspace.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
+#include <algorithm>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include <mach-o/dyld.h>
 #include <unistd.h>
 
 #include "view_params.h"
-#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
@@ -55,6 +62,9 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 
+#include "color_policy.h"
+#include <vk_frame_ring.h> // dxr::VkFrameRing — INV-4.10 frame-submit discipline
+
 // ============================================================================
 // Logging
 // ============================================================================
@@ -62,6 +72,9 @@
 #define LOG_INFO(fmt, ...)  fprintf(stdout, "[INFO]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(fmt, ...)  fprintf(stderr, "[WARN]  " fmt "\n", ##__VA_ARGS__)
 #define LOG_ERROR(fmt, ...) fprintf(stderr, "[ERROR] " fmt "\n", ##__VA_ARGS__)
+
+//! --lift / DISPLAYXR_LIFT_PROBE=1 (test_apps/common/lift_cpu_probe.h).
+static dxr_test::LiftCpuProbe g_liftProbe;
 
 #define XR_CHECK(call) \
     do { \
@@ -140,10 +153,12 @@ static NSView *g_metalView = nil;
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
-// Smooth 2D<->3D disparity ramp, driven inline (macOS has its own session +
-// InputState, not the Windows-only XrSessionManager helper).
+// Smooth 2D<->3D disparity ramp (displayxr-common mode_switch.h). macOS has its
+// own session + InputState, not the Windows-only XrSessionManager, so it calls
+// the platform-neutral dxr::ModeSwitch::step() directly (defaults: 0.18 s).
 static dxr::ModeSwitch g_modeSwitch;
-static bool g_modeSwitchConfigured = false;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // Borderless fullscreen state
@@ -187,6 +202,42 @@ static uint32_t g_windowW = 0, g_windowH = 0;
 static const uint32_t HUD_PIXEL_WIDTH = 380;
 static const uint32_t HUD_PIXEL_HEIGHT = 470;
 static const float HUD_WIDTH_FRACTION = 0.20f;
+
+// #1581 — DXR_TEST_QUAD=1 submits real XrCompositionLayerQuad layers so the
+// vk_native quad pass can be judged on pixels. Default OFF: without it this
+// app's layer list is byte-identical to before.
+//
+// Three quads, all sharing one deliberately NON-symmetric 256x256 probe
+// texture (coloured checker, a large "Q" with its tail bottom-right, four
+// distinct corner blocks, an 8 px white border, and a half-alpha quadrant):
+//   (A) LOCAL space, axis-aligned, BOTH eyes, STRAIGHT alpha — the
+//       measurement / alpha / stereo-disparity quad.
+//   (B) LOCAL space, yawed -15 deg about up, BOTH eyes, PREMULTIPLIED — the
+//       other blend state, and a world-locked non-fronto-parallel case.
+//   (C) LOCAL space, LEFT EYE ONLY, straight alpha — the eye-visibility
+//       check (see the submission site for why it is not VIEW space).
+// Sizes and positions are fractions of the CANVAS, not absolute metres: a 3D
+// display's Kooima frustum is narrow and strongly off-axis, so metre-scale
+// poses tuned for an HMD land off-tile. Values match the GL (#1581) and Metal
+// (#1584) probes so the three backends' atlas dumps are directly comparable.
+static bool g_quadTest = false;
+static bool g_quadActive = false;
+static XrSwapchain g_quadSwapchain = XR_NULL_HANDLE;
+static VkImage g_quadVkImage = VK_NULL_HANDLE;
+static uint32_t g_quadTexSize = 256;
+static const float kQuadFracA = 0.53f;  // (A) edge, as a fraction of canvas height
+static const float kQuadFracB = 0.67f;  // (B)
+static const float kQuadFracC = 0.375f; // (C)
+
+// (A)'s LOCAL pose, in canvas units. The ZDP is the display plane (z = 0), so
+// a quad AT z = 0 has zero stereo disparity and tells you nothing; (A) is
+// placed just BEHIND it, at about the depth of the spinning cube, so its
+// per-tile offset is directly comparable with the cube's. It also sits over
+// the cube, so its half-alpha quadrant has something to show through.
+static const float kQuadAx = 0.057f;  // × canvas width
+static const float kQuadAy = 0.207f;  // × canvas height
+static const float kQuadAz = -0.08f;  // × canvas height (-z = behind the plane)
+static const uint64_t kQuadActivationFrame = 10;
 
 // Cached HUD section strings, refreshed at HUD throttle rate (~2 Hz).
 static std::wstring g_hudSessionText, g_hudModeText, g_hudPerfText;
@@ -383,6 +434,60 @@ static const uint32_t cubeFragSpv[] = {
     0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
 };
 
+// XR_DXR_cursor_depth sprite vertex shader: push constant MVP + colour (the
+// textured cube's 128-byte push range, so it shares cubePipelineLayout); the
+// grid fragment shader passes the colour through.
+// GLSL source (regenerate via `glslangValidator -V cursor.vert -o cursor_vert.spv`):
+//   #version 450
+//   layout(push_constant) uniform PC { mat4 mvp; vec4 color; } pc;
+//   layout(location = 0) in vec3 inPos;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       gl_Position = pc.mvp * vec4(inPos, 1.0);
+//       outColor = pc.color;
+//   }
+static const uint32_t cursorVertSpv[] = {
+    0x07230203,0x00010000,0x0008000b,0x00000028,0x00000000,0x00020011,0x00000001,0x0006000b,
+    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
+    0x0008000f,0x00000000,0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00000019,0x00000023,
+    0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00060005,
+    0x0000000b,0x505f6c67,0x65567265,0x78657472,0x00000000,0x00060006,0x0000000b,0x00000000,
+    0x505f6c67,0x7469736f,0x006e6f69,0x00070006,0x0000000b,0x00000001,0x505f6c67,0x746e696f,
+    0x657a6953,0x00000000,0x00070006,0x0000000b,0x00000002,0x435f6c67,0x4470696c,0x61747369,
+    0x0065636e,0x00070006,0x0000000b,0x00000003,0x435f6c67,0x446c6c75,0x61747369,0x0065636e,
+    0x00030005,0x0000000d,0x00000000,0x00030005,0x00000011,0x00004350,0x00040006,0x00000011,
+    0x00000000,0x0070766d,0x00050006,0x00000011,0x00000001,0x6f6c6f63,0x00000072,0x00030005,
+    0x00000013,0x00006370,0x00040005,0x00000019,0x6f506e69,0x00000073,0x00050005,0x00000023,
+    0x4374756f,0x726f6c6f,0x00000000,0x00030047,0x0000000b,0x00000002,0x00050048,0x0000000b,
+    0x00000000,0x0000000b,0x00000000,0x00050048,0x0000000b,0x00000001,0x0000000b,0x00000001,
+    0x00050048,0x0000000b,0x00000002,0x0000000b,0x00000003,0x00050048,0x0000000b,0x00000003,
+    0x0000000b,0x00000004,0x00030047,0x00000011,0x00000002,0x00040048,0x00000011,0x00000000,
+    0x00000005,0x00050048,0x00000011,0x00000000,0x00000007,0x00000010,0x00050048,0x00000011,
+    0x00000000,0x00000023,0x00000000,0x00050048,0x00000011,0x00000001,0x00000023,0x00000040,
+    0x00040047,0x00000019,0x0000001e,0x00000000,0x00040047,0x00000023,0x0000001e,0x00000000,
+    0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
+    0x00040017,0x00000007,0x00000006,0x00000004,0x00040015,0x00000008,0x00000020,0x00000000,
+    0x0004002b,0x00000008,0x00000009,0x00000001,0x0004001c,0x0000000a,0x00000006,0x00000009,
+    0x0006001e,0x0000000b,0x00000007,0x00000006,0x0000000a,0x0000000a,0x00040020,0x0000000c,
+    0x00000003,0x0000000b,0x0004003b,0x0000000c,0x0000000d,0x00000003,0x00040015,0x0000000e,
+    0x00000020,0x00000001,0x0004002b,0x0000000e,0x0000000f,0x00000000,0x00040018,0x00000010,
+    0x00000007,0x00000004,0x0004001e,0x00000011,0x00000010,0x00000007,0x00040020,0x00000012,
+    0x00000009,0x00000011,0x0004003b,0x00000012,0x00000013,0x00000009,0x00040020,0x00000014,
+    0x00000009,0x00000010,0x00040017,0x00000017,0x00000006,0x00000003,0x00040020,0x00000018,
+    0x00000001,0x00000017,0x0004003b,0x00000018,0x00000019,0x00000001,0x0004002b,0x00000006,
+    0x0000001b,0x3f800000,0x00040020,0x00000021,0x00000003,0x00000007,0x0004003b,0x00000021,
+    0x00000023,0x00000003,0x0004002b,0x0000000e,0x00000024,0x00000001,0x00040020,0x00000025,
+    0x00000009,0x00000007,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,
+    0x00000005,0x00050041,0x00000014,0x00000015,0x00000013,0x0000000f,0x0004003d,0x00000010,
+    0x00000016,0x00000015,0x0004003d,0x00000017,0x0000001a,0x00000019,0x00050051,0x00000006,
+    0x0000001c,0x0000001a,0x00000000,0x00050051,0x00000006,0x0000001d,0x0000001a,0x00000001,
+    0x00050051,0x00000006,0x0000001e,0x0000001a,0x00000002,0x00070050,0x00000007,0x0000001f,
+    0x0000001c,0x0000001d,0x0000001e,0x0000001b,0x00050091,0x00000007,0x00000020,0x00000016,
+    0x0000001f,0x00050041,0x00000021,0x00000022,0x0000000d,0x0000000f,0x0003003e,0x00000022,
+    0x00000020,0x00050041,0x00000025,0x00000026,0x00000013,0x00000024,0x0004003d,0x00000007,
+    0x00000027,0x00000026,0x0003003e,0x00000023,0x00000027,0x000100fd,0x00010038,
+};
+
 // Grid vertex shader: push constant MVP, fixed gray color
 static const uint32_t gridVertSpv[] = {
     0x07230203,0x00010000,0x000d000a,0x00000024,0x00000000,0x00020011,0x00000001,0x0006000b,
@@ -419,20 +524,76 @@ static const uint32_t gridVertSpv[] = {
     0x00010038,
 };
 
-// Grid fragment shader: pass-through color
+// Grid fragment shader: pass-through vertex colour. Same `uLinearize` rule as
+// the cube FS: the grid colour is authored display-referred, so it must be
+// decoded when the attachment will encode on write -- otherwise the grid
+// brightens on an `_SRGB` swapchain while the textured cube stays put.
+//
+// GLSL source (regenerate via `glslangValidator -V grid.frag -o grid_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
+//   layout(location = 0) in vec4 inColor;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       vec3 col = inColor.rgb;
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       outColor = vec4(col, inColor.a);
+//   }
 static const uint32_t gridFragSpv[] = {
-    0x07230203,0x00010000,0x000d000a,0x0000000d,0x00000000,0x00020011,0x00000001,0x0006000b,
-    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-    0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000b,0x00030010,
-    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
-    0x00000000,0x00050005,0x00000009,0x4374756f,0x726f6c6f,0x00000000,0x00040005,0x0000000b,
-    0x6f436e69,0x00726f6c,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000b,
-    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
-    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
-    0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00040020,0x0000000a,
-    0x00000001,0x00000007,0x0004003b,0x0000000a,0x0000000b,0x00000001,0x00050036,0x00000002,
-    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x00000007,0x0000000c,
-    0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
+    0x07230203,0x00010000,0x0008000b,0x00000033,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x0007000f,0x00000004,
+    0x00000004,0x6e69616d,0x00000000,0x0000000c,0x00000028,0x00030010,
+    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,
+    0x00000004,0x6e69616d,0x00000000,0x00030005,0x00000009,0x006c6f63,
+    0x00040005,0x0000000c,0x6f436e69,0x00726f6c,0x00050005,0x00000010,
+    0x6e694c75,0x69726165,0x0000657a,0x00050005,0x00000028,0x4374756f,
+    0x726f6c6f,0x00000000,0x00040047,0x0000000c,0x0000001e,0x00000000,
+    0x00040047,0x00000010,0x00000001,0x00000000,0x00040047,0x00000028,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
+    0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,0x00000007,
+    0x00040017,0x0000000a,0x00000006,0x00000004,0x00040020,0x0000000b,
+    0x00000001,0x0000000a,0x0004003b,0x0000000b,0x0000000c,0x00000001,
+    0x00020014,0x0000000f,0x00030031,0x0000000f,0x00000010,0x0004002b,
+    0x00000006,0x00000014,0x3d6147ae,0x0004002b,0x00000006,0x00000017,
+    0x3f870a3d,0x0004002b,0x00000006,0x0000001a,0x4019999a,0x0006002c,
+    0x00000007,0x0000001b,0x0000001a,0x0000001a,0x0000001a,0x0004002b,
+    0x00000006,0x0000001e,0x414eb852,0x0004002b,0x00000006,0x00000022,
+    0x3d25aee6,0x0006002c,0x00000007,0x00000023,0x00000022,0x00000022,
+    0x00000022,0x00040017,0x00000024,0x0000000f,0x00000003,0x00040020,
+    0x00000027,0x00000003,0x0000000a,0x0004003b,0x00000027,0x00000028,
+    0x00000003,0x00040015,0x0000002a,0x00000020,0x00000000,0x0004002b,
+    0x0000002a,0x0000002b,0x00000003,0x00040020,0x0000002c,0x00000001,
+    0x00000006,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,
+    0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
+    0x0004003d,0x0000000a,0x0000000d,0x0000000c,0x0008004f,0x00000007,
+    0x0000000e,0x0000000d,0x0000000d,0x00000000,0x00000001,0x00000002,
+    0x0003003e,0x00000009,0x0000000e,0x000300f7,0x00000012,0x00000000,
+    0x000400fa,0x00000010,0x00000011,0x00000012,0x000200f8,0x00000011,
+    0x0004003d,0x00000007,0x00000013,0x00000009,0x00060050,0x00000007,
+    0x00000015,0x00000014,0x00000014,0x00000014,0x00050081,0x00000007,
+    0x00000016,0x00000013,0x00000015,0x00060050,0x00000007,0x00000018,
+    0x00000017,0x00000017,0x00000017,0x00050088,0x00000007,0x00000019,
+    0x00000016,0x00000018,0x0007000c,0x00000007,0x0000001c,0x00000001,
+    0x0000001a,0x00000019,0x0000001b,0x0004003d,0x00000007,0x0000001d,
+    0x00000009,0x00060050,0x00000007,0x0000001f,0x0000001e,0x0000001e,
+    0x0000001e,0x00050088,0x00000007,0x00000020,0x0000001d,0x0000001f,
+    0x0004003d,0x00000007,0x00000021,0x00000009,0x000500bc,0x00000024,
+    0x00000025,0x00000021,0x00000023,0x000600a9,0x00000007,0x00000026,
+    0x00000025,0x00000020,0x0000001c,0x0003003e,0x00000009,0x00000026,
+    0x000200f9,0x00000012,0x000200f8,0x00000012,0x0004003d,0x00000007,
+    0x00000029,0x00000009,0x00050041,0x0000002c,0x0000002d,0x0000000c,
+    0x0000002b,0x0004003d,0x00000006,0x0000002e,0x0000002d,0x00050051,
+    0x00000006,0x0000002f,0x00000029,0x00000000,0x00050051,0x00000006,
+    0x00000030,0x00000029,0x00000001,0x00050051,0x00000006,0x00000031,
+    0x00000029,0x00000002,0x00070050,0x0000000a,0x00000032,0x0000002f,
+    0x00000030,0x00000031,0x0000002e,0x0003003e,0x00000028,0x00000032,
+    0x000100fd,0x00010038,
 };
 
 // Textured cube vertex shader: push constants (MVP + model), outputs UV/normal/tangent
@@ -529,15 +690,53 @@ static const uint32_t cubeTexturedVertSpv[] = {
 
 // Textured cube fragment shader: lighting matches cube_handle_gl_macos /
 // cube_handle_metal_macos — lightDir = normalize(0.3, 0.5, 1.0), 0.8·diffuse,
-// 0.3 + 0.15·ao ambient. Regenerate via `glslangValidator -V cube.frag -o
-// cube_frag.spv` from the GLSL source documented in
-// test_apps/cube_handle_vk_win/vk_renderer.cpp (kept in sync with this).
+// 0.3 + 0.15·ao ambient.
+//
+// ADR-021 / INV-4.6: the `uLinearize` specialization constant (SpecId 0) adds
+// the standard sRGB EOTF to the emitted colour. The basecolor/AO textures are
+// DISPLAY-REFERRED (VK_FORMAT_R8G8B8A8_UNORM). The colour swapchain is `_SRGB`
+// (dxr::ChooseColorSwapchainFormat), whose attachment encodes on write, so
+// emitting those numbers raw would encode them twice (washed out). Decoding
+// here makes the round-trip an identity. Specialized at pipeline-creation time
+// from dxr::RenderSceneLinear(); see color_policy.h. Same rule as the Windows
+// VK cube apps (#1650).
+//
+// GLSL source (regenerate via `glslangValidator -V cube.frag -o cube_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
+//   layout(set = 0, binding = 0) uniform sampler2D uBasecolorTex;
+//   layout(set = 0, binding = 1) uniform sampler2D uNormalTex;
+//   layout(set = 0, binding = 2) uniform sampler2D uAOTex;
+//   layout(location = 0) in vec2 fragUV;
+//   layout(location = 1) in vec3 fragWorldNormal;
+//   layout(location = 2) in vec3 fragWorldTangent;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       vec3 baseColor = texture(uBasecolorTex, fragUV).rgb;
+//       vec3 normalMap = texture(uNormalTex, fragUV).rgb * 2.0 - 1.0;
+//       float ao = texture(uAOTex, fragUV).r;
+//       vec3 N = normalize(fragWorldNormal);
+//       vec3 T = normalize(fragWorldTangent);
+//       vec3 B = cross(N, T);
+//       mat3 TBN = mat3(T, B, N);
+//       vec3 normal = normalize(TBN * normalMap);
+//       vec3 lightDir = normalize(vec3(0.3, 0.5, 1.0));
+//       float diffuse = max(dot(normal, lightDir), 0.0) * 0.8 * ao;
+//       float ambient = 0.3 + 0.15 * ao;
+//       vec3 col = baseColor * (diffuse + ambient);
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       outColor = vec4(col, 1.0);
+//   }
 static const uint32_t cubeTexturedFragSpv[] = {
-    0x07230203,0x00010000,0x0008000b,0x0000006f,0x00000000,0x00020011,
+    0x07230203,0x00010000,0x0008000b,0x00000089,0x00000000,0x00020011,
     0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
     0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,
     0x00000004,0x6e69616d,0x00000000,0x00000011,0x0000002c,0x00000030,
-    0x00000065,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
+    0x00000083,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
     0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
     0x00000009,0x65736162,0x6f6c6f43,0x00000072,0x00060005,0x0000000d,
     0x73614275,0x6c6f6365,0x6554726f,0x00000078,0x00040005,0x00000011,
@@ -551,14 +750,16 @@ static const uint32_t cubeTexturedFragSpv[] = {
     0x00000039,0x004e4254,0x00040005,0x0000004b,0x6d726f6e,0x00006c61,
     0x00050005,0x00000050,0x6867696c,0x72694474,0x00000000,0x00040005,
     0x00000055,0x66666964,0x00657375,0x00040005,0x0000005e,0x69626d61,
-    0x00746e65,0x00050005,0x00000065,0x4374756f,0x726f6c6f,0x00000000,
-    0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x0000000d,
-    0x00000022,0x00000000,0x00040047,0x00000011,0x0000001e,0x00000000,
-    0x00040047,0x00000017,0x00000021,0x00000001,0x00040047,0x00000017,
-    0x00000022,0x00000000,0x00040047,0x00000023,0x00000021,0x00000002,
-    0x00040047,0x00000023,0x00000022,0x00000000,0x00040047,0x0000002c,
-    0x0000001e,0x00000001,0x00040047,0x00000030,0x0000001e,0x00000002,
-    0x00040047,0x00000065,0x0000001e,0x00000000,0x00020013,0x00000002,
+    0x00746e65,0x00030005,0x00000064,0x006c6f63,0x00050005,0x0000006b,
+    0x6e694c75,0x69726165,0x0000657a,0x00050005,0x00000083,0x4374756f,
+    0x726f6c6f,0x00000000,0x00040047,0x0000000d,0x00000021,0x00000000,
+    0x00040047,0x0000000d,0x00000022,0x00000000,0x00040047,0x00000011,
+    0x0000001e,0x00000000,0x00040047,0x00000017,0x00000021,0x00000001,
+    0x00040047,0x00000017,0x00000022,0x00000000,0x00040047,0x00000023,
+    0x00000021,0x00000002,0x00040047,0x00000023,0x00000022,0x00000000,
+    0x00040047,0x0000002c,0x0000001e,0x00000001,0x00040047,0x00000030,
+    0x0000001e,0x00000002,0x00040047,0x0000006b,0x00000001,0x00000000,
+    0x00040047,0x00000083,0x0000001e,0x00000000,0x00020013,0x00000002,
     0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
     0x00040017,0x00000007,0x00000006,0x00000003,0x00040020,0x00000008,
     0x00000007,0x00000007,0x00090019,0x0000000a,0x00000006,0x00000001,
@@ -581,73 +782,95 @@ static const uint32_t cubeTexturedFragSpv[] = {
     0x0006002c,0x00000007,0x00000054,0x00000051,0x00000052,0x00000053,
     0x0004002b,0x00000006,0x0000005a,0x3f4ccccd,0x0004002b,0x00000006,
     0x0000005f,0x3e99999a,0x0004002b,0x00000006,0x00000060,0x3e19999a,
-    0x00040020,0x00000064,0x00000003,0x00000013,0x0004003b,0x00000064,
-    0x00000065,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
-    0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,
-    0x00000007,0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,
-    0x00000021,0x00000022,0x00000007,0x0004003b,0x00000008,0x0000002a,
-    0x00000007,0x0004003b,0x00000008,0x0000002f,0x00000007,0x0004003b,
-    0x00000008,0x00000033,0x00000007,0x0004003b,0x00000038,0x00000039,
-    0x00000007,0x0004003b,0x00000008,0x0000004b,0x00000007,0x0004003b,
-    0x00000008,0x00000050,0x00000007,0x0004003b,0x00000021,0x00000055,
-    0x00000007,0x0004003b,0x00000021,0x0000005e,0x00000007,0x0004003d,
-    0x0000000b,0x0000000e,0x0000000d,0x0004003d,0x0000000f,0x00000012,
-    0x00000011,0x00050057,0x00000013,0x00000014,0x0000000e,0x00000012,
-    0x0008004f,0x00000007,0x00000015,0x00000014,0x00000014,0x00000000,
-    0x00000001,0x00000002,0x0003003e,0x00000009,0x00000015,0x0004003d,
-    0x0000000b,0x00000018,0x00000017,0x0004003d,0x0000000f,0x00000019,
-    0x00000011,0x00050057,0x00000013,0x0000001a,0x00000018,0x00000019,
-    0x0008004f,0x00000007,0x0000001b,0x0000001a,0x0000001a,0x00000000,
-    0x00000001,0x00000002,0x0005008e,0x00000007,0x0000001d,0x0000001b,
-    0x0000001c,0x00060050,0x00000007,0x0000001f,0x0000001e,0x0000001e,
-    0x0000001e,0x00050083,0x00000007,0x00000020,0x0000001d,0x0000001f,
-    0x0003003e,0x00000016,0x00000020,0x0004003d,0x0000000b,0x00000024,
-    0x00000023,0x0004003d,0x0000000f,0x00000025,0x00000011,0x00050057,
-    0x00000013,0x00000026,0x00000024,0x00000025,0x00050051,0x00000006,
-    0x00000029,0x00000026,0x00000000,0x0003003e,0x00000022,0x00000029,
-    0x0004003d,0x00000007,0x0000002d,0x0000002c,0x0006000c,0x00000007,
-    0x0000002e,0x00000001,0x00000045,0x0000002d,0x0003003e,0x0000002a,
-    0x0000002e,0x0004003d,0x00000007,0x00000031,0x00000030,0x0006000c,
-    0x00000007,0x00000032,0x00000001,0x00000045,0x00000031,0x0003003e,
-    0x0000002f,0x00000032,0x0004003d,0x00000007,0x00000034,0x0000002a,
-    0x0004003d,0x00000007,0x00000035,0x0000002f,0x0007000c,0x00000007,
-    0x00000036,0x00000001,0x00000044,0x00000034,0x00000035,0x0003003e,
-    0x00000033,0x00000036,0x0004003d,0x00000007,0x0000003a,0x0000002f,
-    0x0004003d,0x00000007,0x0000003b,0x00000033,0x0004003d,0x00000007,
-    0x0000003c,0x0000002a,0x00050051,0x00000006,0x0000003e,0x0000003a,
-    0x00000000,0x00050051,0x00000006,0x0000003f,0x0000003a,0x00000001,
-    0x00050051,0x00000006,0x00000040,0x0000003a,0x00000002,0x00050051,
-    0x00000006,0x00000041,0x0000003b,0x00000000,0x00050051,0x00000006,
-    0x00000042,0x0000003b,0x00000001,0x00050051,0x00000006,0x00000043,
-    0x0000003b,0x00000002,0x00050051,0x00000006,0x00000044,0x0000003c,
-    0x00000000,0x00050051,0x00000006,0x00000045,0x0000003c,0x00000001,
-    0x00050051,0x00000006,0x00000046,0x0000003c,0x00000002,0x00060050,
-    0x00000007,0x00000047,0x0000003e,0x0000003f,0x00000040,0x00060050,
-    0x00000007,0x00000048,0x00000041,0x00000042,0x00000043,0x00060050,
-    0x00000007,0x00000049,0x00000044,0x00000045,0x00000046,0x00060050,
-    0x00000037,0x0000004a,0x00000047,0x00000048,0x00000049,0x0003003e,
-    0x00000039,0x0000004a,0x0004003d,0x00000037,0x0000004c,0x00000039,
-    0x0004003d,0x00000007,0x0000004d,0x00000016,0x00050091,0x00000007,
-    0x0000004e,0x0000004c,0x0000004d,0x0006000c,0x00000007,0x0000004f,
-    0x00000001,0x00000045,0x0000004e,0x0003003e,0x0000004b,0x0000004f,
-    0x0003003e,0x00000050,0x00000054,0x0004003d,0x00000007,0x00000056,
-    0x0000004b,0x0004003d,0x00000007,0x00000057,0x00000050,0x00050094,
-    0x00000006,0x00000058,0x00000056,0x00000057,0x0007000c,0x00000006,
-    0x00000059,0x00000001,0x00000028,0x00000058,0x0000003d,0x00050085,
-    0x00000006,0x0000005b,0x00000059,0x0000005a,0x0004003d,0x00000006,
-    0x0000005c,0x00000022,0x00050085,0x00000006,0x0000005d,0x0000005b,
-    0x0000005c,0x0003003e,0x00000055,0x0000005d,0x0004003d,0x00000006,
-    0x00000061,0x00000022,0x00050085,0x00000006,0x00000062,0x00000060,
-    0x00000061,0x00050081,0x00000006,0x00000063,0x0000005f,0x00000062,
-    0x0003003e,0x0000005e,0x00000063,0x0004003d,0x00000007,0x00000066,
-    0x00000009,0x0004003d,0x00000006,0x00000067,0x00000055,0x0004003d,
-    0x00000006,0x00000068,0x0000005e,0x00050081,0x00000006,0x00000069,
-    0x00000067,0x00000068,0x0005008e,0x00000007,0x0000006a,0x00000066,
-    0x00000069,0x00050051,0x00000006,0x0000006b,0x0000006a,0x00000000,
-    0x00050051,0x00000006,0x0000006c,0x0000006a,0x00000001,0x00050051,
-    0x00000006,0x0000006d,0x0000006a,0x00000002,0x00070050,0x00000013,
-    0x0000006e,0x0000006b,0x0000006c,0x0000006d,0x0000001e,0x0003003e,
-    0x00000065,0x0000006e,0x000100fd,0x00010038
+    0x00020014,0x0000006a,0x00030031,0x0000006a,0x0000006b,0x0004002b,
+    0x00000006,0x0000006f,0x3d6147ae,0x0004002b,0x00000006,0x00000072,
+    0x3f870a3d,0x0004002b,0x00000006,0x00000075,0x4019999a,0x0006002c,
+    0x00000007,0x00000076,0x00000075,0x00000075,0x00000075,0x0004002b,
+    0x00000006,0x00000079,0x414eb852,0x0004002b,0x00000006,0x0000007d,
+    0x3d25aee6,0x0006002c,0x00000007,0x0000007e,0x0000007d,0x0000007d,
+    0x0000007d,0x00040017,0x0000007f,0x0000006a,0x00000003,0x00040020,
+    0x00000082,0x00000003,0x00000013,0x0004003b,0x00000082,0x00000083,
+    0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,
+    0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
+    0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,0x00000021,
+    0x00000022,0x00000007,0x0004003b,0x00000008,0x0000002a,0x00000007,
+    0x0004003b,0x00000008,0x0000002f,0x00000007,0x0004003b,0x00000008,
+    0x00000033,0x00000007,0x0004003b,0x00000038,0x00000039,0x00000007,
+    0x0004003b,0x00000008,0x0000004b,0x00000007,0x0004003b,0x00000008,
+    0x00000050,0x00000007,0x0004003b,0x00000021,0x00000055,0x00000007,
+    0x0004003b,0x00000021,0x0000005e,0x00000007,0x0004003b,0x00000008,
+    0x00000064,0x00000007,0x0004003d,0x0000000b,0x0000000e,0x0000000d,
+    0x0004003d,0x0000000f,0x00000012,0x00000011,0x00050057,0x00000013,
+    0x00000014,0x0000000e,0x00000012,0x0008004f,0x00000007,0x00000015,
+    0x00000014,0x00000014,0x00000000,0x00000001,0x00000002,0x0003003e,
+    0x00000009,0x00000015,0x0004003d,0x0000000b,0x00000018,0x00000017,
+    0x0004003d,0x0000000f,0x00000019,0x00000011,0x00050057,0x00000013,
+    0x0000001a,0x00000018,0x00000019,0x0008004f,0x00000007,0x0000001b,
+    0x0000001a,0x0000001a,0x00000000,0x00000001,0x00000002,0x0005008e,
+    0x00000007,0x0000001d,0x0000001b,0x0000001c,0x00060050,0x00000007,
+    0x0000001f,0x0000001e,0x0000001e,0x0000001e,0x00050083,0x00000007,
+    0x00000020,0x0000001d,0x0000001f,0x0003003e,0x00000016,0x00000020,
+    0x0004003d,0x0000000b,0x00000024,0x00000023,0x0004003d,0x0000000f,
+    0x00000025,0x00000011,0x00050057,0x00000013,0x00000026,0x00000024,
+    0x00000025,0x00050051,0x00000006,0x00000029,0x00000026,0x00000000,
+    0x0003003e,0x00000022,0x00000029,0x0004003d,0x00000007,0x0000002d,
+    0x0000002c,0x0006000c,0x00000007,0x0000002e,0x00000001,0x00000045,
+    0x0000002d,0x0003003e,0x0000002a,0x0000002e,0x0004003d,0x00000007,
+    0x00000031,0x00000030,0x0006000c,0x00000007,0x00000032,0x00000001,
+    0x00000045,0x00000031,0x0003003e,0x0000002f,0x00000032,0x0004003d,
+    0x00000007,0x00000034,0x0000002a,0x0004003d,0x00000007,0x00000035,
+    0x0000002f,0x0007000c,0x00000007,0x00000036,0x00000001,0x00000044,
+    0x00000034,0x00000035,0x0003003e,0x00000033,0x00000036,0x0004003d,
+    0x00000007,0x0000003a,0x0000002f,0x0004003d,0x00000007,0x0000003b,
+    0x00000033,0x0004003d,0x00000007,0x0000003c,0x0000002a,0x00050051,
+    0x00000006,0x0000003e,0x0000003a,0x00000000,0x00050051,0x00000006,
+    0x0000003f,0x0000003a,0x00000001,0x00050051,0x00000006,0x00000040,
+    0x0000003a,0x00000002,0x00050051,0x00000006,0x00000041,0x0000003b,
+    0x00000000,0x00050051,0x00000006,0x00000042,0x0000003b,0x00000001,
+    0x00050051,0x00000006,0x00000043,0x0000003b,0x00000002,0x00050051,
+    0x00000006,0x00000044,0x0000003c,0x00000000,0x00050051,0x00000006,
+    0x00000045,0x0000003c,0x00000001,0x00050051,0x00000006,0x00000046,
+    0x0000003c,0x00000002,0x00060050,0x00000007,0x00000047,0x0000003e,
+    0x0000003f,0x00000040,0x00060050,0x00000007,0x00000048,0x00000041,
+    0x00000042,0x00000043,0x00060050,0x00000007,0x00000049,0x00000044,
+    0x00000045,0x00000046,0x00060050,0x00000037,0x0000004a,0x00000047,
+    0x00000048,0x00000049,0x0003003e,0x00000039,0x0000004a,0x0004003d,
+    0x00000037,0x0000004c,0x00000039,0x0004003d,0x00000007,0x0000004d,
+    0x00000016,0x00050091,0x00000007,0x0000004e,0x0000004c,0x0000004d,
+    0x0006000c,0x00000007,0x0000004f,0x00000001,0x00000045,0x0000004e,
+    0x0003003e,0x0000004b,0x0000004f,0x0003003e,0x00000050,0x00000054,
+    0x0004003d,0x00000007,0x00000056,0x0000004b,0x0004003d,0x00000007,
+    0x00000057,0x00000050,0x00050094,0x00000006,0x00000058,0x00000056,
+    0x00000057,0x0007000c,0x00000006,0x00000059,0x00000001,0x00000028,
+    0x00000058,0x0000003d,0x00050085,0x00000006,0x0000005b,0x00000059,
+    0x0000005a,0x0004003d,0x00000006,0x0000005c,0x00000022,0x00050085,
+    0x00000006,0x0000005d,0x0000005b,0x0000005c,0x0003003e,0x00000055,
+    0x0000005d,0x0004003d,0x00000006,0x00000061,0x00000022,0x00050085,
+    0x00000006,0x00000062,0x00000060,0x00000061,0x00050081,0x00000006,
+    0x00000063,0x0000005f,0x00000062,0x0003003e,0x0000005e,0x00000063,
+    0x0004003d,0x00000007,0x00000065,0x00000009,0x0004003d,0x00000006,
+    0x00000066,0x00000055,0x0004003d,0x00000006,0x00000067,0x0000005e,
+    0x00050081,0x00000006,0x00000068,0x00000066,0x00000067,0x0005008e,
+    0x00000007,0x00000069,0x00000065,0x00000068,0x0003003e,0x00000064,
+    0x00000069,0x000300f7,0x0000006d,0x00000000,0x000400fa,0x0000006b,
+    0x0000006c,0x0000006d,0x000200f8,0x0000006c,0x0004003d,0x00000007,
+    0x0000006e,0x00000064,0x00060050,0x00000007,0x00000070,0x0000006f,
+    0x0000006f,0x0000006f,0x00050081,0x00000007,0x00000071,0x0000006e,
+    0x00000070,0x00060050,0x00000007,0x00000073,0x00000072,0x00000072,
+    0x00000072,0x00050088,0x00000007,0x00000074,0x00000071,0x00000073,
+    0x0007000c,0x00000007,0x00000077,0x00000001,0x0000001a,0x00000074,
+    0x00000076,0x0004003d,0x00000007,0x00000078,0x00000064,0x00060050,
+    0x00000007,0x0000007a,0x00000079,0x00000079,0x00000079,0x00050088,
+    0x00000007,0x0000007b,0x00000078,0x0000007a,0x0004003d,0x00000007,
+    0x0000007c,0x00000064,0x000500bc,0x0000007f,0x00000080,0x0000007c,
+    0x0000007e,0x000600a9,0x00000007,0x00000081,0x00000080,0x0000007b,
+    0x00000077,0x0003003e,0x00000064,0x00000081,0x000200f9,0x0000006d,
+    0x000200f8,0x0000006d,0x0004003d,0x00000007,0x00000084,0x00000064,
+    0x00050051,0x00000006,0x00000085,0x00000084,0x00000000,0x00050051,
+    0x00000006,0x00000086,0x00000084,0x00000001,0x00050051,0x00000006,
+    0x00000087,0x00000084,0x00000002,0x00070050,0x00000013,0x00000088,
+    0x00000085,0x00000086,0x00000087,0x0000001e,0x0003003e,0x00000083,
+    0x00000088,0x000100fd,0x00010038,
 };
 
 // ============================================================================
@@ -675,6 +898,10 @@ struct VkRenderer {
     VkPipelineLayout cubePipelineLayout = VK_NULL_HANDLE;   // textured cube: descriptor set + push constants (128 bytes)
     VkPipeline cubePipeline = VK_NULL_HANDLE;
     VkPipeline gridPipeline = VK_NULL_HANDLE;
+    VkPipeline cursorPipeline = VK_NULL_HANDLE; // XR_DXR_cursor_depth sprite: lines, depth test off
+    VkBuffer cursorVertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory cursorVertexMemory = VK_NULL_HANDLE;
+    int cursorVertexCount = 0;
     VkBuffer cubeVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory cubeVertexMemory = VK_NULL_HANDLE;
     VkBuffer cubeIndexBuffer = VK_NULL_HANDLE;
@@ -682,10 +909,19 @@ struct VkRenderer {
     VkBuffer gridVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
     int gridVertexCount = 0;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE; // init-time uploads only
+    // INV-4.10 / #1917: N frames in flight, ONE vkQueueSubmit per frame, never
+    // a wait on the frame just submitted. Owns the per-frame command buffers
+    // and fences (and the blocking one-off path, submitImmediate()).
+    dxr::VkFrameRing ring;
     float cubeRotation = 0.0f;
+
+    // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
+    // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
+    // the matching `uLinearize` specialization constant, so the per-frame clear
+    // colour must follow the SAME latched decision rather than re-reading the
+    // environment and drifting out of step with the baked shaders.
+    bool sceneLinear = false;
     SwapchainFramebuffers swapchainFBs;
     VkRenderPass renderPassLoad = VK_NULL_HANDLE;
     // Texture resources
@@ -1031,6 +1267,34 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     renderer.graphicsQueue = graphicsQueue;
     g_physDevice = physDevice;
 
+    // ADR-021 / INV-4.6: decide ONCE, here, whether the fragment shaders emit
+    // scene-linear. This runs after CreateSwapchains() noted the colour format,
+    // so dxr::RenderSceneLinear() is authoritative: `_SRGB` swapchain => the
+    // attachment encodes on write => the shaders must hand it decoded (linear)
+    // values, or the authored display-referred colour gets encoded twice and
+    // washes out. DXR_TRUE_LINEAR overrides in both directions (see
+    // color_policy.h). Same shape as the Windows VK cube apps (#1650).
+    renderer.sceneLinear = dxr::RenderSceneLinear();
+    const VkBool32 specLinearize = renderer.sceneLinear ? VK_TRUE : VK_FALSE;
+    VkSpecializationMapEntry specEntry = {};
+    specEntry.constantID = 0;  // layout(constant_id = 0) const bool uLinearize
+    specEntry.offset = 0;
+    specEntry.size = sizeof(VkBool32);
+    VkSpecializationInfo fragSpec = {};
+    fragSpec.mapEntryCount = 1;
+    fragSpec.pMapEntries = &specEntry;
+    fragSpec.dataSize = sizeof(specLinearize);
+    fragSpec.pData = &specLinearize;
+
+    // One-off init line (never per frame) so a washed-out capture can be told
+    // apart from a mis-selected swapchain format without a rebuild.
+    LOG_WARN("[color] colorFormat=%d sceneLinear=%s (%s)",
+             (int)colorFormat,
+             renderer.sceneLinear ? "yes" : "no",
+             renderer.sceneLinear
+                 ? "fragment shaders decode authored colour; the attachment re-encodes"
+                 : "fragment shaders write authored display-referred bytes raw");
+
     // Render pass
     VkAttachmentDescription attachments[2] = {};
     attachments[0].format = colorFormat;
@@ -1056,12 +1320,31 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     subpass.pColorAttachments = &colorRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
+    // One depth image is shared by every frame, and with several frames in
+    // flight (VkFrameRing) the previous frame's pass may still be writing it:
+    // order this pass's attachment writes after any earlier ones. The old
+    // per-frame fence wait gave this ordering implicitly.
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask = dep.srcStageMask;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo rpInfo = {};
     rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpInfo.attachmentCount = 2;
     rpInfo.pAttachments = attachments;
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 1;
+    rpInfo.pDependencies = &dep;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
 
     // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
@@ -1175,6 +1458,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = cubeFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.stride = sizeof(CubeVertex);
@@ -1224,6 +1508,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = gridFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.stride = sizeof(GridVertex);
@@ -1256,6 +1541,18 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         pipelineInfo.layout = renderer.pipelineLayout;
         pipelineInfo.renderPass = renderer.renderPass;
         VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &renderer.gridPipeline));
+
+        // XR_DXR_cursor_depth sprite: same line list + grid FS, colour from the
+        // push constant, drawn last with the depth test OFF (never occluded).
+        VkShaderModule cursorVert = createShaderModule(cursorVertSpv, sizeof(cursorVertSpv));
+        stages[0].module = cursorVert;
+        VkPipelineDepthStencilStateCreateInfo noDepth = depthStencil;
+        noDepth.depthTestEnable = VK_FALSE;
+        noDepth.depthWriteEnable = VK_FALSE;
+        pipelineInfo.pDepthStencilState = &noDepth;
+        pipelineInfo.layout = renderer.cubePipelineLayout;
+        VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &renderer.cursorPipeline));
+        vkDestroyShaderModule(device, cursorVert, nullptr);
     }
 
     vkDestroyShaderModule(device, cubeVert, nullptr);
@@ -1340,6 +1637,23 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     memcpy(data, gridVerts.data(), (size_t)gridBufSize);
     vkUnmapMemory(device, renderer.gridVertexMemory);
 
+    // XR_DXR_cursor_depth sprite: crosshair + small square in its XY plane,
+    // unit = the sprite height the runtime returns.
+    static const GridVertex cursorLines[] = {
+        {{-0.5f, 0.0f, 0.0f}}, {{-0.15f, 0.0f, 0.0f}}, {{0.15f, 0.0f, 0.0f}}, {{0.5f, 0.0f, 0.0f}},
+        {{0.0f, -0.5f, 0.0f}}, {{0.0f, -0.15f, 0.0f}}, {{0.0f, 0.15f, 0.0f}}, {{0.0f, 0.5f, 0.0f}},
+        {{-0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, 0.15f, 0.0f}},
+        {{0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, -0.15f, 0.0f}},
+    };
+    renderer.cursorVertexCount = (int)(sizeof(cursorLines) / sizeof(cursorLines[0]));
+    if (!CreateBuffer(device, physDevice, sizeof(cursorLines),
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        renderer.cursorVertexBuffer, renderer.cursorVertexMemory)) return false;
+    vkMapMemory(device, renderer.cursorVertexMemory, 0, sizeof(cursorLines), 0, &data);
+    memcpy(data, cursorLines, sizeof(cursorLines));
+    vkUnmapMemory(device, renderer.cursorVertexMemory);
+
     // Command pool + buffer
     VkCommandPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1347,17 +1661,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     poolInfo.queueFamilyIndex = queueFamilyIndex;
     VK_CHECK(vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool));
 
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = renderer.commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer));
-
-    VkFenceCreateInfo fenceInfo = {};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
+    // Frame ring (default 3 in flight; DXR_VK_FRAMES_IN_FLIGHT overrides).
+    // Grid / cube / cursor MVPs are push constants, so the ring owns no UBO.
+    if (!renderer.ring.init(device, physDevice, graphicsQueue, queueFamilyIndex,
+                            dxr::VkFrameRing::Config{})) {
+        LOG_ERROR("VkFrameRing init failed");
+        return false;
+    }
 
     // Load textures and create descriptor set
     {
@@ -1447,21 +1757,185 @@ struct EyeRenderParams {
     float projMat[16];
 };
 
+// ============================================================================
+// XR_DXR_cursor_depth (ADR-046) — same adoption as cube_handle_metal_macos.
+//
+// The app owns the depth: it answers "ray -> first cube hit" (RayHitCube) and
+// displayxr-common's dxr::CursorDepth does the rest — the pointer as a canvas
+// UV, the footprint rays from the outer eyes of the previous locate, the
+// nearest hit, the struct chain on xrLocateViews, and hiding the OS cursor
+// exactly while the depth cursor replaces it. Spec v5 (ADR-046 Amendment 2 B), the
+// default: the runtime DRAWS it (XrCursorDepthDrawInfoDXR) - its default look,
+// or our own sprite with DISPLAYXR_CURSOR_DEPTH_SPRITE=custom - and the app
+// hides the OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw.
+// DISPLAYXR_CURSOR_DEPTH_DRAW=app: the app draws its crosshair last, depth
+// test off, and hides the OS cursor while it does. Opt out with
+// DISPLAYXR_CURSOR_DEPTH=0; DISPLAYXR_CURSOR_DEPTH_UV=u,v scripts the cursor
+// for headless capture.
+// ============================================================================
+
+static const float kCubeSize = 0.06f;
+static const float kCursorHeight = 0.04f; // fraction of canvas height
+
+struct CursorDepthDraw {
+    bool active = false;
+    XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
+    float height = 0.0f;
+};
+static CursorDepthDraw g_cursorDraw;
+
+// Slab test against the cube as RenderScene places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
+{
+    const float c = cosf(rot), s = sinf(rot), h = kCubeSize * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
+
+// Model matrix of the cursor sprite: pose (rotation then translation), scaled
+// by the returned height. Column-major, like the other mat4_* helpers.
+static void CursorSpriteModel(float *out)
+{
+    const XrQuaternionf q = g_cursorDraw.pose.orientation;
+    float rot[16];
+    mat4_identity(rot);
+    rot[0] = 1 - 2 * (q.y * q.y + q.z * q.z);
+    rot[1] = 2 * (q.x * q.y + q.z * q.w);
+    rot[2] = 2 * (q.x * q.z - q.y * q.w);
+    rot[4] = 2 * (q.x * q.y - q.z * q.w);
+    rot[5] = 1 - 2 * (q.x * q.x + q.z * q.z);
+    rot[6] = 2 * (q.y * q.z + q.x * q.w);
+    rot[8] = 2 * (q.x * q.z + q.y * q.w);
+    rot[9] = 2 * (q.y * q.z - q.x * q.w);
+    rot[10] = 1 - 2 * (q.x * q.x + q.y * q.y);
+    float trans[16], scl[16], tmp[16];
+    mat4_translation(trans, g_cursorDraw.pose.position.x, g_cursorDraw.pose.position.y,
+                     g_cursorDraw.pose.position.z);
+    mat4_scale(scl, g_cursorDraw.height, g_cursorDraw.height, g_cursorDraw.height);
+    mat4_multiply(tmp, rot, scl);
+    mat4_multiply(out, trans, tmp);
+}
+
+// ============================================================================
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3) test content: a synthetic
+// STEREO PHOTO (test_apps/common/stereo_photo_test.h) copied into each view's
+// tile instead of the cube. DISPLAYXR_CURSOR_DEPTH_SOURCE=measured selects it
+// (and the measured-disparity source); DISPLAYXR_STEREO_PHOTO=1 shows it alone;
+// DISPLAYXR_STEREO_PHOTO_ANIMATE=1 pans it a pixel per frame (a playing video:
+// every frame is a new measurement, nothing is answered from the cache).
+// ============================================================================
+struct VkStereoPhoto
+{
+    bool on = false;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::vector<VkImage> images; // the swapchain's
+    VkBuffer buf = VK_NULL_HANDLE;
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    uint32_t w = 0, h = 0, pad = 32;
+    int eyes = 0;
+    bool animate = false;
+    uint32_t frame = 0;
+};
+static VkStereoPhoto g_vkPhoto;
+
+static bool EnsureVkStereoPhoto(VkDevice device, uint32_t w, uint32_t h, int eyes)
+{
+    VkStereoPhoto &sp = g_vkPhoto;
+    if (sp.buf != VK_NULL_HANDLE && sp.w == w && sp.h == h && sp.eyes == eyes) return true;
+    if (sp.buf != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(device); // a size change only (setup, not per frame)
+        vkDestroyBuffer(device, sp.buf, nullptr);
+        vkFreeMemory(device, sp.mem, nullptr);
+        sp.buf = VK_NULL_HANDLE;
+    }
+    const uint32_t tw = w + sp.pad; // a pan margin for the animated mode
+    const VkDeviceSize view_bytes = (VkDeviceSize)tw * h * 4;
+    if (!CreateBuffer(device, g_physDevice, view_bytes * eyes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, sp.buf, sp.mem)) {
+        sp.buf = VK_NULL_HANDLE;
+        return false;
+    }
+    uint8_t *mapped = nullptr;
+    vkMapMemory(device, sp.mem, 0, VK_WHOLE_SIZE, 0, (void **)&mapped);
+    const bool bgra = sp.format == VK_FORMAT_B8G8R8A8_UNORM || sp.format == VK_FORMAT_B8G8R8A8_SRGB;
+    std::vector<uint8_t> px;
+    for (int e = 0; e < eyes; e++) {
+        dxr_test::PhotoFill(e, eyes, w, tw, h, bgra, px);
+        memcpy(mapped + view_bytes * e, px.data(), px.size());
+    }
+    vkUnmapMemory(device, sp.mem);
+    sp.w = w;
+    sp.h = h;
+    sp.eyes = eyes;
+    LOG_INFO("stereo photo: %d views of %ux%u (%s; foreground +%.1f px crossed, ground %.1f px)", eyes, w, h,
+             bgra ? "BGRA" : "RGBA", dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w);
+    return true;
+}
+
+// After the scene pass: copy each view's photo into its tile (image left in
+// COLOR_ATTACHMENT_OPTIMAL, the render pass's final layout).
+static void CopyVkStereoPhoto(VkRenderer &renderer, VkCommandBuffer cmd, uint32_t imageIndex,
+                              const EyeRenderParams *eyes, int eyeCount)
+{
+    if (eyeCount < 1 || imageIndex >= g_vkPhoto.images.size()) return;
+    if (!EnsureVkStereoPhoto(renderer.device, eyes[0].width, eyes[0].height, eyeCount)) return;
+    VkImage img = g_vkPhoto.images[imageIndex];
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+    const uint32_t tw = g_vkPhoto.w + g_vkPhoto.pad;
+    const uint32_t scroll = g_vkPhoto.animate ? (g_vkPhoto.frame++ % g_vkPhoto.pad) : 0u;
+    for (int e = 0; e < eyeCount; e++) {
+        VkBufferImageCopy r = {};
+        r.bufferOffset = (VkDeviceSize)tw * g_vkPhoto.h * 4 * e + (VkDeviceSize)scroll * 4;
+        r.bufferRowLength = tw;
+        r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        r.imageOffset = {(int32_t)eyes[e].viewportX, (int32_t)eyes[e].viewportY, 0};
+        r.imageExtent = {eyes[e].width < g_vkPhoto.w ? eyes[e].width : g_vkPhoto.w,
+                         eyes[e].height < g_vkPhoto.h ? eyes[e].height : g_vkPhoto.h, 1};
+        vkCmdCopyBufferToImage(cmd, g_vkPhoto.buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+    }
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &b);
+}
+
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     const EyeRenderParams* eyes, int eyeCount)
 {
-    VkDevice device = renderer.device;
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
     auto& fb = renderer.swapchainFBs;
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    // INV-4.10: waits only the fence of the frame that used this ring slot N
+    // frames ago (normally long signalled), then resets + begins its buffer.
+    VkCommandBuffer cmd = renderer.ring.beginFrame();
+    if (cmd == VK_NULL_HANDLE) return;
 
     // Transparent-background mode (DISPLAYXR_TRANSPARENT_BG=1) clears RGBA(0,0,0,0)
     // so the desktop shows through everywhere the cube isn't drawn. Pairs with
@@ -1473,6 +1947,18 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     VkClearValue clearValues[2] = {};
     clearValues[0].color = transparent_bg ? VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}}
                                           : VkClearColorValue{{0.05f, 0.05f, 0.1f, 1.0f}};
+    // ADR-021 / INV-4.6: VkClearColorValue is taken in the attachment's OWN
+    // space, so an `_SRGB` attachment encodes it -- the display-referred
+    // background would come out visibly brighter than the cube drawn over it.
+    // Decode it off the SAME latched flag the pipelines were specialized with.
+    // Alpha (and so premultiplication) is linear in both spaces and is never
+    // converted.
+    if (renderer.sceneLinear) {
+        for (int i = 0; i < 3; i++) {
+            clearValues[0].color.float32[i] =
+                dxr::DisplayReferredToSceneLinear(clearValues[0].color.float32[i]);
+        }
+    }
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
@@ -1515,7 +2001,7 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
 
         // Draw cube (textured)
         {
-            const float cubeSize = 0.06f;
+            const float cubeSize = kCubeSize;
             const float cubeHeight = cubeSize / 2.0f;
             float rot[16], scl[16], trans[16], model[16], tmp[16];
             mat4_rotation_y(rot, renderer.cubeRotation);
@@ -1540,16 +2026,36 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
             vkCmdBindIndexBuffer(cmd, renderer.cubeIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
             vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
         }
+
+        // --- Depth-aware cursor (XR_DXR_cursor_depth): last, never occluded ---
+        if (g_cursorDraw.active && renderer.cursorPipeline != VK_NULL_HANDLE) {
+            float model[16];
+            CursorSpriteModel(model);
+            float pushData[20];
+            mat4_multiply(pushData, vp, model);
+            pushData[16] = 1.0f; // display-referred amber, as the Metal cube's
+            pushData[17] = 0.85f;
+            pushData[18] = 0.1f;
+            pushData[19] = 1.0f;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, renderer.cursorPipeline);
+            vkCmdPushConstants(cmd, renderer.cubePipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, 80, pushData);
+            VkDeviceSize offset = 0;
+            vkCmdBindVertexBuffers(cmd, 0, 1, &renderer.cursorVertexBuffer, &offset);
+            vkCmdDraw(cmd, renderer.cursorVertexCount, 1, 0, 0);
+        }
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
 
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+    // XR_DXR_cursor_depth v7 test content: the stereo photo over the cube.
+    if (g_vkPhoto.on) {
+        CopyVkStereoPhoto(renderer, cmd, imageIndex, eyes, eyeCount);
+    }
+
+    // ONE submit for every view, no wait. Must precede xrReleaseSwapchainImage
+    // (the runtime composes on the same queue).
+    VkResult r = renderer.ring.endFrame();
+    if (r != VK_SUCCESS) LOG_WARN("VkFrameRing::endFrame: vkQueueSubmit failed (%d)", (int)r);
 }
 
 // Workspace chrome self-test (#48): one-shot clear of a chrome swapchain image
@@ -1624,6 +2130,11 @@ static void FillWorkspaceSwapchain(XrSwapchain sc, VkDevice device, VkQueue queu
 static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.device == VK_NULL_HANDLE) return;
     vkDeviceWaitIdle(renderer.device);
+    if (g_vkPhoto.buf != VK_NULL_HANDLE) { // XR_DXR_cursor_depth v7 test content
+        vkDestroyBuffer(renderer.device, g_vkPhoto.buf, nullptr);
+        vkFreeMemory(renderer.device, g_vkPhoto.mem, nullptr);
+        g_vkPhoto.buf = VK_NULL_HANDLE;
+    }
 
     {
         auto& fb = renderer.swapchainFBs;
@@ -1634,7 +2145,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
         if (fb.depthMemory) vkFreeMemory(renderer.device, fb.depthMemory, nullptr);
     }
 
-    if (renderer.frameFence) vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
+    renderer.ring.destroy(); // after vkDeviceWaitIdle above; frees its pool/fences
     if (renderer.commandPool) vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
     if (renderer.gridVertexBuffer) vkDestroyBuffer(renderer.device, renderer.gridVertexBuffer, nullptr);
     if (renderer.gridVertexMemory) vkFreeMemory(renderer.device, renderer.gridVertexMemory, nullptr);
@@ -1643,6 +2154,9 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
     if (renderer.cubeVertexBuffer) vkDestroyBuffer(renderer.device, renderer.cubeVertexBuffer, nullptr);
     if (renderer.cubeVertexMemory) vkFreeMemory(renderer.device, renderer.cubeVertexMemory, nullptr);
     if (renderer.gridPipeline) vkDestroyPipeline(renderer.device, renderer.gridPipeline, nullptr);
+    if (renderer.cursorPipeline) vkDestroyPipeline(renderer.device, renderer.cursorPipeline, nullptr);
+    if (renderer.cursorVertexBuffer) vkDestroyBuffer(renderer.device, renderer.cursorVertexBuffer, nullptr);
+    if (renderer.cursorVertexMemory) vkFreeMemory(renderer.device, renderer.cursorVertexMemory, nullptr);
     if (renderer.cubePipeline) vkDestroyPipeline(renderer.device, renderer.cubePipeline, nullptr);
     // Texture cleanup
     if (renderer.descriptorPool) vkDestroyDescriptorPool(renderer.device, renderer.descriptorPool, nullptr);
@@ -1716,6 +2230,35 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
+// Test knob: place the window's CONTENT rect at x,y,w,h in top-down global
+// points (origin = the main display's top-left, the CGDisplayBounds /
+// XrDisplayDesktopPositionDXR space), e.g. to put it on a given display or
+// make it straddle two without dragging. Read from @p env_name; false when
+// unset or malformed. Same knob as cube_handle_metal_macos.
+static bool ApplyTestWindowRect(const char *env_name) {
+    const char *e = getenv(env_name);
+    if (e == nullptr || g_window == nil) {
+        return false;
+    }
+    int x = 0, y = 0, w = 0, h = 0;
+    if (sscanf(e, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+        LOG_WARN("%s='%s' ignored (want x,y,w,h in top-down points)", env_name, e);
+        return false;
+    }
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary == nil) {
+        return false;
+    }
+    const CGFloat bottom = primary.frame.size.height - (CGFloat)y - (CGFloat)h;
+    NSRect content = NSMakeRect((CGFloat)x, bottom, (CGFloat)w, (CGFloat)h);
+    NSRect frame = [g_window frameRectForContentRect:content];
+    // setFrame:display: does not run constrainFrameRect, so a window may
+    // straddle displays exactly where asked.
+    [g_window setFrame:frame display:YES];
+    LOG_INFO("%s: content rect -> %d,%d %dx%d pt (top-down)", env_name, x, y, w, h);
+    return true;
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -1729,19 +2272,39 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
-        NSRect frame = NSMakeRect(100, 100, width, height);
-        NSScreen *primary = [NSScreen screens].firstObject;
-        if (primary != nil) {
-            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+        // Resolve the NSScreen that holds the panel's top-left, and put the
+        // WHOLE window (title bar included) inside its visibleFrame. Placing
+        // the content top AT the panel top pushes the title bar off-screen,
+        // and AppKit then re-constrains the window onto [NSScreen mainScreen]
+        // -- whichever screen has focus at launch, i.e. often the laptop.
+        // Same fix as cube_handle_metal_macos.
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *target = nil;
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                          primary.frame.size.height - (CGFloat)screenTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { target = s; break; }
+            }
+        }
+        if (target != nil) {
+            const NSRect vf = target.visibleFrame; // below that screen's menu bar
+            const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+            const CGFloat titleH = wf.size.height - (CGFloat)height;
+            frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+        }
 
         g_window = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
+        if (target != nil) {
+            // Global coordinates, title bar on-screen: no re-constrain.
+            [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+        }
 
         [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
@@ -1763,8 +2326,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
 
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        // Ordering front may re-constrain the frame onto one display; put
+        // the test rect back once the window is on screen.
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
 
         // Pump events so the window appears
         NSEvent *event;
@@ -2051,6 +2618,18 @@ struct AppXrSession {
     // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    bool hasCursorDepthExt = false; // XR_DXR_cursor_depth (ADR-046)
+    uint32_t cursorDepthSpecVersion = 0;
+    // XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B):
+    // DISPLAYXR_CURSOR_DEPTH_DRAW=runtime (default) | app. Runtime: chain
+    // XrCursorDepthDrawInfoDXR and let the runtime draw the cursor; hide the
+    // OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw. App: draw
+    // the crosshair ourselves from the placement (v1-v4 behaviour).
+    bool cursorDepthRuntimeDraw = false;
+    // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: hand the runtime our own sprite
+    // (a cyan ring with a dot) instead of its default look.
+    bool cursorDepthCustomSprite = false;
+    XrSwapchain cursorSpriteSwapchain = XR_NULL_HANDLE;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
     // XR_DXR_spatial_workspace (#48): when running OOP via the service, the
@@ -2098,8 +2677,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XR_CHECK(xrEnumerateInstanceExtensionProperties(nullptr, extensionCount, &extensionCount, extensions.data()));
 
     bool hasVulkan = false;
+    bool hasLift = false;
     for (const auto& ext : extensions) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
+        if (strcmp(ext.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0) hasLift = true;
         if (strcmp(ext.extensionName, XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) {
             xr.hasCocoaWindowBinding = true;
         }
@@ -2111,6 +2692,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             xr.hasViewRigExt = true;
+        }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            xr.hasCursorDepthExt = true;
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
         }
         if (strcmp(ext.extensionName, XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME) == 0) {
             xr.hasSpatialWorkspaceExt = true;
@@ -2142,10 +2727,54 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     }
+    if (xr.hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            xr.hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s", xr.hasCursorDepthExt ? "ENABLED" : "off");
+    if (xr.hasCursorDepthExt) {
+        // Spec v5: who draws the cursor. Default: the runtime.
+        const char *drawWho = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+        const bool wantApp = drawWho != nullptr && strcmp(drawWho, "app") == 0;
+        if (!wantApp && xr.cursorDepthSpecVersion >= 5) {
+            xr.cursorDepthRuntimeDraw = true;
+            const char *sprite = getenv("DISPLAYXR_CURSOR_DEPTH_SPRITE");
+            xr.cursorDepthCustomSprite = sprite != nullptr && strcmp(sprite, "custom") == 0;
+        } else if (!wantApp) {
+            LOG_WARN("XR_DXR_cursor_depth v%u has no runtime-drawn cursor (needs v5) - drawing it ourselves",
+                     xr.cursorDepthSpecVersion);
+        }
+        LOG_INFO("XR_DXR_cursor_depth draw: %s",
+                 !xr.cursorDepthRuntimeDraw ? "APP (crosshair from the placement)"
+                 : xr.cursorDepthCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
+                                              : "RUNTIME, default look");
+    }
+    if (xr.hasSpatialWorkspaceExt && g_liftProbe.enabled &&
+        getenv("XRT_FORCE_MODE") == nullptr) {
+        // A hybrid runtime routes any session that enables the workspace
+        // extension through the service (IPC); --lift is here to exercise the
+        // IN-PROCESS lift link, so it leaves it off (XRT_FORCE_MODE=ipc still
+        // gives the IPC route on purpose).
+        LOG_INFO("--lift: XR_DXR_spatial_workspace left off so the session "
+                 "stays in-process");
+        xr.hasSpatialWorkspaceExt = false;
+    }
     if (xr.hasSpatialWorkspaceExt) {
         enabledExtensions.push_back(XR_DXR_SPATIAL_WORKSPACE_EXTENSION_NAME);
     }
     LOG_INFO("XR_DXR_spatial_workspace: %s", xr.hasSpatialWorkspaceExt ? "available" : "not available");
+    if (g_liftProbe.enabled) {
+        if (hasLift) {
+            enabledExtensions.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+        } else {
+            LOG_WARN("--lift: XR_DXR_lift not advertised by the runtime; probe off");
+            g_liftProbe.enabled = false;
+        }
+    }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "SimCubeExtMacOS", XR_MAX_APPLICATION_NAME_SIZE);
@@ -2156,6 +2785,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     XR_CHECK(xrCreateInstance(&createInfo, &xr.instance));
     LOG_INFO("OpenXR instance created");
+    g_liftProbe.OnInstance(xr.instance);
 
     XrSystemGetInfo sysInfo = {XR_TYPE_SYSTEM_GET_INFO};
     sysInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
@@ -2411,6 +3041,18 @@ static bool GetVulkanDeviceExtensions(AppXrSession& xr,
             extensionStorage.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
         }
     }
+    // --lift-gpu: the IOSurface import / export extensions (ADR-053 P5 step E).
+    if (g_liftProbe.gpu) {
+        uint32_t n = 0;
+        const char *const *names = dxr_test::LiftCpuProbe::GpuDeviceExtensions(&n);
+        for (uint32_t i = 0; i < n; i++) {
+            const bool have = std::find(extensionStorage.begin(), extensionStorage.end(), names[i]) !=
+                              extensionStorage.end();
+            if (!have && isAvailable(names[i])) {
+                extensionStorage.push_back(names[i]);
+            }
+        }
+    }
 
     // Phase 2: Build deviceExtensions pointers from final extensionStorage
     // (safe now since extensionStorage won't be modified again)
@@ -2561,7 +3203,22 @@ static bool CreateSwapchains(AppXrSession& xr) {
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    int64_t selectedFormat = formats[0];
+    // ADR-021 / INV-4.6: request an honest `_SRGB` colour swapchain. The runtime
+    // lists B8G8R8A8_UNORM first, and since #1623 vk_native treats a UNORM
+    // swapchain as holding LINEAR values and encodes it on output, so this
+    // app's display-referred bytes would be encoded a second time (washed out).
+    // dxr::ChooseColorSwapchainFormat() takes the advertised `_SRGB` sibling of
+    // formats[0] (channel order kept); DXR_SWAPCHAIN_ENCODING=unorm restores the
+    // old choice for A/B. Noting it is what makes dxr::RenderSceneLinear() --
+    // and therefore the shaders' `uLinearize` -- follow the swapchain.
+    const dxr::ColorFormatChoice colorChoice =
+        dxr::ChooseColorSwapchainFormat(formats, dxr::ColorEncodingPreferenceFromEnvironment());
+    int64_t selectedFormat = colorChoice.format;
+    dxr::NoteColorSwapchainFormat(selectedFormat);
+    if (colorChoice.fellBack) {
+        LOG_WARN("[color] no `_SRGB` swapchain format satisfied the request; using %lld",
+                 (long long)selectedFormat);
+    }
     LOG_INFO("Selected swapchain format: %lld", (long long)selectedFormat);
 
     // Single SBS swapchain at native display resolution
@@ -2647,6 +3304,7 @@ static bool PollEvents(AppXrSession& xr) {
             break;
         }
         default:
+            g_liftProbe.OnEvent(event);
             break;
         }
         event = {XR_TYPE_EVENT_DATA_BUFFER};
@@ -2657,7 +3315,31 @@ static bool PollEvents(AppXrSession& xr) {
 static bool BeginFrame(AppXrSession& xr, XrFrameState& frameState) {
     frameState = {XR_TYPE_FRAME_STATE};
     XrFrameWaitInfo waitInfo = {XR_TYPE_FRAME_WAIT_INFO};
+    // DISPLAYXR_FRAME_STATS=1: frame interval, and the part of it the app
+    // spent outside xrWaitFrame (its own work + xrLocateViews + xrEndFrame),
+    // averaged and logged every 300 frames (the ADR-046 Amendment 3 cost
+    // evidence).
+    static const bool frameStats = []() {
+        const char *e = getenv("DISPLAYXR_FRAME_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    static struct { uint32_t n = 0; double interval_ms = 0, busy_ms = 0, last_end = 0; } fs;
+    const double tWait0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
     XrResult result = xrWaitFrame(xr.session, &waitInfo, &frameState);
+    if (frameStats) {
+        const double now = CFAbsoluteTimeGetCurrent();
+        if (fs.last_end > 0) {
+            fs.interval_ms += (now - fs.last_end) * 1e3;
+            fs.busy_ms += (tWait0 - fs.last_end) * 1e3;
+            if (++fs.n == 300) {
+                LOG_INFO("frame stats (300 frames): interval %.3f ms, busy outside xrWaitFrame %.3f ms",
+                         fs.interval_ms / 300.0, fs.busy_ms / 300.0);
+                fs.n = 0;
+                fs.interval_ms = fs.busy_ms = 0;
+            }
+        }
+        fs.last_end = now;
+    }
     if (XR_FAILED(result)) { xr.exitRequested = true; return false; }
 
     XrFrameBeginInfo beginInfo = {XR_TYPE_FRAME_BEGIN_INFO};
@@ -2693,7 +3375,7 @@ struct HudVkUploader {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    dxr::VkFrameRing* ring = nullptr; // uploads go through ring->submitImmediate()
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     uint8_t* stagingMapped = nullptr;
@@ -2719,13 +3401,13 @@ static bool VkFindMemoryTypeForHud(VkPhysicalDevice phys, uint32_t typeBits,
 }
 
 static bool InitializeHudVkUploader(HudVkUploader& up,
-    VkDevice device, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+    VkDevice device, VkPhysicalDevice phys, VkQueue queue, dxr::VkFrameRing* ring,
     uint32_t width, uint32_t height)
 {
     up.device = device;
     up.physDevice = phys;
     up.queue = queue;
-    up.cmdPool = pool;
+    up.ring = ring;
     up.width = width;
     up.height = height;
     up.stagingSize = (VkDeviceSize)width * (VkDeviceSize)height * 4;
@@ -2779,54 +3461,390 @@ static bool UploadHudPixels(HudVkUploader& up, VkImage hudImage,
         }
     }
 
-    VkCommandBufferAllocateInfo ca = {};
-    ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ca.commandPool = up.cmdPool;
-    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ca.commandBufferCount = 1;
+    // A HUD upload is a one-off (only when the HUD text changes — see the
+    // caller), so it takes the ring's one sanctioned blocking path: its own
+    // command buffer + fence, allocated once. The wait also keeps the single
+    // staging buffer safe to rewrite next time.
+    VkResult r = up.ring->submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = hudImage;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {up.width, up.height, 1};
+        vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+    });
+    return r == VK_SUCCESS;
+}
+
+// ============================================================================
+// #1581 quad-layer probe
+// ============================================================================
+
+// Fill one static 256x256 RGBA image and hand it to a swapchain (acquire /
+// fill / release once; the layers reference the released image every frame —
+// the same lifecycle the GL and Metal probes use, so the three are comparable).
+//
+// Every feature here exists to make a specific defect visible in the atlas
+// dump, so do not "tidy" it into a symmetric pattern:
+//   - 8 px opaque WHITE border  -> the quad's exact extent, so its width can
+//                                  be MEASURED in tile pixels and compared
+//                                  against the fov the app was handed.
+//   - four distinct corner blocks (TL red, TR green, BL blue, BR yellow)
+//                                  -> catches a transpose or a 180 deg flip
+//                                     that a mirror-symmetric pattern hides.
+//   - a large "Q" with its tail at the BOTTOM-RIGHT
+//                                  -> catches a Y flip (tail moves to the
+//                                     top) and a UV transpose (tail moves to
+//                                     the left).
+//   - 24 px coloured checker      -> filtering / scale sanity.
+//   - bottom-left quadrant at alpha 128 (STRAIGHT alpha)
+//                                  -> the alpha blend: the cube must show
+//                                     through it.
+//
+// Rows are authored TOP-DOWN (row 0 = the image's top) and uploaded with
+// vkCmdCopyBufferToImage, so uv.y = 0 is the top — the same mapping the GL
+// probe gets from glTexSubImage2D and the Metal one from replaceRegion.
+// ============================================================================
+// XR_DXR_cursor_depth v5 — a custom cursor sprite for the runtime to draw
+// ============================================================================
+
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: a 64x64 cyan ring with a centre dot
+// (hotspot = the centre), dark-edged so it reads over the white cube. Filled
+// once (acquire / fill / release) through the HUD uploader; the runtime
+// samples the last released image every frame, as STRAIGHT alpha. `_SRGB`
+// when offered: the bytes are display-referred. Row 0 = the top (Vulkan).
+static bool CreateCursorSprite(AppXrSession& xr, VkDevice device, VkPhysicalDevice phys, VkQueue queue,
+                               dxr::VkFrameRing* ring)
+{
+    const uint32_t S = 64;
+    uint32_t formatCount = 0;
+    xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr);
+    std::vector<int64_t> formats(formatCount);
+    xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data());
+    int64_t fmt = 0;
+    const int64_t preferred[] = {(int64_t)VK_FORMAT_R8G8B8A8_SRGB, (int64_t)VK_FORMAT_B8G8R8A8_SRGB,
+                                 (int64_t)VK_FORMAT_R8G8B8A8_UNORM, (int64_t)VK_FORMAT_B8G8R8A8_UNORM};
+    for (int64_t pref : preferred) {
+        for (int64_t f : formats) {
+            if (f == pref && fmt == 0) fmt = pref;
+        }
+    }
+    if (fmt == 0) return false;
+    const bool bgra = fmt == (int64_t)VK_FORMAT_B8G8R8A8_SRGB || fmt == (int64_t)VK_FORMAT_B8G8R8A8_UNORM;
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = fmt;
+    sci.sampleCount = 1;
+    sci.width = S;
+    sci.height = S;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &xr.cursorSpriteSwapchain))) {
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(xr.cursorSpriteSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(xr.cursorSpriteSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(xr.cursorSpriteSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(xr.cursorSpriteSwapchain, &wi);
+
+    std::vector<uint8_t> buf((size_t)S * S * 4);
+    auto cover = [](float d, float r0, float r1) { // 1 inside [r0, r1], 1-px soft edges
+        const float a = std::min(d - r0 + 0.5f, r1 - d + 0.5f);
+        return a <= 0.0f ? 0.0f : (a >= 1.0f ? 1.0f : a);
+    };
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            const float d = hypotf((float)x + 0.5f - S * 0.5f, (float)y + 0.5f - S * 0.5f);
+            const float ring = std::max(cover(d, 21.0f, 27.0f), cover(d, 0.0f, 5.0f)); // cyan
+            const float edge = std::max(cover(d, 19.5f, 28.5f), cover(d, 0.0f, 6.5f)); // dark rim
+            uint8_t *px = &buf[((size_t)y * S + x) * 4];
+            // Straight alpha: cyan where the ring is, near-black rim.
+            const uint8_t r = 0, g = (uint8_t)(220.0f * ring), b = (uint8_t)(255.0f * ring);
+            px[0] = bgra ? b : r;
+            px[1] = g;
+            px[2] = bgra ? r : b;
+            px[3] = (uint8_t)(255.0f * std::max(ring, edge));
+        }
+    }
+
+    HudVkUploader up = {};
+    bool ok = InitializeHudVkUploader(up, device, phys, queue, ring, S, S) &&
+              UploadHudPixels(up, imgs[idx].image, buf.data(), S * 4);
+    CleanupHudVkUploader(up);
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(xr.cursorSpriteSwapchain, &ri);
+    if (ok) {
+        LOG_INFO("Cursor sprite swapchain created: %ux%u, format %lld (cyan ring, hotspot = centre)", S, S,
+                 (long long)fmt);
+    }
+    return ok;
+}
+
+static bool CreateAndFillQuadTexture(AppXrSession& xr, uint32_t size,
+                                     VkDevice device, VkPhysicalDevice phys,
+                                     VkQueue queue, VkCommandPool pool)
+{
+    // Pick an RGBA8 UNORM format if the runtime offers one: the bytes below
+    // are authored linear, and an _SRGB view would re-encode them.
+    uint32_t formatCount = 0;
+    if (XR_FAILED(xrEnumerateSwapchainFormats(xr.session, 0, &formatCount, nullptr)) ||
+        formatCount == 0) {
+        return false;
+    }
+    std::vector<int64_t> formats(formatCount);
+    if (XR_FAILED(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount,
+                                              formats.data()))) {
+        return false;
+    }
+    int64_t selectedFormat = formats[0];
+    const int64_t preferred[] = {(int64_t)VK_FORMAT_R8G8B8A8_UNORM,
+                                 (int64_t)VK_FORMAT_R8G8B8A8_SRGB,
+                                 (int64_t)VK_FORMAT_B8G8R8A8_UNORM};
+    bool picked = false;
+    for (int64_t pref : preferred) {
+        for (int64_t f : formats) {
+            if (f == pref) { selectedFormat = pref; picked = true; break; }
+        }
+        if (picked) break;
+    }
+    const bool bgra = (selectedFormat == (int64_t)VK_FORMAT_B8G8R8A8_UNORM);
+    LOG_INFO("Quad probe swapchain format: %lld (%s)", (long long)selectedFormat,
+             bgra ? "BGRA8" : "RGBA8");
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                     XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+                     XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    sci.format = selectedFormat;
+    sci.sampleCount = 1;
+    sci.width = size;
+    sci.height = size;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(xr.session, &sci, &g_quadSwapchain))) {
+        return false;
+    }
+
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(g_quadSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageVulkanKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(g_quadSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader*)imgs.data()))) {
+        return false;
+    }
+
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(g_quadSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(g_quadSwapchain, &wi);
+
+    const size_t stride = (size_t)size * 4;
+    const size_t bytes = stride * size;
+    uint8_t* buf = (uint8_t*)malloc(bytes);
+    if (buf == nullptr) {
+        XrSwapchainImageReleaseInfo rr = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_quadSwapchain, &rr);
+        return false;
+    }
+
+    auto put = [&](uint32_t x, uint32_t y, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        uint8_t* px = buf + (size_t)y * stride + (size_t)x * 4;
+        if (bgra) { px[0] = b; px[1] = g; px[2] = r; }
+        else      { px[0] = r; px[1] = g; px[2] = b; }
+        px[3] = a;
+    };
+
+    const float fs = (float)size;
+    const uint32_t border = 8;
+    const uint32_t corner = size / 5;
+
+    // Ring + tail geometry for the "Q" (normalized, origin top-left).
+    const float cx = 0.47f * fs, cy = 0.46f * fs;
+    const float rOut = 0.28f * fs, rIn = 0.175f * fs;
+    const float tx0 = 0.56f * fs, ty0 = 0.60f * fs;   // tail start (inside the ring)
+    const float tx1 = 0.80f * fs, ty1 = 0.86f * fs;   // tail end (bottom-right)
+    const float tailHalf = 0.035f * fs;
+
+    for (uint32_t y = 0; y < size; y++) {
+        for (uint32_t x = 0; x < size; x++) {
+            // Coloured checker base (same RGB values as the GL/Metal probes).
+            bool check = (((x / 24) + (y / 24)) & 1) != 0;
+            uint8_t r = check ? 120 : 25;
+            uint8_t g = check ? 185 : 75;
+            uint8_t b = check ? 190 : 100;
+
+            // Corner blocks, inside the border.
+            const bool left = (x >= border && x < border + corner);
+            const bool right = (x + border + corner >= size && x + border < size);
+            const bool top = (y >= border && y < border + corner);
+            const bool bottom = (y + border + corner >= size && y + border < size);
+            if (left && top)          { r = 255; g = 0;   b = 0;   }  // TL red
+            else if (right && top)    { r = 40;  g = 210; b = 40;  }  // TR green
+            else if (left && bottom)  { r = 0;   g = 60;  b = 255; }  // BL blue
+            else if (right && bottom) { r = 235; g = 220; b = 20;  }  // BR yellow
+
+            // The "Q": black ring + a tail running to the bottom-right.
+            const float dx = (float)x - cx, dy = (float)y - cy;
+            const float d = sqrtf(dx * dx + dy * dy);
+            bool ink = (d <= rOut && d >= rIn);
+            if (!ink) {
+                // Distance from the point to the tail segment.
+                const float sx = tx1 - tx0, sy = ty1 - ty0;
+                const float px = (float)x - tx0, py = (float)y - ty0;
+                float t = (px * sx + py * sy) / (sx * sx + sy * sy);
+                t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+                const float qx = px - t * sx, qy = py - t * sy;
+                ink = sqrtf(qx * qx + qy * qy) <= tailHalf;
+            }
+            if (ink) { r = 15; g = 15; b = 15; }
+
+            // Bottom-left quadrant at half alpha (STRAIGHT alpha bytes).
+            uint8_t a = (x < size / 2 && y >= size / 2) ? 128 : 255;
+
+            // Opaque white border last, so it is never punched by the alpha
+            // quadrant — it is the measurement fiducial.
+            if (x < border || y < border || x + border >= size || y + border >= size) {
+                r = g = b = 255;
+                a = 255;
+            }
+
+            put(x, y, r, g, b, a);
+        }
+    }
+
+    // --- Upload: host-visible staging buffer -> vkCmdCopyBufferToImage. The
+    // image is left in SHADER_READ_ONLY_OPTIMAL, which is what the vk_native
+    // compositor samples a released swapchain image from (same contract as
+    // UploadHudPixels above).
+    bool ok = false;
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(up.device, &ca, &cmd) != VK_SUCCESS) return false;
+    do {
+        VkBufferCreateInfo bci = {};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = bytes;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(device, &bci, nullptr, &staging) != VK_SUCCESS) break;
 
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+        VkMemoryRequirements memReqs;
+        vkGetBufferMemoryRequirements(device, staging, &memReqs);
+        uint32_t memType = 0;
+        if (!VkFindMemoryTypeForHud(phys, memReqs.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                &memType)) {
+            break;
+        }
+        VkMemoryAllocateInfo mai = {};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = memReqs.size;
+        mai.memoryTypeIndex = memType;
+        if (vkAllocateMemory(device, &mai, nullptr, &stagingMem) != VK_SUCCESS) break;
+        if (vkBindBufferMemory(device, staging, stagingMem, 0) != VK_SUCCESS) break;
 
-    VkImageMemoryBarrier b = {};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = hudImage;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
+        void* mapped = nullptr;
+        if (vkMapMemory(device, stagingMem, 0, bytes, 0, &mapped) != VK_SUCCESS) break;
+        memcpy(mapped, buf, bytes);
+        vkUnmapMemory(device, stagingMem);
 
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {up.width, up.height, 1};
-    vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkCommandBufferAllocateInfo ca = {};
+        ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        ca.commandPool = pool;
+        ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ca.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &ca, &cmd) != VK_SUCCESS) break;
 
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
+        VkCommandBufferBeginInfo bi = {};
+        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
 
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(up.queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(up.queue);
-    vkFreeCommandBuffers(up.device, up.cmdPool, 1, &cmd);
-    return true;
+        VkImageMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = imgs[idx].image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {size, size, 1};
+        vkCmdCopyBufferToImage(cmd, staging, imgs[idx].image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+
+        vkEndCommandBuffer(cmd);
+        VkSubmitInfo si = {};
+        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE) != VK_SUCCESS) break;
+        vkQueueWaitIdle(queue);
+        ok = true;
+    } while (false);
+
+    if (cmd != VK_NULL_HANDLE) vkFreeCommandBuffers(device, pool, 1, &cmd);
+    if (stagingMem != VK_NULL_HANDLE) vkFreeMemory(device, stagingMem, nullptr);
+    if (staging != VK_NULL_HANDLE) vkDestroyBuffer(device, staging, nullptr);
+    free(buf);
+
+    g_quadVkImage = imgs[idx].image;
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(g_quadSwapchain, &ri);
+    g_quadTexSize = size;
+    return ok;
 }
 
 static bool EndFrame(AppXrSession& xr, XrTime displayTime,
@@ -2848,7 +3866,99 @@ static bool EndFrame(AppXrSession& xr, XrTime displayTime,
     return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
 }
 
+// #1581 — the DXR_TEST_QUAD variant of EndFrame: the same projection layer,
+// plus three XrCompositionLayerQuad layers on the one probe texture. Kept as a
+// separate function so the default (no DXR_TEST_QUAD) path above is untouched.
+static bool EndFrameWithQuads(AppXrSession& xr, XrTime displayTime,
+    const XrCompositionLayerProjectionView* views, uint32_t viewCount) {
+    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    projectionLayer.space = xr.localSpace;
+    projectionLayer.viewCount = viewCount;
+    projectionLayer.views = views;
+
+    const XrCompositionLayerBaseHeader* layers[8] = {
+        (XrCompositionLayerBaseHeader*)&projectionLayer
+    };
+    uint32_t layerCount = 1;
+
+    XrCompositionLayerQuad quadA = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad quadB = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad quadC = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+
+    XrSwapchainSubImage sub = {};
+    sub.swapchain = g_quadSwapchain;
+    sub.imageRect.offset = {0, 0};
+    sub.imageRect.extent = {(int32_t)g_quadTexSize, (int32_t)g_quadTexSize};
+    sub.imageArrayIndex = 0;
+
+    // Everything is sized and placed in units of the CANVAS, not in absolute
+    // metres: a 3D display's Kooima frustum is narrow and strongly off-axis
+    // vertically, so absolute-metre poses that read fine on an HMD land
+    // off-tile here. Fractions of the canvas keep all three quads inside both
+    // tiles on any display, which is what makes the picture judgeable.
+    const float cw = (g_input.canvasWidthM > 0.01f) ? g_input.canvasWidthM : 0.44f;
+    const float ch = (g_input.canvasHeightM > 0.01f) ? g_input.canvasHeightM : 0.24f;
+
+    // (A) LOCAL space, axis-aligned, both eyes, STRAIGHT alpha. This is the
+    // measurement quad: LOCAL is the same space the projection layer's view
+    // poses are submitted in, so the expected projected width is exactly
+    // computable from xrLocateViews (see [QUAD-EXPECT]). Also the alpha and
+    // stereo-disparity probe.
+    quadA.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quadA.space = xr.localSpace;
+    quadA.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quadA.subImage = sub;
+    quadA.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    quadA.pose.position = {kQuadAx * cw, kQuadAy * ch, kQuadAz * ch};
+    quadA.size = {kQuadFracA * ch, kQuadFracA * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadA;
+
+    // (B) LOCAL space, yawed -15 deg about up, both eyes, and deliberately
+    // WITHOUT the source-alpha bit — the OPAQUE_COVER case (its half-alpha
+    // quadrant reads brighter than (A)'s — expected).
+    const float halfYaw = -15.0f * 0.5f * (float)M_PI / 180.0f;
+    quadB.layerFlags = 0;
+    quadB.space = xr.localSpace;
+    quadB.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    quadB.subImage = sub;
+    quadB.pose.orientation = {0.0f, sinf(halfYaw), 0.0f, cosf(halfYaw)};
+    quadB.pose.position = {0.45f * cw, -0.29f * ch, -0.5f * ch};
+    quadB.size = {kQuadFracB * ch, kQuadFracB * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadB;
+
+    // (C) LEFT EYE ONLY — its absence from the right-hand tile is the
+    // eye-visibility check.
+    //
+    // LOCAL, not VIEW, and that is a finding rather than a preference: a
+    // VIEW-space layer pose comes out of oxr_session_frame_end's handle_space
+    // HEAD-RELATIVE, but every other layer pose — and the projection view
+    // poses the camera is built from — is resolved into the head xdev's
+    // TRACKING frame, in which the head sits ~1.6 m up. So a VIEW-space quad
+    // lands ~1.6 m below everything else and falls straight out of the
+    // frustum. This is a pre-existing cross-backend space bug (#1584 confirmed
+    // it on Metal, and D3D11 has it too), not a #1581 regression.
+    quadC.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+    quadC.space = xr.localSpace;
+    quadC.eyeVisibility = XR_EYE_VISIBILITY_LEFT;
+    quadC.subImage = sub;
+    quadC.pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+    quadC.pose.position = {-0.379f * cw, -0.311f * ch, 0.0f};
+    quadC.size = {kQuadFracC * ch, kQuadFracC * ch};
+    layers[layerCount++] = (XrCompositionLayerBaseHeader*)&quadC;
+
+    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = displayTime;
+    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    endInfo.layerCount = layerCount;
+    endInfo.layers = layers;
+    return XR_SUCCEEDED(xrEndFrame(xr.session, &endInfo));
+}
+
 static void CleanupOpenXR(AppXrSession& xr) {
+    g_liftProbe.Shutdown();
+    if (xr.cursorSpriteSwapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(xr.cursorSpriteSwapchain);
+    }
     if (xr.swapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(xr.swapchain.swapchain);
     }
@@ -2942,7 +4052,9 @@ static void PollForwardedInput(AppXrSession& xr) {
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    g_liftProbe.enabled = dxr_test::LiftCpuProbe::Requested(argc, argv);
+    g_liftProbe.gpu = g_liftProbe.enabled && dxr_test::LiftCpuProbe::RequestedGpu(argc, argv);
     // Ensure logs appear immediately even when piped
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -2951,6 +4063,20 @@ int main() {
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== Sim Cube OpenXR + External macOS Window ===");
+
+    // #1581 quad layers.
+    {
+        const char* e = getenv("DXR_TEST_QUAD");
+        g_quadTest = (e != NULL && e[0] != '\0' && e[0] != '0');
+        if (g_quadTest) {
+            // The HUD is a window-space layer drawn AFTER the quads; keep it
+            // off so the atlas dump is unambiguous. (It is already off by
+            // default in this app — this makes the guarantee explicit.)
+            g_input.hudVisible = false;
+            LOG_INFO("DXR_TEST_QUAD=1 — submitting 3 XrCompositionLayerQuad layers "
+                     "(axis-aligned, yawed, LEFT-eye-only)");
+        }
+    }
 
     // Initial rendering mode is sourced from the runtime via v13 `isActive`
     // (set during xrEnumerateDisplayRenderingModesDXR). Fallback is mode 1
@@ -3026,6 +4152,8 @@ int main() {
         return 1;
     }
 
+    g_liftProbe.SetVulkan(physDevice, vkDevice, graphicsQueue, queueFamilyIndex);
+
     // Step 4: Create OpenXR session WITH the external window binding
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr);
@@ -3054,9 +4182,72 @@ int main() {
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         CleanupOpenXR(xr);
+        vkRenderer.ring.destroy(); // a partial init may have created it; free before the device
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
         return 1;
+    }
+    if (xr.cursorDepthRuntimeDraw && xr.cursorDepthCustomSprite &&
+        !CreateCursorSprite(xr, vkDevice, physDevice, graphicsQueue, &vkRenderer.ring)) {
+        LOG_WARN("Cursor sprite swapchain creation failed - using the runtime's default look");
+        xr.cursorDepthCustomSprite = false;
+    }
+
+    // XR_DXR_cursor_depth (ADR-046): the displayxr-common helper. enable(0)
+    // (extension off / opted out) leaves it inert: no structs, no OS cursor.
+    dxr::CursorDepth cursor;
+    cursor.enable(xr.hasCursorDepthExt ? xr.cursorDepthSpecVersion : 0);
+    cursor.setWindowCocoa((__bridge void *)g_metalView);
+    cursor.setCursorHeight(kCursorHeight);
+    cursor.setWantPlacement(true); // the diagnostics below
+    // The OS-cursor hand-off, as the user sees it: hidden exactly while the
+    // runtime reports willDraw (#1952: also false after a compositor
+    // refusal). First 12 transitions only - never per frame.
+    cursor.onDepthCursorShownChanged([](bool shown) {
+        static int logged = 0;
+        if (logged < 12) {
+            logged++;
+            LOG_INFO("cursor_depth: OS cursor %s", shown ? "HIDDEN (depth cursor drawn)" : "SHOWN");
+        }
+    });
+    if (!xr.cursorDepthRuntimeDraw) {
+        cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
+        cursor.setFootprintBodyOffset(dxr::kCursorCenteredBodyOffset); // our crosshair is centred
+    } else if (xr.cursorDepthCustomSprite) {
+        cursor.setSprite(xr.cursorSpriteSwapchain, {0.5f, 0.5f}, 0.01f); // ring: hotspot = centre, 1 cm
+    }
+    // XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured shows the stereo photo and lets the runtime measure its
+    // disparity. dxr::CursorDepth (displayxr-common v2.29.0) predates spec v7,
+    // so the source struct is chained by hand ahead of the helper below.
+    bool cursorDepthMeasured = false;
+    if (const char *src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE"); src != nullptr && strcmp(src, "measured") == 0) {
+        if (xr.hasCursorDepthExt && xr.cursorDepthSpecVersion >= 7) {
+            cursorDepthMeasured = true;
+        } else {
+            LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u)",
+                     xr.cursorDepthSpecVersion);
+        }
+    }
+    {
+        const char *sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        g_vkPhoto.on = cursorDepthMeasured || (sp != nullptr && sp[0] == '1');
+        g_vkPhoto.format = colorFormat;
+        const char *an = getenv("DISPLAYXR_STEREO_PHOTO_ANIMATE");
+        g_vkPhoto.animate = an != nullptr && an[0] == '1';
+    }
+    LOG_INFO("XR_DXR_cursor_depth source: %s", cursorDepthMeasured ? "MEASURED DISPARITY" : "app hit test");
+    XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+    measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+    if (!cursorDepthMeasured) {
+        cursor.setRayCast([&vkRenderer](const dxr::CursorRay &r) -> std::optional<float> {
+            float t;
+            return RayHitCube(r.origin, r.dir, vkRenderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+        });
+    }
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
     }
 
     {
@@ -3066,6 +4257,7 @@ int main() {
         for (uint32_t i = 0; i < count; i++) {
             images[i] = swapchainImages[i].image;
         }
+        g_vkPhoto.images = images; // XR_DXR_cursor_depth v7 test content
         if (!CreateSwapchainFramebuffers(vkRenderer, images.data(), count,
             xr.swapchain.width, xr.swapchain.height, colorFormat)) {
             CleanupVkRenderer(vkRenderer);
@@ -3095,7 +4287,7 @@ int main() {
             }
             if (InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT) &&
                 InitializeHudVkUploader(hudUploader, vkDevice, physDevice,
-                    graphicsQueue, vkRenderer.commandPool,
+                    graphicsQueue, &vkRenderer.ring,
                     HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
                 hudReady = true;
                 LOG_INFO("HUD window-space layer ready (%ux%u, %u images, format %lld)",
@@ -3283,54 +4475,71 @@ int main() {
         g_frameCount++;
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
+        // Test knob: move the window once, at frame DXR_TEST_WINDOW_MOVE_FRAME
+        // (default 300), to DXR_TEST_WINDOW_RECT2 — exercises a segment table
+        // change (split -> single, or the reverse) in one run.
+        {
+            static long moveFrame = -2;
+            if (moveFrame == -2) {
+                const char *mf = getenv("DXR_TEST_WINDOW_MOVE_FRAME");
+                moveFrame = getenv("DXR_TEST_WINDOW_RECT2") != nullptr ? (mf != nullptr ? atol(mf) : 300) : -1;
+            }
+            if (moveFrame >= 0 && (long)g_frameCount == moveFrame) {
+                (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT2");
+            }
+        }
+
+        // #1581: create + fill the quad probe texture once the session runs.
+        if (g_quadTest && !g_quadActive && g_frameCount >= kQuadActivationFrame) {
+            static bool quadAttempted = false;
+            if (!quadAttempted) {
+                quadAttempted = true;
+                g_quadActive = CreateAndFillQuadTexture(xr, 256, vkDevice, physDevice,
+                                                        graphicsQueue, vkRenderer.commandPool);
+                LOG_INFO("Quad probe texture %s (256x256, VkImage %p)",
+                         g_quadActive ? "ready" : "FAILED", (void*)g_quadVkImage);
+            }
+        }
+
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
         vkRenderer.cubeRotation += deltaTime * 0.5f;
         if (vkRenderer.cubeRotation > 2.0f * 3.14159265f)
             vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
 
-        // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
-        // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
-        // event updates xr.currentModeIndex (render paths + HUD read it directly).
-        if (!g_modeSwitchConfigured) {
-            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
-            g_modeSwitchConfigured = true;
-        }
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() — the same sequencer the
+        // Windows apps drive via XrSessionUpdateModeSwitch: it eases
+        // g_input.viewParams.ipdFactor around the switch and says on which frame
+        // to call xrRequestDisplayRenderingModeDXR (README "Smooth 2D<->3D
+        // transitions"). The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates xr.currentModeIndex.
         {
-            const float steady = g_input.viewParams.steadyIpdFactor;
-            auto vcOf = [&](uint32_t m) -> uint32_t {
-                return (m < xr.renderingModeCount && xr.renderingModeViewCounts[m] > 0)
-                           ? xr.renderingModeViewCounts[m] : 1;
-            };
-            int32_t target = -1;
+            int32_t want = -1;
             if (g_input.cycleRenderingModeRequested) {
                 g_input.cycleRenderingModeRequested = false;
-                if (xr.renderingModeCount > 0)
-                    target = (int32_t)((xr.currentModeIndex + 1) % xr.renderingModeCount);
+                want = dxr::ModeSwitch::cycleTarget(xr.currentModeIndex, xr.renderingModeCount);
             }
             if (g_input.absoluteRenderingModeRequested >= 0) {
-                int32_t a = g_input.absoluteRenderingModeRequested;
+                want = g_input.absoluteRenderingModeRequested;
                 g_input.absoluteRenderingModeRequested = -1;
-                if ((uint32_t)a < xr.renderingModeCount) target = a;
             }
-            if (target >= 0 && xr.session != XR_NULL_HANDLE && xr.pfnRequestDisplayRenderingModeEXT) {
-                const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
-                g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target),
-                                     xr.currentModeIndex, vcOf(xr.currentModeIndex),
-                                     curIpd, steady);
+            if (xr.sessionRunning) {
+                const int32_t knob = g_modeSwitchKnob.poll(deltaTime, xr.currentModeIndex, xr.renderingModeCount,
+                                                           xr.renderingModeViewCounts);
+                if (knob >= 0) want = knob;
             }
-            if (g_modeSwitch.active()) {
-                float ipd = steady; bool fire = false; uint32_t mode = xr.currentModeIndex;
-                g_modeSwitch.update(deltaTime, &ipd, &fire, &mode);
-                g_input.viewParams.ipdFactor = ipd;
-                if (fire && mode != xr.currentModeIndex && xr.session != XR_NULL_HANDLE &&
-                    xr.pfnRequestDisplayRenderingModeEXT)
-                    xr.pfnRequestDisplayRenderingModeEXT(xr.session, mode);
-            } else {
-                g_input.viewParams.ipdFactor = steady;
-            }
+            const bool canRequest = xr.session != XR_NULL_HANDLE && xr.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                deltaTime, canRequest ? want : -1, xr.renderingModeCount, xr.renderingModeViewCounts,
+                xr.currentModeIndex, g_input.viewParams.steadyIpdFactor);
+            g_input.viewParams.ipdFactor = f.ipd;
+            if (f.fire && canRequest)
+                xr.pfnRequestDisplayRenderingModeEXT(xr.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ipd=%.4f fire=%d mode=%u current=%u", deltaTime, f.ipd,
+                         (int)f.fire, f.mode, xr.currentModeIndex);
         }
 
         // Handle eye tracking mode toggle (T key)
@@ -3347,6 +4556,10 @@ int main() {
         }
 
         PollEvents(xr);
+
+        if (xr.sessionRunning && g_liftProbe.Tick(xr.session)) {
+            xrRequestExitSession(xr.session); // DISPLAYXR_LIFT_PROBE_FRAMES reached
+        }
 
         if (xr.sessionRunning) {
             XrFrameState frameState;
@@ -3430,11 +4643,114 @@ int main() {
                         eyeTrackingState.next = &viewRigRaw;
                     }
 
+                    // Multi-screen M3 (XR_DXR_display_info v22): when the window
+                    // spans displays the runtime hands out one view set per
+                    // display; which views belong to which display (and its
+                    // segment rect) comes back here. Same recipe as
+                    // cube_handle_metal_macos.
+                    XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                    XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+                    XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                    viewBindings.bindingCapacityInput = 4;
+                    viewBindings.bindings = viewBindingStorage;
+                    viewBindings.next = viewState.next;
+                    viewActivity.next = &viewBindings;
+                    viewState.next = &viewActivity;
+
+                    // XR_DXR_cursor_depth (ADR-046): pointer UV, the footprint
+                    // hit test against the previous locate's views (a frame
+                    // late, which the runtime's filter absorbs), and the hint /
+                    // draw-request / state structs on both chains. Inert when
+                    // the extension is off.
+                    if (cursorDepthMeasured && cursor.enabled()) {
+                        measuredSource.next = locateInfo.next;
+                        locateInfo.next = &measuredSource;
+                    }
+                    cursor.chain(locateInfo, viewState);
+
                     uint32_t viewCount = (uint32_t)xr.configViews.size();
                     std::vector<XrView> views(viewCount, {XR_TYPE_VIEW});
 
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo,
                         &viewState, viewCount, &viewCount, views.data());
+
+                    if (cursor.enabled() && XR_SUCCEEDED(locResult)) {
+                        const bool d3 = (xr.currentModeIndex < xr.renderingModeCount)
+                            ? xr.renderingModeDisplay3D[xr.currentModeIndex] : true;
+                        // Hides / shows the OS cursor; remembers the views for next frame.
+                        cursor.afterLocate(views.data(), d3 ? (modeViewCount < viewCount ? modeViewCount : viewCount) : 1);
+
+                        // App mode: we draw the crosshair from the placement.
+                        const XrCursorDepthPlacementDXR &placement = cursor.placement();
+                        g_cursorDraw.active = cursor.appShouldDraw();
+                        static uint64_t measuredLogFrame = 0;
+                        if (cursorDepthMeasured && cursor.pointerInCanvas() && (++measuredLogFrame % 60) == 30) {
+                            LOG_INFO("cursor_depth measured: uv=(%.3f,%.3f) target=%.4f disparity=%.4f active=%d "
+                                     "willDraw=%d",
+                                     cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                                     placement.disparity, (int)placement.isActive, (int)cursor.drawState().willDraw);
+                        }
+                        g_cursorDraw.pose = placement.pose;
+                        g_cursorDraw.height = placement.height;
+
+                        static int willDrawLogged = 0;
+                        if (cursor.runtimeDraws() && willDrawLogged < 3 && cursor.pointerInCanvas()) {
+                            static int lastWillDraw = -1;
+                            if ((int)cursor.drawState().willDraw != lastWillDraw) {
+                                lastWillDraw = (int)cursor.drawState().willDraw;
+                                willDrawLogged++;
+                                LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
+                                         cursor.drawState().willDraw ? "TRUE" : "FALSE", cursor.hint().cursorUV.x,
+                                         cursor.hint().cursorUV.y, placement.disparity);
+                            }
+                        }
+                        static int cursorLogged = 0;
+                        if (placement.isActive && cursor.hint().hasContent && cursorLogged < 3) {
+                            cursorLogged++;
+                            LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
+                                     cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                                     placement.disparity, placement.height, placement.pose.position.x,
+                                     placement.pose.position.y, placement.pose.position.z);
+                        }
+                    }
+
+                    // Multi-screen M3: render EVERY view set (the sum is
+                    // activeViewCount), each set's local view j into tile j at
+                    // that display's segment rect (placed below once the tile
+                    // size is known).
+                    const bool routedViews = XR_SUCCEEDED(locResult) && display3D &&
+                                             xr.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                                             viewBindings.bindingCountOutput > 0 &&
+                                             viewBindings.bindingCountOutput <= 4;
+                    if (routedViews) {
+                        int routedEyes = 0;
+                        for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                            const int end = (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                            if (end > routedEyes) routedEyes = end;
+                        }
+                        if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+                        if (routedEyes > (int)viewCount) routedEyes = (int)viewCount;
+                        if (routedEyes > 0) eyeCount = routedEyes;
+                    }
+                    {
+                        static std::string lastBindings;
+                        std::string now = routedViews ? "routed" : "single";
+                        for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                            const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                            char buf[160];
+                            snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                                     (unsigned long long)vb.displayId, vb.firstView,
+                                     vb.firstView + vb.viewCount - 1, vb.segmentRect.offset.x,
+                                     vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                                     vb.segmentRect.extent.height);
+                            now += buf;
+                        }
+                        if (now != lastBindings) {
+                            LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                                     viewActivity.activeViewCount, eyeCount);
+                            lastBindings = now;
+                        }
+                    }
 
                     // Capture the runtime's resolved CANVAS size (the window
                     // client area in meters) — the physical_height_m the
@@ -3507,11 +4823,44 @@ int main() {
                         const float rigVH =
                             g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
+                        // Multi-screen M3: per-view placement under routing — the
+                        // display's segment rect (window px) scaled into the tile,
+                        // edges rounded independently so two segments sharing a
+                        // seam share the column.
+                        struct ViewPlace {
+                            uint32_t tile;
+                            int32_t x, y;
+                            uint32_t w, h;
+                            bool set;
+                        };
+                        ViewPlace viewPlace[8] = {};
+                        if (routedViews && g_windowW > 0 && g_windowH > 0) {
+                            const float fx = (float)renderW / (float)g_windowW;
+                            const float fy = (float)renderH / (float)g_windowH;
+                            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                                const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                                const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                                const int32_t x1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                                const int32_t y1 = (int32_t)lroundf(
+                                    (float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                                const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                                    const uint32_t i = vb.firstView + j;
+                                    if (i >= 8) break;
+                                    viewPlace[i] = {j, x0, y0, sw, sh, true};
+                                }
+                            }
+                        }
+
                         rendered = true;
                         uint32_t imageIndex;
                         if (AcquireSwapchainImage(xr, imageIndex)) {
                             std::vector<EyeRenderParams> eyeParams(eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
+                                const bool placed = routedViews && eye < 8 && viewPlace[eye].set;
                                 int vi = eye < (int)viewCount ? eye : 0;
                                 XrFovf submitFov = views[vi].fov;
                                 if (useRig) {
@@ -3533,18 +4882,29 @@ int main() {
                                 // Tile-aware viewport: place each view in the correct tile position
                                 uint32_t tileX = display3D ? (eye % tileColumns) : 0;
                                 uint32_t tileY = display3D ? (eye / tileColumns) : 0;
+                                uint32_t vpW = renderW;
+                                uint32_t vpH = renderH;
+                                if (placed) {
+                                    tileX = viewPlace[eye].tile % tileColumns;
+                                    tileY = viewPlace[eye].tile / tileColumns;
+                                }
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
+                                if (placed) {
+                                    // Multi-screen M3: this view's display segment inside its tile.
+                                    vpX = (uint32_t)((int32_t)vpX + viewPlace[eye].x);
+                                    vpY = (uint32_t)((int32_t)vpY + viewPlace[eye].y);
+                                    vpW = viewPlace[eye].w;
+                                    vpH = viewPlace[eye].h;
+                                }
                                 eyeParams[eye].viewportX = vpX;
                                 eyeParams[eye].viewportY = vpY;
-                                eyeParams[eye].width = renderW;
-                                eyeParams[eye].height = renderH;
+                                eyeParams[eye].width = vpW;
+                                eyeParams[eye].height = vpH;
 
                                 projectionViews[eye].subImage.swapchain = xr.swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
-                                projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH};
+                                projectionViews[eye].subImage.imageRect.extent = {(int32_t)vpW, (int32_t)vpH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                                 projectionViews[eye].fov = submitFov;
@@ -3600,14 +4960,101 @@ int main() {
                         } else {
                             rendered = false;
                         }
+
+                        // #1581 — publish what the quad pass OUGHT to produce,
+                        // so the atlas dump can be checked against arithmetic
+                        // instead of against a feeling.
+                        //
+                        // Quad (A) is axis-aligned with the eye and lives in
+                        // LOCAL — the same space the projection layer's view
+                        // poses are submitted in — so its projected width is
+                        // exactly
+                        //     px = size_m * tile_w_px / ((tan(fovR) - tan(fovL)) * d)
+                        // where d is the eye-to-quad distance along the eye's
+                        // -Z. Everything on the right-hand side is read from
+                        // what the runtime just handed us at xrLocateViews;
+                        // nothing is assumed about the compositor's camera. A
+                        // compositor using the old hardcoded +-45 deg camera
+                        // misses this by 1.7-2.7x, which is the whole point.
+                        if (g_quadTest && g_quadActive && viewCount >= 1 && g_renderW > 0) {
+                            static int quadExpectLogged = 0;
+                            if (g_frameCount > 60 && quadExpectLogged < 2) {
+                                quadExpectLogged++;
+                                const float cw = (g_input.canvasWidthM > 0.01f)
+                                                     ? g_input.canvasWidthM : 0.44f;
+                                const float ch = (g_input.canvasHeightM > 0.01f)
+                                                     ? g_input.canvasHeightM : 0.24f;
+                                const float sizeA = kQuadFracA * ch;
+                                const XrVector3f qa = {kQuadAx * cw, kQuadAy * ch, kQuadAz * ch};
+
+                                LOG_INFO("[QUAD-EXPECT] canvas=%.4fx%.4f m  quadA size=%.4f m at LOCAL "
+                                         "(%.4f,%.4f,%.4f)",
+                                         cw, ch, sizeA, qa.x, qa.y, qa.z);
+
+                                for (uint32_t v = 0; v < viewCount && v < 8; v++) {
+                                    const XrPosef& e = views[v].pose;
+                                    XrQuaternionf inv = {-e.orientation.x, -e.orientation.y,
+                                                         -e.orientation.z, e.orientation.w};
+                                    float lx, ly, lz;
+                                    quat_rotate_vec3(inv, qa.x - e.position.x, qa.y - e.position.y,
+                                                     qa.z - e.position.z, &lx, &ly, &lz);
+                                    const float dEye = -lz;
+                                    const float tanL = tanf(views[v].fov.angleLeft);
+                                    const float tanR = tanf(views[v].fov.angleRight);
+                                    const float tanSpanX = tanR - tanL;
+                                    const float expectPx =
+                                        (dEye > 0.001f && tanSpanX > 0.0001f)
+                                            ? (sizeA * (float)g_renderW / (tanSpanX * dEye))
+                                            : 0.0f;
+                                    // Tile-local x and y of the quad CENTRE, same
+                                    // derivation. y matters as much as x: the
+                                    // vertical mapping is where a Vulkan-vs-GL
+                                    // clip-Y convention slip hides, and an
+                                    // asymmetric Kooima fov turns that slip into a
+                                    // large displacement rather than a no-op.
+                                    const float tanU = tanf(views[v].fov.angleUp);
+                                    const float tanD = tanf(views[v].fov.angleDown);
+                                    const float tanSpanY = tanU - tanD;
+                                    const float centrePx =
+                                        (dEye > 0.001f && tanSpanX > 0.0001f)
+                                            ? ((lx / dEye) - tanL) / tanSpanX * (float)g_renderW
+                                            : 0.0f;
+                                    const float centrePy =
+                                        (dEye > 0.001f && tanSpanY > 0.0001f)
+                                            ? (tanU - (ly / dEye)) / tanSpanY * (float)g_renderH
+                                            : 0.0f;
+                                    LOG_INFO("[QUAD-EXPECT] view=%u tile=%ux%u fovLRUD=(%.4f,%.4f,%.4f,%.4f) rad "
+                                             "eye=(%.4f,%.4f,%.4f) quadA_eyerel=(%.4f,%.4f,%.4f) d=%.4f m "
+                                             "tanSpanX=%.4f -> width %.1f px (%.1f%% of tile), centre (%.1f, %.1f) px",
+                                             v, g_renderW, g_renderH, views[v].fov.angleLeft,
+                                             views[v].fov.angleRight, views[v].fov.angleUp,
+                                             views[v].fov.angleDown, e.position.x, e.position.y,
+                                             e.position.z, lx, ly, lz, dEye, tanSpanX, expectPx,
+                                             100.0f * expectPx / (float)g_renderW, centrePx, centrePy);
+                                }
+                            }
+                        }
                     }
                 }
 
                 // Render HUD into the window-space layer swapchain (when visible).
+                // INV-4.10: re-render + upload only when the HUD text changed.
+                // Otherwise the layer keeps showing the swapchain's last
+                // released image (OpenXR composes the most recently released
+                // one), so an unchanged HUD costs no acquire, no upload and no
+                // blocking submit.
                 bool hudSubmitted = false;
                 if (hudReady && g_input.hudVisible && rendered && frameState.shouldRender) {
+                    static std::wstring s_hudUploadedKey;
+                    static bool s_hudHasImage = false;
+                    std::wstring hudKey = g_hudSessionText + L'\x1f' + g_hudModeText + L'\x1f' +
+                        g_hudPerfText + L'\x1f' + g_hudDisplayText + L'\x1f' + g_hudEyeText +
+                        L'\x1f' + g_hudCameraText + L'\x1f' + g_hudStereoText + L'\x1f' +
+                        g_hudHelpText;
                     uint32_t hudIndex = 0;
-                    if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
+                    if (s_hudHasImage && hudKey == s_hudUploadedKey) {
+                        hudSubmitted = true;
+                    } else if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
                         uint32_t rowPitch = 0;
                         const void* pixels = RenderHudAndMap(hudRenderer, &rowPitch,
                             g_hudSessionText, g_hudModeText, g_hudPerfText, g_hudDisplayText,
@@ -3615,6 +5062,8 @@ int main() {
                         if (pixels) {
                             if (UploadHudPixels(hudUploader, hudVkImages[hudIndex], pixels, rowPitch)) {
                                 hudSubmitted = true;
+                                s_hudHasImage = true;
+                                s_hudUploadedKey = std::move(hudKey);
                             }
                             UnmapHud(hudRenderer);
                         }
@@ -3635,7 +5084,13 @@ int main() {
                         projectionViews.data(), locatedCount,
                         hudSwapchain, 0.0f, 0.0f, fracW, fracH, 0.0f);
                 } else if (rendered) {
-                    EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), locatedCount);
+                    // #1581: identical projection layer, plus the three quads.
+                    if (g_quadTest && g_quadActive && g_quadSwapchain != XR_NULL_HANDLE) {
+                        EndFrameWithQuads(xr, frameState.predictedDisplayTime,
+                                          projectionViews.data(), locatedCount);
+                    } else {
+                        EndFrame(xr, frameState.predictedDisplayTime, projectionViews.data(), locatedCount);
+                    }
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
@@ -3771,14 +5226,18 @@ int main() {
     LOG_INFO("=== Shutting down ===");
 
     if (hudReady) {
-        // HUD uploader uses vkRenderer.commandPool — clean up before
-        // CleanupVkRenderer destroys the pool.
+        // HUD uploader submits through vkRenderer.ring — clean up before
+        // CleanupVkRenderer destroys it.
         CleanupHudVkUploader(hudUploader);
         CleanupHudRenderer(hudRenderer);
     }
     if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
         // Destroy before CleanupOpenXR releases the session.
         xrDestroySwapchain(hudSwapchain.swapchain);
+    }
+    if (g_quadSwapchain != XR_NULL_HANDLE) { // #1581
+        xrDestroySwapchain(g_quadSwapchain);
+        g_quadSwapchain = XR_NULL_HANDLE;
     }
 
     CleanupVkRenderer(vkRenderer);

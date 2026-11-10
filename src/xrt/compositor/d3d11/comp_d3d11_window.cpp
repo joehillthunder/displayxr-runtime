@@ -245,6 +245,14 @@ struct comp_d3d11_window
 	//! it must NOT rely on focused_slot, which the controller mutates async.
 	volatile HWND last_pointer_down_target;
 
+	//! The HWND the most recent real button-UP was forwarded to, with that
+	//! UP's button (1/2/3) and message time. The service reads it to tell
+	//! whether a synthetic DOWN it posted (one-click-drag) was already paired
+	//! by a real UP, or is still owed one. Written only at the forward site.
+	volatile HWND last_pointer_up_target;
+	volatile LONG last_pointer_up_button;
+	volatile LONG last_pointer_up_time_ms;
+
 	//! Workspace display processor for ESC/close 2D mode switch (opaque, can be NULL).
 	volatile void *workspace_dp;
 
@@ -961,11 +969,11 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 		if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
 			// Workspace mode with no focused app: input_forward_hwnd is NULL so
 			// we fall into this block, but closing the window kills the service.
-			// Swallow the key instead; user can press Ctrl+Space to dismiss.
+			// Swallow the key instead; user can press the launch hotkey to dismiss.
 			//
 			// Phase 2.G considered removing this carve-out (the workspace
 			// controller now owns deactivate semantics via xrDeactivateSpatial-
-			// WorkspaceEXT and Ctrl+Space, so the runtime in principle could
+			// WorkspaceEXT and the launch hotkey, so the runtime in principle could
 			// fall through to WM_CLOSE on bare ESC). We kept it because an
 			// accidental ESC press while in empty-workspace state would still
 			// take the service down with the window, which is a real regression
@@ -1355,6 +1363,13 @@ wnd_proc_inner(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 					// the controller's async focus update.
 					if (is_button_down) {
 						w->last_pointer_down_target = fwd;
+					}
+					if (is_button_up) {
+						InterlockedExchange(&w->last_pointer_up_time_ms,
+						                    (LONG)GetMessageTime());
+						InterlockedExchange(&w->last_pointer_up_button, (LONG)evt_button);
+						InterlockedExchangePointer((volatile PVOID *)&w->last_pointer_up_target,
+						                           fwd);
 					}
 
 					// For mouse buttons: also inject via SendInput so apps
@@ -2128,6 +2143,23 @@ comp_d3d11_window_get_last_pointer_down_target(struct comp_d3d11_window *window)
 	    (volatile PVOID *)&window->last_pointer_down_target, NULL, NULL);
 }
 
+void *
+comp_d3d11_window_get_last_pointer_up(struct comp_d3d11_window *window, uint32_t *out_button, uint32_t *out_time_ms)
+{
+	if (window == NULL) {
+		return NULL;
+	}
+	void *target =
+	    (void *)InterlockedCompareExchangePointer((volatile PVOID *)&window->last_pointer_up_target, NULL, NULL);
+	if (out_button != NULL) {
+		*out_button = (uint32_t)InterlockedCompareExchange(&window->last_pointer_up_button, 0, 0);
+	}
+	if (out_time_ms != NULL) {
+		*out_time_ms = (uint32_t)InterlockedCompareExchange(&window->last_pointer_up_time_ms, 0, 0);
+	}
+	return target;
+}
+
 void
 comp_d3d11_window_set_workspace_mode_active(struct comp_d3d11_window *window, bool active)
 {
@@ -2283,6 +2315,15 @@ comp_d3d11_window_is_workspace_pointer_capture_enabled(struct comp_d3d11_window 
 extern "C" void
 comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window, bool enabled, uint32_t button)
 {
+	comp_d3d11_window_set_workspace_pointer_capture_ex(window, enabled, button, true);
+}
+
+extern "C" void
+comp_d3d11_window_set_workspace_pointer_capture_ex(struct comp_d3d11_window *window,
+                                                   bool enabled,
+                                                   uint32_t button,
+                                                   bool grab)
+{
 	if (window == NULL) {
 		return;
 	}
@@ -2291,8 +2332,11 @@ comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window
 	// Phase 2.K: also drive Win32 SetCapture / ReleaseCapture so the WndProc
 	// keeps receiving WM_MOUSEMOVE while the cursor leaves the workspace
 	// window during a drag. SetCapture must run on the thread that owns the
-	// HWND, so post to the window thread.
-	if (window->hwnd != NULL) {
+	// HWND, so post to the window thread. Release is always posted (the
+	// window thread only releases a capture it holds); the grab only when
+	// asked — ADR-052: of several presenter windows, only the one the press
+	// went down on can take the capture.
+	if (window->hwnd != NULL && (grab || !enabled)) {
 		PostMessageW(window->hwnd, WM_WORKSPACE_SET_CAPTURE, enabled ? 1 : 0, 0);
 	}
 }

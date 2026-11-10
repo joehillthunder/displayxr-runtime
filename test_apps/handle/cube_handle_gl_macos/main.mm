@@ -32,6 +32,7 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <algorithm>
 #include <vector>
 
 #include <unistd.h>
@@ -40,7 +41,8 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "view_params.h"
-#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -48,6 +50,8 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
+#include "cursor_depth.h" // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
 
 // ============================================================================
@@ -432,6 +436,10 @@ struct GLRenderer {
     GLuint cubeVAO, cubeVBO, cubeEBO;
     GLuint gridVAO, gridVBO;
     int gridVertexCount;
+    // XR_DXR_cursor_depth app-drawn sprite (DISPLAYXR_CURSOR_DEPTH_DRAW=app):
+    // crosshair lines, drawn with the grid program.
+    GLuint cursorVAO = 0, cursorVBO = 0;
+    int cursorVertexCount = 0;
 
     // Textures (GL_TEXTURE_RECTANGLE for loaded images)
     GLuint textures[3]; // basecolor, normal, AO
@@ -571,6 +579,27 @@ static bool InitRenderer(GLRenderer &r)
 
     glBindVertexArray(0);
 
+    // XR_DXR_cursor_depth app-drawn sprite: crosshair + small square in its
+    // XY plane, unit = the sprite height the runtime returns (same lines as
+    // cube_handle_vk_macos).
+    {
+        static const GridVertex cursorLines[] = {
+            {{-0.5f, 0.0f, 0.0f}}, {{-0.15f, 0.0f, 0.0f}}, {{0.15f, 0.0f, 0.0f}}, {{0.5f, 0.0f, 0.0f}},
+            {{0.0f, -0.5f, 0.0f}}, {{0.0f, -0.15f, 0.0f}}, {{0.0f, 0.15f, 0.0f}}, {{0.0f, 0.5f, 0.0f}},
+            {{-0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, 0.15f, 0.0f}},
+            {{0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, -0.15f, 0.0f}},
+        };
+        r.cursorVertexCount = (int)(sizeof(cursorLines) / sizeof(cursorLines[0]));
+        glGenVertexArrays(1, &r.cursorVAO);
+        glBindVertexArray(r.cursorVAO);
+        glGenBuffers(1, &r.cursorVBO);
+        glBindBuffer(GL_ARRAY_BUFFER, r.cursorVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(cursorLines), cursorLines, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(GridVertex), (void *)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+    }
+
     // Load textures
     std::string texDir = GetTextureDir();
     r.textures[0] = LoadTextureRect((texDir + "Wood_Crate_001_basecolor.jpg").c_str(),
@@ -612,6 +641,83 @@ static void EnsureFBO(GLRenderer &r, uint32_t w, uint32_t h)
 // ============================================================================
 // Render scene into swapchain texture (GL_TEXTURE_RECTANGLE)
 // ============================================================================
+
+// ============================================================================
+// XR_DXR_cursor_depth (ADR-046) — same adoption as cube_handle_metal_macos.
+//
+// The app owns the depth: it answers "ray -> first cube hit" (RayHitCube) and
+// displayxr-common's dxr::CursorDepth does the rest — the pointer as a canvas
+// UV, the footprint rays from the outer eyes of the previous locate, the
+// nearest hit, the struct chain on xrLocateViews, and hiding the OS cursor
+// exactly while the depth cursor replaces it. Spec v5 (ADR-046
+// Amendment 2 B), the default: the runtime DRAWS the cursor
+// (XrCursorDepthDrawInfoDXR) - its default look, or our own sprite with
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom - and the app hides the OS cursor
+// exactly while XrCursorDepthDrawStateDXR::willDraw.
+// DISPLAYXR_CURSOR_DEPTH_DRAW=app draws a crosshair from the placement
+// instead. DISPLAYXR_CURSOR_DEPTH=0 opts out; DISPLAYXR_CURSOR_DEPTH_UV=u,v
+// scripts the cursor for headless capture.
+// ============================================================================
+
+static const float kCubeSize = 0.06f;
+static const float kCursorHeight = 0.04f; // fraction of canvas height
+
+struct CursorDepthDraw {
+    bool active = false;
+    XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
+    float height = 0.0f;
+};
+static CursorDepthDraw g_cursorDraw;
+
+// Slab test against the cube as RenderScene places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
+{
+    const float c = cosf(rot), s = sinf(rot), h = kCubeSize * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
+
+// Model matrix of the app-drawn cursor sprite: pose (rotation then
+// translation), scaled by the returned height. Column-major, like the other
+// mat4_* helpers.
+static void CursorSpriteModel(float *out)
+{
+    const XrQuaternionf q = g_cursorDraw.pose.orientation;
+    float rot[16];
+    mat4_identity(rot);
+    rot[0] = 1 - 2 * (q.y * q.y + q.z * q.z);
+    rot[1] = 2 * (q.x * q.y + q.z * q.w);
+    rot[2] = 2 * (q.x * q.z - q.y * q.w);
+    rot[4] = 2 * (q.x * q.y - q.z * q.w);
+    rot[5] = 1 - 2 * (q.x * q.x + q.z * q.z);
+    rot[6] = 2 * (q.y * q.z + q.x * q.w);
+    rot[8] = 2 * (q.x * q.z + q.y * q.w);
+    rot[9] = 2 * (q.y * q.z - q.x * q.w);
+    rot[10] = 1 - 2 * (q.x * q.x + q.y * q.y);
+    float trans[16], scl[16], tmp[16];
+    mat4_translation(trans, g_cursorDraw.pose.position.x, g_cursorDraw.pose.position.y,
+                     g_cursorDraw.pose.position.z);
+    mat4_scaling(scl, g_cursorDraw.height);
+    mat4_multiply(tmp, rot, scl);
+    mat4_multiply(out, trans, tmp);
+}
 
 static void RenderScene(GLRenderer &r, GLuint targetTex, uint32_t targetW, uint32_t targetH,
                          const EyeRenderParams *eyes, int eyeCount)
@@ -706,6 +812,21 @@ static void RenderScene(GLRenderer &r, GLuint targetTex, uint32_t targetW, uint3
             glBindVertexArray(r.gridVAO);
             glDrawArrays(GL_LINES, 0, r.gridVertexCount);
         }
+
+        // --- Depth-aware cursor, app-drawn (DISPLAYXR_CURSOR_DEPTH_DRAW=app):
+        // last, never occluded. In runtime mode the runtime draws it. ---
+        if (g_cursorDraw.active && r.cursorVAO != 0) {
+            float model[16], mvp[16];
+            CursorSpriteModel(model);
+            mat4_multiply(mvp, vp_mat, model);
+            glDisable(GL_DEPTH_TEST);
+            glUseProgram(r.gridProgram);
+            glUniformMatrix4fv(r.gridLocMVP, 1, GL_FALSE, mvp);
+            glUniform4f(r.gridLocColor, 1.0f, 0.85f, 0.1f, 1.0f); // display-referred amber
+            glBindVertexArray(r.cursorVAO);
+            glDrawArrays(GL_LINES, 0, r.cursorVertexCount);
+            glEnable(GL_DEPTH_TEST);
+        }
     }
 
     glDisable(GL_SCISSOR_TEST);
@@ -762,10 +883,12 @@ struct InputState {
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
-// Smooth 2D<->3D disparity ramp, driven inline (macOS has its own AppXrSession/
-// InputState, not the Windows-only XrSessionManager helper).
+// Smooth 2D<->3D disparity ramp (displayxr-common mode_switch.h). macOS has its
+// own AppXrSession/InputState, not the Windows-only XrSessionManager, so it calls
+// the platform-neutral dxr::ModeSwitch::step() directly (defaults: 0.18 s).
 static dxr::ModeSwitch g_modeSwitch;
-static bool g_modeSwitchConfigured = false;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
 // HUD window-space layer (XR_EXT_window_space_layer): replaces the legacy
@@ -1186,6 +1309,18 @@ struct AppXrSession {
     // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    bool hasCursorDepthExt = false; // XR_DXR_cursor_depth (ADR-046)
+    uint32_t cursorDepthSpecVersion = 0;
+    // XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B):
+    // DISPLAYXR_CURSOR_DEPTH_DRAW=runtime (default) | app. Runtime: chain
+    // XrCursorDepthDrawInfoDXR and let the runtime draw the cursor; hide the
+    // OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw. App: draw
+    // the crosshair ourselves from the placement.
+    bool cursorDepthRuntimeDraw = false;
+    // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: hand the runtime our own sprite
+    // (a cyan ring with a dot) instead of its default look.
+    bool cursorDepthCustomSprite = false;
+    XrSwapchain cursorSpriteSwapchain = XR_NULL_HANDLE;
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
     // Enumerated rendering mode info. currentModeIndex is initialized to mode 1
     // as a fallback for runtimes that don't expose isActive; v13+ runtimes
@@ -1240,6 +1375,10 @@ static bool InitializeOpenXR(AppXrSession &app)
             app.hasAtlasCaptureExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            app.hasCursorDepthExt = true;
+            app.cursorDepthSpecVersion = e.extensionVersion;
+        }
     }
 
     if (!app.hasMacosGlBinding) {
@@ -1269,6 +1408,34 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    // XR_DXR_cursor_depth (ADR-046): on by default, DISPLAYXR_CURSOR_DEPTH=0
+    // opts out (the runtime then does no cursor work at all).
+    if (app.hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            app.hasCursorDepthExt = false;
+        } else {
+            enabledExts.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s", app.hasCursorDepthExt ? "ENABLED" : "off");
+    if (app.hasCursorDepthExt) {
+        // Spec v5: who draws the cursor. Default: the runtime.
+        const char *drawWho = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+        const bool wantApp = drawWho != nullptr && strcmp(drawWho, "app") == 0;
+        if (!wantApp && app.cursorDepthSpecVersion >= 5) {
+            app.cursorDepthRuntimeDraw = true;
+            const char *sprite = getenv("DISPLAYXR_CURSOR_DEPTH_SPRITE");
+            app.cursorDepthCustomSprite = sprite != nullptr && strcmp(sprite, "custom") == 0;
+        } else if (!wantApp) {
+            LOG_WARN("XR_DXR_cursor_depth v%u has no runtime-drawn cursor (needs v5) - drawing it ourselves",
+                     app.cursorDepthSpecVersion);
+        }
+        LOG_INFO("XR_DXR_cursor_depth draw: %s",
+                 !app.cursorDepthRuntimeDraw ? "APP (crosshair from the placement)"
+                 : app.cursorDepthCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
+                                               : "RUNTIME, default look");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1503,13 +1670,20 @@ static bool CreateSwapchain(AppXrSession &app)
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
     LOG_INFO("Supported swapchain formats:");
+    // ADR-044 / INV-4.6: prefer GL_SRGB8_ALPHA8, fall back to GL_RGBA8.
+    // The shaders write display-referred bytes with GL_FRAMEBUFFER_SRGB
+    // off, so an `_SRGB` swapchain stores exactly the authored bytes, honestly
+    // declared; the format-honest GL compositor (>= v2.21.2) reads a UNORM
+    // swapchain as LINEAR and encodes it -- the old GL_RGBA8 preference came
+    // out washed out there.
     int64_t selectedFormat = formats[0];
+    bool haveSrgb = false, haveRgba8 = false;
     for (auto f : formats) {
-        // Prefer GL_RGBA8 (0x8058) or GL_SRGB8_ALPHA8 (0x8C43)
-        if (f == 0x8058) { // GL_RGBA8
-            selectedFormat = f;
-        }
+        if (f == GL_SRGB8_ALPHA8) haveSrgb = true;
+        if (f == GL_RGBA8) haveRgba8 = true;
     }
+    if (haveSrgb) selectedFormat = GL_SRGB8_ALPHA8;
+    else if (haveRgba8) selectedFormat = GL_RGBA8;
     for (auto f : formats) {
         LOG_INFO("  format 0x%llx%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
@@ -1592,6 +1766,90 @@ static bool CreateSwapchain(AppXrSession &app)
 // (An app that genuinely hands over a top-down image says so with
 // XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB -> xrt_layer_data::flip_y,
 // which the compositor honours in post_transform.)
+// ============================================================================
+// XR_DXR_cursor_depth v5 — a custom cursor sprite for the runtime to draw
+// ============================================================================
+
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: a 64x64 cyan ring with a centre dot
+// (hotspot = the centre), dark-edged so it reads over the white cube. Filled
+// once (acquire / fill / release); the runtime samples the last released
+// image every frame, as STRAIGHT alpha. GL_SRGB8_ALPHA8 when offered: the
+// bytes are display-referred. Uploaded BOTTOM row first - a GL image's top is
+// its last row, which is how the runtime reads a GL sprite.
+static bool CreateCursorSprite(AppXrSession &app)
+{
+    const uint32_t S = 64;
+    uint32_t formatCount = 0;
+    xrEnumerateSwapchainFormats(app.session, 0, &formatCount, nullptr);
+    std::vector<int64_t> formats(formatCount);
+    xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data());
+    int64_t fmt = GL_RGBA8;
+    for (auto f : formats) {
+        if (f == GL_SRGB8_ALPHA8) fmt = GL_SRGB8_ALPHA8;
+    }
+
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = fmt;
+    sci.sampleCount = 1;
+    sci.width = S;
+    sci.height = S;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(app.session, &sci, &app.cursorSpriteSwapchain))) {
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageOpenGLKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader *)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(app.cursorSpriteSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(app.cursorSpriteSwapchain, &wi);
+
+    std::vector<uint8_t> buf((size_t)S * S * 4);
+    auto cover = [](float d, float r0, float r1) { // 1 inside [r0, r1], 1-px soft edges
+        const float a = std::min(d - r0 + 0.5f, r1 - d + 0.5f);
+        return a <= 0.0f ? 0.0f : (a >= 1.0f ? 1.0f : a);
+    };
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            const float d = hypotf((float)x + 0.5f - S * 0.5f, (float)y + 0.5f - S * 0.5f);
+            const float ring = std::max(cover(d, 21.0f, 27.0f), cover(d, 0.0f, 5.0f)); // cyan
+            const float edge = std::max(cover(d, 19.5f, 28.5f), cover(d, 0.0f, 6.5f)); // dark rim
+            // Row y counted from the TOP of the sprite -> GL row S-1-y.
+            uint8_t *px = &buf[((size_t)(S - 1 - y) * S + x) * 4];
+            // RGBA, straight alpha: cyan where the ring is, near-black rim.
+            px[0] = 0;
+            px[1] = (uint8_t)(220.0f * ring);
+            px[2] = (uint8_t)(255.0f * ring);
+            px[3] = (uint8_t)(255.0f * std::max(ring, edge));
+        }
+    }
+    GLint prev = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &prev);
+    glBindTexture(GL_TEXTURE_2D, imgs[idx].image);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)S, (GLsizei)S, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+    glBindTexture(GL_TEXTURE_2D, (GLuint)prev);
+    glFlush();
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(app.cursorSpriteSwapchain, &ri);
+    LOG_INFO("Cursor sprite swapchain created: %ux%u, format 0x%llx (cyan ring, hotspot = centre)", S, S,
+             (long long)fmt);
+    return true;
+}
+
 static bool CreateAndFillQuadTexture(AppXrSession &app, uint32_t size)
 {
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1841,6 +2099,32 @@ int main(int argc, char **argv)
         LOG_ERROR("Failed to create swapchain");
         return 1;
     }
+    if (app.cursorDepthRuntimeDraw && app.cursorDepthCustomSprite && !CreateCursorSprite(app)) {
+        LOG_WARN("Cursor sprite swapchain creation failed - using the runtime's default look");
+        app.cursorDepthCustomSprite = false;
+    }
+
+    // XR_DXR_cursor_depth (ADR-046): the displayxr-common helper. enable(0)
+    // (extension off / opted out) leaves it inert: no structs, no OS cursor.
+    dxr::CursorDepth cursor;
+    cursor.enable(app.hasCursorDepthExt ? app.cursorDepthSpecVersion : 0);
+    cursor.setWindowCocoa((__bridge void *)g_glView);
+    cursor.setCursorHeight(kCursorHeight);
+    cursor.setWantPlacement(true); // the diagnostics below
+    if (!app.cursorDepthRuntimeDraw) {
+        cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
+        cursor.setFootprintBodyOffset(dxr::kCursorCenteredBodyOffset); // our crosshair is centred
+    } else if (app.cursorDepthCustomSprite) {
+        cursor.setSprite(app.cursorSpriteSwapchain, {0.5f, 0.5f}, 0.01f); // ring: hotspot = centre, 1 cm
+    }
+    cursor.setRayCast([&renderer](const dxr::CursorRay &r) -> std::optional<float> {
+        float t;
+        return RayHitCube(r.origin, r.dir, renderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+    });
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
+    }
 
     // HUD window-space layer swapchain (XR_EXT_window_space_layer).
     // GL on macOS routes through the Metal native compositor with IOSurface-
@@ -1923,48 +2207,37 @@ int main(int argc, char **argv)
             }
         }
 
-        // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
-        // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
-        // event updates app.currentModeIndex (render paths + HUD read it directly).
-        if (!g_modeSwitchConfigured) {
-            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
-            g_modeSwitchConfigured = true;
-        }
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() — the same sequencer the
+        // Windows apps drive via XrSessionUpdateModeSwitch: it eases
+        // g_input.viewParams.ipdFactor around the switch and says on which frame
+        // to call xrRequestDisplayRenderingModeDXR (README "Smooth 2D<->3D
+        // transitions"). The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates app.currentModeIndex.
         {
-            const float steady = g_input.viewParams.steadyIpdFactor;
-            auto vcOf = [&](uint32_t m) -> uint32_t {
-                return (m < app.renderingModeCount && app.renderingModeViewCounts[m] > 0)
-                           ? app.renderingModeViewCounts[m] : 1;
-            };
-            int32_t target = -1;
+            int32_t want = -1;
             if (g_input.cycleRenderingModeRequested) {
                 g_input.cycleRenderingModeRequested = false;
-                if (app.renderingModeCount > 0)
-                    target = (int32_t)((app.currentModeIndex + 1) % app.renderingModeCount);
+                want = dxr::ModeSwitch::cycleTarget(app.currentModeIndex, app.renderingModeCount);
             }
             if (g_input.absoluteRenderingModeRequested >= 0) {
-                int32_t a = g_input.absoluteRenderingModeRequested;
+                want = g_input.absoluteRenderingModeRequested;
                 g_input.absoluteRenderingModeRequested = -1;
-                if ((uint32_t)a < app.renderingModeCount) target = a;
             }
-            if (target >= 0 && app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT) {
-                const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
-                g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target),
-                                     app.currentModeIndex, vcOf(app.currentModeIndex),
-                                     curIpd, steady);
-            }
-            if (g_modeSwitch.active()) {
-                float ipd = steady; bool fire = false; uint32_t mode = app.currentModeIndex;
-                g_modeSwitch.update(dt, &ipd, &fire, &mode);
-                g_input.viewParams.ipdFactor = ipd;
-                if (fire && mode != app.currentModeIndex && app.session != XR_NULL_HANDLE &&
-                    app.pfnRequestDisplayRenderingModeEXT)
-                    app.pfnRequestDisplayRenderingModeEXT(app.session, mode);
-            } else {
-                g_input.viewParams.ipdFactor = steady;
-            }
+            const int32_t knob = g_modeSwitchKnob.poll(dt, app.currentModeIndex, app.renderingModeCount,
+                                                       app.renderingModeViewCounts);
+            if (knob >= 0) want = knob;
+            const bool canRequest = app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                dt, canRequest ? want : -1, app.renderingModeCount, app.renderingModeViewCounts,
+                app.currentModeIndex, g_input.viewParams.steadyIpdFactor);
+            g_input.viewParams.ipdFactor = f.ipd;
+            if (f.fire && canRequest)
+                app.pfnRequestDisplayRenderingModeEXT(app.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ipd=%.4f fire=%d mode=%u current=%u", dt, f.ipd,
+                         (int)f.fire, f.mode, app.currentModeIndex);
         }
 
         UpdateCameraMovement(g_input, dt, app.displayHeightM);
@@ -2041,8 +2314,49 @@ int main(int argc, char **argv)
             viewState.next = &viewRigRaw;
         }
 
+        // XR_DXR_cursor_depth (ADR-046): pointer UV, the footprint hit test
+        // against the previous locate's views (a frame late, which the
+        // runtime's filter absorbs), and the hint / draw-request / state
+        // structs on both chains. Inert when the extension is off.
+        cursor.chain(locateInfo, viewState);
+
         uint32_t viewCount = 0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+
+        if (cursor.enabled()) {
+            const bool d3 = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
+            const uint32_t mvc = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
+            // Hides / shows the OS cursor; remembers the views for next frame.
+            cursor.afterLocate(views.data(), d3 ? (mvc < viewCount ? mvc : viewCount) : 1);
+
+            // App mode: we draw the crosshair from the placement.
+            const XrCursorDepthPlacementDXR &placement = cursor.placement();
+            g_cursorDraw.active = cursor.appShouldDraw();
+            g_cursorDraw.pose = placement.pose;
+            g_cursorDraw.height = placement.height;
+
+            static int willDrawLogged = 0;
+            if (cursor.runtimeDraws() && willDrawLogged < 3 && cursor.pointerInCanvas()) {
+                static int lastWillDraw = -1;
+                if ((int)cursor.drawState().willDraw != lastWillDraw) {
+                    lastWillDraw = (int)cursor.drawState().willDraw;
+                    willDrawLogged++;
+                    LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
+                             cursor.drawState().willDraw ? "TRUE" : "FALSE", cursor.hint().cursorUV.x,
+                             cursor.hint().cursorUV.y, placement.disparity);
+                }
+            }
+            static int cursorLogged = 0;
+            if (placement.isActive && cursor.hint().hasContent && cursorLogged < 3) {
+                cursorLogged++;
+                LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
+                         cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                         placement.disparity, placement.height, placement.pose.position.x,
+                         placement.pose.position.y, placement.pose.position.z);
+            }
+        }
 
         // Capture the runtime's resolved CANVAS size (the window client area in
         // meters) — the physical_height_m the Kooima/rig math runs on, which the
@@ -2554,6 +2868,8 @@ int main(int argc, char **argv)
     if (hudSwapchain.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(hudSwapchain.swapchain);
     }
+    if (app.cursorSpriteSwapchain != XR_NULL_HANDLE)
+        xrDestroySwapchain(app.cursorSpriteSwapchain);
     if (app.swapchain.swapchain)
         xrDestroySwapchain(app.swapchain.swapchain);
     if (app.localSpace)

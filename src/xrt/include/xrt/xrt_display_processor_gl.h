@@ -480,6 +480,101 @@ struct xrt_display_processor_gl
 	 */
 	bool (*get_background_preview)(struct xrt_display_processor_gl *xdp,
 	                               struct xrt_dp_background_preview *out_preview);
+
+	/*!
+	 * Multi-screen M6 (ADR-047 D2 on Windows, the GL twin of
+	 * xrt_display_processor_d3d11::set_present_origin): where the window's
+	 * client area sits on the DP's screen, so a WINDOWLESS DP (created
+	 * through `create_dp_gl_for_screen` with a NULL window) can phase its
+	 * interlace to the panel. Phase = this origin + the canvas offset handed
+	 * to @ref process_atlas (both top-left origin), in that screen's device
+	 * pixels relative to its top-left; either may be negative for a window
+	 * that starts off-screen. The compositor calls it every frame it weaves,
+	 * before process_atlas (cheap; a drag moves it).
+	 *
+	 * A DP that has the real HWND derives its phase from the window itself
+	 * and may ignore this call.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP has no windowed-phase support and weaves display-scoped. Appended
+	 * after @ref get_background_preview per ADR-020 (append-only within a
+	 * major; no version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_GL_HAS_PRESENT_ORIGIN.
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param panel_x  Window client-area left edge, screen-relative device px.
+	 * @param panel_y  Window client-area top edge, screen-relative device px.
+	 */
+	void (*set_present_origin)(struct xrt_display_processor_gl *xdp, int32_t panel_x, int32_t panel_y);
+
+	/*!
+	 * Eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144).
+	 *
+	 * @p target_ns is when the pixels the caller is about to produce are
+	 * expected to be SEEN — a display time on the `os_monotonic_get_ns()`
+	 * clock: xrLocateViews passes the frame's displayTime, a compositor its
+	 * weave / scan-out instant, a status query "now". The DP predicts (or
+	 * samples) its tracker for THAT instant and fills @p out exactly as
+	 * @ref get_predicted_eye_positions does; `out->timestamp_ns` is the time
+	 * of the tracker sample the answer is based on — not the target — so the
+	 * caller can tell how far it was predicted.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime falls back to @ref get_predicted_eye_positions ("now + the
+	 * vendor's default horizon") and uses that answer UNCHANGED — today's
+	 * behaviour; implementing the slot opts in to display-time sampling.
+	 * Appended after
+	 * @ref set_present_origin per ADR-020 (append-only within a major; no
+	 * version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_GL_HAS_EYE_POSITIONS_AT.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param      target_ns  Monotonic time the eyes are wanted for.
+	 * @param[out] out        Eye positions at @p target_ns.
+	 * @return true if @p out is valid.
+	 */
+	bool (*get_eye_positions_at)(struct xrt_display_processor_gl *xdp,
+	                             int64_t target_ns,
+	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Phase-snap a runtime-owned window the user is dragging (#2405).
+	 *
+	 * The GL / D3D12 twin of @ref xrt_display_processor_d3d11::snap_window_rect
+	 * (D3D11 slot 18) and xrt_display_processor_vk::snap_window_rect, with
+	 * exactly their signature and semantics, so a plug-in can share one body.
+	 * The runtime passes the drag-start window top-left and the proposed
+	 * top-left, both absolute screen device pixels in the SAME frame; the DP
+	 * returns the nearest top-left with the phase the window had at the drag
+	 * origin. Only the top-left is snapped; the caller keeps the size.
+	 *
+	 * Called only from the window's drag path, by whoever is about to move
+	 * the window — never per weave. A pure query: it must not move a window,
+	 * re-phase a live weaver or touch the lens state.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ no snap;
+	 * the runtime leaves the window at @p target_x/y. Appended after
+	 * @ref get_eye_positions_at per ADR-020 (append-only within a major; no
+	 * version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_GL_HAS_SNAP_WINDOW_RECT.
+	 *
+	 * @param      xdp       Pointer to self.
+	 * @param      origin_x  Drag-start window left, absolute screen px.
+	 * @param      origin_y  Drag-start window top, absolute screen px.
+	 * @param      target_x  Proposed window left, absolute screen px.
+	 * @param      target_y  Proposed window top, absolute screen px.
+	 * @param[out] out_x     Phase-snapped window left, absolute screen px.
+	 * @param[out] out_y     Phase-snapped window top, absolute screen px.
+	 * @return true if a snap was produced (out_x/out_y valid); false ⟹ the
+	 *         caller uses target_x/target_y unchanged.
+	 */
+	bool (*snap_window_rect)(struct xrt_display_processor_gl *xdp,
+	                         int32_t origin_x,
+	                         int32_t origin_y,
+	                         int32_t target_x,
+	                         int32_t target_y,
+	                         int32_t *out_x,
+	                         int32_t *out_y);
 };
 
 
@@ -542,7 +637,10 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_frame_timing)   
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_backend_state)           == XRT_DP_GL_BASE_OFF + 19 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_scanout_caps)            == XRT_DP_GL_BASE_OFF + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_background_preview) == XRT_DP_GL_BASE_OFF + 21 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, set_present_origin)     == XRT_DP_GL_BASE_OFF + 22 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, get_eye_positions_at)   == XRT_DP_GL_BASE_OFF + 23 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_gl, snap_window_rect)       == XRT_DP_GL_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                                == XRT_DP_GL_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -564,6 +662,28 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_gl)                       
  * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
  */
 #define XRT_DP_GL_HAS_BACKEND_STATE 1
+
+/*!
+ * Defined when this header carries the set_present_origin slot (multi-screen
+ * M6, GL), so a plug-in built against an older runtime can #ifdef-guard its
+ * implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_GL_HAS_PRESENT_ORIGIN 1
+
+/*!
+ * Defined when this header carries the get_eye_positions_at slot (ADR-054
+ * §4.1 / N6 Part 1, #2144 — the target-time eye query), so a plug-in built
+ * against an older runtime can #ifdef-guard its implementation. Purely
+ * additive (ADR-020).
+ */
+#define XRT_DP_GL_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the snap_window_rect slot (#2405 — drag
+ * phase-snap for a runtime-owned window), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_GL_HAS_SNAP_WINDOW_RECT 1
 
 // clang-format on
 
@@ -972,6 +1092,101 @@ xrt_display_processor_gl_get_background_preview(struct xrt_display_processor_gl 
 		return false;
 	}
 	return xdp->get_background_preview(xdp, out_preview);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::set_present_origin
+ *
+ * Helper for calling through the function pointer; a no-op when the slot is
+ * absent (older plug-in `struct_size`) or NULL.
+ *
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline void
+xrt_display_processor_gl_set_present_origin(struct xrt_display_processor_gl *xdp, int32_t panel_x, int32_t panel_y)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_present_origin) || xdp->set_present_origin == NULL) {
+		return;
+	}
+	xdp->set_present_origin(xdp, panel_x, panel_y);
+}
+
+/*!
+ * Does this DP answer a target-time eye query itself (the
+ * @ref xrt_display_processor_gl::get_eye_positions_at slot is present and
+ * non-NULL)? When not, the trunk uses the DP's
+ * get_predicted_eye_positions answer unchanged (no display-time sampling).
+ *
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_has_eye_positions_at(struct xrt_display_processor_gl *xdp)
+{
+	return xdp != NULL && XRT_DP_HAS_SLOT(xdp, get_eye_positions_at) && xdp->get_eye_positions_at != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::get_eye_positions_at
+ *
+ * Falls back to @ref xrt_display_processor_gl_get_predicted_eye_positions
+ * when the slot is absent (older plug-in `struct_size`) or NULL — an older
+ * plug-in keeps working and its answer means "now + the vendor's default
+ * horizon". @ref xrt_display_processor_gl_has_eye_positions_at tells the two
+ * apart.
+ *
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_get_eye_positions_at(struct xrt_display_processor_gl *xdp,
+                                              int64_t target_ns,
+                                              struct xrt_eye_positions *out)
+{
+	if (!xrt_display_processor_gl_has_eye_positions_at(xdp)) {
+		return xrt_display_processor_gl_get_predicted_eye_positions(xdp, out);
+	}
+	return xdp->get_eye_positions_at(xdp, target_ns, out);
+}
+
+/*!
+ * @copydoc xrt_display_processor_gl::snap_window_rect
+ *
+ * Returns false (leave the window at the target) when the slot is absent
+ * (older plug-in `struct_size`) or NULL.
+ *
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_snap_window_rect(struct xrt_display_processor_gl *xdp,
+                                          int32_t origin_x,
+                                          int32_t origin_y,
+                                          int32_t target_x,
+                                          int32_t target_y,
+                                          int32_t *out_x,
+                                          int32_t *out_y)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, snap_window_rect) || xdp->snap_window_rect == NULL) {
+		return false;
+	}
+	return xdp->snap_window_rect(xdp, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
+/*!
+ * Does the DP's output survive a display-server resample
+ * (@ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE)? Every "didn't answer" case —
+ * absent slot, NULL, false return — is false: the conservative reading. The
+ * GL twin of xrt_display_processor_d3d11_tolerates_resample.
+ *
+ * @public @memberof xrt_display_processor_gl
+ */
+static inline bool
+xrt_display_processor_gl_tolerates_resample(struct xrt_display_processor_gl *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_gl_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
 }
 
 #ifdef __cplusplus

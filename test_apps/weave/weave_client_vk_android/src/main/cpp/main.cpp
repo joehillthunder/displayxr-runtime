@@ -43,6 +43,7 @@
 #include <stdlib.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <poll.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
@@ -58,6 +59,8 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_weave.h>
+
+#include <vk_frame_ring.h>
 
 #define LOG_TAG "weave_client_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -123,9 +126,10 @@ struct WeaveApp
 	VkDevice vk_device = VK_NULL_HANDLE;
 	uint32_t vk_queue_family = UINT32_MAX;
 	VkQueue vk_queue = VK_NULL_HANDLE;
-	VkCommandPool cmd_pool = VK_NULL_HANDLE;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	VkFence fence = VK_NULL_HANDLE;
+	// Frame submission ring (dxr::VkFrameRing, displayxr-common): the present
+	// blit is ONE submit per frame with no wait on it — INV-4.10 / #1917. Also
+	// owns the one-off submitImmediate() path (input upload, debug dump).
+	dxr::VkFrameRing ring;
 	VkSemaphore acquire_sem = VK_NULL_HANDLE;
 	VkSemaphore present_sem = VK_NULL_HANDLE;
 	PFN_vkGetAndroidHardwareBufferPropertiesANDROID get_ahb_props = nullptr;
@@ -483,21 +487,14 @@ vk_create_instance_and_device()
 		return false;
 	}
 
-	// Command pool / buffer / sync.
-	VkCommandPoolCreateInfo pool_ci = {};
-	pool_ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	pool_ci.queueFamilyIndex = g_app.vk_queue_family;
-	pool_ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	VK_CHECK(vkCreateCommandPool(g_app.vk_device, &pool_ci, nullptr, &g_app.cmd_pool), "vkCreateCommandPool");
-	VkCommandBufferAllocateInfo cb_ai = {};
-	cb_ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	cb_ai.commandPool = g_app.cmd_pool;
-	cb_ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	cb_ai.commandBufferCount = 1;
-	VK_CHECK(vkAllocateCommandBuffers(g_app.vk_device, &cb_ai, &g_app.cmd), "vkAllocateCommandBuffers");
-	VkFenceCreateInfo fence_ci = {};
-	fence_ci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	VK_CHECK(vkCreateFence(g_app.vk_device, &fence_ci, nullptr, &g_app.fence), "vkCreateFence");
+	// Frame ring (command buffers + fences) and present semaphores. Android
+	// processes have no usable environment: pass frames-in-flight explicitly.
+	dxr::VkFrameRing::Config ring_cfg;
+	ring_cfg.framesInFlight = 3;
+	if (!g_app.ring.init(g_app.vk_device, g_app.vk_phys, g_app.vk_queue, g_app.vk_queue_family, ring_cfg)) {
+		LOGE("frame ring init failed");
+		return false;
+	}
 	VkSemaphoreCreateInfo sem_ci = {};
 	sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 	VK_CHECK(vkCreateSemaphore(g_app.vk_device, &sem_ci, nullptr, &g_app.acquire_sem), "vkCreateSemaphore");
@@ -930,41 +927,30 @@ barrier(VkCommandBuffer cmd,
 //! Upload the CPU pattern into the input AHardwareBuffer and WAIT for it. The
 //! weave contract is "caller's writes are complete before xrWeaveSubmitDXR"
 //! (there is no acquire fence on this platform yet, #1036 follow-up), so this
-//! wait is the contract, not laziness.
+//! wait is the contract, not laziness — hence the ring's one sanctioned
+//! blocking path, submitImmediate().
 bool
 upload_input()
 {
-	vkResetCommandBuffer(g_app.cmd, 0);
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	VK_CHECK(vkBeginCommandBuffer(g_app.cmd, &bi), "vkBeginCommandBuffer(upload)");
+	const VkResult r = g_app.ring.submitImmediate([](VkCommandBuffer cmd) {
+		barrier(cmd, g_app.in_image,
+		        g_app.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+		        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+		g_app.in_first_use = false;
 
-	barrier(g_app.cmd, g_app.in_image,
-	        g_app.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
-	        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-	g_app.in_first_use = false;
+		VkBufferImageCopy copy = {};
+		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.imageExtent = {g_app.in_w, g_app.in_h, 1};
+		vkCmdCopyBufferToImage(cmd, g_app.staging, g_app.in_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+		                       &copy);
 
-	VkBufferImageCopy copy = {};
-	copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	copy.imageExtent = {g_app.in_w, g_app.in_h, 1};
-	vkCmdCopyBufferToImage(g_app.cmd, g_app.staging, g_app.in_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-	                       &copy);
-
-	// GENERAL is what the runtime's importer expects to find across frames.
-	barrier(g_app.cmd, g_app.in_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-	        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-
-	VK_CHECK(vkEndCommandBuffer(g_app.cmd), "vkEndCommandBuffer(upload)");
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &g_app.cmd;
-	VK_CHECK(vkQueueSubmit(g_app.vk_queue, 1, &si, g_app.fence), "vkQueueSubmit(upload)");
-	VK_CHECK(vkWaitForFences(g_app.vk_device, 1, &g_app.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(upload)");
-	vkResetFences(g_app.vk_device, 1, &g_app.fence);
+		// GENERAL is what the runtime's importer expects to find across frames.
+		barrier(cmd, g_app.in_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+		        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+	});
+	VK_CHECK(r, "submitImmediate(upload)");
 	return true;
 }
 
@@ -992,11 +978,11 @@ present_woven()
 		LOGW("vkAcquireNextImageKHR: SUBOPTIMAL (presenting anyway)");
 	}
 
-	vkResetCommandBuffer(g_app.cmd, 0);
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	VK_CHECK(vkBeginCommandBuffer(g_app.cmd, &bi), "vkBeginCommandBuffer(present)");
+	VkCommandBuffer cmd = g_app.ring.beginFrame();
+	if (cmd == VK_NULL_HANDLE) {
+		LOGE("frame ring beginFrame failed");
+		return false;
+	}
 
 	// Passthrough (debug.dxr.weave.passthrough) blits the pre-weave input, which
 	// is the A/B for "is my present path or the weave at fault?".
@@ -1005,12 +991,12 @@ present_woven()
 	const uint32_t src_w = passthrough ? g_app.in_w : g_app.out_w;
 	const uint32_t src_h = passthrough ? g_app.in_h : g_app.out_h;
 
-	barrier(g_app.cmd, src_image, g_app.out_first_use && !passthrough ? VK_IMAGE_LAYOUT_UNDEFINED
+	barrier(cmd, src_image, g_app.out_first_use && !passthrough ? VK_IMAGE_LAYOUT_UNDEFINED
 	                                                                 : VK_IMAGE_LAYOUT_GENERAL,
 	        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
 	        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 	g_app.out_first_use = false;
-	barrier(g_app.cmd, g_app.swapchain_images[index], VK_IMAGE_LAYOUT_UNDEFINED,
+	barrier(cmd, g_app.swapchain_images[index], VK_IMAGE_LAYOUT_UNDEFINED,
 	        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
 	        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
@@ -1021,30 +1007,21 @@ present_woven()
 	blit.dstOffsets[1] = {(int32_t)g_app.swapchain_w, (int32_t)g_app.swapchain_h, 1};
 	// NEAREST: the woven output is an interlaced lattice — any filtering here
 	// would smear neighbouring views into each other and destroy the 3D.
-	vkCmdBlitImage(g_app.cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	vkCmdBlitImage(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	               g_app.swapchain_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
 	               VK_FILTER_NEAREST);
 
-	barrier(g_app.cmd, g_app.swapchain_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	barrier(cmd, g_app.swapchain_images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-	barrier(g_app.cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+	barrier(cmd, src_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
 	        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 	        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
 
-	VK_CHECK(vkEndCommandBuffer(g_app.cmd), "vkEndCommandBuffer(present)");
-
+	// ONE submit with the ring slot's fence and NO wait on it (INV-4.10).
 	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.waitSemaphoreCount = 1;
-	si.pWaitSemaphores = &g_app.acquire_sem;
-	si.pWaitDstStageMask = &wait_stage;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &g_app.cmd;
-	si.signalSemaphoreCount = 1;
-	si.pSignalSemaphores = &g_app.present_sem;
-	VK_CHECK(vkQueueSubmit(g_app.vk_queue, 1, &si, g_app.fence), "vkQueueSubmit(present)");
+	VK_CHECK(g_app.ring.endFrame(&g_app.acquire_sem, &wait_stage, 1, &g_app.present_sem, 1),
+	         "frame ring endFrame(present)");
 
 	VkPresentInfoKHR pi = {};
 	pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -1059,9 +1036,6 @@ present_woven()
 		logged_present = true;
 		LOGW("vkQueuePresentKHR: %d", (int)present_res);
 	}
-
-	VK_CHECK(vkWaitForFences(g_app.vk_device, 1, &g_app.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences(present)");
-	vkResetFences(g_app.vk_device, 1, &g_app.fence);
 	return true;
 }
 
@@ -1113,29 +1087,19 @@ dump_image(VkImage image, uint32_t w, uint32_t h, const char *path)
 	vkAllocateMemory(g_app.vk_device, &mai, nullptr, &memory);
 	vkBindBufferMemory(g_app.vk_device, buffer, memory, 0);
 
-	vkResetCommandBuffer(g_app.cmd, 0);
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(g_app.cmd, &bi);
-	barrier(g_app.cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-	        VK_PIPELINE_STAGE_TRANSFER_BIT);
-	VkBufferImageCopy copy = {};
-	copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	copy.imageExtent = {w, h, 1};
-	vkCmdCopyImageToBuffer(g_app.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
-	barrier(g_app.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
-	        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-	vkEndCommandBuffer(g_app.cmd);
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &g_app.cmd;
-	vkQueueSubmit(g_app.vk_queue, 1, &si, g_app.fence);
-	vkWaitForFences(g_app.vk_device, 1, &g_app.fence, VK_TRUE, UINT64_MAX);
-	vkResetFences(g_app.vk_device, 1, &g_app.fence);
+	// Debug one-off (on demand, once): the ring's sanctioned blocking path.
+	g_app.ring.submitImmediate([&](VkCommandBuffer cmd) {
+		barrier(cmd, image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		        VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		        VK_PIPELINE_STAGE_TRANSFER_BIT);
+		VkBufferImageCopy copy = {};
+		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.imageExtent = {w, h, 1};
+		vkCmdCopyImageToBuffer(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
+		barrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+		        VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+	});
 
 	uint8_t *mapped = nullptr;
 	if (vkMapMemory(g_app.vk_device, memory, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void **>(&mapped)) ==
@@ -1174,6 +1138,47 @@ maybe_dump()
 }
 
 //! One present-owner frame: paint -> upload -> weave -> composite -> present.
+/*
+ * XR_DXR_weave v20 functional probe, OFF by default: `setprop
+ * debug.dxr.weave.syncfd 1`. Chains XrWeaveOutputSyncDXR (release fence) and,
+ * from the second frame, XrWeaveSubmitSyncDXR with a dup of the PREVIOUS
+ * frame's release fence as the acquire (already signalled by then — it
+ * exercises the service's SYNC_FD import + the fd plumbing both ways). Each
+ * release fence is polled (bounded); counts are logged every 60 frames. The
+ * app still drains its own ring before the submit, so the acquire is
+ * redundant here by construction — this is a plumbing check, not a perf one.
+ */
+static int g_sync_prev_release = -1;
+static uint32_t g_sync_fds = 0, g_sync_minus1 = 0, g_sync_signalled = 0, g_sync_timeouts = 0;
+
+static bool
+sync_probe_enabled()
+{
+	char v[PROP_VALUE_MAX] = {0};
+	return __system_property_get("debug.dxr.weave.syncfd", v) > 0 && v[0] == '1';
+}
+
+static void
+sync_probe_after_submit(int release_fd)
+{
+	if (release_fd < 0) {
+		g_sync_minus1++;
+		return;
+	}
+	g_sync_fds++;
+	struct pollfd pfd = {release_fd, POLLIN, 0};
+	int r = poll(&pfd, 1, 1000);
+	if (r > 0) {
+		g_sync_signalled++;
+	} else {
+		g_sync_timeouts++;
+	}
+	if (g_sync_prev_release >= 0) {
+		close(g_sync_prev_release);
+	}
+	g_sync_prev_release = release_fd;
+}
+
 bool
 render_frame()
 {
@@ -1190,6 +1195,12 @@ render_frame()
 	}
 
 	paint_frame(g_app.frame, rects, kRectCount);
+	// The previous frame's present blit may still be reading the woven output
+	// (and, under passthrough, the input). The weave contract is that the
+	// caller has finished with both before xrWeaveSubmitDXR — the runtime
+	// rewrites the one shared output and has no acquire fence on Android — so
+	// drain the ring here. The CPU paint above still overlaps that GPU work.
+	g_app.ring.waitAll();
 	if (!upload_input()) {
 		return false;
 	}
@@ -1217,12 +1228,32 @@ render_frame()
 	XrWeaveOutputDXR out = {};
 	out.type = XR_TYPE_WEAVE_OUTPUT_DXR;
 
+	// v20 probe (see sync_probe_enabled).
+	const bool sync_probe = sync_probe_enabled();
+	XrWeaveSubmitSyncDXR sync_in = {};
+	XrWeaveOutputSyncDXR sync_out = {};
+	if (sync_probe) {
+		sync_in.type = XR_TYPE_WEAVE_SUBMIT_SYNC_DXR;
+		sync_in.next = info.next;
+		sync_in.acquireFenceFd = g_sync_prev_release >= 0 ? dup(g_sync_prev_release) : -1;
+		info.next = &sync_in;
+		sync_out.type = XR_TYPE_WEAVE_OUTPUT_SYNC_DXR;
+		sync_out.releaseFenceFd = -1;
+		out.next = &sync_out;
+	}
+
 	const uint64_t t0 = now_ns();
 	XrResult res = g_app.weave_submit(g_app.xr_session, &info, &out);
 	const uint64_t dt = now_ns() - t0;
 	if (res != XR_SUCCESS) {
+		if (sync_probe && sync_in.acquireFenceFd >= 0) {
+			close(sync_in.acquireFenceFd); // stays ours on failure (v10 ownership rule)
+		}
 		LOGE("xrWeaveSubmitDXR failed: %d", (int)res);
 		return false;
+	}
+	if (sync_probe) {
+		sync_probe_after_submit(sync_out.releaseFenceFd);
 	}
 	g_app.submit_ns_total += dt;
 	g_app.submit_samples++;
@@ -1275,6 +1306,11 @@ render_frame()
 		g_app.submit_ns_total = 0;
 		g_app.submit_ns_max = 0;
 		g_app.submit_samples = 0;
+		if (sync_probe) {
+			LOGW("WEAVE_CLIENT v20 syncfd: release fds=%u (signalled=%u timeouts=%u), release -1=%u", g_sync_fds,
+			     g_sync_signalled, g_sync_timeouts, g_sync_minus1);
+			g_sync_fds = g_sync_minus1 = g_sync_signalled = g_sync_timeouts = 0;
+		}
 	}
 	return true;
 }
@@ -1339,6 +1375,7 @@ reconcile_size()
 
 	LOGI("WEAVE_CLIENT: surface is now %ux%u (was %ux%u) — rebuilding", w, h, g_app.swapchain_w,
 	     g_app.swapchain_h);
+	g_app.ring.waitAll();
 	vkDeviceWaitIdle(g_app.vk_device);
 	destroy_input();
 	destroy_swapchain();
@@ -1415,10 +1452,12 @@ render_thread(void *)
 		}
 	}
 
+	g_app.ring.waitAll();
 	vkDeviceWaitIdle(g_app.vk_device);
 	destroy_output();
 	destroy_input();
 	destroy_swapchain();
+	g_app.ring.destroy();
 	if (g_app.xr_session != XR_NULL_HANDLE) {
 		xrDestroySession(g_app.xr_session);
 	}

@@ -34,11 +34,29 @@
 #include "xrt/xrt_results.h"
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
+#include "sim_display_stereo_camera.h"
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
 #include "vk/vk_helpers.h" // #1243: sizeof(struct vk_bundle) fingerprint
 #endif
 
 #include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+
+
+/*!
+ * ADR-051: bumped by probe_displays when the monitor SET it was handed
+ * differs from the previous probe's, so the per-screen status change_counter
+ * moves on a topology change and nowhere else. It must not count probes: the
+ * service re-probes every 10 s while the fallback plug-in is active, and a
+ * counter that moved per probe made every status watcher refetch an
+ * identical snapshot on each tick (xrt_plugin_iface: "bump change_counter on
+ * your own device / topology events, never by polling").
+ */
+static xrt_atomic_s32_t g_sim_display_topology_count = 0;
+//! FNV-1a of the last probed monitor set (order-independent); 0 = none yet.
+static uint64_t g_sim_display_last_set_key = 0;
 
 
 /*
@@ -131,18 +149,79 @@ sim_display_plugin_get_display_info(struct xrt_plugin_instance *inst,
 	 * toggle re-enables MANUAL_BIT (paired with HAS_TRACKING on the 3D
 	 * rendering modes in sim_display_device.c) so the MANUAL path and
 	 * XrEventDataEyeTrackingStateChangedDXR are testable without
-	 * hardware. */
-	if (sim_display_fake_tracking_enabled()) {
-		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
-		out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
-	} else {
-		out_info->supported_eye_tracking_modes = 0u; /* no tracking */
-		out_info->default_eye_tracking_mode = 0u;    /* undefined; keep 0 */
-	}
+	 * hardware. Opt-in webcam tracking (#1855, SIM_DISPLAY_WEBCAM_TRACKING
+	 * with a face estimator built in) adds MANAGED_BIT and makes MANAGED the
+	 * default. Neither: 0 / 0. */
+	sim_display_eye_tracking_caps(&out_info->supported_eye_tracking_modes, &out_info->default_eye_tracking_mode);
 
 	return true;
 }
 
+
+/*!
+ * Multi-screen M1: describe ONE monitor sim_display won (FALLBACK claim) —
+ * the per-monitor twin of @ref sim_display_plugin_get_display_info. Physical
+ * size from the monitor's EDID mm (the env/default size when EDID has none),
+ * pixels from the connector's device mode (else the desktop mode), sim's
+ * usual nominal viewer, and the same eye-tracking advertisement as the head
+ * (none, or MANUAL under SIM_DISPLAY_FAKE_TRACKING=1).
+ */
+static bool
+sim_display_plugin_get_display_info_for_monitor(struct xrt_plugin_instance *inst,
+                                                const struct xrt_display_descriptor *display,
+                                                const struct xrt_display_physical *physical,
+                                                struct xrt_plugin_display_info *out_info)
+{
+	(void)inst;
+	if (display == NULL || out_info == NULL ||
+	    out_info->struct_size <
+	        offsetof(struct xrt_plugin_display_info, supported_eye_tracking_modes) + 2 * sizeof(uint32_t)) {
+		return false;
+	}
+
+	float w_m = 0.0f, h_m = 0.0f, ny = 0.0f, nz = 0.0f;
+	sim_display_get_default_viewer(&w_m, &h_m, &ny, &nz);
+
+	uint32_t mm_w = 0, mm_h = 0, px_w = 0, px_h = 0;
+	if (physical != NULL &&
+	    physical->struct_size >= offsetof(struct xrt_display_physical, native_pixel_height) + sizeof(uint32_t)) {
+		mm_w = physical->physical_width_mm;
+		mm_h = physical->physical_height_mm;
+		px_w = physical->native_pixel_width;
+		px_h = physical->native_pixel_height;
+	}
+	if (mm_w > 0 && mm_h > 0) {
+		w_m = (float)mm_w / 1000.0f;
+		h_m = (float)mm_h / 1000.0f;
+	}
+	if (px_w == 0 || px_h == 0) {
+		px_w = display->pixel_width;
+		px_h = display->pixel_height;
+	}
+
+	out_info->display_width_m = w_m;
+	out_info->display_height_m = h_m;
+	out_info->nominal_viewer_x_m = 0.0f;
+	out_info->nominal_viewer_y_m = ny;
+	out_info->nominal_viewer_z_m = nz;
+	out_info->display_pixel_width = px_w;
+	out_info->display_pixel_height = px_h;
+	out_info->recommended_view_scale_x = 0.0f; // runtime derives
+	out_info->recommended_view_scale_y = 0.0f;
+	out_info->display_screen_left = display->screen_left;
+	out_info->display_screen_top = display->screen_top;
+	if (sim_display_fake_tracking_enabled()) {
+		out_info->supported_eye_tracking_modes = 2u; /* MANUAL_BIT */
+		out_info->default_eye_tracking_mode = 1u;    /* MANUAL */
+	} else {
+		out_info->supported_eye_tracking_modes = 0u;
+		out_info->default_eye_tracking_mode = 0u;
+	}
+	if (out_info->struct_size >= offsetof(struct xrt_plugin_display_info, refresh_mhz) + sizeof(uint32_t)) {
+		out_info->refresh_mhz = display->refresh_mhz;
+	}
+	return true;
+}
 
 static uint32_t
 sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
@@ -152,6 +231,26 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
                                   uint32_t max_claims)
 {
 	(void)inst;
+
+	// Order-independent key of the set: the sum of per-descriptor hashes.
+	uint64_t set_key = 1469598103934665603ull ^ display_count;
+	for (uint32_t i = 0; i < display_count; i++) {
+		uint64_t h = 1469598103934665603ull;
+		const unsigned char *b = (const unsigned char *)&displays[i].monitor_id;
+		for (size_t k = 0; k < sizeof(displays[i].monitor_id); k++) {
+			h = (h ^ b[k]) * 1099511628211ull;
+		}
+		set_key += h;
+	}
+	if (set_key == 0) {
+		set_key = 1; // keep 0 as "no probe yet"
+	}
+	// Probes are serialized by the loader's refresh lock; a benign race here
+	// costs one extra bump, never a missed one.
+	if (set_key != g_sim_display_last_set_key) {
+		g_sim_display_last_set_key = set_key;
+		xrt_atomic_s32_inc_return(&g_sim_display_topology_count);
+	}
 
 	/*
 	 * sim_display is the vendor-neutral fallback (#69 / ADR-015): claim
@@ -174,6 +273,9 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 #endif
 #if defined(_WIN32)
 		c->supported_apis |= XRT_DP_API_BIT_D3D11 | XRT_DP_API_BIT_D3D12;
+		// ADR-060 R2: its screen-bound D3D11 DP is exact at any origin (no
+		// D3D11 sim mode has a position-dependent phase), so say so up front.
+		c->supported_apis |= XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
 #endif
 #if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
 		// Desktop-GL DP only; Android is VK-only and a headless Linux build
@@ -188,12 +290,111 @@ sim_display_plugin_probe_displays(struct xrt_plugin_instance *inst,
 	return n;
 }
 
+/*!
+ * ADR-051 D2 per-screen status: synthetic values, so every dashboard row has
+ * one on a box with no hardware. Pure C, reads only process-local state —
+ * passive by construction.
+ */
+static xrt_result_t
+sim_display_plugin_get_screen_status(struct xrt_plugin_instance *inst,
+                                     uint64_t monitor_id,
+                                     struct xrt_plugin_screen_status *out)
+{
+	(void)inst;
+	if (out == NULL || out->struct_size < sizeof(struct xrt_plugin_screen_status)) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // caller too old for v1: "no vendor status"
+	}
+
+	uint64_t edges = 0;
+	bool tracking = sim_display_fake_tracking_sample(&edges);
+	// #1855: a running webcam tracker is the real state (MANAGED wins over the fake).
+	bool webcam_tracking = false;
+	uint64_t webcam_edges = 0;
+	const bool webcam = sim_display_webcam_tracking_status(&webcam_tracking, &webcam_edges);
+	if (webcam) {
+		tracking = webcam_tracking;
+		edges = webcam_edges;
+	}
+
+	out->version = XRT_PLUGIN_SCREEN_STATUS_VERSION;
+	// Both terms are monotonic, so the sum moves on every tracker edge and
+	// every change of the probed monitor set, and nowhere else (not per
+	// probe). cmpxchg(0, 0) is an atomic load.
+	int32_t topo = xrt_atomic_s32_cmpxchg(&g_sim_display_topology_count, 0, 0);
+	out->change_counter = edges + (uint64_t)(uint32_t)topo;
+	out->ready = true;
+	out->verified = true;
+	out->calibrated = true;
+	if (!webcam && !sim_display_fake_tracking_enabled()) {
+		out->tracker = XRT_PLUGIN_TRACKER_STATE_NONE;
+	} else {
+		out->tracker = tracking ? XRT_PLUGIN_TRACKER_STATE_RUNNING : XRT_PLUGIN_TRACKER_STATE_DOWN;
+	}
+	// The output mode is one process-singleton atomic, shared by every screen
+	// sim drives: it is the mode of THIS process (in a diagnostic process that
+	// is the SIM_DISPLAY_OUTPUT start-up mode, not a client's live one).
+	out->lens = sim_display_get_output_mode() == SIM_DISPLAY_OUTPUT_PASSTHROUGH ? XRT_PLUGIN_LENS_STATE_2D
+	                                                                            : XRT_PLUGIN_LENS_STATE_3D;
+	snprintf(out->model, sizeof(out->model), "Sim");
+	snprintf(out->serial, sizeof(out->serial), "SIM-%016llx", (unsigned long long)monitor_id);
+	out->warning_count = 1;
+	memset(out->warnings, 0, sizeof(out->warnings));
+	snprintf(out->warnings[0].code, sizeof(out->warnings[0].code), "SIMULATED");
+	out->warnings[0].level = XRT_PLUGIN_SCREEN_WARNING_LEVEL_INFO;
+	// UTF-8 em dash spelled out: MSVC reads this file in the ANSI code page.
+	snprintf(out->warnings[0].text, sizeof(out->warnings[0].text),
+	         "Simulated display processor \xE2\x80\x94 no hardware");
+	out->dashboard_command[0] = '\0';
+	return XRT_SUCCESS;
+}
+
 
 /*
  *
  * Vtable.
  *
  */
+
+/*!
+ * ADR-045 platform state. sim_display has no platform to be missing: it is
+ * always READY, and it is the FALLBACK plug-in — the runtime adopts a vendor
+ * plug-in on re-probe only while this one is active.
+ */
+static bool
+sim_display_plugin_get_platform_state(struct xrt_plugin_platform_status *out_status)
+{
+	if (out_status == NULL || out_status->struct_size < offsetof(struct xrt_plugin_platform_status, hint)) {
+		return false;
+	}
+	out_status->state = XRT_PLUGIN_PLATFORM_STATE_READY;
+	out_status->flags = XRT_PLUGIN_PLATFORM_FLAG_FALLBACK;
+	return true;
+}
+
+//! ADR-043 Amendment 5: the cameras this display owns — the webcam the opt-in tracker reads.
+_Static_assert(XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX == 256, "sim_display_webcam_claimed_cameras writes 256-byte ids");
+static uint32_t
+sim_display_plugin_get_claimed_cameras(struct xrt_plugin_instance *inst,
+                                       uint32_t capacity,
+                                       char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX])
+{
+	(void)inst;
+	return sim_display_webcam_claimed_cameras(capacity, out_ids);
+}
+
+/*!
+ * ADR-054 N6 Part 2: the viewer policy. sim_display has no eye tracker of its
+ * own (unless a dev toggle turns one on, in which case it advertises tracking
+ * and the trunk uses ITS eyes whatever this says), so its views may follow a
+ * viewer-tracking provider: EXTERNAL_OK, on every screen it drives.
+ */
+static uint32_t
+sim_display_plugin_get_viewer_policy(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display)
+{
+	(void)inst;
+	(void)display;
+	return XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK;
+}
 
 static struct xrt_plugin_iface g_sim_display_iface = {
     .struct_size = sizeof(struct xrt_plugin_iface),
@@ -207,13 +408,13 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .probe = sim_display_plugin_probe,
     .create_device = sim_display_plugin_create_device,
 
-    /*
-     * Per-graphics-API DP factories. sim_display ships factories for
-     * every API the platform supports; the runtime picks one at session
-     * creation based on the app's graphics binding. Each function
-     * pointer is the existing factory from sim_display_interface.h —
-     * the signatures already match the xrt_dp_factory_*_fn_t typedefs.
-     */
+/*
+ * Per-graphics-API DP factories. sim_display ships factories for
+ * every API the platform supports; the runtime picks one at session
+ * creation based on the app's graphics binding. Each function
+ * pointer is the existing factory from sim_display_interface.h —
+ * the signatures already match the xrt_dp_factory_*_fn_t typedefs.
+ */
 #if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
     .create_dp_vk = sim_display_dp_factory_vk,
     /* #1243: vk_bundle ABI fingerprint (size + table offset) — see xrt_plugin_iface. */
@@ -254,6 +455,81 @@ static struct xrt_plugin_iface g_sim_display_iface = {
     .set_pose_source = sim_display_plugin_set_pose_source,
 
     .probe_displays = sim_display_plugin_probe_displays,
+
+    /*
+     * ADR-042 lift-only D3D11 DP. sim_display builds no weaver or tracker for
+     * any DP, so its ordinary factory is already "lift-only"-cheap; the lift
+     * slots are filled only under SIM_DISPLAY_FAKE_LIFT=1.
+     */
+#if defined(_WIN32)
+    .create_dp_d3d11_lift = sim_display_dp_factory_d3d11,
+#else
+    .create_dp_d3d11_lift = NULL,
+#endif
+
+    .get_platform_state = sim_display_plugin_get_platform_state,
+
+    /*
+     * ADR-043 stereo camera source. The slots are always filled; the FAKE
+     * camera itself only exists under SIM_DISPLAY_FAKE_STEREO_CAMERA=1 (the
+     * enumerate slot reports zero cameras otherwise).
+     */
+    .stereo_camera_enumerate = sim_display_stereo_camera_enumerate,
+    .stereo_camera_get_calibration = sim_display_stereo_camera_get_calibration,
+    .stereo_camera_open = sim_display_stereo_camera_open,
+    .stereo_camera_wait_frame = sim_display_stereo_camera_wait_frame,
+    .stereo_camera_release_frame = sim_display_stereo_camera_release_frame,
+    .stereo_camera_close = sim_display_stereo_camera_close,
+
+    /* Multi-screen M1: per-monitor display info for every monitor sim wins. */
+    .get_display_info_for_monitor = sim_display_plugin_get_display_info_for_monitor,
+
+    /* Multi-screen M2: one VK DP per screen a spanning window covers. */
+#if defined(XRT_HAVE_VULKAN) || !defined(_WIN32)
+    .create_dp_vk_for_screen = sim_display_dp_factory_vk_for_screen,
+#else
+    .create_dp_vk_for_screen = NULL,
+#endif
+
+    /* Multi-screen M6: one D3D11 DP per screen a spanning window covers. */
+#if defined(_WIN32)
+    .create_dp_d3d11_for_screen = sim_display_dp_factory_d3d11_for_screen,
+#else
+    .create_dp_d3d11_for_screen = NULL,
+#endif
+
+    /* Multi-screen on macOS: one Metal DP per screen a spanning window covers. */
+#if defined(__APPLE__)
+    .create_dp_metal_for_screen = sim_display_dp_factory_metal_for_screen,
+#else
+    .create_dp_metal_for_screen = NULL,
+#endif
+
+/* Multi-screen M6 (D3D12): one D3D12 DP per screen a spanning window covers. */
+#if defined(_WIN32)
+    .create_dp_d3d12_for_screen = sim_display_dp_factory_d3d12_for_screen,
+#else
+    .create_dp_d3d12_for_screen = NULL,
+#endif
+
+    /* ADR-051 D2: per-screen status for the dashboard (pure C, every platform). */
+    .get_screen_status = sim_display_plugin_get_screen_status,
+
+/* Multi-screen M6 (GL): one GL DP per screen a spanning window covers. */
+#if !defined(XRT_OS_ANDROID) && defined(XRT_HAVE_OPENGL)
+    .create_dp_gl_for_screen = sim_display_dp_factory_gl_for_screen,
+#else
+    .create_dp_gl_for_screen = NULL,
+#endif
+
+    /* N3c (ADR-054 decision 7): what `displayxr-cli dp options sim-display` lists. */
+    .describe_settings = sim_display_describe_settings,
+
+    /* ADR-043 Amendment 5: the opt-in webcam tracker's camera is never the UVC source's. */
+    .get_claimed_cameras = sim_display_plugin_get_claimed_cameras,
+
+    /* ADR-054 N6 Part 2: views may follow a viewer-tracking provider when sim does not track. */
+    .get_viewer_policy = sim_display_plugin_get_viewer_policy,
 };
 
 
@@ -269,8 +545,6 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
                    struct xrt_plugin_iface **out_iface,
                    uint32_t *out_plugin_api_version)
 {
-	(void)host;
-
 	*out_plugin_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
 
 	if (runtime_api_version != XRT_PLUGIN_API_VERSION_CURRENT) {
@@ -281,6 +555,10 @@ xrtPluginNegotiate(uint32_t runtime_api_version,
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+
+	/* N3c: settings come through the host from now on (the pointer lives
+	 * in the runtime for the life of the process, like request_display_rescan). */
+	sim_display_settings_bind(host);
 
 	*out_iface = &g_sim_display_iface;
 	return XRT_SUCCESS;

@@ -703,6 +703,51 @@
 
 
 /*
+ * XR_DXR_stereo_comfort
+ *
+ * Hand-added DisplayXR extension. No entry points: an optional next-chain input
+ * on XrViewLocateInfo and a next-chain output on XrViewState.
+ */
+#if defined(XR_DXR_stereo_comfort)
+#define OXR_HAVE_DXR_stereo_comfort
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
+    _(DXR_stereo_comfort, DXR_STEREO_COMFORT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_)
+#endif
+
+
+/*
+ * XR_DXR_cursor_depth
+ *
+ * Hand-added DisplayXR extension (ADR-046). No entry points: a next-chain
+ * input on XrViewLocateInfo and a next-chain output on XrViewState.
+ */
+#if defined(XR_DXR_cursor_depth)
+#define OXR_HAVE_DXR_cursor_depth
+#define OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    _(DXR_cursor_depth, DXR_CURSOR_DEPTH)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_)
+#endif
+
+
+/*
+ * XR_DXR_swapchain_color_encoding
+ *
+ * Hand-added DisplayXR extension (ADR-044 amendment). No entry points: a
+ * next-chain input on XrSwapchainCreateInfo.
+ */
+#if defined(XR_DXR_swapchain_color_encoding)
+#define OXR_HAVE_DXR_swapchain_color_encoding
+#define OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_)                                                          \
+	_(DXR_swapchain_color_encoding, DXR_SWAPCHAIN_COLOR_ENCODING)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_)
+#endif
+
+
+/*
  * XR_DXR_display_zones
  *
  * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing
@@ -746,6 +791,99 @@
     _(DXR_weave, DXR_WEAVE)
 #else
 #define OXR_EXTENSION_SUPPORT_DXR_weave(_)
+#endif
+
+
+/*
+ * XR_DXR_lift
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks — keep them when regenerating). 2D→3D conversion streams
+ * (ADR-042). Advertised on every desktop platform the weave service is (it is
+ * an IPC-only service like XR_DXR_weave); the conversion module itself is
+ * implemented by the Windows D3D11 service, and everywhere else
+ * xrGetLiftPropertiesDXR honestly reports supportedModes 0 / UNAVAILABLE.
+ */
+#if defined(XR_DXR_lift) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) ||                       \
+                             (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
+#define OXR_HAVE_DXR_lift
+#define OXR_EXTENSION_SUPPORT_DXR_lift(_) \
+    _(DXR_lift, DXR_LIFT)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_lift(_)
+#endif
+
+/*
+ * XR_DXR_stereo_camera
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks — keep them when regenerating). A display's stereo
+ * camera as a plug-in-provided, service-owned source (ADR-043). Advertised on
+ * every platform: the camera manager is platform-neutral service code, and an
+ * instance with no camera (in-process, no plug-in source, kill switch) simply
+ * enumerates zero.
+ */
+#if defined(XR_DXR_stereo_camera)
+#define OXR_HAVE_DXR_stereo_camera
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
+    _(DXR_stereo_camera, DXR_STEREO_CAMERA)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_)
+#endif
+
+/*
+ * XR_DXR_app_share
+ *
+ * Hand-added DisplayXR extension (keep when regenerating). 3D screen share
+ * (ADR-061): running apps' pre-weave views listed as stereo-camera sources of
+ * kind app. Requires XR_DXR_stereo_camera (checked at xrCreateInstance).
+ * Advertised wherever the stereo camera is: an app entry the service cannot
+ * tap is listed UNAVAILABLE with a reason, never hidden.
+ */
+#if defined(XR_DXR_app_share) && defined(XR_DXR_stereo_camera)
+#define OXR_HAVE_DXR_app_share
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
+    _(DXR_app_share, DXR_APP_SHARE)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_app_share(_)
+#endif
+
+
+/*
+ * XR_DXR_desktop_control
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks - keep them when regenerating). An app's agent operates
+ * the desktop through the OS's own consent, inside the app's process
+ * (ADR-056). Advertised on every desktop OS a backend can exist on; a build or
+ * session with no backend reports XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR.
+ * Never Android (gate on "Linux AND NOT Android", the XRT_OS_LINUX_DESKTOP rule).
+ */
+#if defined(XR_DXR_desktop_control) && (defined(XR_USE_PLATFORM_WIN32) || defined(XR_USE_PLATFORM_MACOS) ||           \
+                                        (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)))
+#define OXR_HAVE_DXR_desktop_control
+#define OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \
+    _(DXR_desktop_control, DXR_DESKTOP_CONTROL)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_desktop_control(_)
+#endif
+
+
+/*
+ * XR_DXR_input_providers
+ *
+ * Hand-added DisplayXR extension (generate_oxr_ext_support.py knows nothing of
+ * the DisplayXR blocks - keep them when regenerating). Per-client input-provider
+ * selection (ADR-034 Amendment 5, #2181): enumerate the resident providers as
+ * this client sees them and request one per role family. Advertised on every
+ * platform; a system with no selection support lists no providers.
+ */
+#if defined(XR_DXR_input_providers)
+#define OXR_HAVE_DXR_input_providers
+#define OXR_EXTENSION_SUPPORT_DXR_input_providers(_) \
+    _(DXR_input_providers, DXR_INPUT_PROVIDERS)
+#else
+#define OXR_EXTENSION_SUPPORT_DXR_input_providers(_)
 #endif
 
 
@@ -1259,10 +1397,18 @@
     OXR_EXTENSION_SUPPORT_DXR_local_3d_zone(_) \
     OXR_EXTENSION_SUPPORT_DXR_view_rig(_) \
     OXR_EXTENSION_SUPPORT_DXR_depth_budget(_) \
+    OXR_EXTENSION_SUPPORT_DXR_cursor_depth(_) \
+    OXR_EXTENSION_SUPPORT_DXR_stereo_comfort(_) \
+    OXR_EXTENSION_SUPPORT_DXR_swapchain_color_encoding(_) \
     OXR_EXTENSION_SUPPORT_DXR_display_zones(_) \
     OXR_EXTENSION_SUPPORT_DXR_weave(_) \
+    OXR_EXTENSION_SUPPORT_DXR_lift(_) \
+    OXR_EXTENSION_SUPPORT_DXR_stereo_camera(_) \
+    OXR_EXTENSION_SUPPORT_DXR_app_share(_) \
     OXR_EXTENSION_SUPPORT_DXR_workspace_file_dialog(_) \
     OXR_EXTENSION_SUPPORT_DXR_mcp_tools(_) \
+    OXR_EXTENSION_SUPPORT_DXR_desktop_control(_) \
+    OXR_EXTENSION_SUPPORT_DXR_input_providers(_) \
     OXR_EXTENSION_SUPPORT_BD_controller_interaction(_) \
     OXR_EXTENSION_SUPPORT_FB_body_tracking(_) \
     OXR_EXTENSION_SUPPORT_FB_composition_layer_alpha_blend(_) \

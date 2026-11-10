@@ -8,8 +8,17 @@
 
 #include "ipc_server_input_queue.h"
 
+#include "multi/comp_multi_workspace.h" // hit-test + focus for ipc_server_input_route
+#include "os/os_time.h"
+
 #include <pthread.h>
 #include <string.h>
+
+#ifdef XRT_OS_LINUX_DESKTOP
+#include <sys/eventfd.h>
+#include <stdint.h>
+#include <unistd.h>
+#endif
 
 // Power-of-two ring so head/tail wrap with a mask. Sized well above a frame's
 // worth of events at 60 Hz; on overflow the oldest event is overwritten.
@@ -33,6 +42,8 @@ struct target_queue
 };
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct ipc_workspace_input_event g_frame_tick; //!< Latest tick, under g_lock.
+static bool g_frame_tick_pending;
 static struct target_queue g_queues[INPUT_QUEUE_MAX_TARGETS];
 static bool g_input_grab;
 static bool g_pointer_capture;
@@ -71,6 +82,40 @@ find_or_add_locked(void *target)
 	return NULL;
 }
 
+#ifdef XRT_OS_LINUX_DESKTOP
+//! Controller wakeup (xrAcquireWorkspaceWakeupEventDXR, POSIX form): an eventfd
+//! the server keeps for its lifetime; every controller-queue push makes it
+//! readable. -1 until first acquired. Guarded by g_lock.
+static int g_wakeup_fd = -1;
+
+int
+ipc_server_input_queue_get_wakeup_fd(void)
+{
+	pthread_mutex_lock(&g_lock);
+	if (g_wakeup_fd < 0) {
+		g_wakeup_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	}
+	int fd = g_wakeup_fd;
+	pthread_mutex_unlock(&g_lock);
+	return fd;
+}
+
+//! Caller holds g_lock.
+static void
+signal_wakeup_locked(void)
+{
+	if (g_wakeup_fd >= 0) {
+		uint64_t one = 1;
+		// EAGAIN only when the counter is saturated — already signalled.
+		(void)!write(g_wakeup_fd, &one, sizeof(one));
+	}
+}
+#else
+static inline void
+signal_wakeup_locked(void)
+{}
+#endif
+
 void
 ipc_server_input_queue_push(void *target, const struct ipc_workspace_input_event *event)
 {
@@ -92,6 +137,9 @@ ipc_server_input_queue_push(void *target, const struct ipc_workspace_input_event
 		} else {
 			// Full: the write above clobbered the oldest slot, advance tail too.
 			q->tail++;
+		}
+		if (q->target == IPC_INPUT_TARGET_CONTROLLER) {
+			signal_wakeup_locked();
 		}
 	}
 	pthread_mutex_unlock(&g_lock);
@@ -118,8 +166,52 @@ ipc_server_input_queue_drain(void *target, uint32_t capacity, struct ipc_workspa
 		}
 		q->count -= n;
 	}
+	// The coalesced FRAME_TICK rides after the controller's events, if there is
+	// room; otherwise it waits (still the latest) for the next drain.
+	if (target == IPC_INPUT_TARGET_CONTROLLER && g_frame_tick_pending && n < capacity) {
+		out_batch->events[n++] = g_frame_tick;
+		g_frame_tick_pending = false;
+	}
 	out_batch->count = n;
 	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_publish_frame_tick(const struct ipc_workspace_input_event *tick)
+{
+	if (tick == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&g_lock);
+	g_frame_tick = *tick;
+	g_frame_tick_pending = true;
+	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_clear_frame_tick(void)
+{
+	pthread_mutex_lock(&g_lock);
+	g_frame_tick_pending = false;
+	pthread_mutex_unlock(&g_lock);
+}
+
+void
+ipc_server_input_queue_frame_tick_sink(void *userdata, const struct comp_multi_frame_tick *tick)
+{
+	(void)userdata;
+	struct ipc_workspace_input_event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.event_type = IPC_WORKSPACE_INPUT_EVENT_FRAME_TICK;
+	ev.timestamp_ms = (uint32_t)(tick->timestamp_ns / 1000000);
+	ev.u.frame_tick.timestamp_ns = tick->timestamp_ns;
+	ev.u.frame_tick.viewer_x = tick->viewer_x;
+	ev.u.frame_tick.viewer_y = tick->viewer_y;
+	ev.u.frame_tick.viewer_z = tick->viewer_z;
+	ev.u.frame_tick.viewer_valid = tick->viewer_valid ? 1u : 0u;
+	ev.u.frame_tick.cursor_x = tick->cursor_x;
+	ev.u.frame_tick.cursor_y = tick->cursor_y;
+	ipc_server_input_queue_publish_frame_tick(&ev);
 }
 
 void
@@ -169,4 +261,99 @@ ipc_server_input_queue_pointer_captured(void)
 	bool v = g_pointer_capture;
 	pthread_mutex_unlock(&g_lock);
 	return v;
+}
+
+
+/*
+ *
+ * Routing (#61) — shared by the desktop-Linux surface input; the macOS pump
+ * keeps its inline copy of the same policy.
+ *
+ */
+
+//! Workspace chords stay with the controller and never reach a content app.
+static bool
+is_workspace_key(uint32_t vk, uint32_t mods)
+{
+	if (mods & (1u << 1)) { // CTRL
+		return true;
+	}
+	switch (vk) {
+	case 0x09: // VK_TAB    — cycle focus
+	case 0x1B: // VK_ESCAPE — restore maximized / close launcher
+	case 0x2E: // VK_DELETE — close window
+	case 0x7A: // VK_F11    — maximize toggle
+	case 0x25: // VK_LEFT
+	case 0x26: // VK_UP
+	case 0x27: // VK_RIGHT
+	case 0x28: // VK_DOWN
+	case 0xDB: // VK_OEM_4 [ — step Z back
+	case 0xDD: // VK_OEM_6 ] — step Z forward
+		return true;
+	default: return false;
+	}
+}
+
+void
+ipc_server_input_route(const struct ipc_workspace_input_event *ev)
+{
+	const bool grab = ipc_server_input_queue_input_grabbed();
+	const bool cap = ipc_server_input_queue_pointer_captured();
+
+	switch (ev->event_type) {
+	case IPC_WORKSPACE_INPUT_EVENT_KEY:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !is_workspace_key(ev->u.key.vk_code, ev->u.key.modifiers)) {
+			void *app = comp_multi_workspace_get_focused_client();
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_SCROLL:
+		if (grab || cap) {
+			ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		} else {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.scroll.cursor_x,
+			                                                    (int32_t)ev->u.scroll.cursor_y);
+			ipc_server_input_queue_push(app != NULL ? app : IPC_INPUT_TARGET_CONTROLLER, ev);
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.pointer.cursor_x,
+			                                                    (int32_t)ev->u.pointer.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	case IPC_WORKSPACE_INPUT_EVENT_POINTER_MOTION:
+		ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev);
+		if (!grab && !cap) {
+			void *app = comp_multi_workspace_hit_test_window_px((int32_t)ev->u.pointer_motion.cursor_x,
+			                                                    (int32_t)ev->u.pointer_motion.cursor_y);
+			if (app != NULL) {
+				ipc_server_input_queue_push(app, ev);
+			}
+		}
+		break;
+	default: ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, ev); break;
+	}
+}
+
+void
+ipc_server_input_queue_push_controller_key(uint32_t vk_code, uint32_t modifiers)
+{
+	struct ipc_workspace_input_event ev;
+	memset(&ev, 0, sizeof(ev));
+	ev.event_type = IPC_WORKSPACE_INPUT_EVENT_KEY;
+	ev.timestamp_ms = (uint32_t)(os_monotonic_get_ns() / 1000000);
+	ev.u.key.vk_code = vk_code;
+	ev.u.key.modifiers = modifiers;
+	ev.u.key.is_down = 1;
+	ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, &ev);
+	ev.u.key.is_down = 0;
+	ipc_server_input_queue_push(IPC_INPUT_TARGET_CONTROLLER, &ev);
 }

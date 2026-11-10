@@ -11,9 +11,17 @@ add_library(cli_query STATIC cli_query.c cli_query.h)
 target_link_libraries(
 	cli_query
 	PUBLIC xrt-interfaces
-	PRIVATE aux_util aux_os target_lists xrt-external-cjson
+	PRIVATE aux_util aux_os target_lists xrt-external-cjson displayxr::conversion_core
 	)
 target_include_directories(cli_query PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Display dashboard phase 8: `info --json` carries workspace_controllers[]
+# (service.json + the controller registry; absent on Android, which has no
+# workspace-controller registry).
+if(TARGET target_workspace_config)
+	target_link_libraries(cli_query PRIVATE target_workspace_config)
+	target_compile_definitions(cli_query PRIVATE CLI_HAVE_WORKSPACE_CONFIG)
+endif()
 
 # Headless zone-caps probe (#224 / ADR-027 P4): cli_query.c creates a D3D11
 # WARP device on Windows to exercise the plug-in's create_dp_d3d11 +
@@ -37,11 +45,23 @@ add_executable(
 	cli_cmd_dp.c
 	cli_cmd_perf.c
 	cli_cmd_input.c
+	cli_cmd_tracking.c
+	cli_cmd_tracking_calibrate.c
 	cli_cmd_runtime.c
 	cli_cmd_displays.c
+	cli_cmd_status.c
 	cli_cmd_probe.c
 	cli_cmd_test.c
 	cli_cmd_clients.c
+	cli_cmd_workspace.c
+	cli_cmd_lift.cpp
+	cli_cmd_camera.c
+	cli_cmd_camera_calibration.c
+	cli_cmd_conv.cpp
+	cli_cmd_conv_run.cpp
+	cli_component_options.c
+	cli_component_options.h
+	cli_lift_service.c
 	cli_common.h
 	cli_main.c
 	)
@@ -72,20 +92,49 @@ target_link_libraries(
 	PRIVATE
 		xrt-interfaces
 		aux_os
-		aux_os_ble
+		# ADR-043 Amendment 4: `camera uvc-devices` lists capture devices + the UVC config.
+		aux_os_uvc
 		aux_util
 		aux_math
 		cli_query
 		target_instance_no_comp
 		target_lists
 		drv_includes
+		xrt-external-cjson
+		# Display dashboard phase 8: `workspace list|set|reset|launch`.
+		target_workspace_config
+		# ADR-053 (#2006): `conv list|status` runs the conversion core's
+		# selection headless (conv_select.h names, policy resolution).
+		displayxr::conversion_core
+		# ADR-053 P4 (#2108): `conv models` and the snapshot's model-store rows.
+		displayxr::conversion_store
 	)
+
+# ADR-056: `displayxr-cli desktop ...` -- the desktop-control store + audit log
+# (u_desktop_policy only; the CLI never creates a desktop backend).
+if(TARGET aux_desktop)
+	target_sources(cli PRIVATE cli_cmd_desktop.c)
+	target_link_libraries(cli PRIVATE aux_desktop)
+	target_compile_definitions(cli PRIVATE CLI_HAVE_DESKTOP)
+endif()
 
 # #960: `displayxr-cli clients` connects to the live service over IPC (DIAG class).
 # Same gating as targets/diag-lib.
 if(XRT_FEATURE_SERVICE AND XRT_MODULE_IPC)
 	target_link_libraries(cli PRIVATE ipc_client)
 	target_compile_definitions(cli PRIVATE CLI_HAVE_IPC)
+	# The CLI's one non-launching connect (#1966): every command reaches the service through it.
+	target_sources(cli PRIVATE cli_ipc.c cli_ipc.h)
+endif()
+
+# ADR-042: `displayxr-cli lift probe` loads / writes images (stb, header-only,
+# compiled static into cli_cmd_lift.cpp) and drives D3D11 shared textures.
+# ADR-043: `displayxr-cli camera probe --out` writes PNGs with the same stb
+# (compiled static into cli_cmd_camera.c).
+target_include_directories(cli PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+if(WIN32)
+	# shell32: CommandLineToArgvW (camera allow|deny|trust <exe> reads the path as UTF-16)
+	target_link_libraries(cli PRIVATE d3d11 dxgi shell32)
 endif()
 
 install(TARGETS cli RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

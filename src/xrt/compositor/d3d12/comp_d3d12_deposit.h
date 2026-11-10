@@ -9,7 +9,7 @@
  *
  * The D3D12 flavour of the VK tier's deposit (comp_vk_native_deposit.h — read
  * its topology section first): a ring of D3D11 textures the D3D12 renderer's
- * atlas lands in directly, so the proven d3d11 fill arm (comp_vk_split — which
+ * atlas lands in directly, so the proven d3d11 fill arm (comp_hub_d3d11 — which
  * is Vulkan-free and consumes only the pure-D3D11 handoff struct) can weave and
  * present it. Measured motivation: under real app GPU load the d3d12 out arm
  * serializes (8–9 ms fires; Intel preemption is draw-granular, PRIORITY_HIGH
@@ -21,7 +21,7 @@
  *       D3D11 deposit texture (same adapter, NT-shared, fence-synced)
  *          |  app queue Signal()s a shared ID3D11Fence (opened as ID3D12Fence)
  *          v
- *   comp_vk_split's ingress GPU-waits on the D3D11 immediate context --> the
+ *   comp_hub_d3d11's ingress GPU-waits on the D3D11 immediate context --> the
  *   d3d11-ends comp_xbridge --> the d3d11 out device fill arm
  * @endverbatim
  *
@@ -49,7 +49,7 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_results.h"
 
-#include "vk_native/comp_vk_native_deposit.h" // struct comp_vk_deposit_handoff (pure D3D11/Win32)
+#include "hub_d3d11/comp_hub_d3d11_handoff.h" // struct comp_hub_d3d11_handoff (pure D3D11/Win32)
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -99,6 +99,12 @@ comp_d3d12_deposit_resize(struct comp_d3d12_deposit *dep, uint32_t width, uint32
  * wait: if a consumer has claimed the slot, queue a GPU-side
  * `ID3D12CommandQueue::Wait` for its release value on @p app_queue
  * (`ID3D12CommandQueue *`). Costs nothing when already satisfied.
+ *
+ * #2317 P2a review: advances only past a slot that was HANDED OFF
+ * (@ref comp_d3d12_deposit_note_handed). A frame that failed before its
+ * handoff leaves its slot unsubmitted, and the next frame re-renders into that
+ * same slot rather than lapping onto the one the hub may still be reading
+ * (and whose release it has not owed yet).
  */
 void
 comp_d3d12_deposit_advance(struct comp_d3d12_deposit *dep, void *app_queue);
@@ -122,11 +128,11 @@ void
 comp_d3d12_deposit_signal(struct comp_d3d12_deposit *dep, void *app_queue);
 
 /*!
- * Fill @p out for comp_vk_split (same contract as the VK deposit's handoff:
+ * Fill @p out for comp_hub_d3d11 (same contract as the VK deposit's handoff:
  * pointers BORROWED, `keyed_mutex` NULL — this flavour is always fence mode).
  */
 bool
-comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_vk_deposit_handoff *out);
+comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_hub_d3d11_handoff *out);
 
 /*!
  * The consumer's staging copy of @p slot has been recorded on the D3D11
@@ -136,6 +142,42 @@ comp_d3d12_deposit_get_handoff(struct comp_d3d12_deposit *dep, struct comp_vk_de
  */
 void
 comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
+
+//! #2317 P2a review: the current slot was handed to the consumer
+//! (comp_hub_d3d11_submit_atlas). The next @ref comp_d3d12_deposit_advance may
+//! move past it.
+void
+comp_d3d12_deposit_note_handed(struct comp_d3d12_deposit *dep);
+
+/*!
+ * @name #2317 P2a: the hub's DIRECT ingress (same adapter)
+ *
+ * The hub then opens each ring slot on its OWN device and weaves it in place —
+ * no staging copy, no @ref comp_d3d12_deposit_note_consumed. Its reads are
+ * released on a SEPARATE fence the hub owns (comp_hub_d3d11's consumer fence),
+ * so this deposit's fence keeps exactly one signaller (the app queue) and can
+ * never step backwards. Ordering stays GPU-side both ways (ADR-055).
+ * @{
+ */
+
+/*!
+ * Open the hub's consumer fence (`HANDLE`, from
+ * comp_hub_d3d11_get_consumer_fence_handle) on the app's D3D12 device. NULL
+ * unbinds (and forgets every owed release). False when the open failed — the
+ * caller must then keep the hub off DIRECT ingress, since nothing else would
+ * order a slot rewrite after the hub's read.
+ */
+bool
+comp_d3d12_deposit_bind_consumer_fence(struct comp_d3d12_deposit *dep, void *nt_handle);
+
+/*!
+ * The hub has moved off @p slot (comp_hub_d3d11_take_slot_release): its reads
+ * complete when the consumer fence reaches @p value. The app queue's next
+ * write into the slot waits for it in @ref comp_d3d12_deposit_advance.
+ */
+void
+comp_d3d12_deposit_note_hub_release(struct comp_d3d12_deposit *dep, uint32_t slot, uint64_t value);
+/*! @} */
 
 /*!
  * @name The PLANE surfaces (#1264 reroute plane transport)
@@ -166,7 +208,7 @@ comp_d3d12_deposit_note_consumed(struct comp_d3d12_deposit *dep, uint32_t slot);
  */
 struct comp_d3d12_deposit_plane
 {
-	void *shared_handle; //!< `HANDLE` for comp_vk_split_stage_*.
+	void *shared_handle; //!< `HANDLE` for comp_hub_d3d11_stage_*.
 	void *resource12;    //!< `ID3D12Resource *` — the copy destination (COMMON at rest).
 	uint32_t width;
 	uint32_t height;
@@ -184,7 +226,7 @@ comp_d3d12_deposit_plane_get(struct comp_d3d12_deposit *dep, uint32_t plane, str
 
 /*!
  * The d3d11 arm's producer has recorded its reads of every live plane (the
- * caller has just run comp_vk_split_submit_atlas, whose pre_plane_write wait
+ * caller has just run comp_hub_d3d11_submit_atlas, whose pre_plane_write wait
  * sits ahead on the same D3D11 immediate context) — signal the shared fence
  * past every claim so far on that context. One signal covers all planes.
  */
@@ -196,6 +238,17 @@ comp_d3d12_deposit_note_planes_consumed(struct comp_d3d12_deposit *dep);
 //! any plane. No-op while nothing has consumed a plane.
 void
 comp_d3d12_deposit_plane_wait(struct comp_d3d12_deposit *dep, void *app_queue);
+
+/*!
+ * #2317 P2c: the planes' back edge on the hub's DIRECT ingress. The hub reads
+ * the plane surfaces in place on every weave and repaint, so the app queue's
+ * next plane rewrite GPU-waits for @p value (comp_hub_d3d11_get_plane_release_value)
+ * on the hub's consumer fence bound by @ref comp_d3d12_deposit_bind_consumer_fence.
+ * Queue before executing a list that rewrites any plane. No-op with no fence
+ * bound or @p value 0; free once satisfied.
+ */
+void
+comp_d3d12_deposit_plane_wait_hub(struct comp_d3d12_deposit *dep, void *app_queue, uint64_t value);
 /*! @} */
 
 #ifdef __cplusplus

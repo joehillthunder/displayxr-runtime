@@ -1,0 +1,162 @@
+# XR_DXR_desktop_control end-to-end over the in-memory fake backend (ADR-056).
+# Never touches the real desktop. Needs displayxr-cli on PATH:
+#   PATH=<build>/src/xrt/targets/cli:$PATH XR_RUNTIME_JSON=<build>/openxr_displayxr-dev.json \
+#   DXR_DESKTOP_BACKEND=fake DXR_DESKTOP_CONTROL_DIR=$(mktemp -d) desktop_control_probe script e2e_fake.txt
+# Exit code 0 = every expectation held. The last block uses a POSIX shell (`run sh -c`).
+expect-state NOT_REQUESTED
+request so the probe can type for you
+expect-state GRANTED
+list
+pointer
+pick 200 200
+pick 5 5
+text 200 200
+# keyboard: 101 has focus
+act type target=101 text="secret words 123"
+expect XR_SUCCESS
+expect-text 200 200 "secret words 123"
+act type target=102 text="must not land"
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key target=101 keys=ctrl+s
+expect XR_SUCCESS
+act key target=101 keys=ctrl+banana
+expect XR_ERROR_VALIDATION_FAILURE
+# pointer
+act click target=101 x=300 y=300
+expect XR_SUCCESS
+act click target=102 x=300 y=300
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act activate target=102
+expect XR_SUCCESS
+act type target=102 text="now it lands"
+expect XR_SUCCESS
+act drag target=102 x=1100 y=300 x2=1300 y2=500
+expect XR_SUCCESS
+act scroll target=102 x=1100 y=300 sy=3
+expect XR_SUCCESS
+act move target=103 rect=60,700,0,0
+expect XR_SUCCESS
+act close target=103
+expect XR_SUCCESS
+act close target=103
+expect XR_ERROR_DESKTOP_WINDOW_LOST_DXR
+list
+# the kill switch
+run displayxr-cli desktop stop
+act key target=102 keys=ctrl+s
+expect XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+expect-state SUSPENDED
+run displayxr-cli desktop resume
+# the kill switch ENDS the grant (ADR-056 Amendment 2): DENIED until a new request
+expect-state DENIED
+request so the probe can type for you
+expect-state GRANTED
+act key target=102 keys=ctrl+s
+expect XR_SUCCESS
+run displayxr-cli desktop audit --tail 40
+# contract v2 (spec §6.1): an unparseable store never means defaults
+run sh -c 'echo {not-json, > $DXR_DESKTOP_CONTROL_DIR/desktop_control.json'
+expect-state GRANTED
+run displayxr-cli desktop status
+# ...and the kill switch still works over it (moved aside, suspended store written)
+run displayxr-cli desktop stop
+expect-state SUSPENDED
+run displayxr-cli desktop resume
+expect-state DENIED
+request so the probe can type for you
+expect-state GRANTED
+act key target=102 keys=ctrl+w
+expect XR_SUCCESS
+# spec v2: screen capture — its own consent scope, stills on request, never on disk
+expect-capture-state NOT_REQUESTED
+capture desktop
+expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+# the consent dialog's parent window (xdg-desktop-portal form); anything else is refused
+expect-rejected request-scopes capture --parent=hwnd:1234 so the probe can see your screen
+expect-rejected request-scopes capture --parent=wayland: so the probe can see your screen
+expect-capture-state NOT_REQUESTED
+request-scopes capture --parent=x11:4a00007 so the probe can see your screen
+expect-capture-state GRANTED
+# a mutter handle is printable ASCII and often has spaces (leading / inner / trailing): accepted
+request-scopes capture --parent="wayland: Ab#c d\e " so the probe can see your screen
+expect XR_SUCCESS
+request-scopes capture --parent-hex=7761796c616e643a2022612062222020 so the probe can see your screen
+expect XR_SUCCESS
+expect-rejected request-scopes capture --parent-hex=7761796c616e643a0961 so the probe can see your screen
+expect-state GRANTED
+capture desktop max=960x960
+expect-capture XR_SUCCESS 960x540
+capture region 1900 1060 100 100
+expect-capture XR_SUCCESS 20x20
+expect-desktop-pixel 1910 1070 118 46 128 255
+capture region 5000 5000 10 10
+expect-capture XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+run displayxr-cli desktop stop
+capture desktop
+expect-capture XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR
+expect-capture-state SUSPENDED
+run displayxr-cli desktop resume
+expect-capture-state DENIED
+expect-state DENIED
+request-scopes all so the probe can type and see your screen
+expect-capture-state GRANTED
+expect-state GRANTED
+capture window 102 max=400x400
+expect-capture XR_SUCCESS
+run displayxr-cli desktop status
+sleep 2500
+run displayxr-cli desktop audit --tail 8
+# spec v3 (§11): held input — keys and buttons stay down across actions until released
+act key-down target=102 keys=alt
+expect XR_SUCCESS
+act key-down target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=tab
+expect XR_SUCCESS
+act key-down target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=tab
+expect XR_SUCCESS
+act key-up target=102 keys=alt
+expect XR_SUCCESS
+act key-up target=102 keys=alt
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key-down target=102 keys=ctrl+a
+expect XR_ERROR_VALIDATION_FAILURE
+act click target=102 x=1100 y=300 mods=ctrl+shift
+expect XR_SUCCESS
+act key mods=ctrl target=102 keys=a
+expect XR_ERROR_VALIDATION_FAILURE
+act button-down target=102 x=1100 y=300
+expect XR_SUCCESS
+act move-pointer target=102 x=1200 y=350
+expect XR_SUCCESS
+act button-up target=102 x=1300 y=400
+expect XR_SUCCESS
+# the burst ends (2 s without an action): what is held is released by the runtime
+act key-down target=102 keys=shift
+expect XR_SUCCESS
+sleep 2600
+act key-up target=102 keys=shift
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+run displayxr-cli desktop audit --tail 6
+# spec v3 (§11.5): the shell target — input where no app window is, only on request
+act click target=shell x=500 y=10
+expect XR_SUCCESS
+act click target=101 x=500 y=10
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act click target=shell x=300 y=300
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act key target=shell keys=super
+expect XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR
+act maximize target=shell
+expect XR_ERROR_VALIDATION_FAILURE
+# spec v3 (§11.6): clipboard text — sizes in the audit, never the text
+act clip-set text="from the probe ✓"
+expect XR_SUCCESS
+act clip-get
+expect XR_SUCCESS
+expect-clipboard "from the probe ✓"
+act clip-get target=101
+expect XR_ERROR_VALIDATION_FAILURE
+run displayxr-cli desktop audit --tail 4

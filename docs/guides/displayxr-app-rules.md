@@ -301,6 +301,26 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   element's `type` and `next`; reference: `cube_handle_d3d11_win/xr_session.cpp`). Ref:
   `XR_DXR_display_info.h` v14 block, `docs/specs/vendor/eye-tracking-modes.md`.
 
+- **INV-2.9 (advisory) — Ease every mode switch through `dxr::ModeSwitch`.** The runtime
+  switches a rendering mode in **one frame**: the atlas recipe, the DP's weave-vs-flat choice and
+  the switchable lens follow the mode the moment it lands (ADR-028), on every platform and every
+  graphics API. It never ramps the stereo disparity; that is app content. An app that calls
+  `xrRequestDisplayRenderingModeDXR` straight from a key press therefore snaps between full
+  parallax and flat. Route V / 0-8 through displayxr-common's `mode_switch.h`. Call
+  `dxr::ModeSwitch::step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd)` once per
+  frame, submit the returned `ipd` as the rig's `ipdFactor` (zones apps multiply each zone's
+  `ipdFactor` by it, with `steadyIpd = 1`), and call the request only on the frame it returns
+  `fire`. The sequencer flattens **before** requesting 2D, and requests 3D **before** growing
+  the depth back. Windows `XrSessionManager` apps call `XrSessionUpdateModeSwitch()`, a wrapper
+  over the same function.
+  - Wrong: `if (vPressed) xrRequestDisplayRenderingModeDXR(session, next);`
+  - Right: `test_apps/handle/cube_handle_metal_macos/main.mm` (search `ModeSwitch::step`);
+    zones: `test_apps/handle/cube_zones_metal_macos/main.mm` (`g_modeRamp`).
+  - Contract and wiring: displayxr-common README, *Smooth 2D↔3D transitions*.
+    `DXR_TEST_MODE_TOGGLE_S=<s>` makes the in-tree macOS cube apps toggle 3D↔2D by themselves
+    every `<s>` seconds and log each ramp frame (`ModeSwitch trace:`), so you can verify the ramp
+    without pressing keys.
+
 ---
 
 ## 3. Views — the locate-views gotcha
@@ -416,6 +436,16 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `dxr_view_config.h` (`displayxr::rules`) rather than pasting a copy.
   `activity.activeViewCount` is the runtime's own answer for how many views are
   live this frame — prefer it to deriving the number from the rendering mode.
+  Under `PRIMARY_MULTIVIEW_DXR` it can be LARGER than the mode's view count: a window
+  spanning two displays gets one view set per display (multi-screen M3, `XR_DXR_display_info`
+  v22), so `activeViewCount` is the sum and, on a system that can split a window (desktop
+  Linux with two DP-backed screens), the reported count is the device max times 2. An app that renders `[0, activeViewCount)`, each view into its own
+  subImage, is correct without knowing why. To render each display's views at that
+  display's resolution, chain `XrViewDisplayBindingsDXR` beside `XrViewActivityStateDXR`:
+  each binding names a display, its `segmentRect` (window px) and its contiguous view
+  range; render local view `j` of a binding into tile `j` at the segment's position
+  (`cube_handle_vk_linux` does exactly this). INV-3.1 and INV-3.4 already lint the rest
+  (begin multiview, submit the located count, alias the tail), so there is no separate rule.
 
   **Every leg of a multi-platform app needs its own call.** `check_displayxr_app.py` checks
   INV-3.4 per top-level platform directory (`windows/`, `macos/`, `linux/`, `android/`, …):
@@ -432,6 +462,25 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   still accepts a 1-view layer in a 1-view mode — `PRIMARY_STEREO` or `PRIMARY_MULTIVIEW_DXR`,
   #1612 — and logs it once per session). Do not build on it: the window closes once every demo
   aliases its inactive views.
+
+- **INV-3.5 (advisory) — Viewer-independent content chains `XrViewLocateFixedViewerDXR`.**
+  (`XR_DXR_display_info` v25.) Asking `xrLocateViews` for a viewer is what starts a
+  viewer-tracking provider — on a display that does not track the viewer itself, a webcam
+  tracker opens its camera on the first such locate. A video player (2D, side-by-side,
+  top-bottom), a stereo photo viewer or a flat UI renders the same picture wherever the viewer
+  is, so it should say so and get the nominal viewer's fixed views instead:
+
+  ```c
+  XrViewLocateFixedViewerDXR fixedViewer = {XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR};
+  fixedViewer.fixedViewer = contentIsViewerIndependent ? XR_TRUE : XR_FALSE;
+  locateInfo.next = &fixedViewer; // beside any XR_DXR_view_rig descriptor
+  ```
+
+  Per call, so an app that shows both kinds sets it only while the viewer-independent content
+  is on screen. Never for content rendered from a 3D scene (a model, a splat, a game):
+  look-around is the point there. Gate on the extension's spec version (`>= 25`); an older
+  runtime ignores the struct. Spec: `docs/specs/extensions/XR_DXR_display_info.md`
+  § *Fixed-viewer locates*.
 
 ---
 
@@ -480,9 +529,11 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `eyeCount = 1`, render at full window resolution, center-eye = average of the located eyes.
   The runtime accepts `viewCount == 1` only in a 2D/non-3D mode. Ref: `main.cpp:415,632-644,707-711`.
 
-- **INV-4.6 — Color space: request an sRGB swapchain.** The display panel is sRGB, and an
-  in-process native compositor is a **byte passthrough to the panel** — it does *not* color-manage
-  a linear-format swapchain. So the encoding of the bytes you store is what reaches the display.
+- **INV-4.6 — Color space: request an sRGB swapchain.** The display panel is sRGB, and the
+  runtime reads a swapchain the way OpenXR says to: an `*_SRGB` format holds **encoded** colour and
+  reaches the panel as stored; every other format "will be treated as linear values" and is
+  **sRGB-encoded** on the way to the panel (#1589). So what you store must match the format you
+  asked for.
   - **Do this — request an sRGB swapchain format:** `..._UNORM_SRGB` (D3D11/D3D12),
     `GL_SRGB8_ALPHA8` (GL), `..._SRGB` (Vulkan), `MTLPixelFormat*sRGB` (Metal). Then you are
     correct **either way you render into it**:
@@ -499,15 +550,23 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
       scratch image of the swapchain's UNORM sibling, then `vkCmdCopyImage` into the swapchain
       (a copy never converts). This is byte-exact on any runtime;
     - clear with the linearized colour (sRGB EOTF), not the display-referred one.
-  - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) is NOT color-managed** on the
-    in-process path: the compositor passes the bytes straight through with no linear→sRGB encode.
-    It's only correct if you write display-referred bytes into it; writing genuinely-linear values
-    and expecting the runtime to encode → **too bright**. ("Submit a linear-format swapchain and
-    the runtime color-manages it" is a future runtime follow-up, not current behavior.) **Subject to
-    change — see [#409](https://github.com/DisplayXR/displayxr-runtime/issues/409):** if the color
-    model lands on linear-compose ("Model B"), a linear-format swapchain *would* be honored as
-    linear (the runtime would encode at the DP boundary). This bullet describes current ("Model A")
-    behavior; the recommendation above (request an sRGB swapchain) stays correct either way.
+  - **A linear / UNORM swapchain (`R8G8B8A8_UNORM`, `GL_RGBA8`, …) holds LINEAR values** and the
+    runtime encodes it. Display-referred (already gamma-encoded) bytes stored in one are encoded a
+    **second** time → **washed out**: lifted blacks, desaturated colour (a splat demo's authored
+    `(229,182,127)` reaches the atlas as `(243,220,187)`). This is the #1589/#1610 format-honest
+    colour model, shipped per backend — D3D11 in v2.21.0, D3D12 v2.21.1, GL v2.21.2, **Vulkan
+    (`vk_native`, incl. Android) v2.21.7**, and **Metal** in the first release after v2.32.0
+    (ADR-044 §1 — the last backend that still passed UNORM bytes through). Before those
+    releases a UNORM swapchain *was* a byte passthrough, which is why an app that picked UNORM and
+    wrote display-referred bytes looked right until it met a newer runtime — including a leg that
+    lagged its siblings (an Android leg that still preferred `{R8G8B8A8_UNORM, B8G8R8A8_UNORM}`
+    after the desktop legs had moved to `_SRGB`). **Every leg of a multi-platform app must make the
+    same `_SRGB`-first choice** — route it through one shared helper rather than a per-leg
+    preference list; `scripts/check_displayxr_app.py` flags a UNORM-first preference per leg.
+  - **A/B on a runtime:** `DXR_COLOR_LEGACY_UNORM_ENCODED=1` restores the old passthrough reading
+    of UNORM (on Android: `adb shell setprop debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1`, then
+    relaunch the app). If that makes a washed-out app look right, the app is storing
+    display-referred bytes in UNORM — fix the app, the knob is a diagnostic, not a setting.
   - **Data textures (normal, AO, roughness, metalness) are ALWAYS linear — never sRGB.** Only
     albedo/color is sRGB; sample those through an `_SRGB` texture view (or decode in-shader) so
     lighting runs in linear, then write your result into the sRGB swapchain per above.
@@ -516,6 +575,9 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
     linear atlas — see the canonical reference). As an app author you don't depend on which path
     runs you: request an sRGB swapchain and write a correctly-encoded image, and both paths are
     correct.
+  - **The per-backend contract** (enumerated order, what each backend does with `_SRGB` vs UNORM
+    vs float, what the DP receives, which CTS test pins it, which rows are not CTS-covered):
+    [ADR-044](../adr/ADR-044-colour-contract-per-backend.md).
   - Reference: PRs [#407](https://github.com/DisplayXR/displayxr-runtime/pull/407) (GL) and
     [#408](https://github.com/DisplayXR/displayxr-runtime/pull/408) (D3D11/D3D12/Vulkan/Metal),
     which established the cross-API sRGB-passthrough contract, plus
@@ -577,6 +639,75 @@ re-implementing — see [INV-8.1](#8-app-folder-layout--what-to-include)).
   `viewConfigurationType` (the event is instance-level and carries no `XrSession`), and expect at
   most one event per view configuration per second — the runtime coalesces, as the spec requires.
   Advisory rule (WARN). Ref: `#1488`.
+
+- **INV-4.10 — Vulkan: keep ≥2 frames in flight, ONE `vkQueueSubmit` per frame, never wait the
+  frame you just submitted.** How you feed the GPU is part of rendering correctly into the
+  swapchain, not an optimisation, because on mobile it decides the GPU clock. The rule is
+  platform-neutral:
+  1. **≥2 frames in flight** (3 is the measured default) — a ring of command buffers + fences
+     indexed by frame slot, not one of each.
+  2. **Exactly one `vkQueueSubmit` per frame per queue.** All tiles/views of the atlas go into
+     one command buffer, ordered by a barrier between tiles — never one submit per tile or per eye
+     (with or without a wait in between).
+  3. **Never wait the fence of the frame you just submitted.** The only wait on the hot path is on
+     the slot's fence from N frames ago (normally long signalled).
+  4. **No `vkQueueWaitIdle` / `vkDeviceWaitIdle` on the steady-state frame path.**
+  5. **Command buffers are allocated once and reset** (`vkResetCommandBuffer` / a per-slot pool
+     reset) — never `vkAllocateCommandBuffers` + `vkFreeCommandBuffers` per frame.
+
+  **Why.** Mobile GPU governors pick the clock from GPU *busy %*. A loop that submits, waits, then
+  submits again leaves the GPU idle while the CPU waits, so the governor reads ~50 % busy and parks
+  the GPU at about a third of its clock — every frame is then slower, which keeps it idle. Measured
+  on Adreno 740 (`msm-adreno-tz`, ADPF hint sessions unsupported): the GPU sits near 220 MHz of
+  680, ~10 fps ([#1917](https://github.com/DisplayXR/displayxr-runtime/issues/1917); see
+  [android-build-guide § Low frame rate with an idle-looking GPU](../getting-started/android-build-guide.md#low-frame-rate-with-an-idle-looking-gpu-the-clock-never-ramps-1917)).
+  Per-frame command-buffer allocation adds a fresh zeroed allocation in the Adreno driver every
+  frame ([#1935](https://github.com/DisplayXR/displayxr-runtime/issues/1935) /
+  [#1936](https://github.com/DisplayXR/displayxr-runtime/pull/1936) — the runtime's own `vk_native`
+  compositor was fixed the same way). On a desktop dGPU the same mistake costs only the lost
+  CPU↔GPU overlap, which is why it survives desktop testing.
+
+  **Evidence.** `displayxr-demo-modelviewer` on the Leia phone went **13 → 30 fps** by keeping 3
+  frames in flight with one submit per frame and nothing else changed
+  ([modelviewer#170](https://github.com/DisplayXR/displayxr-demo-modelviewer/pull/170)).
+
+  **Sanctioned pattern — `dxr::VkFrameRing`** (displayxr-common `common/vk_frame_ring.h`,
+  ≥ v2.28.0, header-only; [displayxr-common#74](https://github.com/DisplayXR/displayxr-common/pull/74)):
+  ```cpp
+  dxr::VkFrameRing ring;                       // init(device, physDevice, queue, family, cfg) once
+  // per frame:
+  xrWaitFrame / xrBeginFrame / xrLocateViews
+  xrAcquireSwapchainImage + xrWaitSwapchainImage
+  VkCommandBuffer cmd = ring.beginFrame();     // waits only the slot from N frames ago
+  for (uint32_t i = 0; i < viewCount; ++i) {
+      if (i > 0) dxr::VkFrameRing::tileBarrier(cmd);   // shared targets between tiles
+      // ... record tile i into its atlas sub-rect (per-slot UBO via ring.viewUbo(i, &dynOff)) ...
+  }
+  ring.endFrame();                             // the ONE vkQueueSubmit; never waits
+  xrReleaseSwapchainImage                      // AFTER endFrame: the runtime composes on the same queue
+  xrEndFrame
+  ```
+  **Allowed exceptions:** genuine one-off uploads (textures, meshes, a static quad-layer fill) go
+  through `ring.submitImmediate()` — the one named blocking escape hatch; resize and teardown drain
+  with `ring.waitAll()`; a resource the GPU may still be reading is released with
+  `ring.deferDestroy()`. `DXR_VK_FRAMES_IN_FLIGHT=1` reproduces the anti-pattern for an A/B
+  (desktop only — Android processes pass `Config::framesInFlight` explicitly).
+
+  **Lint (WARN, advisory).** `scripts/check_displayxr_app.py` finds the enclosing function of every
+  `vkQueueSubmit` in a `.c/.cc/.cpp/.cxx/.mm` source by brace matching (falling back to a ±60-line
+  window when no function body can be delimited) and judges it only if it is on the **frame path**
+  — it records a draw / render pass / dispatch, calls `xrWaitFrame`/`xrBeginFrame`/`xrEndFrame`, or
+  is named `*render*` (not `*Renderer*`) / `*draw*` / `*frame*` / `*present*`. Any other function is
+  treated as a one-off upload and left alone. In a frame-path function it flags: (a)
+  `vkQueueWaitIdle`/`vkDeviceWaitIdle` anywhere in the body; (b) `vkWaitForFences` *after* the
+  submit on the same handle passed as its fence; (c) `vkAllocateCommandBuffers` **and**
+  `vkFreeCommandBuffers` both in the body. As INFO only, (d) one un-indexed fence waited at the top
+  of the function and signalled by its submit (at most one frame in flight — a fence reached through
+  a slot pointer looks the same to a text matcher). A deliberate blocking submit (a capture
+  readback tool, a single-shot test) is exempted with `// dxr-lint: allow-blocking-submit <reason>`
+  on the submit line or on the function's signature line. It does not see a per-frame drain hidden
+  behind a helper call in another function, and does not count submits per frame. Ref: `#1917`,
+  `#1935`, `modelviewer#170`, `displayxr-common#74`.
 
 ---
 
@@ -684,7 +815,10 @@ its own content by definition, so there is no full-window backer. Reference apps
   build your own asymmetric off-axis frustum. The plane itself is
   `XrViewDisplayRawDXR::displayPlanePose`, reported in the locate space: compose it in when you draw
   something you located in that space through a RAW view (`cube_handle_d3d11_win` rebases its
-  grip / joint markers this way). Ref: `XR_DXR_display_info.md:976-989`.
+  grip / joint markers this way). RAW `XrView.pose` needs a session that binds its own window (or a
+  bridge relay); a hosted session without a window binding gets render-ready poses and reads the
+  tracked eyes from `XrViewDisplayRawDXR` on `XrViewState::next` instead (ADR-024 Amendment 1,
+  item 3). Ref: `XR_DXR_display_info.md:976-989`.
 
 - **INV-6.2 — Without the extension (legacy/RENDER_READY), the runtime returns converged poses +
   FOV; you still build the matrix from `XrFovf`** (the runtime never returns a matrix).
@@ -886,6 +1020,19 @@ launcher. The bare runtime ignores manifests — discovery is the workspace laye
   there is no cross-API intermediary. Authoritative: `docs/architecture/multi-compositor.md`; live
   code `src/xrt/compositor/d3d11_service/comp_d3d11_service.cpp` (`multi_compositor_render`).
 
+- **INV-10.4 — Never expose desktop control through your MCP tools.** `XR_DXR_desktop_control`
+  runs in your process under a grant the OS (or DisplayXR's own prompt, on Windows) gave to
+  **your app**, by name. Your app's MCP tools (`XR_DXR_mcp_tools`) are served on an endpoint that
+  **any local process** of the same user can call, unauthenticated. A tool whose handler lists
+  windows, reads UI text, types, clicks or moves windows hands your grant to every program on the
+  machine — exactly the hole ADR-056 D2 closes. MCP stays **inbound**: agents operate *your app*;
+  only your app's own agent (in your process) operates the desktop. The runtime itself exposes no
+  desktop-control MCP tools either. If a future case needs it, it requires per-client
+  authorisation in the MCP framework first, and its own ADR (ADR-056 D4). The linter flags an
+  app that uses both APIs (WARN); after checking that no tool handler reaches an
+  `xr*Desktop*DXR` call, exempt it with `// dxr-lint: allow-mcp-desktop <reason>`.
+  Spec: `docs/specs/extensions/XR_DXR_desktop_control.md`.
+
 ---
 
 ## 11. Android — pixel-exactness rules
@@ -1047,12 +1194,15 @@ macOS app (no manifest → no Android findings).
 - [ ] View configuration chosen at startup: N-view app begins `PRIMARY_MULTIVIEW_DXR` (when enumerated), stereo-fixed app stays on `PRIMARY_STEREO`; `xrLocateViews` into an 8-wide buffer; **render** `eyeCount` from the active mode, not 2 (INV-3.1)
 - [ ] Projection layer **submits the LOCATED count**, with the inactive tail aliased via `DxrAliasInactiveViews()` — including every 3D zone layer (INV-3.4)
 - [ ] App swapchain sized once to worst-case atlas (INV-4.2); per-tile = window/canvas × scaleXY, never display (INV-4.3)
-- [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); linear/UNORM swapchain is not color-managed; data textures always linear (INV-4.6)
+- [ ] Color space: request an **sRGB swapchain** and write a correctly-encoded image (linear render + GPU sRGB-write, or display-referred bytes — not both); a linear/UNORM swapchain is read as LINEAR and encoded by the runtime (display-referred bytes in it wash out); same `_SRGB`-first choice on every leg; data textures always linear (INV-4.6)
 - [ ] Whole declared `imageRect` is written — partial-tile renders clear the full tile to `(0,0,0,0)` first (or shrink the rect); no undefined pixels reach the atlas, esp. transparent-bg (INV-4.7)
 - [ ] (if `XR_EXT_view_configuration_views_change` is enabled) the handler re-enumerates and **moves `subImage.imageRect`** — no `xrCreateSwapchain` from the event; filters on `systemId` **and** `viewConfigurationType` (INV-4.9)
+- [ ] (Vulkan) ≥2 frames in flight, ONE `vkQueueSubmit` per frame, no wait on the frame just submitted, no `vkQueueWaitIdle`/`vkDeviceWaitIdle` on the frame path, command buffers allocated once — `dxr::VkFrameRing` (INV-4.10)
 - [ ] (texture) regions declared via display-zones — 3D zones + Local2D zones, not output-rect/surround (INV-5.1/5.3)
 - [ ] (texture) shared surface sized once to worst-case; full composite presented (INV-5.2)
+- [ ] (video / stereo-photo / flat content) `XrViewLocateFixedViewerDXR` chained on the locate while it is on screen, so no viewer tracker starts for it (INV-3.5)
 - [ ] Window-relative Kooima; matrices transposed for DirectX (INV-6.3/6.4)
+- [ ] (agent apps) no MCP tool handler reaches an `xr*Desktop*DXR` call — desktop control is never re-exported (INV-10.4)
 - [ ] Capture via `xrCaptureAtlasDXR`, prefix without extension, mono-guarded; no app-side readback (INV-7.1/7.2/7.3)
 - [ ] Full mip chain + trilinear on every backend (INV-7.5)
 - [ ] Loader DLL shipped next to exe; no compiled-in runtime path (INV-8.2)

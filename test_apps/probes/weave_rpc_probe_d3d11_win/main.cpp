@@ -55,6 +55,18 @@
  * Closing the probe must destroy only its own DP: the panel keeps its mode and
  * the split does not change.
  *
+ * ── Spec v19 per-screen parts (#1884, ADR-047 Amendment 4) ──────────────────
+ *
+ * On a runtime reporting spec >= 19 the probe chains XrWeaveOutputRectPartsDXR
+ * on every submit and logs, on every geometry change (the struct's
+ * `generation`), how the service split the window: each screen segment
+ * (display id, window rect, woven or flat, its eyes) and each part of the
+ * weave rect. Run with `--rect=full` on a two-panel box and drag the window
+ * across the seam: the log must go from `segments=0` (one panel) to
+ * `segments=2` with two parts whose eyes differ (each panel's own tracker),
+ * and back. The probe itself still renders ONE eye pair (the base eyes) —
+ * it proves the runtime half; rendering per part is the browser's job.
+ *
  * ── Spec v8 per-region hardware wish (browser#88) ────────────────────────────
  *
  * Two flags drive the two ways to declare a region PHYSICALLY FLAT, so the wish
@@ -78,6 +90,26 @@
  * the panel, to 2D. The per-REGION half is observable on a DP reporting a real
  * cell grid; sim_display simulates one via SIM_DISPLAY_ZONE_GRID +
  * SIM_DISPLAY_ZONE_DUMP, which logs the resolved cell map.
+ *
+ * ── XR_DXR_cursor_depth v8: the web cursor, browser-free (ADR-046 Amendment 4) ─
+ *
+ *   --cursor-depth[=PX]   chain XrCursorDepthWeaveRequestDXR on every submit with
+ *                         ONE rect entry (rect 0): a SYNTHETIC page disparity of
+ *                         PX device pixels (default -24: in front of the glass),
+ *                         and read XrCursorDepthWeaveStateDXR back. The OS cursor
+ *                         is hidden exactly while the runtime reports it drew and
+ *                         the pointer is inside drawnBounds - the browser's rule.
+ *   --cursor-sprite=K     hcursor (default: the IDC_HAND HCURSOR, as the browser
+ *                         passes `pointer`), texture (a 32x32 shared NT texture:
+ *                         a green ring), default (the runtime's look), none
+ *                         (CSS cursor:none - nothing drawn), or cycle (all four,
+ *                         3 s each, a new generation per switch).
+ *   --cursor-content=off  hasContent = XR_FALSE (the cursor stays the OS one).
+ *   --cursor-sweep        the disparity ramps -48 px -> +16 px -> -48 px over 6 s,
+ *                         exercising rise, sink, the hand-back and "never behind".
+ *
+ * Needs runtime spec >= 8. Watch the service log's "[weave cursor]" lines (one
+ * per outcome change) and this probe's "cursor v8:" lines (one per state change).
  */
 
 #include "xr_session.h"
@@ -86,8 +118,13 @@
 #include <d3d11_4.h>
 #include <dxgi1_3.h>
 #include <dcomp.h>
+#include <d2d1_1.h>
+#include <dwrite.h>
 #include <wrl/client.h>
 
+#include <wincodec.h> // --lift: load the still
+
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib> // atoi — --flat-band / --screen-flat parsing
@@ -98,12 +135,38 @@
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
 
 using Microsoft::WRL::ComPtr;
 
 // ---- Layout constants -------------------------------------------------------
-static const uint32_t kWinW = 1280;
+static const uint32_t kWinW = 1280; //!< default; --size=WxH overrides (g_winW/H)
 static const uint32_t kWinH = 720;
+static uint32_t g_winW = kWinW;
+static uint32_t g_winH = kWinH;
+
+// ---- 2D-under-the-lens test layer (ADR-027 Amendment) ------------------------
+// --overlay=bar (default, the original magenta bar) | none | page | page-anim.
+// `page` paints a whole-window flat PAGE as the v4 overlay — white background,
+// body text (DirectWrite, GRAYSCALE AA, as the weaver requires), a semi-
+// transparent pill, a label over the 3D — with an alpha-0 HOLE where the woven
+// element shows through: the shape the browser sends for "whole page as
+// overlay". `page-anim` repaints it every frame with the text scrolling, the
+// worst case for any per-layer-update cost. Page modes default the weave rect
+// to the centred HALF of the window (not 640x360) unless --rect is given.
+enum OverlayMode
+{
+	OVERLAY_BAR = 0,
+	OVERLAY_NONE,
+	OVERLAY_PAGE,
+	OVERLAY_PAGE_ANIM,
+};
+static OverlayMode g_overlayMode = OVERLAY_BAR;
+//! --filter-strength=X (XR_DXR_weave v15): chain XrWeaveSubmitOverlayFilterDXR with
+//! this lens-filter strength on every overlay submit; negative = omit (DP default).
+static float g_filterStrength = -1.0f;
+static uint32_t g_pageFrame = 0;
 static const uint32_t kRectW = 640; //!< weaved sub-rect (per-view = kRectW)
 static const uint32_t kRectH = 360;
 
@@ -174,13 +237,140 @@ static ComPtr<ID3D11RenderTargetView> g_overlayRtv;
 static ComPtr<IDXGIKeyedMutex> g_overlayMutex;
 static HANDLE g_overlayHandle = nullptr; //!< NT handle chained on XrWeaveSubmitOverlaysDXR
 static uint32_t g_overlayW = 0, g_overlayH = 0;
+static ComPtr<ID2D1Bitmap1> g_d2dTarget; //!< D2D view of the overlay (page modes)
 
 // Weaved output handback (opened from the runtime's exported handles).
 static ComPtr<ID3D11Texture2D> g_weavedTex;
 static ComPtr<ID3D11Fence> g_weaveFence;
 static uint32_t g_weavedW = 0, g_weavedH = 0;
 
+// ---- --lift: a real still, lifted by the runtime (XR_DXR_lift) ----------------
+// `--lift[=path]` (or DXR_WEAVE_LIFT_IMAGE=path, which may contain spaces) draws
+// a 2D still into the weave rect and flags the rect as LIFTED: the runtime
+// converts it and weaves the views. `--lift-cursor` also chains
+// XrCursorDepthLiftRectDXR (XR_DXR_cursor_depth v6, ADR-046 Amendment 1): the
+// runtime draws the depth-aware cursor into the lifted views, and this probe
+// hides its OS cursor over the rect only on frames the runtime reports it drew.
+static bool g_lift = false;
+static bool g_liftCursor = false;
+static std::wstring g_liftPath;
+static XrLiftStreamDXR g_liftStream = XR_NULL_HANDLE;
+static ComPtr<IWICBitmapSource> g_liftImage; //!< decoded once, rescaled per rect size
+static ComPtr<ID3D11Texture2D> g_liftTex;    //!< the still at the current rect size
+static uint32_t g_liftTexW = 0, g_liftTexH = 0;
+static volatile bool g_liftCursorDrawn = false; //!< last submit: the runtime drew the cursor
+// ---- --cursor-depth: XR_DXR_cursor_depth v8 (ADR-046 Amendment 4) ----------------
+enum CursorSpriteMode
+{
+	CURSOR_SPRITE_HCURSOR = 0,
+	CURSOR_SPRITE_TEXTURE,
+	CURSOR_SPRITE_DEFAULT,
+	CURSOR_SPRITE_NONE,
+	CURSOR_SPRITE_CYCLE,
+};
+static bool g_cursorDepth = false;
+static float g_cursorDepthPx = -24.0f;
+static bool g_cursorContent = true;
+static bool g_cursorSweep = false;
+static CursorSpriteMode g_cursorSprite = CURSOR_SPRITE_HCURSOR;
+static volatile bool g_weaveCursorDrawn = false; //!< last state: drawn (mask != 0)
+static RECT g_weaveCursorBounds = {};            //!< last state's drawnBounds, client px
+static ComPtr<ID3D11Texture2D> g_cursorTex;     //!< --cursor-sprite=texture carrier
+static HANDLE g_cursorTexHandle = nullptr;
+static RECT g_liftRect = {};                    //!< the lifted rect, client pixels
+
+//! Decode the still once (WIC), as 32bpp RGBA.
+static bool
+LoadLiftImage()
+{
+	ComPtr<IWICImagingFactory> wic;
+	if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) {
+		LOG_ERROR("--lift: WIC unavailable");
+		return false;
+	}
+	ComPtr<IWICBitmapDecoder> dec;
+	ComPtr<IWICBitmapFrameDecode> frame;
+	ComPtr<IWICFormatConverter> conv;
+	if (FAILED(wic->CreateDecoderFromFilename(g_liftPath.c_str(), nullptr, GENERIC_READ,
+	                                          WICDecodeMetadataCacheOnDemand, &dec)) ||
+	    FAILED(dec->GetFrame(0, &frame)) || FAILED(wic->CreateFormatConverter(&conv)) ||
+	    FAILED(conv->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0,
+	                            WICBitmapPaletteTypeCustom))) {
+		LOG_ERROR("--lift: cannot decode '%ls'", g_liftPath.c_str());
+		return false;
+	}
+	// Keep the factory alive through the converter's lifetime.
+	g_liftImage = conv;
+	wic.Detach();
+	UINT w = 0, h = 0;
+	g_liftImage->GetSize(&w, &h);
+	LOG_INFO("--lift: still '%ls' %ux%u", g_liftPath.c_str(), w, h);
+	return true;
+}
+
+//! The still stretched to @p w x @p h, as an RGBA8 texture (rebuilt on resize).
+static bool
+EnsureLiftTexture(uint32_t w, uint32_t h)
+{
+	if (g_liftTex && g_liftTexW == w && g_liftTexH == h) {
+		return true;
+	}
+	g_liftTex.Reset();
+	ComPtr<IWICImagingFactory> wic;
+	ComPtr<IWICBitmapScaler> scaler;
+	if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) ||
+	    FAILED(wic->CreateBitmapScaler(&scaler)) ||
+	    FAILED(scaler->Initialize(g_liftImage.Get(), w, h, WICBitmapInterpolationModeFant))) {
+		return false;
+	}
+	std::vector<uint8_t> px((size_t)w * h * 4);
+	if (FAILED(scaler->CopyPixels(nullptr, w * 4, (UINT)px.size(), px.data()))) {
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w;
+	td.Height = h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_IMMUTABLE;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init = {px.data(), w * 4, 0};
+	if (FAILED(g_device->CreateTexture2D(&td, &init, &g_liftTex))) {
+		return false;
+	}
+	g_liftTexW = w;
+	g_liftTexH = h;
+	return true;
+}
+
+//! Batch layout, lifted: the WHOLE rect holds the 2D frame (not squeezed SBS);
+//! the rest of the window-sized input is a transparent gap.
+static void
+RenderLiftStill(int32_t rx, int32_t ry, int32_t rw, int32_t rh)
+{
+	if (!g_sbsRtv || !g_sbsMutex || rw <= 0 || rh <= 0 || !EnsureLiftTexture((uint32_t)rw, (uint32_t)rh)) {
+		return;
+	}
+	if (g_sbsMutex->AcquireSync(0, 1000) != S_OK) {
+		return;
+	}
+	const float gap[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+	g_context->ClearView(g_sbsRtv.Get(), gap, nullptr, 0);
+	D3D11_BOX box = {0, 0, 0, (UINT)rw, (UINT)rh, 1};
+	g_context->CopySubresourceRegion(g_sbsTex.Get(), 0, (UINT)rx, (UINT)ry, 0, g_liftTex.Get(), 0, &box);
+	g_context->Flush();
+	g_sbsMutex->ReleaseSync(0);
+}
+
 // ---- Win32 window -----------------------------------------------------------
+// The class is registered with RegisterClassExW, so this is a UNICODE window and
+// every Win32 call that touches its messages must be the explicit W variant: this
+// file does not define UNICODE, so bare DefWindowProc is DefWindowProcA, which
+// reads WM_NCCREATE's UTF-16 title as ANSI and stores the one-char title "D". The
+// service names a slotted client after its window title, so every per-client log
+// line then said 'D' instead of the app (#2101).
 static LRESULT CALLBACK
 WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -197,7 +387,27 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			g_quit = true;
 		}
 		return 0;
-	default: return DefWindowProc(hwnd, msg, wParam, lParam);
+	case WM_SETCURSOR:
+		// --cursor-depth (v8): hide the OS cursor exactly while the runtime reports
+		// it drew AND the pointer is inside the drawn bounds - the browser's rule.
+		if (g_cursorDepth && LOWORD(lParam) == HTCLIENT && g_weaveCursorDrawn) {
+			POINT pt;
+			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && PtInRect(&g_weaveCursorBounds, pt)) {
+				SetCursor(nullptr);
+				return TRUE;
+			}
+		}
+		// --lift-cursor: the runtime draws the cursor into the lifted views; hide
+		// the OS one over the rect only while it reports it did (else keep it).
+		if (g_liftCursor && LOWORD(lParam) == HTCLIENT && g_liftCursorDrawn) {
+			POINT pt;
+			if (GetCursorPos(&pt) && ScreenToClient(hwnd, &pt) && PtInRect(&g_liftRect, pt)) {
+				SetCursor(nullptr);
+				return TRUE;
+			}
+		}
+		return DefWindowProcW(hwnd, msg, wParam, lParam);
+	default: return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
 }
 
@@ -211,7 +421,7 @@ CreateAppWindow(HINSTANCE hInst)
 	wc.lpszClassName = L"DXRWeaveRpcProbe";
 	RegisterClassExW(&wc);
 
-	RECT r = {0, 0, (LONG)kWinW, (LONG)kWinH};
+	RECT r = {0, 0, (LONG)g_winW, (LONG)g_winH};
 	AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, WS_EX_NOREDIRECTIONBITMAP);
 	// WS_EX_NOREDIRECTIONBITMAP: required for a DComp-presented (alpha) window.
 	g_hwnd = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, wc.lpszClassName, L"DisplayXR Weave RPC Probe (#625)",
@@ -368,6 +578,60 @@ EnsureSbsTexture(uint32_t w, uint32_t h)
 // composites it "over" the woven output, so the bar should read as crisp 2D at
 // screen depth — no interlace, and NO parallax when the head moves (unlike the
 // woven squares). Painted once per (re)size; the service re-composites each frame.
+//! --cursor-sprite=texture: a 32x32 premultiplied RGBA8 green ring with a dark
+//! outline, hotspot at its centre, as a shared NT texture (no keyed mutex).
+static bool
+EnsureCursorTexture()
+{
+	if (g_cursorTex) {
+		return true;
+	}
+	const uint32_t n = 32;
+	std::vector<uint32_t> px(n * n, 0u);
+	for (uint32_t y = 0; y < n; y++) {
+		for (uint32_t x = 0; x < n; x++) {
+			const float dx = (float)x + 0.5f - 16.0f, dy = (float)y + 0.5f - 16.0f;
+			const float r = sqrtf(dx * dx + dy * dy);
+			// R8G8B8A8, little-endian 0xAABBGGRR, premultiplied.
+			if (r >= 9.0f && r < 13.0f) {
+				px[y * n + x] = 0xFF30E030u; // green ring
+			} else if ((r >= 7.5f && r < 9.0f) || (r >= 13.0f && r < 14.5f)) {
+				px[y * n + x] = 0xFF101010u; // outline
+			}
+		}
+	}
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = n;
+	td.Height = n;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+	D3D11_SUBRESOURCE_DATA init = {};
+	init.pSysMem = px.data();
+	init.SysMemPitch = n * 4;
+	HRESULT hr = g_device->CreateTexture2D(&td, &init, &g_cursorTex);
+	ComPtr<IDXGIResource1> res;
+	if (SUCCEEDED(hr)) {
+		hr = g_cursorTex.As(&res);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = res->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+		                             &g_cursorTexHandle);
+	}
+	if (FAILED(hr)) {
+		LOG_ERROR("--cursor-sprite=texture: shared texture create failed: 0x%08lx", hr);
+		g_cursorTex.Reset();
+		g_cursorTexHandle = nullptr;
+		return false;
+	}
+	g_context->Flush();
+	return true;
+}
+
 static bool
 EnsureOverlayTexture(uint32_t w, uint32_t h)
 {
@@ -390,7 +654,10 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 	td.Height = h;
 	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // premultiplied alpha
+	// Premultiplied alpha. Page modes use BGRA (what Direct2D and the browser
+	// produce); the original bar keeps RGBA.
+	const bool page = (g_overlayMode == OVERLAY_PAGE || g_overlayMode == OVERLAY_PAGE_ANIM);
+	td.Format = page ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -415,6 +682,15 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 		return false;
 	}
 
+	if (page) {
+		g_d2dTarget.Reset(); // re-bound to the new texture by PaintPageOverlay
+		g_overlayW = w;
+		g_overlayH = h;
+		LOG_INFO("v4 overlay atlas ready (%ux%u, NT handle=%p) — whole-window PAGE (%s)", w, h, g_overlayHandle,
+		         g_overlayMode == OVERLAY_PAGE_ANIM ? "repainted + scrolled every frame" : "static");
+		return true;
+	}
+
 	// Paint once: transparent everywhere, one opaque magenta bar near the top.
 	if (g_overlayMutex->AcquireSync(0, 1000) != S_OK) {
 		LOG_ERROR("overlay AcquireSync failed");
@@ -431,6 +707,164 @@ EnsureOverlayTexture(uint32_t w, uint32_t h)
 	g_overlayW = w;
 	g_overlayH = h;
 	LOG_INFO("v4 overlay atlas ready (%ux%u, NT handle=%p) — magenta 2D bar", w, h, g_overlayHandle);
+	return true;
+}
+
+// ---- Whole-window PAGE overlay (Direct2D/DirectWrite on the shared texture) ---
+static ComPtr<ID2D1Factory1> g_d2dFactory;
+static ComPtr<ID2D1Device> g_d2dDevice;
+static ComPtr<ID2D1DeviceContext> g_d2dCtx;
+static ComPtr<IDWriteFactory> g_dwFactory;
+static ComPtr<IDWriteTextFormat> g_dwBody;
+static ComPtr<IDWriteTextFormat> g_dwLabel;
+
+static bool
+EnsureD2D()
+{
+	if (g_d2dCtx) {
+		return true;
+	}
+	if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), nullptr,
+	                             reinterpret_cast<void **>(g_d2dFactory.GetAddressOf())))) {
+		LOG_ERROR("D2D1CreateFactory failed");
+		return false;
+	}
+	ComPtr<IDXGIDevice> dxgiDev;
+	if (FAILED(g_device.As(&dxgiDev)) || FAILED(g_d2dFactory->CreateDevice(dxgiDev.Get(), &g_d2dDevice)) ||
+	    FAILED(g_d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_d2dCtx))) {
+		LOG_ERROR("Direct2D device on the session D3D11 device failed (needs BGRA support)");
+		return false;
+	}
+	if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+	                               reinterpret_cast<IUnknown **>(g_dwFactory.GetAddressOf())))) {
+		LOG_ERROR("DWriteCreateFactory failed");
+		return false;
+	}
+	// Grayscale AA: the weaver contract (ClearType's per-channel coverage cannot
+	// be expressed in one alpha, and the lens rearranges the subpixels anyway).
+	g_d2dCtx->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+	return true;
+}
+
+//! Text through an IDWriteTextLayout + DrawTextLayout (sidesteps the winuser.h
+//! DrawText -> DrawTextW macro, which renames ID2D1RenderTarget::DrawText).
+static void
+DrawStr(const wchar_t *str, IDWriteTextFormat *fmt, const D2D1_RECT_F &r, ID2D1Brush *brush)
+{
+	ComPtr<IDWriteTextLayout> layout;
+	if (SUCCEEDED(g_dwFactory->CreateTextLayout(str, (UINT32)wcslen(str), fmt, r.right - r.left, r.bottom - r.top,
+	                                             &layout))) {
+		g_d2dCtx->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.Get(), brush);
+	}
+}
+
+//! Paint the page into the shared overlay (producer side of the keyed mutex).
+//! Hole = the woven element's window rect, left alpha 0 so the 3D shows through.
+static bool
+PaintPageOverlay(uint32_t w, uint32_t h, int32_t hx, int32_t hy, int32_t hw, int32_t hh, float scroll)
+{
+	if (!EnsureD2D()) {
+		return false;
+	}
+	if (!g_d2dTarget) {
+		ComPtr<IDXGISurface> surf;
+		D2D1_BITMAP_PROPERTIES1 bp = D2D1::BitmapProperties1(
+		    D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+		    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+		if (FAILED(g_overlayTex.As(&surf)) || FAILED(g_d2dCtx->CreateBitmapFromDxgiSurface(surf.Get(), &bp,
+		                                                                                     &g_d2dTarget))) {
+			LOG_ERROR("CreateBitmapFromDxgiSurface on the overlay failed");
+			return false;
+		}
+		const float bodyPx = (float)h / 54.0f; // ~40 px at 2160, ~13 px at 720
+		g_dwBody.Reset();
+		g_dwLabel.Reset();
+		g_dwFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+		                              DWRITE_FONT_STRETCH_NORMAL, bodyPx, L"en-us", &g_dwBody);
+		g_dwFactory->CreateTextFormat(L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+		                              DWRITE_FONT_STRETCH_NORMAL, bodyPx * 1.2f, L"en-us", &g_dwLabel);
+	}
+	if (g_overlayMutex->AcquireSync(0, 1000) != S_OK) {
+		return false;
+	}
+	g_d2dCtx->SetTarget(g_d2dTarget.Get());
+	g_d2dCtx->BeginDraw();
+	g_d2dCtx->Clear(D2D1::ColorF(0.98f, 0.98f, 0.97f, 1.0f)); // opaque page
+
+	ComPtr<ID2D1SolidColorBrush> ink, pill, pillInk, labelBg;
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.08f, 0.08f, 0.10f, 1.0f), &ink);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.35f, 0.90f, 0.55f), &pill); // semi-transparent
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &pillInk);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.45f), &labelBg);
+
+	static const wchar_t *kLine =
+	    L"The quick brown fox jumps over the lazy dog 0123456789 \u2014 thin strokes, serifs and dots "
+	    L"alias through a lens unless the weaver band-limits them for each eye. ";
+	const float lineH = (float)h / 36.0f;
+	const float period = lineH * 40.0f;
+	float off = scroll - floorf(scroll / period) * period;
+	for (float y = -off; y < (float)h; y += lineH) {
+		D2D1_RECT_F lr = D2D1::RectF((float)w * 0.24f, y, (float)w * 0.79f, y + lineH);
+		DrawStr(kLine, g_dwBody.Get(), lr, ink.Get());
+	}
+
+	// Hardest case: LIGHT text on a dark panel (left column), scrolled with the page.
+	ComPtr<ID2D1SolidColorBrush> dark, lightInk, rule;
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.10f, 0.10f, 0.12f, 1.0f), &dark);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.95f, 0.95f, 0.92f, 1.0f), &lightInk);
+	g_d2dCtx->CreateSolidColorBrush(D2D1::ColorF(0.25f, 0.25f, 0.25f, 1.0f), &rule);
+	const D2D1_RECT_F darkCol = D2D1::RectF(0.0f, 0.0f, (float)w * 0.22f, (float)h);
+	g_d2dCtx->FillRectangle(darkCol, dark.Get());
+	static const wchar_t *kLight = L"Light on dark: 1 l I | i j ; . , the hardest case";
+	for (float y = -off; y < (float)h; y += lineH) {
+		DrawStr(kLight, g_dwBody.Get(), D2D1::RectF((float)w * 0.01f, y, darkCol.right, y + lineH), lightInk.Get());
+	}
+
+	// Horizontal rules (1, 2 and 3 px, as underlines / borders) on the right
+	// column: they must read as even grey, with no coloured dots, through the lens.
+	g_d2dCtx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+	g_d2dCtx->FillRectangle(D2D1::RectF((float)w * 0.80f, 0.0f, (float)w, (float)h),
+	                        pillInk.Get()); // white field behind the rules
+	int k = 0;
+	for (float y = lineH * 0.5f - off; y < (float)h; y += lineH * 0.75f, k++) {
+		const float t = (float)(1 + (k % 3)); // 1, 2, 3 px
+		const float yy = floorf(y);
+		g_d2dCtx->FillRectangle(D2D1::RectF((float)w * 0.81f, yy, (float)w * 0.99f, yy + t), rule.Get());
+	}
+	g_d2dCtx->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+
+	// Semi-transparent pill straddling the hole's top edge (2D over 3D AND over page).
+	D2D1_ROUNDED_RECT pr = {D2D1::RectF((float)hx + hw * 0.30f, (float)hy - lineH, (float)hx + hw * 0.70f,
+	                                    (float)hy + lineH),
+	                        lineH, lineH};
+	// The HOLE: alpha 0 where the woven element shows through. Clear honours the clip.
+	g_d2dCtx->PushAxisAlignedClip(D2D1::RectF((float)hx, (float)hy, (float)(hx + hw), (float)(hy + hh)),
+	                              D2D1_ANTIALIAS_MODE_ALIASED);
+	g_d2dCtx->Clear(D2D1::ColorF(0, 0, 0, 0));
+	g_d2dCtx->PopAxisAlignedClip();
+	g_d2dCtx->FillRoundedRectangle(pr, pill.Get());
+	static const wchar_t *kPill = L"translucent pill";
+	DrawStr(kPill, g_dwBody.Get(),
+	        D2D1::RectF(pr.rect.left + lineH, pr.rect.top + lineH * 0.4f, pr.rect.right, pr.rect.bottom),
+	        pillInk.Get());
+
+	// A label OVER the 3D (inside the hole), on a translucent plate.
+	D2D1_RECT_F lb = D2D1::RectF((float)hx + hw * 0.05f, (float)hy + hh - lineH * 2.4f, (float)hx + hw * 0.60f,
+	                             (float)hy + hh - lineH * 0.6f);
+	g_d2dCtx->FillRectangle(lb, labelBg.Get());
+	static const wchar_t *kLabel = L"Label over 3D \u2014 should read flat and crisp";
+	DrawStr(kLabel, g_dwLabel.Get(),
+	        D2D1::RectF(lb.left + lineH * 0.5f, lb.top + lineH * 0.2f, lb.right, lb.bottom),
+	        pillInk.Get());
+
+	HRESULT hr = g_d2dCtx->EndDraw();
+	g_d2dCtx->SetTarget(nullptr);
+	g_context->Flush();
+	g_overlayMutex->ReleaseSync(0);
+	if (FAILED(hr)) {
+		LOG_ERROR("D2D EndDraw failed: 0x%08lx", hr);
+		return false;
+	}
 	return true;
 }
 
@@ -811,6 +1245,66 @@ ParseOptions(PWSTR cmdLineW)
 				ApplyFlatBand(tok + 12);
 			} else if (_strnicmp(tok, "--screen-flat=", 14) == 0) {
 				ApplyScreenFlat(tok + 14);
+			} else if (_strnicmp(tok, "--overlay=", 10) == 0) {
+				const char *v = tok + 10;
+				if (_stricmp(v, "none") == 0) {
+					g_overlayMode = OVERLAY_NONE;
+				} else if (_stricmp(v, "page") == 0) {
+					g_overlayMode = OVERLAY_PAGE;
+				} else if (_stricmp(v, "page-anim") == 0) {
+					g_overlayMode = OVERLAY_PAGE_ANIM;
+				} else if (_stricmp(v, "bar") == 0) {
+					g_overlayMode = OVERLAY_BAR;
+				} else {
+					LOG_ERROR("--overlay: bad value '%s' (want bar|none|page|page-anim) — ignored", v);
+				}
+			} else if (_strnicmp(tok, "--filter-strength=", 18) == 0) {
+				g_filterStrength = (float)atof(tok + 18);
+			} else if (_strnicmp(tok, "--size=", 7) == 0) {
+				unsigned sw = 0, sh = 0;
+				if (sscanf_s(tok + 7, "%ux%u", &sw, &sh) == 2 && sw >= 64 && sh >= 64 && sw <= 8192 && sh <= 8192) {
+					g_winW = sw;
+					g_winH = sh;
+				} else {
+					LOG_ERROR("--size: bad value '%s' (want WxH) — ignored", tok + 7);
+				}
+			} else if (_stricmp(tok, "--lift") == 0 || _strnicmp(tok, "--lift=", 7) == 0) {
+				g_lift = true;
+				if (tok[6] == '=') {
+					wchar_t wp[MAX_PATH] = {0};
+					MultiByteToWideChar(CP_UTF8, 0, tok + 7, -1, wp, MAX_PATH);
+					g_liftPath = wp;
+				}
+			} else if (_stricmp(tok, "--lift-cursor") == 0) {
+				g_lift = true;
+				g_liftCursor = true;
+			} else if (_stricmp(tok, "--cursor-depth") == 0 || _strnicmp(tok, "--cursor-depth=", 15) == 0) {
+				g_cursorDepth = true;
+				if (tok[14] == '=') {
+					g_cursorDepthPx = (float)atof(tok + 15);
+				}
+			} else if (_strnicmp(tok, "--cursor-sprite=", 16) == 0) {
+				g_cursorDepth = true;
+				const char *v = tok + 16;
+				if (_stricmp(v, "hcursor") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_HCURSOR;
+				} else if (_stricmp(v, "texture") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_TEXTURE;
+				} else if (_stricmp(v, "default") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_DEFAULT;
+				} else if (_stricmp(v, "none") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_NONE;
+				} else if (_stricmp(v, "cycle") == 0) {
+					g_cursorSprite = CURSOR_SPRITE_CYCLE;
+				} else {
+					LOG_ERROR("--cursor-sprite: bad value '%s' (want hcursor|texture|default|none|cycle)", v);
+				}
+			} else if (_stricmp(tok, "--cursor-content=off") == 0) {
+				g_cursorDepth = true;
+				g_cursorContent = false;
+			} else if (_stricmp(tok, "--cursor-sweep") == 0) {
+				g_cursorDepth = true;
+				g_cursorSweep = true;
 			} else if (_strnicmp(tok, "--rect=", 7) != 0) {
 				LOG_INFO("unrecognized argument '%s' — ignored", tok);
 			}
@@ -868,7 +1362,8 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		LOG_INFO("  v6 grid=%ux%u views=%u scale=%.3fx%.3f atlas=%s", g_v6Cols, g_v6Rows,
 		         g_v6Cols * g_v6Rows, g_v6ScaleX, g_v6ScaleY, g_v6Exact ? "exact (zero-copy)" : "oversized (crop)");
 	}
-	LOG_INFO("Weave rect: %s", g_fullRect ? "FULL client area" : "centred 640x360 element");
+	LOG_INFO("Weave rect: %s", g_fullRect ? "FULL client area" : "centred element");
+	LOG_INFO("Window %ux%u, overlay mode %d (0=bar 1=none 2=page 3=page-anim)", g_winW, g_winH, (int)g_overlayMode);
 	if (g_flatBandPct == 0) {
 		LOG_INFO("v8 per-submit flat regions: OFF (no chain — byte-for-byte pre-v8)");
 	} else if (g_flatBandPct >= 100) {
@@ -882,6 +1377,23 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		         g_screenFlatRect[1], g_screenFlatRect[2], g_screenFlatRect[3]);
 	} else if (g_screenFlatMode == 2) {
 		LOG_INFO("v8 sticky screen flat regions: CLEAR (rectCount 0)");
+	}
+
+	if (g_lift) {
+		wchar_t envp[MAX_PATH] = {0};
+		if (g_liftPath.empty() && GetEnvironmentVariableW(L"DXR_WEAVE_LIFT_IMAGE", envp, MAX_PATH) > 0) {
+			g_liftPath = envp;
+		}
+		CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+		if (g_liftPath.empty() || !LoadLiftImage()) {
+			LOG_ERROR("--lift needs an image: --lift=<path> or DXR_WEAVE_LIFT_IMAGE=<path>");
+			return 1;
+		}
+		if (g_useV6) {
+			LOG_INFO("--lift: v6 layout not supported by this probe — using the batch layout");
+			g_useV6 = false;
+		}
+		g_overlayMode = OVERLAY_NONE; // nothing over the picture under test
 	}
 
 	XrSessionManager xr;
@@ -898,7 +1410,7 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	if (!CreateDeviceOnAdapter(luid)) {
 		return 1;
 	}
-	if (!CreateCompositionSwapChain(kWinW, kWinH)) {
+	if (!CreateCompositionSwapChain(g_winW, g_winH)) {
 		return 1;
 	}
 	// SBS input is (re)created window-sized in the frame loop via EnsureSbsTexture.
@@ -911,9 +1423,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	LOG_INFO("Waiting for session to start...");
 	for (int i = 0; i < 2000 && !xr.sessionRunning && !g_quit; i++) {
 		MSG msg;
-		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			DispatchMessageW(&msg);
 		}
 		PollEvents(xr);
 		Sleep(2);
@@ -955,6 +1467,43 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	// present-owner's request was stored and never applied (the only consumer
 	// was the per-client commit, which a weave caller never runs), and the
 	// force-3D kick then pinned it to the first 3D-capable mode.
+	if (g_lift) {
+		if (!g_hasLiftExt || g_pfnCreateLiftStream == nullptr) {
+			LOG_ERROR("--lift: XR_DXR_lift is not available on this runtime");
+			return 1;
+		}
+		if (g_liftCursor && g_cursorDepthSpecVersion < 6) {
+			LOG_ERROR("--lift-cursor: the runtime's XR_DXR_cursor_depth is v%u (needs v6) — lifting without it",
+			          g_cursorDepthSpecVersion);
+			g_liftCursor = false;
+		}
+		// The cursor is placed from the conversion's own depth map: ask for it.
+		XrLiftDepthRequestDXR dreq = {XR_TYPE_LIFT_DEPTH_REQUEST_DXR};
+		XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+		ci.next = g_liftCursor ? &dreq : nullptr;
+		ci.mode = XR_LIFT_MODE_SBS_DXR;
+		ci.contentHint = XR_LIFT_CONTENT_HINT_VIDEO_DXR; // the browser's case: a video frame
+		ci.inputScale = 1.0f;
+		XrResult lr = g_pfnCreateLiftStream(xr.session, &ci, &g_liftStream);
+		LogXrResult("xrCreateLiftStreamDXR", lr);
+		if (XR_FAILED(lr)) {
+			return 1;
+		}
+		LOG_INFO("--lift: SBS stream created (depth %s, depth cursor %s)", g_liftCursor ? "requested" : "off",
+		         g_liftCursor ? "REQUESTED" : "off");
+	}
+	if (g_cursorDepth) {
+		if (g_cursorDepthSpecVersion < 8) {
+			LOG_ERROR("--cursor-depth: the runtime's XR_DXR_cursor_depth is v%u (needs v8) - running without it",
+			          g_cursorDepthSpecVersion);
+			g_cursorDepth = false;
+		} else {
+			LOG_INFO("--cursor-depth: v8 weave-rect cursor ON - synthetic disparity %.1f px%s%s, sprite mode %d",
+			         g_cursorDepthPx, g_cursorContent ? "" : " (hasContent = FALSE)",
+			         g_cursorSweep ? " (sweeping -48..+16 px)" : "", (int)g_cursorSprite);
+		}
+	}
+
 	if (g_requestMode >= 0) {
 		PFN_xrRequestDisplayRenderingModeDXR pfnReqMode = nullptr;
 		xrGetInstanceProcAddr(xr.instance, "xrRequestDisplayRenderingModeDXR",
@@ -977,9 +1526,9 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 	LOG_INFO("Entering weave loop (ESC / close to quit)...");
 	while (!g_quit && !xr.exitRequested) {
 		MSG msg;
-		while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+		while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
 			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			DispatchMessageW(&msg);
 		}
 		PollEvents(xr);
 
@@ -1001,8 +1550,11 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 		RECT rc = {};
 		GetClientRect(g_hwnd, &rc);
 		int32_t cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-		uint32_t rw = g_fullRect ? (uint32_t)cw : (uint32_t)min((int32_t)kRectW, cw);
-		uint32_t rh = g_fullRect ? (uint32_t)ch : (uint32_t)min((int32_t)kRectH, ch);
+		const bool pageMode = (g_overlayMode == OVERLAY_PAGE || g_overlayMode == OVERLAY_PAGE_ANIM);
+		uint32_t rw = g_fullRect ? (uint32_t)cw
+		                         : (pageMode && !g_rectOverride ? (uint32_t)cw / 2 : (uint32_t)min((int32_t)kRectW, cw));
+		uint32_t rh = g_fullRect ? (uint32_t)ch
+		                         : (pageMode && !g_rectOverride ? (uint32_t)ch / 2 : (uint32_t)min((int32_t)kRectH, ch));
 		int32_t rx = (cw - (int32_t)rw) / 2;
 		int32_t ry = (ch - (int32_t)rh) / 2;
 
@@ -1036,15 +1588,37 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 				continue;
 			}
 
-			// Render this frame's pre-weave SBS pair off-axis from the eyes the
-			// runtime returned LAST frame (look-around / virtual-camera motion), into
-			// the element's window-relative rect (rest of the window = transparent gap).
-			RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+			if (g_lift) {
+				// --lift: the 2D still in the rect; the runtime lifts it.
+				RenderLiftStill(rx, ry, (int32_t)rw, (int32_t)rh);
+				g_liftRect = {rx, ry, rx + (LONG)rw, ry + (LONG)rh};
+			} else {
+				// Render this frame's pre-weave SBS pair off-axis from the eyes the
+				// runtime returned LAST frame (look-around / virtual-camera motion),
+				// into the element's window-relative rect (rest of the window =
+				// transparent gap).
+				RenderSbsLookAround(g_lastEyeX[0], g_lastEyeX[1], rx, ry, (int32_t)rw, (int32_t)rh);
+			}
 		}
 
 		// v4: keep the overlay atlas sized to the window client area so the DP
 		// composites the 2D badge 1:1 over the woven output.
-		bool haveOverlay = EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+		bool haveOverlay = (g_overlayMode != OVERLAY_NONE) && EnsureOverlayTexture((uint32_t)cw, (uint32_t)ch);
+		bool overlayUnchanged = false; // v14: static page after its first paint
+		if (haveOverlay && pageMode) {
+			// Static page: paint once per (re)size. page-anim: every frame, scrolled.
+			static uint32_t s_paintedW = 0, s_paintedH = 0;
+			const bool fresh = (s_paintedW != (uint32_t)cw || s_paintedH != (uint32_t)ch);
+			if (g_overlayMode == OVERLAY_PAGE_ANIM || fresh) {
+				const float scroll = (g_overlayMode == OVERLAY_PAGE_ANIM) ? (float)g_pageFrame * 2.0f : 0.0f;
+				haveOverlay = PaintPageOverlay((uint32_t)cw, (uint32_t)ch, rx, ry, (int32_t)rw, (int32_t)rh, scroll);
+				s_paintedW = (uint32_t)cw;
+				s_paintedH = (uint32_t)ch;
+			} else {
+				overlayUnchanged = true;
+			}
+			g_pageFrame++;
+		}
 
 		XrWeaveSubmitInfoDXR in = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
 		in.inputTexture = (void *)g_sbsHandle;
@@ -1098,6 +1672,21 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			*tail = &ov;
 			tail = &ov.next;
 		}
+		// v14: declare the overlay unchanged (static page) so a DP can reuse its
+		// lens prefilter of it. Advisory; a pre-v14 runtime ignores the struct.
+		// v15: an explicit lens-filter strength for the overlay (omitted = DP default).
+		XrWeaveSubmitOverlayFilterDXR ovf = {XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR};
+		if (haveOverlay && g_filterStrength >= 0.0f) {
+			ovf.filterStrength = g_filterStrength;
+			*tail = &ovf;
+			tail = &ovf.next;
+		}
+		XrWeaveSubmitOverlayUnchangedDXR ovu = {XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR};
+		if (haveOverlay && overlayUnchanged) {
+			ovu.overlayUnchanged = XR_TRUE;
+			*tail = &ovu;
+			tail = &ovu.next;
+		}
 
 		// v8 (browser#88): declare the FLAT band. wish = union(rects) - union(flat),
 		// published to the DP's zone-wish channel. ADVISORY and HARDWARE-ONLY — the
@@ -1120,7 +1709,107 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			tail = &flat.next;
 		}
 
+		// --lift: flag rect 0 as 2D-to-lift; --lift-cursor asks the runtime to draw
+		// the depth cursor into its lifted views (XR_DXR_cursor_depth v6).
+		XrCursorDepthLiftRectDXR cursorReq = {XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR};
+		XrWeaveRectLiftDXR liftRect = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+		XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+		if (g_lift && g_liftStream != XR_NULL_HANDLE) {
+			liftRect.rectIndex = 0;
+			liftRect.stream = g_liftStream;
+			liftRect.next = g_liftCursor ? &cursorReq : nullptr;
+			lifts.liftCount = 1;
+			lifts.lifts = &liftRect;
+			*tail = &lifts;
+			tail = &lifts.next;
+		}
+
+		// --cursor-depth (XR_DXR_cursor_depth v8): the page's depth under the
+		// pointer for rect 0, plus the cursor the browser would have shown.
+		XrCursorDepthWeaveRectDXR wcEntry = {};
+		XrCursorDepthWeaveRequestDXR wcReq = {XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR};
+		if (g_cursorDepth) {
+			static uint64_t s_gen = 0;
+			static int s_mode = -1;
+			static uint64_t s_sentGen = 0;
+			const ULONGLONG ms = GetTickCount64();
+			int mode = (int)g_cursorSprite;
+			if (g_cursorSprite == CURSOR_SPRITE_CYCLE) {
+				mode = (int)((ms / 3000) % 4); // hcursor, texture, default, none
+			}
+			if (mode != s_mode) {
+				s_mode = mode;
+				s_gen++;
+				LOG_INFO("cursor v8: sprite -> %s (generation %llu)",
+				         mode == CURSOR_SPRITE_HCURSOR ? "HCURSOR (IDC_HAND)"
+				         : mode == CURSOR_SPRITE_TEXTURE ? "TEXTURE (green ring)"
+				         : mode == CURSOR_SPRITE_DEFAULT ? "DEFAULT"
+				                                         : "NONE",
+				         (unsigned long long)s_gen);
+			}
+			wcReq.sprite.generation = s_gen;
+			const bool payload = s_sentGen != s_gen;
+			switch (mode) {
+			case CURSOR_SPRITE_HCURSOR:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				wcReq.sprite.osCursor = (uint64_t)(uintptr_t)LoadCursor(nullptr, IDC_HAND);
+				break;
+			case CURSOR_SPRITE_TEXTURE:
+				if (payload && EnsureCursorTexture()) {
+					wcReq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR;
+					wcReq.sprite.texture = (void *)g_cursorTexHandle;
+					wcReq.sprite.textureKind = XR_WEAVE_HANDLE_KIND_D3D11_NT_DXR;
+					wcReq.sprite.extent = {32, 32};
+					wcReq.sprite.hotSpotPx = {16.0f, 16.0f};
+				} else {
+					wcReq.sprite.kind = XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				}
+				break;
+			case CURSOR_SPRITE_DEFAULT:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				break;
+			default:
+				wcReq.sprite.kind = payload ? XR_CURSOR_DEPTH_WEAVE_SPRITE_NONE_DXR
+				                            : XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR;
+				break;
+			}
+			s_sentGen = s_gen;
+			float px = g_cursorDepthPx;
+			if (g_cursorSweep) {
+				const float ph = (float)(ms % 6000) / 6000.0f; // triangle: -48 -> +16 -> -48
+				px = -48.0f + 64.0f * (ph < 0.5f ? 2.0f * ph : 2.0f - 2.0f * ph);
+			}
+			wcEntry.rectIndex = 0;
+			wcEntry.hasContent = g_cursorContent ? XR_TRUE : XR_FALSE;
+			wcEntry.disparityPx = px;
+			wcEntry.sampleUV = {0.5f, 0.5f};
+			wcReq.rectCount = 1;
+			wcReq.rects = &wcEntry;
+			*tail = &wcReq;
+			tail = &wcReq.next;
+		}
+
 		XrWeaveOutputDXR out = {XR_TYPE_WEAVE_OUTPUT_DXR};
+		// v19 (#1884): ask for the per-screen split of the weave rect. static:
+		// the struct is ~4 KB and is re-read every frame.
+		static XrWeaveOutputRectPartsDXR parts;
+		if (g_weaveSpecVersion >= 19) {
+			memset(&parts, 0, sizeof(parts));
+			parts.type = XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR;
+			out.next = &parts;
+		}
+		XrCursorDepthLiftStateDXR cursorState = {XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR};
+		if (g_liftCursor) {
+			cursorState.next = out.next;
+			out.next = &cursorState;
+		}
+		XrCursorDepthWeaveStateDXR wcState = {XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR};
+		if (g_cursorDepth) {
+			wcState.next = out.next;
+			out.next = &wcState;
+		}
 
 		LARGE_INTEGER t0, t1;
 		QueryPerformanceCounter(&t0);
@@ -1152,6 +1841,83 @@ wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR pCmdLine, int)
 			} else {
 				LOG_INFO("v8 XrWeaveSubmitFlatRegionsDXR CHAIN NOT SENT (--flat-band absent) — "
 				         "wish = the whole weave rect, i.e. pre-v8 behaviour");
+			}
+		}
+
+		// v19: log the per-screen split on a geometry change only (generation).
+		if (g_weaveSpecVersion >= 19) {
+			static uint64_t s_lastGen = UINT64_MAX;
+			static uint32_t s_lastSegs = UINT32_MAX;
+			if (parts.generation != s_lastGen || parts.segmentCount != s_lastSegs) {
+				s_lastGen = parts.generation;
+				s_lastSegs = parts.segmentCount;
+				LOG_INFO("v19 per-screen: segments=%u parts=%u generation=%llu%s", parts.segmentCount,
+				         parts.partCount, (unsigned long long)parts.generation,
+				         parts.segmentCount == 0 ? " (one display processor: base eyes apply)" : "");
+				for (uint32_t k = 0; k < parts.segmentCount; k++) {
+					const XrWeaveScreenSegmentDXR &g = parts.segments[k];
+					LOG_INFO("  segment %u: display 0x%016llx%s window %d,%d %dx%d screen %d,%d %s "
+					         "eyes(valid=%d track=%d n=%u L=%.4f,%.4f,%.4f)",
+					         k, (unsigned long long)g.displayId, g.isPrimary ? " (primary)" : "",
+					         g.windowRect.offset.x, g.windowRect.offset.y, g.windowRect.extent.width,
+					         g.windowRect.extent.height, g.screenRect.offset.x, g.screenRect.offset.y,
+					         g.woven ? "woven" : "FLAT 2D", g.eyesValid, g.eyesTracking, g.eyeCount,
+					         g.eyeCount > 0 ? g.eyes[0].x : 0.0f, g.eyeCount > 0 ? g.eyes[0].y : 0.0f,
+					         g.eyeCount > 0 ? g.eyes[0].z : 0.0f);
+				}
+				for (uint32_t i = 0; i < parts.partCount; i++) {
+					const XrWeaveRectPartDXR &p = parts.parts[i];
+					LOG_INFO("  part %u: rect %u on segment %u — window %d,%d %dx%d, in-rect %d,%d, "
+					         "on-screen %d,%d",
+					         i, p.rectIndex, p.segmentIndex, p.windowRect.offset.x, p.windowRect.offset.y,
+					         p.windowRect.extent.width, p.windowRect.extent.height, p.rectRelative.offset.x,
+					         p.rectRelative.offset.y, p.screenRect.offset.x, p.screenRect.offset.y);
+				}
+			}
+		}
+
+		if (g_liftCursor) {
+			const bool drawn = (cursorState.drawnLiftMask & 1u) != 0;
+			if (drawn != g_liftCursorDrawn) {
+				LOG_INFO("--lift-cursor: runtime %s the depth cursor (frame %llu)",
+				         drawn ? "DRAWS" : "does NOT draw", (unsigned long long)frame);
+				g_liftCursorDrawn = drawn;
+				// Re-evaluate WM_SETCURSOR now rather than on the next mouse move.
+				POINT pt;
+				if (GetCursorPos(&pt)) {
+					SetCursorPos(pt.x, pt.y);
+				}
+			}
+		}
+
+		if (g_cursorDepth) {
+			static uint32_t s_mask = UINT32_MAX;
+			static uint64_t s_gen = UINT64_MAX;
+			static XrRect2Di s_b = {};
+			const XrRect2Di &b = wcState.drawnBounds;
+			const bool moved = b.offset.x != s_b.offset.x || b.offset.y != s_b.offset.y ||
+			                   b.extent.width != s_b.extent.width || b.extent.height != s_b.extent.height;
+			// Log a mask or generation change at once, a bounds change at most 2/s.
+			static ULONGLONG s_lastBoundsLog = 0;
+			const ULONGLONG nowMs = GetTickCount64();
+			if (wcState.drawnRectMask != s_mask || wcState.spriteGeneration != s_gen ||
+			    (moved && nowMs - s_lastBoundsLog > 500)) {
+				s_lastBoundsLog = nowMs;
+				LOG_INFO("cursor v8: drawnRectMask=0x%x spriteGeneration=%llu drawnBounds=%d,%d %dx%d (frame %llu)",
+				         wcState.drawnRectMask, (unsigned long long)wcState.spriteGeneration, b.offset.x,
+				         b.offset.y, b.extent.width, b.extent.height, (unsigned long long)frame);
+			}
+			s_mask = wcState.drawnRectMask;
+			s_gen = wcState.spriteGeneration;
+			s_b = b;
+			const bool drawn = wcState.drawnRectMask != 0;
+			g_weaveCursorBounds = {b.offset.x, b.offset.y, b.offset.x + b.extent.width, b.offset.y + b.extent.height};
+			if (drawn != g_weaveCursorDrawn) {
+				g_weaveCursorDrawn = drawn;
+				POINT pt;
+				if (GetCursorPos(&pt)) {
+					SetCursorPos(pt.x, pt.y); // re-evaluate WM_SETCURSOR now
+				}
 			}
 		}
 

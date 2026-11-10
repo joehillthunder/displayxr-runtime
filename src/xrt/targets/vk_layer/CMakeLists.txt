@@ -6,6 +6,26 @@
 # Deliberately dependency-free: Vulkan headers only (a layer must NOT link the
 # loader — recursion), no xrt/aux libs.
 
+# Android (#1905): SHARED, not MODULE — AGP packages the SHARED_LIBRARY targets
+# it is told to build (build.gradle cmake.targets) into lib/<abi>/, the same
+# route drv_sim_display_plugin takes. The Android loader finds the layer by
+# FILE NAME (libVkLayer*.so on its layer search path), no manifest.
+if(ANDROID)
+	add_library(VkLayer_DXR_queue_lock SHARED queue_lock_layer.c)
+	# Android liblog for the one-shot "loaded" line; libc has pthreads.
+	target_link_libraries(VkLayer_DXR_queue_lock PRIVATE log)
+	set_target_properties(VkLayer_DXR_queue_lock PROPERTIES C_VISIBILITY_PRESET hidden)
+	target_link_options(VkLayer_DXR_queue_lock PRIVATE "LINKER:-Bsymbolic")
+	target_include_directories(VkLayer_DXR_queue_lock PRIVATE ${Vulkan_INCLUDE_DIR})
+	# #1919: the same .so is built twice per CI run — inside the runtime APK
+	# (root CMakeLists.txt) and inside the client AAR (displayxr_client's
+	# standalone src/main/cpp/CMakeLists.txt). Pin DWARF's DW_AT_comp_dir so the
+	# build-tree path is not baked in; otherwise the two copies differ in their
+	# debug info and hence their build-id, and CI could only compare .text.
+	target_compile_options(VkLayer_DXR_queue_lock PRIVATE -fdebug-compilation-dir=.)
+	return()
+endif()
+
 add_library(VkLayer_DXR_queue_lock MODULE queue_lock_layer.c)
 
 # Windows exports come from the .def (no dllexport in code — vk_layer.h's plain
@@ -45,7 +65,10 @@ endif()
 # Dev-tree manifest with an absolute library_path — run scripts point
 # VK_LAYER_PATH here. (Installed builds get a relative-path manifest via the
 # packaging step instead; Windows additionally needs the ExplicitLayers
-# registry key — VK_LAYER_PATH is ignored for elevated processes.)
+# registry key — VK_LAYER_PATH is ignored for elevated processes. The Linux
+# .deb / tarball do not use install() below: scripts/package_deb_linux.sh and
+# scripts/linux/install.sh fill VkLayer_DXR_queue_lock.json.in with the
+# ABSOLUTE installed path and drop it in a vulkan/explicit_layer.d, #2036.)
 if(WIN32)
 	set(DXR_QL_LIBRARY_PATH "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_DXR_queue_lock.dll")
 else()
@@ -54,6 +77,23 @@ endif()
 configure_file(
 	VkLayer_DXR_queue_lock.json.in ${CMAKE_CURRENT_BINARY_DIR}/VkLayer_DXR_queue_lock.json @ONLY
 	)
+
+# #886: the IMPLICIT twin (same layer name, same library) for vulkan_enable1
+# apps, which create their VkInstance themselves so the runtime cannot inject
+# the layer. Gated by enable_environment DXR_VK_QUEUE_LOCK=1 (and
+# disable_environment DXR_VK_QUEUE_LOCK_DISABLE=1), so installing it changes
+# nothing until an app or its launcher opts in. Desktop Linux ships it in
+# /usr/share/vulkan/implicit_layer.d (scripts/package_deb_linux.sh,
+# scripts/linux/install.sh); the dev-tree copy lives in implicit/ so a test can
+# point VK_ADD_IMPLICIT_LAYER_PATH at it without also picking up the explicit
+# manifest above. Not on Windows: there implicit layers are an HKLM
+# ImplicitLayers registry value, which no installer writes yet.
+if(NOT WIN32)
+	configure_file(
+		VkLayer_DXR_queue_lock_implicit.json.in
+		${CMAKE_CURRENT_BINARY_DIR}/implicit/VkLayer_DXR_queue_lock.json @ONLY
+		)
+endif()
 
 # --- Installed-tree manifest + install rules (#902 packaging) ----------------
 #

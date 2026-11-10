@@ -7,7 +7,7 @@
 | **Status** | Implemented (runtime ≥ v1.13, framework ≥ displayxr-mcp v0.4.0) |
 | **Header** | [`XR_DXR_mcp_tools.h`](../../../src/external/openxr_includes/openxr/XR_DXR_mcp_tools.h) (auto-synced to `displayxr-extensions`) |
 | **Design** | [Per-app MCP tools & workspace aggregator](../../roadmap/per-app-mcp-tools.md) |
-| **Depends on** | Nothing at the API level. Functionally inert unless the MCP capability is enabled (`HKLM\Software\DisplayXR\Capabilities\MCP\Enabled` / `DISPLAYXR_MCP`). |
+| **Depends on** | Nothing at the API level. Functionally inert unless the MCP capability is enabled (the per-platform marker of §4.1 / `DISPLAYXR_MCP`). |
 
 ## 1. Overview
 
@@ -44,7 +44,7 @@ header; semantics summary:
 | `xrRegisterMCPToolDXR(session, tool)` | Register `{name, description, inputSchemaJson}`. Strings are copied. Bare name: `^[a-z0-9][a-z0-9_-]{0,62}$`, no `__`. Duplicate → `XR_ERROR_NAME_DUPLICATED`; budget (32/process) → `XR_ERROR_LIMIT_REACHED`. Late registration is first-class: connected agents get `tools/list_changed`. |
 | `xrUnregisterMCPToolDXR(session, name)` | Remove a tool; in-flight calls on it fail to the agent. |
 | `xrGetMCPToolCallArgsDXR(session, callId, cap, count, buf)` | Two-call idiom fetch of a pending call's JSON arguments (`argsSize` in the event is the required capacity). |
-| `xrSubmitMCPToolResultDXR(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error. Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
+| `xrSubmitMCPToolResultDXR(session, callId, success, resultJson)` | Answer a call. `success=XR_FALSE` → agent receives a tool error that keeps `resultJson` (e.g. `{"error":"…"}`), flagged `"isError":true` (MCP `result.isError` with displayxr-mcp ≥ v0.5.6). Late submits on a timed-out call return `XR_SUCCESS` and are dropped. |
 
 **Event** `XrEventDataMCPToolCallDXR` `{session, callId, toolName[64],
 argsSize}` — delivered through the session's normal `xrPollEvent`
@@ -78,6 +78,23 @@ registering tools must never be load-bearing for normal operation.
 The extension is always advertised by the runtime; the gate is
 evaluated per call so an app binary behaves identically on machines
 with and without the MCP Tools package installed.
+
+### 4.1 Capability gate
+
+The per-process server starts at `xrCreateInstance` when the capability marker is on
+(`oxr_mcp_capability_enabled()`); `DISPLAYXR_MCP=1` / `0` in the environment overrides it
+either way.
+
+| platform | marker | enabled when |
+|---|---|---|
+| Windows | `HKLM\Software\DisplayXR\Capabilities\MCP\Enabled` (64-bit view) | `REG_DWORD` == 1 |
+| macOS | `/Library/Application Support/DisplayXR/Capabilities/MCP/Enabled` | first byte `'1'` |
+| desktop Linux | `$XDG_CONFIG_HOME/displayxr/capabilities/mcp/Enabled` (default `~/.config/displayxr/capabilities/mcp/Enabled`), then `/etc/displayxr/capabilities/mcp/Enabled` | first byte `'1'` of the **first marker that exists** — a per-user `0` disables even when the system marker says `1` |
+
+The Linux paths are the ones the DisplayXR Shell's Linux port writes (per-user needs no
+root; a package writes the `/etc` one). A relative `XDG_CONFIG_HOME` is ignored, per the
+XDG spec. POSIX paths: `src/xrt/auxiliary/util/u_mcp_capability.c`, unit-tested by
+`tests_u_mcp_capability`.
 
 ## 5. Manifest pairing & linting
 
@@ -136,3 +153,8 @@ the `displayxr-mcp` adapter's `--target workspace` mode
 App-registered tools carry `_meta {"displayxr/group": "app"}` and are
 exposed by default; Phase A introspection stays `diagnostic` (hidden
 unless `--expose-diagnostics`).
+
+The runtime also registers session-free diagnostic tools that wrap
+`displayxr-cli … --json` (`get_runtime_status`, `run_selftest`,
+`list_display_processors`, `set_preferred_dp`, and `get_status_snapshot` — the
+ADR-051 display status snapshot, `displayxr-cli status --json` verbatim).

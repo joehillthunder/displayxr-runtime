@@ -22,13 +22,48 @@ Compositor                         Display Processor
 5. **Display processor** extracts views from the atlas using tile layout, applies vendor-specific processing (interlacing, lenticular weaving, etc.), writes to the target swapchain
 6. **Compositor presents** the target swapchain to the display/window
 
+## Windows: the D3D11 hub ([ADR-059](../adr/ADR-059-d3d11-hub-compositor-windows.md))
+
+On Windows, steps 4–6 can belong to a different compositor than steps 1–3. `compositor/hub_d3d11/`
+(`comp_hub_d3d11`) is one D3D11 compositor that owns its own device, its own D3D11 display
+processor and the present. When an in-process session runs on the hub:
+
+1. The session's own compositor (D3D11, D3D12, Vulkan or OpenGL) renders and crops the atlas as
+   above, but into a D3D11-shareable **deposit** on the app's adapter, and signals a shared fence.
+2. The hub takes the deposit: read in place (DIRECT) when the hub's device is on the same adapter,
+   or carried by the `compositor/xbridge/` cross-adapter transport on a hybrid box.
+3. The hub composites any 2D planes (Local2D, zones, masks, backdrop), calls the D3D11 DP's
+   `process_atlas()`, and presents on its own swapchain on the scanout adapter. For a texture-class
+   session (client-presents, ADR-059 Amendment 3) it weaves into the caller's shared texture
+   instead, and the caller presents.
+
+So a D3D12, Vulkan or OpenGL session on the hub is woven by the D3D11 display processor. Which
+sessions take the hub:
+
+| Tier | Default | Kill switch / opt-in |
+|---|---|---|
+| D3D11 (`_handle`) | hub on a cross-adapter box and on a single adapter (DIRECT ingress there; ADR-059 Amendment 4) | `DXR_HUB=0` kills (back to the tier's own legs) |
+| D3D12 | hub on a hybrid box (`hybrid_reroute_default_on`); the same fill arm on a single adapter (ADR-039) | `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` (route kill switch); `DXR_HUB=0` while that is unset; `DXR_SPLIT_D3D12_ROUTE=own` keeps the own-legs arm |
+| Vulkan | the tier's output-device split *is* the hub, wherever the split engages | does not read `DXR_HUB`; `DXR_WEAVE_ON_SCANOUT=0` kills the split |
+| OpenGL | own legs | exactly `DXR_HUB=1` opts in |
+
+A D3D11 or OpenGL session, and a D3D12 session on a hybrid box, logs one placement line, `hub placement: hub=1 …` or
+`hub placement: hub=0 reason=<token>`. Tokens a reader meets most often: `hosted_window` (a
+runtime-owned `_hosted` window stays on the tier's own legs), `transparent_background`,
+`shared_texture_session` (a texture-class session not taken by client-presents),
+`no_shared_fence` (the producer could not share the fence the hub waits on), `not_requested`
+(OpenGL without `DXR_HUB=1`) and `disabled_by_env` (`DXR_HUB=0`). `killed_by_env` is the
+output-device split's own token for `DXR_WEAVE_ON_SCANOUT=0`. The full closed set is documented
+beside the `COMP_HUB_REASON_*` defines in `comp_hub_d3d11.h`. A refused session runs the
+pipeline above on its own compositor, unchanged. macOS, Linux and Android have no hub.
+
 ## Key Principles
 
 - **Compositor never weaves** — no vendor-specific display format logic in compositor code. All 3D output processing is delegated to the display processor via `process_atlas()`.
 - **Tile-layout-aware** — the display processor receives `tile_columns` and `tile_rows` rather than assuming any particular view arrangement (e.g., side-by-side). This supports arbitrary multiview layouts.
 - **Canvas sub-rect flows to DP** — for `_texture` apps, the canvas may be a sub-rect of the window. The compositor passes `canvas_offset_x`, `canvas_offset_y`, `canvas_width`, and `canvas_height` through to `process_atlas()` so the display processor can compute correct phase alignment. The app's real window handle (HWND / NSView) is passed directly to the display processor — no hidden windows are involved.
-- **DP-handoff encoding is declared by the DP, not fixed** — DisplayXR owns a vendor-neutral compose space; the display processor *declares* whether it accepts `LINEAR`, `ENCODED`, or `EITHER` input, and the runtime converts compose→handoff to match (a matched-pair step, no-op when they already agree). The runtime never derives the convention from — or bakes a curve of — any particular vendor's weaver (ADR-003/007). Production DPs typically declare `EITHER` (their weaver has an explicit input/output sRGB-conversion control and can do the output encode itself), and the atlas always reaches the DP **encoded**. Since #1589 the runtime is format-honest about how it gets there: an `_SRGB` swapchain already holds encoded bytes and passes through (GL #407, D3D11/D3D12/Vulkan/Metal #408), while a UNORM swapchain holds **linear** values and is encoded by the `_SRGB`-view compose target on the way in. The app's obligation is unchanged and now load-bearing: request an sRGB swapchain and store a correctly-encoded image, or take UNORM and store scene-linear. Full contract incl. the matched-pair invariant and both-direction conversion: [ADR-021](../adr/ADR-021-color-management-encoding-state-invariant.md). (This supersedes an earlier "DP expects linear input" note — that described a service-path *intermediate*, not the handoff, and is the latent half-conversion documented below.)
-- **Vendor isolation** — adding a new display vendor requires zero changes to compositor code. The vendor implements the display processor vtable under `src/xrt/drivers/<vendor>/`.
+- **DP-handoff encoding is declared by the DP, not fixed** — DisplayXR owns a vendor-neutral compose space; the display processor *declares* whether it accepts `LINEAR`, `ENCODED`, or `EITHER` input, and the runtime converts compose→handoff to match (a matched-pair step, no-op when they already agree). The runtime never derives the convention from — or bakes a curve of — any particular vendor's weaver (ADR-003/007). Production DPs typically declare `EITHER` (their weaver has an explicit input/output sRGB-conversion control and can do the output encode itself), and the atlas always reaches the DP **encoded**. Since #1589 the runtime is format-honest about how it gets there: an `_SRGB` swapchain already holds encoded bytes and passes through (GL #407, D3D11/D3D12/Vulkan/Metal #408), while a UNORM swapchain holds **linear** values and is encoded by the `_SRGB`-view compose target on the way in, unless the app declares it display-encoded with [`XR_DXR_swapchain_color_encoding`](../specs/extensions/XR_DXR_swapchain_color_encoding.md) (in-process D3D11 and D3D12; every other path refuses the declaration). The app's obligation is unchanged and now load-bearing: request an sRGB swapchain and store a correctly-encoded image, or take UNORM and store scene-linear. Full contract incl. the matched-pair invariant and both-direction conversion: [ADR-021](../adr/ADR-021-color-management-encoding-state-invariant.md). Per-backend table (enumeration order, `_SRGB` vs UNORM vs float, DP handoff, CTS coverage): [ADR-044](../adr/ADR-044-colour-contract-per-backend.md). (This supersedes an earlier "DP expects linear input" note — that described a service-path *intermediate*, not the handoff, and is the latent half-conversion documented below.)
+- **Vendor isolation** — adding a new display vendor requires zero changes to compositor code. The vendor implements the display processor vtable in its own plug-in DLL ([ADR-019](../adr/ADR-019-vendor-plugin-aux-boundary.md)).
 
 ## Color-space handling (D3D11 service compositor)
 
@@ -39,9 +74,19 @@ The swapchain → per-client atlas blit **stays** a raw `CopySubresourceRegion` 
 **The earlier latent half-conversion ([#409](https://github.com/DisplayXR/displayxr-runtime/issues/409)) is fixed**, and the vendor `linear_to_srgb()` curve was deleted (ADR-021 §2 — the encode belongs in the DP). The two models:
 
 - **Model A (default):** sample the UNORM SRV raw → the combined atlas holds the bytes verbatim (encoded) → `set_atlas_encoding(ENCODED)` → DP passthrough. The blit/crop never convert.
-- **Model B (gated):** engages only when the DP accepts linear, **>1 layer composites, AND every contributing client is a genuine `*_SRGB` swapchain** (`honest_srgb_count == render_count`). A UNORM swapchain is ambiguous (encoded-in-UNORM vs already-linear-in-UNORM — indistinguishable from the format), so UNORM clients stay on Model A. When B engages, the blit shader applies the standard sRGB decode on **every** output — client content (sampled raw) **and** all runtime chrome (window chrome, glow, cursor) — and the `#1a1a1a` backdrop is cleared to its linear value, so the whole atlas is genuinely linear; `set_atlas_encoding(LINEAR)` then has the DP perform the one matched output encode. Single-layer / non-honest-sRGB / ENCODED-only-DP frames stay Model A (B == A when nothing blends). Verified end-to-end against the Leia weaver (declares `EITHER`); exercised in-repo by `sim_display`-D3D11 (also `EITHER`) and a `DXR_SWAPCHAIN_ENCODING=srgb` source.
+- **Model B (gated):** engages only when the DP accepts linear, **>1 layer composites, AND every contributing client is a genuine `*_SRGB` swapchain** (`honest_srgb_count == render_count`). A UNORM swapchain is ambiguous (encoded-in-UNORM vs already-linear-in-UNORM — indistinguishable from the format), so UNORM clients stay on Model A. When B engages, the blit shader applies the standard sRGB decode on **every** output — client content (sampled raw) **and** all runtime chrome (window chrome, glow, cursor) — and the fixed-function blend runs in linear. Since [#1764](https://github.com/DisplayXR/displayxr-runtime/issues/1764) the combined atlas is `R8G8B8A8_TYPELESS` with two RTVs: against an `EITHER` DP the Model-B draws go through its `_SRGB` RTV, so the hardware re-encodes on write, the 8-bit atlas holds ENCODED bytes (no dark-end banding from storing linear light in 8 bits) and is handed off `set_atlas_encoding(ENCODED)`; Model A writes through the UNORM RTV (an `_SRGB` RTV would encode its already-encoded output a second time), and the `#1a1a1a` backdrop is always cleared through the UNORM RTV as encoded bytes. Only a LINEAR-only DP keeps the older shape: UNORM RTV, the backdrop cleared to its linear value, the atlas holding linear bytes and `set_atlas_encoding(LINEAR)` so the DP performs the matched output encode. Every runtime-side source the combine pass samples goes through a NON-decoding view, so b1 is the only decode ([#1765](https://github.com/DisplayXR/displayxr-runtime/issues/1765)): an `_SRGB` controller swapchain (window chrome, workspace overlays, cursor) is byte-copied into a service-owned TYPELESS cache and sampled through its UNORM SRV (a service-created swapchain's shared storage is strongly typed, so no UNORM view of it can exist), and the window-space HUD cache is built the same way. Single-layer / non-honest-sRGB / ENCODED-only-DP frames stay Model A (B == A when nothing blends). Verified end-to-end against the Leia weaver (declares `EITHER`); exercised in-repo by `sim_display`-D3D11 (also `EITHER`) and a `DXR_SWAPCHAIN_ENCODING=srgb` source.
 
 The non-workspace atlas remains UNORM-typed (single `atlas_srv`); only the workspace-mode atlas is TYPELESS-with-dual-SRV. Do not refactor the swapchain → atlas blit into a shared shader path. (#1589/#1610 does not: the raw copy keeps its place as the default, and the private compose target is a *second* target the shader path already had — `blit_to_atlas_texture`'s `rtv_override` — not a unification of the two.)
+
+## Color-space handling (vk_native compose pass)
+
+The Vulkan backend implements the same #1589/#1610 design as the D3D11 path above (ADR-021 § *As shipped*): **the compose space is linear, the encode happens on write into a runtime-private target, and the atlas the DP receives is still ENCODED** (`set_atlas_encoding` is never called, so the default `ENCODED` stands). No DP change, no ABI change.
+
+- **Two compose paths, chosen once per frame.** The **blit** fast path (`vkCmdBlitImage`) is taken only when the frame has a single drawable layer, no zones, *and* the source is already an `_SRGB` swapchain — then passthrough is correct and the commands are byte-for-byte what they always were. Everything else takes the **render pass**, because `loadOp = CLEAR` covers the whole target and a frame cannot be half-blitted and half-drawn.
+- **Sources are read honestly.** The pass samples through a view in the format the *app requested* (`comp_vk_native_swapchain_get_true_image_view`), so an `_SRGB` source is hardware-decoded to linear and a UNORM one is read as the linear values OpenXR says it holds. The non-decoding views and [#1559](https://github.com/DisplayXR/displayxr-runtime/issues/1559)'s UNORM scratch survive to serve the **blit path only** — wiring them into the pass would double-encode.
+- **Blending is linear.** The pass renders into a runtime-private image (same format as the atlas, `MUTABLE_FORMAT` with a `{UNORM, SRGB}` format list) attached through its **`_SRGB` view**, so the fixed-function blender decodes, blends in linear light and re-encodes on store. This is what [#1610](https://github.com/DisplayXR/displayxr-runtime/issues/1610) asks for; no shader applies a transfer function.
+- **Handoff is a copy, never a blit.** `vkCmdCopyImage` between two identically formatted images moves raw bytes. `vkCmdBlitImage` *converts* between the sRGB and UNORM interpretations and would apply the encode twice. **Do not "simplify" that copy into a blit.**
+- **The driver assumption is checked, not assumed.** Blending-in-linear through an `_SRGB` view over a `MUTABLE_FORMAT` UNORM image is driver behaviour; `tools/vk_srgb_blend_probe.c` A/Bs it against a natively-`_SRGB` image. Verified on Apple M1 Pro / MoltenVK (both `(188,188,188,128)`). **Re-run it on a new GPU vendor or driver stack — Android (Adreno, Mali) is untested.**
 
 ## Per-tile alpha (workspace mode)
 

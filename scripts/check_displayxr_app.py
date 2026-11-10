@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -40,9 +41,13 @@ from pathlib import Path
 RULES_DOC = "docs/guides/displayxr-app-rules.md"
 
 # Directories never linted: shared reference code, vendored headers, build output.
+# The Android entries matter after a local Gradle build: AGP's externalNativeBuild
+# tree (.cxx/, older AGP .externalNativeBuild/) holds FetchContent'd displayxr-common
+# sources under _deps/, incl. its tests/, which tripped false INV-3.1 errors.
 EXCLUDE_DIRS = {
     "build", ".git", "third_party", "openxr_includes", "common",
-    "_package", "__pycache__", "node_modules", ".vs", "out",
+    "_package", "__pycache__", "node_modules", ".vs", "out", ".claude",
+    ".cxx", ".externalNativeBuild", ".gradle", "_deps",
 }
 SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".m", ".mm"}
 # JVM sources are linted for the Android rules only (§11) — the C/C++ checks
@@ -53,18 +58,21 @@ JVM_EXTS = {".java", ".kt"}
 RULES = {
     "F-1": "Run the frame loop from READY, gated on a 'session running' flag (not SYNCHRONIZED+); a compliant runtime only leaves READY on your first xrBeginFrame, so a SYNCHRONIZED+ gate deadlocks (black screen).",
     "INV-2.8": "Apps requesting MANUAL eye tracking SHOULD handle XrEventDataEyeTrackingStateChangedDXR (tracking loss is the app's problem in MANUAL).",
+    "INV-2.9": "Apps that request rendering modes SHOULD ease the switch through displayxr-common's dxr::ModeSwitch (step() per frame, or XrSessionUpdateModeSwitch on Windows): the runtime switches in one frame and never ramps the disparity, so a direct xrRequestDisplayRenderingModeDXR on a key press snaps between full parallax and flat. Checked per leg.",
     "INV-3.1": "An N-view app BEGINS XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR (when enumerated; needs XR_DXR_display_info), locates into an XRT_MAX_VIEWS (8)-wide buffer and submits the active mode's viewCount. A stereo-fixed app stays on PRIMARY_STEREO and receives exactly 2. Deriving eyeCount from the rendering mode's viewCount without the opt-in is an error: PRIMARY_STEREO reports 2 and rejects viewCount>2.",
     "INV-3.4": "A projection layer carries the LOCATED view count (what xrLocateViews returned), for every view configuration type. Render only the active mode's views, then alias the inactive tail [active, located) onto view 0's subImage keeping each view's own located pose/fov (DxrAliasInactiveViews in dxr_view_config.h: test_apps/common in-tree, displayxr-common outside). Checked per leg: every platform directory of a multi-leg app must call it itself. Submitting the ACTIVE count is under-submit and xrEndFrame now refuses it (ADR-041). A 3D zone layer is a projection layer and obeys the same rule.",
     "INV-4.3": "Per-tile render size = window/canvas x scaleXY, never display size.",
-    "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode.",
+    "INV-4.6": "Request an sRGB swapchain (and store a correctly-encoded image); don't double-encode. A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589), so display-referred bytes in it wash out. Checked per leg: every platform directory must choose _SRGB first.",
     "INV-4.7": "Write every pixel of the imageRect you declare — clear partial-tile renders to (0,0,0,0) first (or shrink the rect); undefined pixels read as opaque magenta on MoltenVK and break transparent-bg.",
     "INV-4.9": "An app that enables XR_EXT_view_configuration_views_change must not call xrCreateSwapchain from its event handler — move subImage.imageRect instead (an app sized at maxImageRect* per ADR-010 never needs to reallocate).",
+    "INV-4.10": "(Vulkan) Frame-submit discipline: >=2 frames in flight, ONE vkQueueSubmit per frame per queue, never wait the fence of the frame just submitted, no vkQueueWaitIdle/vkDeviceWaitIdle on the frame path, command buffers allocated once and reset (dxr::VkFrameRing, displayxr-common >= v2.28.0). Advisory (WARN). Heuristic: per enclosing function of each vkQueueSubmit (brace-matched; +-60-line window fallback), judged only when the function is on the frame path (draw/render pass/dispatch/xrWaitFrame/xrBeginFrame/xrEndFrame, or a render/draw/frame/present name); exempt with `// dxr-lint: allow-blocking-submit <reason>` on the submit or function-header line.",
     "INV-5.9": "VK apps MUST use XR_KHR_vulkan_enable2 (the runtime creates the VkDevice via xrCreateVulkanDeviceKHR); an app-side vkCreateDevice = enable1, which forfeits the #868 weave-rate decoupling and the late-weave pacing.",
     "INV-7.x": "Capture via xrCaptureAtlasDXR — never reintroduce an app-side CaptureAtlasRegion* readback.",
     "INV-7.2": "xrCaptureAtlasDXR pathPrefix takes NO extension; the runtime appends _atlas.png.",
     "INV-9.1": "Ship a <exe>.displayxr.json (schema_version=1, name 1-64, type 2d|3d) or the app won't appear in the workspace launcher.",
     "INV-9.2": "2D icon is 512x512 (`icon`); 3D icon is 1024x512 (`icon_3d`, requires `icon`); layout in {sbs-lr,sbs-rl,tb,bt}.",
     "INV-10.1": "Apps registering MCP tools (XR_DXR_mcp_tools) declare a manifest `id` (^[a-z0-9][a-z0-9-]{0,31}$) matching the xrSetMCPAppInfoDXR appId.",
+    "INV-10.4": "Never expose desktop control (XR_DXR_desktop_control) through your MCP tools: the per-app MCP endpoint answers any local process, so a tool that lists windows, reads UI text, types or clicks hands your OS grant to all of them (ADR-056 D4). Advisory (WARN) heuristic: a source tree using both APIs is flagged; exempt with `// dxr-lint: allow-mcp-desktop <reason>` once you have checked no tool handler reaches a desktop call.",
     # --- Android pixel-exactness (§11). All no-op unless an AndroidManifest.xml is found. ---
     "INV-1.4": "(Android) Declare PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS=false — else getLocationOnScreen may go window-relative and every window weaves at the same wrong phase.",
     "INV-11.1": "(Android) resizeableActivity=true, no fixed screenOrientation, no min/maxAspectRatio — fixed activities invite invisible server-side size-compat/letterbox scaling that destroys the interlace.",
@@ -156,6 +164,27 @@ SRGB_TOKENS = re.compile(
     re.IGNORECASE,
 )
 CREATES_SWAPCHAIN = re.compile(r"\bxrCreateSwapchain\b")
+ENUMERATES_SWAPCHAIN_FORMATS = re.compile(r"\bxrEnumerateSwapchainFormats\b")
+# INV-4.6, the per-leg shapes of "this leg prefers UNORM" (#1589). Since the
+# format-honest colour model (D3D11 v2.21.0 ... vk_native v2.21.7) an UNORM
+# swapchain holds LINEAR values and is sRGB-encoded on the way to the panel, so
+# an app that picks UNORM and stores display-referred bytes is encoded twice —
+# washed out. Every leg used to get away with it because UNORM was a byte
+# passthrough; the one that did not get migrated (an Android leg preferring
+# {R8G8B8A8_UNORM, B8G8R8A8_UNORM} after its desktop siblings moved to _SRGB)
+# is what these catch. Only checked in files that enumerate swapchain formats.
+_UNORM8 = r"(?:VK_FORMAT|DXGI_FORMAT)_[RB]8G8[RB]8A8_UNORM\b"
+#   (a) a preference list naming only 8-bit UNORM colour formats (2+ entries):
+#       const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
+UNORM_ONLY_PREFERENCE_LIST = re.compile(
+    r"\{\s*(?:\(\s*\w+\s*\)\s*)?" + _UNORM8 +
+    r"(?:\s*,\s*(?:\(\s*\w+\s*\)\s*)?" + _UNORM8 + r")+\s*,?\s*\}"
+)
+#   (b) a scan loop that STOPS at the first UNORM it meets:
+#       if (f == VK_FORMAT_B8G8R8A8_UNORM || ...) { selected = f; break; }
+UNORM_FIRST_BREAK = re.compile(
+    r"==\s*" + _UNORM8 + r"[^;{}]*\)\s*\{[^{}]*\bbreak\b"
+)
 # INV-3.1 (#1486). Two different questions, two different markers:
 #
 #   MULTIVIEW_OPT_IN  — does the app BEGIN the N-view view configuration? Only a
@@ -228,11 +257,51 @@ def strip_comments(text: str) -> str:
     return re.sub(r"//[^\n]*", "", text)
 
 
+_GIT_IGNORED_CACHE: dict = {}
+
+
+def git_ignored_prefixes(root: Path) -> tuple:
+    """Untracked-and-ignored paths under `root`, relative to it (directories end
+    in "/"), per the enclosing git repo's ignore rules. One `git ls-files` call
+    per root, cached. Empty when `root` is not in a git work tree or git is
+    unavailable — EXCLUDE_DIRS is then the only filter. Tracked files are never
+    reported, so a committed file inside an ignored directory is still linted."""
+    key = str(root)
+    if key not in _GIT_IGNORED_CACHE:
+        prefixes: tuple = ()
+        try:
+            out = subprocess.run(
+                ["git", "-C", key, "ls-files", "-z", "--others", "--ignored",
+                 "--exclude-standard", "--directory"],
+                capture_output=True, timeout=30, check=True).stdout
+            prefixes = tuple(e for e in out.decode("utf-8", "replace").split("\0") if e)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _GIT_IGNORED_CACHE[key] = prefixes
+    return _GIT_IGNORED_CACHE[key]
+
+
+def is_excluded(path: Path, root: Path) -> bool:
+    """True for files the linter must skip: anything under an EXCLUDE_DIRS
+    directory, or git-ignored (build trees, generated sources)."""
+    try:
+        relp = path.relative_to(root)
+    except ValueError:
+        return False
+    if any(part in EXCLUDE_DIRS for part in relp.parts[:-1]):
+        return True
+    ignored = git_ignored_prefixes(root)
+    if not ignored:
+        return False
+    posix = relp.as_posix()
+    return any(posix == e or (e.endswith("/") and posix.startswith(e)) for e in ignored)
+
+
 def iter_source_files(root: Path):
     for p in sorted(root.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in SOURCE_EXTS:
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         yield p
 
@@ -291,7 +360,6 @@ def scan_sources(root: Path, findings: list):
             stereo_fixed_marked = True
             stereo_fixed_legs.add(leg_of(path, root))
     is_multiview_app = any(MULTIVIEW_OPT_IN.search(t) for _, t in files)
-    any_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
 
     # INV-3.1 (#1486): mode-derived view counts WITHOUT the PRIMARY_MULTIVIEW_DXR
     # opt-in. The app reads the active mode's viewCount (so it can reach 4) but
@@ -375,7 +443,6 @@ def scan_sources(root: Path, findings: list):
                 "3D zone layers are projection layers and need the same treatment, per zone.",
             ))
 
-    swapchain_loc = None
     for path, text in files:
         for regex, level, rule, msg, fix, multiview_only in SRC_PATTERNS:
             if multiview_only and not is_multiview_app:
@@ -383,10 +450,6 @@ def scan_sources(root: Path, findings: list):
             for m in regex.finditer(text):
                 line_no = text.count("\n", 0, m.start()) + 1
                 findings.append(Finding(level, rule, rel(path, root), line_no, msg, fix))
-        if swapchain_loc is None:
-            m = CREATES_SWAPCHAIN.search(text)
-            if m:
-                swapchain_loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
 
     # INV-5.9 (enforced): a VK app that creates its own VkDevice is using
     # XR_KHR_vulkan_enable (enable1). enable1 forfeits the runtime-owned VkQueue
@@ -411,14 +474,76 @@ def scan_sources(root: Path, findings: list):
             "app-side vkCreateInstance / vkCreateDevice). Reference: test_apps/handle/cube_handle_vk_win.",
         ))
 
-    # INV-4.6 advisory: creates a swapchain but no sRGB format appears anywhere.
-    if swapchain_loc and not any_srgb:
-        p, ln = swapchain_loc
+    check_color_swapchain_per_leg(files, root, findings)
+
+
+def check_color_swapchain_per_leg(files, root: Path, findings: list):
+    """INV-4.6, per leg. A multi-leg app is only as right as its worst leg: the
+    shared/single group ("") counts toward every leg, but one leg's _SRGB choice
+    does not cover another's (the Android leg of a splat demo kept preferring
+    UNORM for months after its desktop legs moved to _SRGB, and an app-wide
+    "any sRGB token anywhere" check was satisfied by the desktop legs)."""
+    fix_unorm = (
+        "Choose the first _SRGB format the runtime enumerates (fall back to UNORM only if none), "
+        "the same way on every leg — ideally through one shared helper. Store display-referred "
+        "bytes in it by a raw copy (blit into an UNORM-sibling scratch, then vkCmdCopyImage) or "
+        "render linear and let the GPU encode; linearize clear colours. Since #1589 an UNORM "
+        "swapchain is read as LINEAR and encoded by the runtime, so display-referred bytes in it "
+        "come out washed out. A/B: DXR_COLOR_LEGACY_UNORM_ENCODED=1 (Android: setprop "
+        "debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1) restores the old passthrough."
+    )
+    by_leg = {}
+    for path, text in files:
+        by_leg.setdefault(leg_of(path, root), []).append((path, text))
+    shared = by_leg.get("", [])
+    shared_srgb = any(SRGB_TOKENS.search(t) for _, t in shared)
+    app_srgb = any(SRGB_TOKENS.search(t) for _, t in files)
+
+    for leg, leg_files in sorted(by_leg.items()):
+        # (a)/(b): a UNORM-first choice, wherever the leg enumerates formats.
+        for path, text in leg_files:
+            if not ENUMERATES_SWAPCHAIN_FORMATS.search(text):
+                continue
+            for regex, what in (
+                (UNORM_ONLY_PREFERENCE_LIST, "a swapchain-format preference list naming only UNORM formats"),
+                (UNORM_FIRST_BREAK, "a swapchain-format scan that stops at the first UNORM format"),
+            ):
+                for m in regex.finditer(text):
+                    findings.append(Finding(
+                        WARN, "INV-4.6", rel(path, root), text.count("\n", 0, m.start()) + 1,
+                        f"UNORM-first colour swapchain choice ({what}). An UNORM swapchain is "
+                        "read as LINEAR and encoded by the runtime (#1589): display-referred "
+                        "bytes stored in it are encoded twice and look washed out.",
+                        fix_unorm,
+                    ))
+        # The leg creates a swapchain but neither it nor the shared code ever
+        # names an sRGB format. Judged per leg only where the leg CHOOSES the
+        # format (enumerates it); a leg that creates swapchains in a format
+        # negotiated elsewhere (displayxr-common's session code, "reuse the
+        # main format") falls back to the app-wide test the check always had.
+        if leg == "" and len(by_leg) > 1:
+            continue  # shared code alone is not a leg
+        loc = None
+        for path, text in leg_files:
+            m = CREATES_SWAPCHAIN.search(text)
+            if m:
+                loc = (rel(path, root), text.count("\n", 0, m.start()) + 1)
+                break
+        if loc is None:
+            continue
+        leg_chooses = any(ENUMERATES_SWAPCHAIN_FORMATS.search(t) for _, t in leg_files)
+        if leg_chooses:
+            if any(SRGB_TOKENS.search(t) for _, t in leg_files) or shared_srgb:
+                continue
+        elif app_srgb:
+            continue
         findings.append(Finding(
-            WARN, "INV-4.6", p, ln,
-            "No sRGB swapchain format detected — INV-4.6 recommends an sRGB swapchain.",
+            WARN, "INV-4.6", loc[0], loc[1],
+            "No sRGB swapchain format detected" + (f" in the {leg}/ leg" if leg else "") +
+            " — INV-4.6 recommends an sRGB swapchain.",
             "Request an sRGB swapchain (_UNORM_SRGB / GL_SRGB8_ALPHA8 / _SRGB / MTLPixelFormat*sRGB). "
-            "A UNORM swapchain is valid ONLY if you store display-referred (already-encoded) bytes.",
+            "A UNORM swapchain is read as LINEAR and encoded by the runtime (#1589); it is valid "
+            "only if you store scene-linear values in it.",
         ))
 
 
@@ -489,7 +614,7 @@ def check_mcp_pairing(root: Path, findings: list):
     # Manifest ids.
     manifest_ids = {}
     for m in root.rglob("*.displayxr.json"):
-        if any(part in EXCLUDE_DIRS for part in m.relative_to(root).parts[:-1]):
+        if is_excluded(m, root):
             continue
         try:
             data = json.loads(m.read_text(encoding="utf-8"))
@@ -512,7 +637,7 @@ def check_mcp_pairing(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -540,6 +665,45 @@ def check_mcp_pairing(root: Path, findings: list):
                                     "Make the code and manifest agree — agents key tool names on this slug."))
 
 
+DESKTOP_CONTROL_CALLS = ("xrSubmitDesktopActionDXR", "xrEnumerateDesktopWindowsDXR", "xrGetDesktopTextAtDXR",
+                         "xrPickDesktopDXR", "xrGetDesktopPointerDXR")
+
+
+def check_mcp_desktop_control(root: Path, findings: list):
+    """INV-10.4 (advisory) — MCP tools must not re-export desktop control (ADR-056 D4).
+
+    The grant is the app's: the OS (or DisplayXR's prompt) asked the user about
+    THIS app. App MCP tools are served on an endpoint any local process can
+    call, so a tool whose handler lists windows, reads UI text, types or clicks
+    gives every process on the machine the app's grant. We cannot prove which
+    handler reaches which call, so an app using BOTH APIs gets one WARN unless
+    a source line carries `dxr-lint: allow-mcp-desktop`.
+    """
+    mcp_at = None
+    desktop_at = None
+    exempt = False
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file() or is_excluded(p, root):
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "dxr-lint: allow-mcp-desktop" in text:
+            exempt = True
+        for i, line in enumerate(text.splitlines(), 1):
+            if mcp_at is None and "xrRegisterMCPToolDXR" in line:
+                mcp_at = (rel(p, root), i)
+            if desktop_at is None and any(c in line for c in DESKTOP_CONTROL_CALLS):
+                desktop_at = (rel(p, root), i)
+    if mcp_at is None or desktop_at is None or exempt:
+        return
+    findings.append(Finding(WARN, "INV-10.4", desktop_at[0], desktop_at[1],
+                            f"App uses XR_DXR_desktop_control and registers MCP tools ({mcp_at[0]}:{mcp_at[1]}).",
+                            "Make sure no MCP tool handler reaches a desktop-control call (ADR-056 D4), then add "
+                            "`// dxr-lint: allow-mcp-desktop <reason>`."))
+
+
 def check_manual_tracking_event(root: Path, findings: list):
     """INV-2.8 (advisory) — MANUAL eye tracking <-> tracking-state event.
 
@@ -557,7 +721,7 @@ def check_manual_tracking_event(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
@@ -584,6 +748,61 @@ def check_manual_tracking_event(root: Path, findings: list):
             "App requests MANUAL eye tracking but never handles XrEventDataEyeTrackingStateChangedDXR.",
             "Handle the event in your xrPollEvent loop (run your own loss transition, request a 2D "
             "mode when ready) — in MANUAL mode the vendor does no grace period or auto-fallback for you.",
+        ))
+
+
+# INV-2.9: a call (not a typedef / PFN declaration / string) of the rendering-mode
+# request, directly or through a function pointer whose name says so.
+MODE_REQUEST_CALL_RE = re.compile(r"\b\w*RequestDisplayRenderingMode\w*\s*\(\s*\w")
+MODE_REQUEST_DECL_RE = re.compile(r"\bPFN_\w*RequestDisplayRenderingMode|XRAPI_\w+\s+\w*RequestDisplayRenderingMode")
+MODE_SWITCH_HELPER_RE = re.compile(r"\bModeSwitch\b|\bXrSessionUpdateModeSwitch\b|mode_switch\.h")
+
+
+def check_mode_switch_easing(root: Path, findings: list):
+    """INV-2.9 (advisory) — ease rendering-mode switches through dxr::ModeSwitch.
+
+    The runtime switches a rendering mode in one frame (atlas recipe, DP weave
+    choice, lens) and never eases the disparity — that is app content. So a leg
+    that requests modes but never references the shared sequencer snaps on
+    every V press. Per leg (LEG_DIRS), because the Windows leg routing through
+    XrSessionUpdateModeSwitch says nothing about a hand-written macOS leg.
+    """
+    first_call = {}  # leg -> (path, line)
+    eased = set()
+    for p in sorted(root.rglob("*")):
+        if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
+            continue
+        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+            continue
+        try:
+            text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        leg = leg_of(p, root)
+        if MODE_SWITCH_HELPER_RE.search(text):
+            eased.add(leg)
+        if leg in first_call:
+            continue
+        for m in MODE_REQUEST_CALL_RE.finditer(text):
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            line_end = text.find("\n", m.start())
+            line_text = text[line_start:line_end if line_end >= 0 else len(text)]
+            if MODE_REQUEST_DECL_RE.search(line_text) or "GetInstanceProcAddr" in line_text:
+                continue
+            first_call[leg] = (rel(p, root), text.count("\n", 0, m.start()) + 1)
+            break
+
+    for leg, (path, line) in sorted(first_call.items()):
+        if leg in eased:
+            continue
+        findings.append(Finding(
+            WARN, "INV-2.9", path, line,
+            f"{'Leg ' + repr(leg) + ' requests' if leg else 'App requests'} rendering modes but never "
+            "uses dxr::ModeSwitch — every switch snaps between full parallax and flat.",
+            "Route V / 0-8 requests through displayxr-common mode_switch.h: call "
+            "g_modeSwitch.step(dt, want, modeCount, modeViewCounts, currentMode, steadyIpd) every frame, "
+            "submit f.ipd as the rig ipdFactor and request f.mode when f.fire (Windows "
+            "XrSessionManager apps: XrSessionUpdateModeSwitch).",
         ))
 
 
@@ -671,7 +890,7 @@ def check_views_change_realloc(root: Path, findings: list):
     for p in sorted(root.rglob("*")):
         if p.suffix.lower() not in SOURCE_EXTS or not p.is_file():
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         try:
             text = strip_comments(p.read_text(encoding="utf-8", errors="replace"))
@@ -704,6 +923,258 @@ def check_views_change_realloc(root: Path, findings: list):
                 break  # one finding per handler region is enough
 
 
+# ---------------------------------------------------------------------------
+# INV-4.10 — Vulkan frame-submit discipline (advisory, WARN).
+#
+# A frame loop that submits, then drains (vkQueueWaitIdle / vkDeviceWaitIdle /
+# vkWaitForFences on the fence it just passed), never overlaps CPU and GPU. On a
+# desktop dGPU that costs only the overlap; on a mobile GPU governor
+# (msm-adreno-tz, Adreno 740) the GPU never looks busy and is parked at about a
+# third of its clock (#1917: ~10 fps -> 30 fps in modelviewer#170 once 3 frames
+# were kept in flight with ONE submit per frame). Per-frame
+# vkAllocateCommandBuffers / vkFreeCommandBuffers adds an alloc + zero cost on
+# Adreno (#1935/#1936). The sanctioned shape is displayxr-common's
+# dxr::VkFrameRing (common/vk_frame_ring.h, >= v2.28.0).
+# ---------------------------------------------------------------------------
+
+VK_DISCIPLINE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".mm"}
+VK_SUBMIT_RE = re.compile(r"\bvkQueueSubmit2?(?:KHR)?\s*\(")
+VK_DRAIN_RE = re.compile(r"\b(vkQueueWaitIdle|vkDeviceWaitIdle)\s*\(")
+VK_WAIT_FENCES_RE = re.compile(r"\bvkWaitForFences\s*\(")
+VK_ALLOC_CB_RE = re.compile(r"\bvkAllocateCommandBuffers\s*\(")
+VK_FREE_CB_RE = re.compile(r"\bvkFreeCommandBuffers\s*\(")
+# "This function is on the steady-state frame path": it records drawing (a draw,
+# a render pass, a dispatch) or drives the OpenXR frame cycle
+# (xrWaitFrame/xrBeginFrame/xrEndFrame — NOT the swapchain acquire/release, which
+# one-off static quad-layer fills also call), or its
+# name says render/draw/frame/present ("Renderer" excluded — that is an init
+# function's name, e.g. InitializeVulkanRenderer). A function with none of these
+# is treated as a one-off upload/clear helper — the allowed exception.
+VK_FRAME_BODY_RE = re.compile(
+    r"\bvkCmdDraw\w*\s*\(|\bvkCmdBeginRenderPass\w*\s*\(|\bvkCmdBeginRendering\w*\s*\("
+    r"|\bvkCmdDispatch\w*\s*\(|\bxr(?:WaitFrame|BeginFrame|EndFrame)\s*\("
+)
+VK_FRAME_NAME_RE = re.compile(r"render(?!er)|draw|frame|present", re.IGNORECASE)
+VK_DISCIPLINE_EXEMPT = "dxr-lint: allow-blocking-submit"
+# Fallback window (lines either side of the submit) when no enclosing function
+# body can be delimited.
+VK_DISCIPLINE_WINDOW = 60
+_CONTROL_HEADER_RE = re.compile(r"\b(?:if|for|while|switch|catch)\s*\(|^(?:else|do|try)\b|\belse\s*$")
+_FUNC_HEADER_RE = re.compile(
+    r"(?:(\w+)\s*\([^;{}]*\)|\]\s*(?:\([^;{}]*\))?)"          # name(args)  |  lambda ](args)
+    r"\s*(?:const|noexcept|override|final|mutable|->\s*[\w:<>*&\s]+)*\s*$"
+)
+_OBJC_METHOD_RE = re.compile(r"^\s*[-+]\s*\(")
+
+
+def _brace_pairs(text: str) -> list:
+    """(open_index, close_index) for every matched {...} in comment-stripped text,
+    skipping braces inside string and char literals."""
+    pairs, stack = [], []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "\"'":
+            j = i + 1
+            while j < n and text[j] != c and text[j] != "\n":
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            pairs.append((stack.pop(), i))
+        i += 1
+    return pairs
+
+
+def _header_before(text: str, open_idx: int) -> tuple:
+    """The declaration text in front of a '{' (back to the previous ; { or }),
+    and its start index."""
+    j = open_idx - 1
+    while j >= 0 and text[j] not in ";{}":
+        j -= 1
+    return text[j + 1:open_idx], j + 1
+
+
+def _enclosing_function(text: str, pairs: list, pos: int):
+    """Innermost {...} enclosing `pos` whose header looks like a function (or
+    lambda / ObjC method) definition rather than a control-flow block or an
+    aggregate initializer. Returns (body_start, body_end, header_start, name)."""
+    cands = sorted((p for p in pairs if p[0] < pos < p[1]), key=lambda p: p[0], reverse=True)
+    for o, c in cands:
+        header, hstart = _header_before(text, o)
+        h = " ".join(header.split())
+        if not h:
+            continue
+        if _OBJC_METHOD_RE.match(h):
+            m = re.search(r"\)\s*(\w+)", h)
+            return (o, c, hstart, m.group(1) if m else "")
+        if _CONTROL_HEADER_RE.search(h):
+            continue
+        m = _FUNC_HEADER_RE.search(h)
+        if m:
+            return (o, c, hstart, m.group(1) or "<lambda>")
+    return None
+
+
+def _call_args(text: str, open_paren: int) -> list:
+    """Top-level comma-split arguments of the call whose '(' is at open_paren."""
+    depth, args, cur = 0, [], []
+    for ch in text[open_paren:]:
+        if ch in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur))
+                break
+        if depth == 1 and ch == ",":
+            args.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    return [" ".join(a.split()) for a in args]
+
+
+def _norm_handle(expr: str) -> str:
+    return re.sub(r"[\s&()]", "", expr)
+
+
+def check_vk_frame_discipline(root: Path, findings: list):
+    """INV-4.10 (advisory) — Vulkan frame-submit discipline.
+
+    THE HEURISTIC, stated plainly (a text matcher, not a parser). For every
+    vkQueueSubmit in a .c/.cc/.cpp/.cxx/.mm source, find the enclosing function
+    body by brace matching (innermost {...} whose header looks like a function,
+    lambda or ObjC method; braces in string/char literals are skipped). If none
+    can be delimited, a +-VK_DISCIPLINE_WINDOW-line window around the submit is
+    used instead. Only functions on the FRAME PATH are judged — the body records
+    a draw / render pass / dispatch or calls xrWaitFrame / xrBeginFrame /
+    xrEndFrame, or the function name contains
+    render (not "renderer") / draw / frame / present. A submit in any other
+    function is treated as a one-off upload (the allowed exception) and is not
+    reported. Within a frame-path body it flags:
+      (a) vkQueueWaitIdle( or vkDeviceWaitIdle( anywhere in the body;
+      (b) vkWaitForFences( AFTER the submit whose fence list names the same
+          handle passed as vkQueueSubmit's fence argument (waiting the frame you
+          just submitted);
+      (c) vkAllocateCommandBuffers( AND vkFreeCommandBuffers( both in the body
+          (per-frame command-buffer churn).
+    Exemption: the comment `// dxr-lint: allow-blocking-submit <reason>` on the
+    submit line, or on any line of the function's header (signature through
+    opening brace), suppresses every finding for that submit.
+    """
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in VK_DISCIPLINE_EXTS:
+            continue
+        if is_excluded(path, root):
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "vkQueueSubmit" not in raw:
+            continue
+        text = strip_comments(raw)
+        raw_lines = raw.splitlines()
+        pairs = _brace_pairs(text)
+        reported = set()  # (body_start, sub-check) — one finding per function per check
+
+        def line_of(idx):
+            return text.count("\n", 0, idx) + 1
+
+        for sm in VK_SUBMIT_RE.finditer(text):
+            submit_line = line_of(sm.start())
+            fn = _enclosing_function(text, pairs, sm.start())
+            if fn:
+                b0, b1, hstart, name = fn
+                header_lines = range(line_of(hstart), line_of(b0) + 1)
+            else:
+                lines_all = text.split("\n")
+                lo = max(0, submit_line - 1 - VK_DISCIPLINE_WINDOW)
+                hi = min(len(lines_all), submit_line + VK_DISCIPLINE_WINDOW)
+                b0 = sum(len(l) + 1 for l in lines_all[:lo])
+                b1 = sum(len(l) + 1 for l in lines_all[:hi])
+                name, header_lines = "", range(0)
+            exempt_lines = [submit_line] + list(header_lines)
+            if any(0 < ln <= len(raw_lines) and VK_DISCIPLINE_EXEMPT in raw_lines[ln - 1]
+                   for ln in exempt_lines):
+                continue
+            body = text[b0:b1]
+            if not (VK_FRAME_BODY_RE.search(body) or (name and VK_FRAME_NAME_RE.search(name))):
+                continue  # one-off upload helper — the allowed exception
+            where = f" in `{name}()`" if name and name != "<lambda>" else ""
+            prel = rel(path, root)
+
+            # (a) queue/device drain in the same frame-path function.
+            dm = VK_DRAIN_RE.search(body)
+            if dm and (b0, "a") not in reported:
+                reported.add((b0, "a"))
+                findings.append(Finding(
+                    WARN, "INV-4.10", prel, line_of(b0 + dm.start()),
+                    f"{dm.group(1)} in the same frame-path function as vkQueueSubmit{where} — "
+                    "the CPU drains the GPU every frame, so nothing overlaps; on mobile GPU "
+                    "governors (Adreno msm-adreno-tz) the clock collapses to ~1/3 (#1917).",
+                    "Keep >=2 frames in flight with one submit per frame: dxr::VkFrameRing "
+                    "(displayxr-common common/vk_frame_ring.h, >= v2.28.0) — beginFrame() / "
+                    "tileBarrier() between tiles / endFrame(); waitAll() only on resize/teardown. "
+                    f"A genuine one-off: `// {VK_DISCIPLINE_EXEMPT} <reason>` on the submit line.",
+                ))
+
+            # (b) waiting the fence of the frame just submitted.
+            args = _call_args(text, sm.end() - 1)
+            fence = _norm_handle(args[3]) if len(args) >= 4 else ""
+            if fence and fence not in ("VK_NULL_HANDLE", "nullptr", "NULL", "0") and (b0, "b") not in reported:
+                for wm in VK_WAIT_FENCES_RE.finditer(text, sm.end(), b1):
+                    wargs = _call_args(text, wm.end() - 1)
+                    if len(wargs) >= 3 and fence in _norm_handle(wargs[2]):
+                        reported.add((b0, "b"))
+                        findings.append(Finding(
+                            WARN, "INV-4.10", prel, line_of(wm.start()),
+                            f"vkWaitForFences on `{fence}` right after submitting with it{where} — "
+                            "waiting the frame you just submitted serialises CPU and GPU (zero "
+                            "frames in flight).",
+                            "Wait the fence of the frame from N slots ago, not this one: "
+                            "dxr::VkFrameRing::beginFrame() does exactly that (displayxr-common "
+                            ">= v2.28.0). Exempt a deliberate one-off with "
+                            f"`// {VK_DISCIPLINE_EXEMPT} <reason>`.",
+                        ))
+                        break
+
+            # (d) one un-indexed fence waited BEFORE the submit that signals it:
+            # the next frame waits the previous one — at most ONE frame in flight.
+            # INFO only: a fence reached through a slot pointer (frame->fence) looks
+            # identical to the matcher, so this is a prompt to look, not a verdict.
+            if (fence and "[" not in fence and fence not in ("VK_NULL_HANDLE", "nullptr", "NULL", "0")
+                    and (b0, "b") not in reported and (b0, "d") not in reported):
+                for wm in VK_WAIT_FENCES_RE.finditer(text, b0, sm.start()):
+                    wargs = _call_args(text, wm.end() - 1)
+                    if len(wargs) >= 3 and fence == _norm_handle(wargs[2]):
+                        reported.add((b0, "d"))
+                        findings.append(Finding(
+                            INFO, "INV-4.10", prel, line_of(wm.start()),
+                            f"Single fence `{fence}` waited at the top of the frame and signalled "
+                            f"by its submit{where} — at most one frame in flight (INV-4.10 asks for >=2).",
+                            "Use a ring of N>=2 fences/command buffers indexed by frame slot "
+                            "(dxr::VkFrameRing, displayxr-common >= v2.28.0, defaults to 3).",
+                        ))
+                        break
+
+            # (c) per-frame command-buffer allocation.
+            am = VK_ALLOC_CB_RE.search(body)
+            if am and VK_FREE_CB_RE.search(body) and (b0, "c") not in reported:
+                reported.add((b0, "c"))
+                findings.append(Finding(
+                    WARN, "INV-4.10", prel, line_of(b0 + am.start()),
+                    f"vkAllocateCommandBuffers + vkFreeCommandBuffers in a frame-path function{where} — "
+                    "per-frame command-buffer churn (Adreno pays a fresh zeroed allocation each "
+                    "time, #1935/#1936).",
+                    "Allocate one command buffer per frame slot once and vkResetCommandBuffer() it "
+                    "(dxr::VkFrameRing does this).",
+                ))
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +1260,7 @@ def iter_android_sources(root: Path):
     for p in sorted(root.rglob("*")):
         if not p.is_file() or p.suffix.lower() not in exts:
             continue
-        if any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1]):
+        if is_excluded(p, root):
             continue
         yield p
 
@@ -949,7 +1420,7 @@ def check_android_manifest(mpath: Path, root: Path, findings: list) -> None:
 def check_android(root: Path, findings: list) -> None:
     """§11 — Android pixel-exactness. No-ops entirely for non-Android apps."""
     manifests = [m for m in sorted(root.rglob("AndroidManifest.xml"))
-                 if not any(part in EXCLUDE_DIRS for part in m.relative_to(root).parts[:-1])]
+                 if not is_excluded(m, root)]
     if not manifests:
         return  # Not an Android app — every check below is Android-only.
 
@@ -1002,7 +1473,7 @@ def check_android(root: Path, findings: list) -> None:
 
 def scan_manifests(root: Path, findings: list):
     manifests = [p for p in root.rglob("*.displayxr.json")
-                 if not any(part in EXCLUDE_DIRS for part in p.relative_to(root).parts[:-1])]
+                 if not is_excluded(p, root)]
     if not manifests:
         findings.append(Finding(WARN, "INV-9.1", str(root), 1,
                                 "No *.displayxr.json found — the app won't appear in any workspace launcher.",
@@ -1063,8 +1534,11 @@ def main(argv=None) -> int:
     scan_sources(root, findings)
     scan_manifests(root, findings)
     check_mcp_pairing(root, findings)
+    check_mcp_desktop_control(root, findings)
     check_manual_tracking_event(root, findings)
+    check_mode_switch_easing(root, findings)
     check_views_change_realloc(root, findings)
+    check_vk_frame_discipline(root, findings)
     check_android(root, findings)
     findings = dedupe(findings)
     print_findings(findings, root)

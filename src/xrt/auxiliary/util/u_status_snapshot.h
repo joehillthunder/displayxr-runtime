@@ -1,0 +1,282 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Pure helpers over @ref xrt_status_snapshot (ADR-051): warning
+ *         derivation, JSON and text serialisation.
+ *
+ * No instance, no loader, no service: everything here reads only the snapshot,
+ * so it is unit-testable on a synthetic one (`tests/tests_status_snapshot.cpp`).
+ * The collectors live where their dependencies do — the headless builder in
+ * `targets/common/target_status_snapshot.h`, the service builder (phase 2) next
+ * to the IPC server.
+ *
+ * Runtime-derived warning codes (design §4):
+ *
+ * | code               | level    | scope  |
+ * |--------------------|----------|--------|
+ * | `NOT_NATIVE`       | critical | screen |
+ * | `CLAIM_FALLBACK`   | warn     | screen |
+ * | `CLAIM_EDID_ONLY`  | info     | screen |
+ * | `NO_PHYSICAL_SIZE` | warn     | screen |
+ * | `SEGMENT_FLAT_2D`  | warn     | screen |
+ * | `TRACKER_DOWN`     | warn     | screen |
+ * | `PLUGIN_NOT_READY` | critical | screen (system when the active plug-in claims none) |
+ * | `SERVICE_HEADLESS` | info     | system |
+ * | `DP_DEGRADED`      | warn     | screen |
+ * | `DP_STALE`         | critical | screen |
+ * | `CLAIM_FORCED`     | info     | screen |
+ * | `CONV_CRASH_LOOP`  | critical | system |
+ * | `CONV_RESEARCH_MODEL_ENABLED` | warn | system |
+ * | `CONV_TASK_UNSERVED` | warn   | system |
+ * | `CONV_CPU_STAGING` | info     | system |
+ *
+ * @ingroup aux_util
+ */
+
+#pragma once
+
+#include "xrt/xrt_display_status.h"
+
+#include <stddef.h>
+
+typedef struct cJSON cJSON;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*!
+ * @name Warning codes (§4)
+ * @{
+ */
+#define U_STATUS_W_NOT_NATIVE "NOT_NATIVE"
+#define U_STATUS_W_CLAIM_FALLBACK "CLAIM_FALLBACK"
+#define U_STATUS_W_CLAIM_EDID_ONLY "CLAIM_EDID_ONLY"
+#define U_STATUS_W_NO_PHYSICAL_SIZE "NO_PHYSICAL_SIZE"
+#define U_STATUS_W_SEGMENT_FLAT_2D "SEGMENT_FLAT_2D"
+#define U_STATUS_W_TRACKER_DOWN "TRACKER_DOWN"
+#define U_STATUS_W_PLUGIN_NOT_READY "PLUGIN_NOT_READY"
+#define U_STATUS_W_SERVICE_HEADLESS "SERVICE_HEADLESS"
+#define U_STATUS_W_DP_DEGRADED "DP_DEGRADED"
+#define U_STATUS_W_DP_STALE "DP_STALE"
+#define U_STATUS_W_CLAIM_FORCED "CLAIM_FORCED"
+//! ADR-053: a conversion capability is FAILED(crash_loop) — 5 abnormal host exits in 10 min.
+#define U_STATUS_W_CONV_CRASH_LOOP "CONV_CRASH_LOOP"
+//! ADR-053: a task is served by a RESEARCH_ONLY / UNKNOWN-licence model (AllowResearchOnly is on).
+#define U_STATUS_W_CONV_RESEARCH_MODEL_ENABLED "CONV_RESEARCH_MODEL_ENABLED"
+//! ADR-053: a task has candidates, but every one is in a terminal state (nothing selected).
+#define U_STATUS_W_CONV_TASK_UNSERVED "CONV_TASK_UNSERVED"
+//! ADR-053: a live stream fell back to CPU staging (no GPU-shared import).
+#define U_STATUS_W_CONV_CPU_STAGING "CONV_CPU_STAGING"
+/*! @} */
+
+//! A screen whose DP has not tracked for longer than this raises TRACKER_DOWN (§4).
+#define U_STATUS_TRACKER_DOWN_MS 5000u
+
+/*!
+ * Recompute every runtime-derived warning of @p snap from its data: clears
+ * `screens[*].warnings` and the system-level `warnings`, then applies the §4
+ * rules. Idempotent. Never touches the vendor cell (vendor warnings pass
+ * through verbatim there).
+ */
+void
+u_status_warnings_derive(struct xrt_status_snapshot *snap);
+
+/*!
+ * Decide a screen's native mode and whether it runs it.
+ *
+ * With a compositor-reported preferred mode (@p preferred_w / @p preferred_h
+ * non-zero; desktop Linux under Mutter), @p mode_w / @p mode_h are the
+ * compositor's CURRENT mode: native = the preferred mode, and `is_native` =
+ * current == preferred, never the desktop rect (which is logical on a scaled
+ * desktop: 3456x2160 for a 2880x1800 panel at 167 %). Otherwise @p mode_w /
+ * @p mode_h ARE the native mode and `is_native` = it equals the desktop rect.
+ * `refresh_mhz` is left as the caller set it.
+ */
+void
+u_status_native_resolve(struct xrt_status_native *n,
+                        uint32_t mode_w,
+                        uint32_t mode_h,
+                        uint32_t preferred_w,
+                        uint32_t preferred_h,
+                        uint32_t desktop_w,
+                        uint32_t desktop_h);
+
+/*!
+ * macOS: decide a screen's native mode from the current mode's BACKING pixels
+ * (@p backing_w / @p backing_h, `CGDisplayModeGetPixelWidth`) against the
+ * panel's native pixel grid (@p panel_w / @p panel_h). `is_native` = they are
+ * equal — true in the default HiDPI mode (1512x982 points @2x = 3024x1964 on a
+ * 3024x1964 panel), false under "More Space" / "Larger Text". An unknown panel
+ * grid (0) leaves the native mode unknown (0x0), which never warns; the
+ * backing is still reported as `current_width/height`.
+ * `refresh_mhz` is left as the caller set it.
+ */
+void
+u_status_native_resolve_backing(
+    struct xrt_status_native *n, uint32_t backing_w, uint32_t backing_h, uint32_t panel_w, uint32_t panel_h);
+
+/*!
+ * A screen's physical size: the claiming plug-in's metres (@p plugin_w_m /
+ * @p plugin_h_m, 0 when the plug-in did not describe the screen) win only
+ * under an EDID or VERIFIED claim (@p confidence); otherwise the EDID's mm
+ * when present, and the plug-in's only when there is no EDID size.
+ */
+void
+u_status_physical_pick(uint32_t confidence,
+                       float plugin_w_m,
+                       float plugin_h_m,
+                       uint32_t edid_w_mm,
+                       uint32_t edid_h_mm,
+                       struct xrt_status_physical *out);
+
+/*!
+ * Append a warning to a fixed array; false when full (the warning is dropped).
+ */
+bool
+u_status_warning_push(struct xrt_status_warning *arr,
+                      uint32_t *count,
+                      uint32_t cap,
+                      const char *code,
+                      enum xrt_status_level level,
+                      const char *text);
+
+/*!
+ * ADR-034 Amendment 5: add `input_holders: [{client, app, generation,
+ * holders{controllers, hand_tracking, gamepad}, preferred{...}}]` to @p root
+ * (null = nobody / the default walk). Shared by the snapshot and
+ * `displayxr-cli input list --json`.
+ */
+void
+u_status_input_holders_add_cjson(cJSON *root, const struct xrt_input_client_holders *rows, uint32_t count);
+
+/*!
+ * The design §3 JSON of @p snap (`schema` first). Caller owns the tree.
+ */
+cJSON *
+u_status_snapshot_to_cjson(const struct xrt_status_snapshot *snap);
+
+/*!
+ * The design §7 text table of @p snap into @p buf (always NUL-terminated when
+ * @p cap > 0; truncated, never overflowed). Returns the length the full text
+ * needs, excluding the NUL — like snprintf, so a caller can size a buffer.
+ */
+size_t
+u_status_snapshot_format_text(const struct xrt_status_snapshot *snap, char *buf, size_t cap);
+
+/*!
+ * The head piece of @p snap (everything but the screen and client rows, plus
+ * the client ids) — what each `system_get_status_snapshot` reply carries.
+ */
+void
+u_status_snapshot_get_head(const struct xrt_status_snapshot *snap, struct xrt_status_head *out);
+
+/*!
+ * Start reassembling a snapshot from its head: zeroes @p snap, copies the head
+ * fields back and sets `screen_count` / `client_count` + each client row's
+ * `id`. The caller then fills `screens[i]` and `clients[i]` from the per-row
+ * replies (each must carry @ref xrt_status_head::generation, else refetch).
+ */
+void
+u_status_snapshot_set_head(struct xrt_status_snapshot *snap, const struct xrt_status_head *head);
+
+/*!
+ * ADR-053: one conversion provider row as a JSON object (the `conv_providers[]`
+ * element; also what `displayxr-cli conv list --json` prints). Caller owns it.
+ */
+cJSON *
+u_status_conv_provider_to_cjson(const struct xrt_status_conv_provider *p);
+
+/*!
+ * ADR-053: one conversion task row as a JSON object (the `conv_tasks[]` element).
+ * @p providers / @p provider_count resolve the row's provider index to its id.
+ */
+cJSON *
+u_status_conv_task_to_cjson(const struct xrt_status_conv_task *t,
+                            const struct xrt_status_conv_provider *providers,
+                            uint32_t provider_count);
+
+/*!
+ * ADR-053 P4: one model pack row (the `conv_packs[]` element). Caller owns it.
+ */
+cJSON *
+u_status_conv_pack_to_cjson(const struct xrt_status_conv_pack *p);
+
+/*!
+ * ADR-053 P4: add `conv_model_store` ({root, source}) and `conv_packs[]` to
+ * @p root when the snapshot carries a store root (a CLI that read it).
+ */
+void
+u_status_conv_store_add_cjson(cJSON *root, const struct xrt_status_snapshot *snap);
+
+/*!
+ * ADR-053: the `displayxr-cli conv list|status --json` document (also MCP
+ * `get_conversion_status`): `{schema, source, generation, providers[],
+ * tasks[], warnings[]}` where `warnings` keeps only the `CONV_*` codes of
+ * @p snap (derive them first). Same row objects as the snapshot's
+ * `conv_providers[]` / `conv_tasks[]`. Caller owns the tree.
+ */
+cJSON *
+u_status_conv_to_cjson(const struct xrt_status_snapshot *snap);
+
+//! All three counters equal (topology, status, conversion).
+bool
+u_status_generation_equal(const struct xrt_status_generation *a, const struct xrt_status_generation *b);
+
+/*!
+ * @name Stable enum spellings (as serialised)
+ * @{
+ */
+const char *
+u_status_source_str(enum xrt_status_source s);
+const char *
+u_status_tracking_str(enum xrt_status_tracking t);
+const char *
+u_status_presenter_str(enum xrt_status_presenter p);
+const char *
+u_status_lease_str(enum xrt_status_lease l);
+const char *
+u_status_level_str(enum xrt_status_level l);
+const char *
+u_status_vendor_tracker_str(enum xrt_status_vendor_tracker t);
+const char *
+u_status_vendor_lens_str(enum xrt_status_vendor_lens l);
+const char *
+u_status_mm_source_str(enum xrt_status_mm_source s);
+const char *
+u_status_layout_source_str(uint32_t xrt_screen_info_source);
+const char *
+u_status_dp_api_str(enum xrt_status_dp_api a);
+const char *
+u_status_dp_kind_str(enum xrt_status_dp_kind k);
+const char *
+u_status_dp_backend_str(enum xrt_status_dp_backend b);
+const char *
+u_status_eye_source_str(enum xrt_status_eye_source e);
+//! `enum xrt_display_claim_confidence` value → "VERIFIED" / "EDID" / "FALLBACK" / "NONE" / "UNKNOWN".
+const char *
+u_status_confidence_str(uint32_t confidence);
+//! "user" / "machine" / "env"; NULL for NONE (JSON null).
+const char *
+u_status_pref_source_str(enum xrt_status_pref_source s);
+//! "live" / "next-session".
+const char *
+u_status_apply_str(enum xrt_status_apply a);
+//! `enum xrt_plugin_platform_state` value → "READY", … (same spellings as the loader).
+const char *
+u_status_platform_state_str(uint32_t state);
+//! `enum xrt_client_class` value → "APP", … ("UNVERIFIED" when @p verified is false).
+const char *
+u_status_client_class_str(uint32_t client_class, bool verified);
+//! "in_service" / "satellite" / "android_service".
+const char *
+u_status_conv_hosting_str(enum xrt_status_conv_hosting h);
+//! XRT_CONV_LICENCE_* → "UNKNOWN" / "PERMISSIVE" / "COMMERCIAL" / "RESEARCH_ONLY".
+const char *
+u_status_conv_licence_str(uint32_t licence_class);
+/*! @} */
+
+#ifdef __cplusplus
+}
+#endif

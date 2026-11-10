@@ -18,27 +18,42 @@
  * motion pattern; left registered and un-gated it silently displaces the
  * qwerty fallback and the user sees phantom controllers sweeping through
  * the scene with nothing driving them. It was a #825 debugging aid, so
- * `probe()` now declines unless `DXR_SIM_INPUT=1` is set in the
- * environment — being registered is no longer enough. (Env var rather
- * than the usual registry gate on purpose: this is a developer switch
- * flipped per-run, not machine configuration. Note the process-level
- * caveat — the runtime DLL has its own static-CRT environment block, so
- * set it before launching the host process, not from a run script.)
+ * `probe()` declines unless its `ENABLE` setting is 1 — being registered
+ * is not enough. Settings reach it ONLY through the host iface (ADR-054
+ * decision 7, the one options contract — N3c): `displayxr-cli input set
+ * sim-input ENABLE 1` (per user; `--machine` = HKLM), or
+ * `DXR_INPUT_SIM_INPUT_ENABLE=1` in the HOSTING process's environment,
+ * which always wins. The pre-N3c `DXR_SIM_INPUT=1` keeps working for one
+ * release as an alias (`sim_input_settings.c`, with a deprecation WARN).
+ * Process-level caveat unchanged: the runtime DLL has its own static-CRT
+ * environment block, so set a variable before launching the host process,
+ * not from a run script.
  *
  * A second, independent opt-in adds the scripted NAVIGATION device that
  * drives the rig role (ADR-034 Amendment 4 / #1380):
  *
- *   - `DXR_SIM_INPUT_NAV=1`            — create it (default OFF, so every
- *                                        pre-existing run is unchanged). It
- *                                        also switches the controllers to
- *                                        display-plane-relative poses, which
- *                                        is what the contract requires of a
- *                                        provider that navigates.
- *   - `DXR_SIM_INPUT_NAV_HOLD_MS=n`    — every n ms the navigation pose reports
- *                                        invalid for 500 ms (composer hold /
- *                                        re-align path). Default 0 = never.
- *   - `DXR_SIM_INPUT_NAV_RECENTER_MS=n`— fire a scripted recenter every n ms.
- *                                        Default 0 = never.
+ *   - `NAV` = 1             (alias `DXR_SIM_INPUT_NAV=1`) — create it (default
+ *                           OFF, so every pre-existing run is unchanged). It
+ *                           also switches the controllers to
+ *                           display-plane-relative poses, which is what the
+ *                           contract requires of a provider that navigates.
+ *   - `NAV_HOLD_MS` = n     (alias `DXR_SIM_INPUT_NAV_HOLD_MS`) — every n ms
+ *                           the navigation pose reports invalid for 500 ms
+ *                           (composer hold / re-align path). Default 0 = never.
+ *   - `NAV_RECENTER_MS` = n (alias `DXR_SIM_INPUT_NAV_RECENTER_MS`) — fire a
+ *                           scripted recenter every n ms. Default 0 = never.
+ *
+ * Hand-script knobs (#2191; new, so no legacy aliases):
+ *
+ *   - `HANDS` = both | left | right | none — which hands track (default both).
+ *   - `PINCH` = wave | hold | open — the curl wave (default), a held
+ *                           thumb+index pinch, or never pinching.
+ *   - `HAND_DISTANCE_M` = m — circle centres in front of the glass (0.25).
+ *
+ * `SOURCE` = script | shared-camera — what presence follows (default script:
+ * always present). shared-camera is the reference consumer of the host
+ * iface's shared-camera slot (`sim_input_shared_camera.h`): presence follows
+ * the display's shared stereo camera, the hands stay scripted.
  *
  * @author David Fattal
  * @ingroup drv_sim_input
@@ -48,14 +63,17 @@
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 
+#include <stddef.h>
+
 #include "util/u_logging.h"
 
 #include "sim_input_interface.h"
+#include "sim_input_settings.h"
+#include "sim_input_shared_camera.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 
@@ -64,42 +82,6 @@
  * Vtable callbacks.
  *
  */
-
-/*!
- * Is @p name set to something truthy? Anything but unset / empty / "0" /
- * "false" / "no" / "off" counts as on.
- */
-static bool
-sim_input_env_on(const char *name)
-{
-	const char *v = getenv(name);
-	if (v == NULL || v[0] == '\0') {
-		return false;
-	}
-	return strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0 && strcmp(v, "off") != 0;
-}
-
-//! Is the `DXR_SIM_INPUT` opt-in set?
-static bool
-sim_input_opted_in(void)
-{
-	return sim_input_env_on("DXR_SIM_INPUT");
-}
-
-/*!
- * A non-negative millisecond knob, 0 when unset / empty / unparseable /
- * negative — every one of which means "feature off" for the callers here.
- */
-static int64_t
-sim_input_env_ms(const char *name)
-{
-	const char *v = getenv(name);
-	if (v == NULL || v[0] == '\0') {
-		return 0;
-	}
-	long long ms = strtoll(v, NULL, 10);
-	return ms > 0 ? (int64_t)ms : 0;
-}
 
 static xrt_result_t
 sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
@@ -111,13 +93,48 @@ sim_input_plugin_probe(struct xrt_input_plugin_instance **out_inst)
 	 * moves on and, with no other provider, qwerty keeps the hand roles.
 	 * No per-instance state; ProbeOrder=200 (set at registration) still
 	 * ranks this after every real-hardware provider when it IS opted in. */
-	if (!sim_input_opted_in()) {
-		U_LOG_I("sim-input: declining — set DXR_SIM_INPUT=1 to enable the simulated input provider.");
+	if (!sim_input_setting_on("ENABLE")) {
+		U_LOG_I(
+		    "sim-input: declining — 'displayxr-cli input set sim-input ENABLE 1' (or "
+		    "DXR_INPUT_SIM_INPUT_ENABLE=1 in the hosting process) enables the simulated input provider.");
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
 
-	U_LOG_W("sim-input: DXR_SIM_INPUT set — SIMULATED controllers will drive the hand roles.");
+	U_LOG_W("sim-input: ENABLE is set — SIMULATED controllers will drive the hand roles.");
 	return XRT_SUCCESS;
+}
+
+/*! The host iface (process-lifetime runtime storage, §4b.6); set at negotiate. */
+static const struct xrt_input_plugin_host_iface *g_host = NULL;
+
+/*! SOURCE=shared-camera: presence follows the shared camera's frames. */
+static bool g_source_shared_camera = false;
+
+/*!
+ * The physical display height from the host's display geometry (the display
+ * plug-in's `get_display_info`, published by the builder before
+ * `create_devices`), or 0 when the host cannot say — the hand script then
+ * uses its fallback height.
+ */
+static float
+sim_input_display_geometry(float *out_viewer_y_m, float *out_viewer_z_m)
+{
+	*out_viewer_y_m = 0.0f;
+	*out_viewer_z_m = 0.0f;
+	if (g_host == NULL ||
+	    g_host->struct_size < offsetof(struct xrt_input_plugin_host_iface, get_display_geometry) +
+	                              sizeof(g_host->get_display_geometry) ||
+	    g_host->get_display_geometry == NULL) {
+		return 0.0f;
+	}
+	struct xrt_input_host_display_geometry geo = {0};
+	geo.struct_size = (uint32_t)sizeof(geo);
+	if (g_host->get_display_geometry(&geo) != XRT_SUCCESS) {
+		return 0.0f;
+	}
+	*out_viewer_y_m = geo.nominal_viewer_y_m;
+	*out_viewer_z_m = geo.nominal_viewer_z_m;
+	return geo.display_height_m;
 }
 
 static xrt_result_t
@@ -131,27 +148,77 @@ sim_input_plugin_create_devices(struct xrt_input_plugin_instance *inst,
 	*out_count = 0;
 
 	/* #1380: the scripted NAVIGATION device is a SECOND opt-in on top of
-	 * DXR_SIM_INPUT. Default OFF, so every existing selftest / CI run that
-	 * only asks for simulated hands keeps exactly the behaviour it had —
-	 * the rig stays on the qwerty floor and the controllers keep their
-	 * stage-anchored circle. With it on, this provider drives the rig
+	 * ENABLE. Default OFF, so every existing selftest / CI run that only
+	 * asks for simulated hands keeps exactly the behaviour it had — the
+	 * rig stays on the qwerty floor. With it on, this provider drives the rig
 	 * role end-to-end with no hardware. */
-	const bool nav = sim_input_env_on("DXR_SIM_INPUT_NAV");
+	const bool nav = sim_input_setting_on("NAV");
 	const uint32_t needed = nav ? 3 : 2;
 	if (max_count < needed) {
 		return XRT_ERROR_ALLOCATION;
 	}
 
-	/* A provider that navigates publishes its controllers
-	 * display-plane-relative (ADR-034 Amendment 4) — so the knob moves the
-	 * controllers' frame too, which is the whole point: the reference
-	 * provider must model the contract, not half of it. */
-	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, nav);
-	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, nav);
+	/* #2191: the hand script. The controllers are display-plane-relative
+	 * (RIG_LOCAL) with or without NAV: what a navigating provider must do
+	 * (ADR-034 Amendment 4), and what puts the hands in front of the glass
+	 * for everyone else. */
+	char v[32];
+	enum sim_input_hands_mode hands = SIM_INPUT_HANDS_BOTH;
+	if (sim_input_setting("HANDS", v, sizeof(v)) && !sim_input_parse_hands(v, &hands)) {
+		U_LOG_W("sim-input: HANDS='%s' is not both|left|right|none - using both.", v);
+	}
+	enum sim_input_pinch_mode pinch = SIM_INPUT_PINCH_WAVE;
+	if (sim_input_setting("PINCH", v, sizeof(v)) && !sim_input_parse_pinch(v, &pinch)) {
+		U_LOG_W("sim-input: PINCH='%s' is not wave|hold|open - using wave.", v);
+	}
+	const float distance = sim_input_setting_float("HAND_DISTANCE_M", SIM_INPUT_HAND_DISTANCE_DEFAULT_M);
+
+	const float gain = sim_input_setting_float("HAND_SCALE_H_PER_M", SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M);
+
+	float viewer_y = 0.0f, viewer_z = 0.0f;
+	const float display_h = sim_input_display_geometry(&viewer_y, &viewer_z);
+	const float hand_scale = sim_input_hand_scale(gain, display_h);
+
+	struct sim_input_controller_config lcfg = {
+	    sim_input_hand_enabled(hands, true), pinch, distance, display_h, viewer_y, viewer_z, hand_scale};
+	struct sim_input_controller_config rcfg = {
+	    sim_input_hand_enabled(hands, false), pinch, distance, display_h, viewer_y, viewer_z, hand_scale};
+	{
+		const struct xrt_pose lc = sim_input_hand_center(true, distance, display_h, viewer_y, viewer_z);
+		const struct xrt_pose rc = sim_input_hand_center(false, distance, display_h, viewer_y, viewer_z);
+		U_LOG_W(
+		    "sim-input: hands=%s%s pinch=%s; display height %.3f m (%s); circle centres (display-plane frame, "
+		    "+Z toward the viewer) L(%.3f, %.3f, %.3f) R(%.3f, %.3f, %.3f), r=%.3f m; hand scale %.3f m/m "
+		    "(HAND_SCALE_H_PER_M %.2f).",
+		    lcfg.active ? "L" : "-", rcfg.active ? "R" : "-",
+		    pinch == SIM_INPUT_PINCH_HOLD ? "hold" : (pinch == SIM_INPUT_PINCH_OPEN ? "open" : "wave"),
+		    (double)(display_h > 0.0f ? display_h : SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M),
+		    display_h > 0.0f ? "host display geometry" : "fallback - host published none",
+		    (double)lc.position.x, (double)lc.position.y, (double)lc.position.z, (double)rc.position.x,
+		    (double)rc.position.y, (double)rc.position.z,
+		    (double)sim_input_hand_radius(display_h, distance, viewer_z), (double)hand_scale, (double)gain);
+	}
+
+	/* SOURCE: what presence follows. shared-camera opens the display's shared
+	 * stereo camera here, on demand (never in probe), and presence follows its
+	 * frames; the hand script below is the same either way. */
+	if (sim_input_setting("SOURCE", v, sizeof(v)) && strcmp(v, "script") != 0) {
+		if (strcmp(v, "shared-camera") == 0) {
+			g_source_shared_camera = true;
+			U_LOG_W(
+			    "sim-input: SOURCE=shared-camera - presence follows the display's shared stereo camera.");
+			sim_input_shared_camera_start(g_host);
+		} else {
+			U_LOG_W("sim-input: SOURCE='%s' is not script|shared-camera - using script.", v);
+		}
+	}
+
+	struct xrt_device *left = sim_input_create_controller(XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER, &lcfg);
+	struct xrt_device *right = sim_input_create_controller(XRT_DEVICE_TYPE_RIGHT_HAND_CONTROLLER, &rcfg);
 	struct xrt_device *navdev = NULL;
 	if (nav) {
-		navdev = sim_input_create_navigation(sim_input_env_ms("DXR_SIM_INPUT_NAV_HOLD_MS"),
-		                                     sim_input_env_ms("DXR_SIM_INPUT_NAV_RECENTER_MS"));
+		navdev = sim_input_create_navigation(sim_input_setting_ms("NAV_HOLD_MS"),
+		                                     sim_input_setting_ms("NAV_RECENTER_MS"));
 	}
 
 	if (left == NULL || right == NULL || (nav && navdev == NULL)) {
@@ -181,13 +248,20 @@ sim_input_plugin_destroy(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
 	/* No instance state — devices are destroyed by the runtime via
-	 * their own xrt_device::destroy. */
+	 * their own xrt_device::destroy. The shared-camera stream (if any) is
+	 * the provider's own: close it. */
+	sim_input_shared_camera_stop();
 }
 
 static enum xrt_input_provider_presence
 sim_input_plugin_get_presence(struct xrt_input_plugin_instance *inst)
 {
 	(void)inst;
+	/* SOURCE=shared-camera: present exactly while the display's shared
+	 * camera delivers frames (the poll thread's verdict; non-blocking). */
+	if (g_source_shared_camera) {
+		return sim_input_shared_camera_presence();
+	}
 	/* Simulated hardware is present exactly when it was asked for, and
 	 * probe() already enforced the opt-in — so once we are loaded at all,
 	 * the answer is yes, and the roles stay with us rather than bouncing
@@ -216,6 +290,9 @@ static struct xrt_input_plugin_iface g_sim_input_iface = {
     .destroy = sim_input_plugin_destroy,
 
     .get_presence = sim_input_plugin_get_presence,
+
+    /* N3c: what `displayxr-cli input options sim-input` lists. */
+    .describe_settings = sim_input_describe_settings,
 };
 
 
@@ -231,8 +308,6 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
                         struct xrt_input_plugin_iface **out_iface,
                         uint32_t *out_plugin_api_version)
 {
-	(void)host;
-
 	*out_plugin_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
 
 	if (runtime_api_version != XRT_INPUT_PLUGIN_API_VERSION_CURRENT) {
@@ -241,6 +316,11 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 		*out_iface = NULL;
 		return XRT_ERROR_PROBER_NOT_SUPPORTED;
 	}
+
+	/* N3c: settings come through the host from now on (the pointer lives
+	 * in the runtime for the life of the process; a provider may keep it). */
+	sim_input_settings_bind(host);
+	g_host = host;
 
 	*out_iface = &g_sim_input_iface;
 	return XRT_SUCCESS;

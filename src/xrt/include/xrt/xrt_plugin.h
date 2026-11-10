@@ -35,6 +35,7 @@
 #pragma once
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_component_settings.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_display_processor.h"
 #include "xrt/xrt_display_processor_d3d11.h"
@@ -43,6 +44,7 @@
 #include "xrt/xrt_display_processor_metal.h"
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -140,7 +142,38 @@ struct xrt_plugin_display_info
 	 *  swapchain compositor to source vblank from. Append-only (struct_size
 	 *  guards older plug-ins that don't write it). */
 	uint32_t refresh_mhz;
+
+	/*! `XRT_PLUGIN_DISPLAY_FLAG_*` bits qualifying the fields above. 0 from
+	 *  every plug-in built before the field existed (the runtime zeroes the
+	 *  struct and an older plug-in never writes this far), which reads as
+	 *  exactly the old contract. Append-only. */
+	uint32_t display_flags;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_1;
 };
+
+/*!
+ * `xrt_plugin_display_info::display_flags`: `display_screen_left/top` is a
+ * real position, even when it is (0, 0).
+ *
+ * Without the bit, (0, 0) has to mean "no preference" — sim_display reports
+ * it, and so does a plug-in that could not resolve its panel — so the runtime
+ * cannot tell it apart from a panel that IS the monitor at the desktop
+ * origin, and falls back to claim, size and primary heuristics. With two
+ * panels of one vendor and the primary one at (0, 0), those heuristics picked
+ * the other panel as the head screen (#2577). A plug-in that set its origin
+ * from an identified monitor (EDID record, SR enumeration, verified claim)
+ * sets the bit; one that defaulted the fields leaves it clear.
+ */
+#define XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID (1u << 0)
+
+/*!
+ * Defined when this header carries `xrt_plugin_display_info::display_flags`
+ * and @ref XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID: a plug-in built
+ * against an older header can `#ifdef` its use.
+ */
+#define XRT_PLUGIN_HAS_DISPLAY_ORIGIN_VALID 1
 
 
 /*
@@ -157,8 +190,14 @@ struct xrt_plugin_display_info
  *
  * Forward-compat: the runtime sets `struct_size` to its own
  * `sizeof(struct xrt_display_descriptor)` before the call; plug-ins MUST
- * NOT read past that offset. Field additions append at the end with no
- * API version bump.
+ * NOT read past that offset.
+ *
+ * **Growth caveat (multi-screen M1):** `probe_displays` receives these as an
+ * ARRAY, and a plug-in indexes it with its own compile-time `sizeof`, so
+ * appending a field changes the array stride under every existing plug-in —
+ * that is a layout break (an XRT_PLUGIN_API_VERSION_CURRENT bump), not the
+ * free append `struct_size` suggests. New per-monitor facts go in a separate
+ * struct passed by pointer instead (see @ref xrt_display_physical).
  */
 struct xrt_display_descriptor
 {
@@ -200,13 +239,107 @@ struct xrt_display_descriptor
 };
 
 /*!
+ * Physical facts about one monitor that @ref xrt_display_descriptor does not
+ * carry (multi-screen M1), handed by pointer — never as an array — to
+ * `xrt_plugin_iface::get_display_info_for_monitor`, so it can grow by
+ * appending under `struct_size` with no ABI bump.
+ *
+ * The runtime sets `struct_size` to its own `sizeof`; a plug-in MUST NOT
+ * read past it.
+ */
+struct xrt_display_physical
+{
+	/*! `sizeof(struct xrt_display_physical)` at the runtime's compile time. */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*! Physical size from EDID (detailed timing, else the basic block),
+	 *  millimetres; 0 = unknown. */
+	uint32_t physical_width_mm;
+	uint32_t physical_height_mm;
+
+	/*! The connector's device (native) mode; may differ from the
+	 *  descriptor's pixel size under a scaled desktop. 0 = unknown. */
+	uint32_t native_pixel_width;
+	uint32_t native_pixel_height;
+};
+
+/*!
+ * The screen a display processor is created for (multi-screen M2, ADR-047
+ * D2): which monitor, where it sits on the desktop, and its physical facts.
+ * Handed by pointer to `xrt_plugin_iface::create_dp_vk_for_screen` so the DP
+ * can describe THAT screen (its own panel size, pixel size and desktop
+ * origin) instead of the plug-in's one process-wide panel.
+ *
+ * The runtime sets `struct_size` to its own `sizeof`; a plug-in MUST NOT
+ * read past it. Grows by appending (never passed as an array).
+ */
+struct xrt_screen_binding
+{
+	/*! `sizeof(struct xrt_screen_binding)` at the runtime's compile time. */
+	uint32_t struct_size;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*! Registry monitor id (`xrt_display_descriptor::monitor_id`). */
+	uint64_t monitor_id;
+
+	/*! The monitor's desktop rect, in the space the OS places windows in
+	 *  (X11: the root window). */
+	int32_t desktop_left;
+	int32_t desktop_top;
+	uint32_t desktop_width;
+	uint32_t desktop_height;
+
+	/*! The connector's device (native) mode; 0 = unknown. Equal to the
+	 *  desktop size exactly when window pixels reach the panel unresampled. */
+	uint32_t native_pixel_width;
+	uint32_t native_pixel_height;
+
+	/*! EDID physical size, millimetres; 0 = unknown. */
+	uint32_t physical_width_mm;
+	uint32_t physical_height_mm;
+
+	/*! Desktop compositor scale for this output; 0 = unknown. */
+	float desktop_scale;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_1;
+
+	/*! Vendor display identity for the plug-in's own SDK (e.g. the LeiaSR
+	 *  `displayId` of SR-P1/P2); 0 = none. Opaque to the runtime. */
+	uint64_t display_id;
+
+	/*! Vendor serial from the winning claim ("" = n/a). */
+	char serial[64];
+
+	/*! OS output name (X11: RandR output, else the DRM connector); "" = unknown. */
+	char device_name[64];
+};
+
+/*!
  * How sure a plug-in is that a monitor is its hardware. The runtime
  * resolves competing claims for the same monitor by highest confidence
  * (ties broken by registration ProbeOrder).
  */
 enum xrt_display_claim_confidence
 {
-	XRT_DISPLAY_CLAIM_FALLBACK = 10,  //!< sim_display: "anything unclaimed".
+	XRT_DISPLAY_CLAIM_FALLBACK = 10, //!< sim_display: "anything unclaimed".
+	/*!
+	 * "My panel, but my backend cannot drive it yet" — e.g. a 3D panel whose
+	 * vendor service has not authenticated it after a hotplug. It outranks a
+	 * FALLBACK claim, so no other display processor weaves the panel, but the
+	 * runtime makes NO display processor for it: the screen shows flat 2D (one
+	 * view, no weave, the lens untouched) until the plug-in claims it for real
+	 * and asks for a sweep (`xrt_plugin_host_iface::request_display_rescan`).
+	 * Display hotplug, ADR-047 Amendment 8; announced by
+	 * XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY. An older runtime treats it as an
+	 * ordinary low claim, so the plug-in must also refuse to make a DP for it.
+	 */
+	XRT_DISPLAY_CLAIM_PRESENT_NOT_READY = 20,
 	XRT_DISPLAY_CLAIM_EDID = 50,      //!< matched my EDID table.
 	XRT_DISPLAY_CLAIM_VERIFIED = 100, //!< EDID + SDK/service/serial handshake.
 };
@@ -222,6 +355,26 @@ enum xrt_display_claim_confidence
 #define XRT_DP_API_BIT_GL (1u << 3)
 #define XRT_DP_API_BIT_METAL (1u << 4)
 /*! @} */
+
+/*!
+ * Not an API but a capability HINT, carried in the same mask so it costs no
+ * ABI change (ADR-060 R2, decision 4): this monitor's per-screen factories
+ * (`create_dp_<api>_for_screen`, window NULL) can make a DP that declares
+ * XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN — e.g. the vendor SDK on this
+ * box supports external weaver routing. It lets the runtime skip a windowless
+ * create that is bound to be refused (a vendor weaver bring-up and teardown
+ * for nothing). A HINT only: the instance's scanout bit stays the authority.
+ * Bit clear (every plug-in built before it) = do not try. Kept far above the
+ * API bits so a future API bit never collides with it.
+ */
+#define XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE (1u << 24)
+
+/*!
+ * Defined when this header carries @ref XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE
+ * (and XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN): a plug-in built against
+ * an older header can `#ifdef` its use.
+ */
+#define XRT_PLUGIN_HAS_WINDOWLESS_PHASE_HINT 1
 
 /*!
  * One monitor a plug-in claims, returned from
@@ -244,6 +397,81 @@ struct xrt_display_claim
 	/*! Vendor device serial (e.g. Leia FPC) tying this monitor to a
 	 *  specific camera/calibration unit; empty string if not applicable. */
 	char serial[64];
+};
+
+/*!
+ * Generic state of the vendor platform a plug-in drives (ADR-045), reported
+ * through `xrt_plugin_iface::get_platform_state`. Vendor-neutral by design:
+ * the runtime acts only on these values and shows the plug-in's hint string
+ * verbatim; it never learns what the platform is.
+ *
+ * Values are stable ABI (appended only).
+ */
+enum xrt_plugin_platform_state
+{
+	//! Not reported: slot absent (older plug-in), call returned false, or a
+	//! value this runtime does not know. Treated as "carry on as before".
+	XRT_PLUGIN_PLATFORM_STATE_UNKNOWN = 0,
+	//! Platform installed, running, and its display is attached.
+	XRT_PLUGIN_PLATFORM_STATE_READY = 1,
+	//! The vendor platform runtime is not installed on this machine.
+	XRT_PLUGIN_PLATFORM_STATE_PLATFORM_ABSENT = 2,
+	//! Installed, but its service/daemon is not running (yet).
+	XRT_PLUGIN_PLATFORM_STATE_PLATFORM_NOT_RUNNING = 3,
+	//! Platform present and running, but none of its displays is attached.
+	XRT_PLUGIN_PLATFORM_STATE_NO_DISPLAY = 4,
+	//! Platform present but unusable by this plug-in (version too old/new,
+	//! unsupported OS or GPU, ...). The hint says what.
+	XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE = 5,
+};
+
+/*!
+ * Bits for @ref xrt_plugin_platform_status::flags.
+ * @{
+ */
+/*!
+ * This plug-in is a FALLBACK (e.g. the vendor-neutral simulation display):
+ * it claims any system so the runtime always has a display processor. The
+ * runtime adopts a better plug-in on re-probe only while the active one
+ * carries this bit — the "no live swap" rule (ADR-045 D3). Vendor plug-ins
+ * MUST NOT set it.
+ */
+#define XRT_PLUGIN_PLATFORM_FLAG_FALLBACK (1u << 0)
+/*! @} */
+
+/*! Size of @ref xrt_plugin_platform_status::hint, including the NUL. */
+#define XRT_PLUGIN_PLATFORM_HINT_MAX 128
+
+/*!
+ * Out-param of `xrt_plugin_iface::get_platform_state`. The runtime sets
+ * @ref struct_size and zero-fills the rest before the call; the plug-in
+ * MUST NOT write past `struct_size`. Grows by consuming @ref reserved
+ * (append-only; no ABI bump).
+ */
+struct xrt_plugin_platform_status
+{
+	/*! `sizeof(struct xrt_plugin_platform_status)` as the RUNTIME knows it. */
+	uint32_t struct_size;
+
+	/*! @ref xrt_plugin_platform_state value. */
+	uint32_t state;
+
+	/*! Bitmask of `XRT_PLUGIN_PLATFORM_FLAG_*`. */
+	uint32_t flags;
+
+	/*! Reserved for alignment. Must be 0. */
+	uint32_t reserved_0;
+
+	/*!
+	 * Short, user-facing, vendor-written hint, UTF-8, NUL-terminated,
+	 * truncated to fit — e.g. what to install or plug in. Empty when there
+	 * is nothing to say (typically READY). Shown verbatim by the runtime's
+	 * diagnostics (cli, tray); never parsed.
+	 */
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+
+	/*! Reserved for future fields. Plug-ins MUST leave these 0. */
+	uint64_t reserved[8];
 };
 
 
@@ -529,11 +757,68 @@ struct xrt_plugin_host_iface
 	bool (*android_package_is_visible)(const char *package_name);
 
 	/*!
+	 * Tell the runtime that the set of displays this plug-in can drive may
+	 * have changed — a panel came up or went away on the vendor side (its
+	 * service re-authenticated a hotplugged panel, its topology event fired).
+	 * The runtime then re-runs the per-monitor claim sweep (ADR-047
+	 * Amendment 8): it re-enumerates the monitors, re-probes every plug-in
+	 * that is not a claim source yet (so a plug-in that DECLINED at instance
+	 * create is probed again), calls `probe_displays` on every source and
+	 * publishes the new screen table to live sessions. The request is
+	 * debounced and served on a runtime worker thread, never synchronously:
+	 * a plug-in may call it from any thread, including its vendor SDK's event
+	 * thread and while holding its own locks, and it returns at once.
+	 *
+	 * The OS display-reconfiguration event already triggers the same sweep;
+	 * this slot exists for the gap after it — a vendor backend that only
+	 * recognises the panel a few seconds after the OS saw the monitor.
+	 *
+	 * @param reason  Short free text for the runtime's log (may be NULL).
+	 *
+	 * The function pointer stays valid for the process lifetime (it lives in
+	 * the runtime), so a plug-in may copy it at negotiate time and call it
+	 * later — even after its probe() declined. Carved out of the former
+	 * `reserved[]` block like the slots above: `struct_size` is unchanged and
+	 * an older runtime leaves it zero, so plug-ins MUST NULL-check it, and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Announced by
+	 * @ref XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN.
+	 */
+	void (*request_display_rescan)(const char *reason);
+
+	/*!
+	 * The one options contract (ADR-054 decision 7, N3c): the plug-in's
+	 * per-component settings, read ONLY through this slot — never `getenv`,
+	 * never an ad-hoc vendor registry key — with `id` = the plug-in's own
+	 * `iface->id`. The runtime resolves `DXR_DP_<ID>_<KEY>` in the hosting
+	 * process's environment, then the per-user store, then the registration
+	 * row's `Settings\<KEY>` / manifest `settings`
+	 * (`xrt/xrt_component_settings.h`; `displayxr-cli dp options|set|unset`).
+	 * The pointer lives in the runtime for the process lifetime, so a plug-in
+	 * may copy it at negotiate time (as for @ref request_display_rescan) and
+	 * read later; read at init and cache, not per frame.
+	 *
+	 * Carved out of the former `reserved[]` block like the slots above:
+	 * `struct_size` is unchanged and an older runtime leaves it zero, so
+	 * plug-ins MUST NULL-check it (and cover-check `struct_size`), and no
+	 * @ref XRT_PLUGIN_API_VERSION_CURRENT bump is needed. Announced by
+	 * @ref XRT_PLUGIN_HOST_HAS_GET_SETTING.
+	 */
+	xrt_component_get_setting_fn_t get_setting;
+
+	/*!
 	 * Reserved space for forward-compatible host-supplied callbacks.
 	 * Plug-ins MUST NOT dereference any reserved slot.
 	 */
-	void *reserved[10];
+	void *reserved[8];
 };
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::get_setting slot (the one options contract,
+ * ADR-054 decision 7 / N3c), so a plug-in that must also compile against an
+ * older runtime header can `#ifdef`-guard its use.
+ */
+#define XRT_PLUGIN_HOST_HAS_GET_SETTING 1
 
 /*!
  * Defined when this header carries the
@@ -552,6 +837,304 @@ struct xrt_plugin_host_iface
  * `#ifdef`-guard its use. runtime#1079 / ADR-036 D2.
  */
 #define XRT_PLUGIN_HOST_HAS_ANDROID_PACKAGE_VISIBILITY 1
+
+/*!
+ * Defined when this header carries the
+ * @ref xrt_plugin_host_iface::request_display_rescan slot (display hotplug,
+ * ADR-047 Amendment 8), so a plug-in that must also compile against an older
+ * runtime header can `#ifdef`-guard its use.
+ */
+#define XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN 1
+
+/*!
+ * Defined when this header carries @ref XRT_DISPLAY_CLAIM_PRESENT_NOT_READY
+ * (display hotplug, ADR-047 Amendment 8).
+ */
+#define XRT_PLUGIN_HAS_CLAIM_PRESENT_NOT_READY 1
+
+/*
+ *
+ * Stereo camera source (ADR-043, XR_DXR_stereo_camera).
+ *
+ * A display's stereo camera — usually the one its eye tracker looks through —
+ * produced by the plug-in from its own stack WITHOUT taking the device from
+ * the tracker. The runtime service owns threads, fan-out, rectification,
+ * format conversion, transport, consent and the in-use indicator; the plug-in
+ * owns reading + decoding frames and, per camera index, the calibration of
+ * THAT camera's device (one camera per device; several devices = several
+ * cameras, each keyed by its own device_identity).
+ * Graphics-API-neutral on purpose: a camera is a sensor, not a weaver, and it
+ * must not share a lifetime with a display processor that is recreated on
+ * presenter changes. Slots on @ref xrt_plugin_iface (appended, ADR-020).
+ *
+ */
+
+//! @ref xrt_plugin_stereo_camera_info::flags — values equal the
+//! XrStereoCameraFlagsDXR bits (static-asserted in the state tracker).
+#define XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING (1u << 0)
+#define XRT_PLUGIN_STEREO_CAMERA_USER_FACING (1u << 1)
+#define XRT_PLUGIN_STEREO_CAMERA_CALIBRATED (1u << 2)
+#define XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED (1u << 3)
+#define XRT_PLUGIN_STEREO_CAMERA_MONOCHROME (1u << 4)
+//! Service-set (spec v7): a RECTIFIED stream delivers rectified frames. A
+//! plug-in never sets it; the service clears it and derives it per camera.
+#define XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE (1u << 5)
+
+//! Pixel formats a plug-in delivers (values equal XrStereoCameraFormatDXR).
+enum xrt_plugin_stereo_camera_format
+{
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_GRAY8 = 1,
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_NV12 = 2,
+	XRT_PLUGIN_STEREO_CAMERA_FORMAT_BGRA8 = 3,
+};
+
+//! Lens models (values equal XrStereoCameraDistortionModelDXR).
+enum xrt_plugin_stereo_camera_distortion
+{
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_NONE = 0,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN5 = 1,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_RADTAN8 = 2,
+	XRT_PLUGIN_STEREO_CAMERA_DISTORTION_KB4 = 3,
+};
+
+//! Result of @ref xrt_plugin_iface::stereo_camera_wait_frame.
+enum xrt_plugin_stereo_camera_wait
+{
+	//! @p out holds a new frame; call stereo_camera_release_frame when done.
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_OK = 0,
+	//! No frame within the timeout (source up; e.g. tracker warming up).
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_TIMEOUT = 1,
+	//! The source is temporarily not delivering (tracker stopped).
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_SUSPENDED = 2,
+	//! The source failed or went away; the runtime closes it.
+	XRT_PLUGIN_STEREO_CAMERA_WAIT_ERROR = 3,
+};
+
+/*!
+ * @ref xrt_plugin_stereo_camera_info::frame_orientation: the clockwise turn that
+ * makes the frame the plug-in delivers (the whole side-by-side image) upright in
+ * the device's NATURAL orientation — Camera2 SENSOR_ORIENTATION semantics for the
+ * delivered frame, after any turn the plug-in itself applied. Fixed per camera.
+ * 0 = UNKNOWN on purpose, so a plug-in that does not write the field (or predates
+ * it) reads as unknown and consumers keep their own fallback.
+ */
+enum xrt_plugin_stereo_camera_frame_orientation
+{
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN = 0,
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0 = 1,   //!< already upright in the natural orientation
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_90 = 2,  //!< turn 90 deg clockwise to make it upright
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_180 = 3, //!< turn 180 deg
+	XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_270 = 4, //!< turn 270 deg clockwise
+};
+
+/*!
+ * One camera, as a plug-in describes it. The runtime sets @ref struct_size to
+ * its own size before the call; the plug-in must not write past it.
+ */
+struct xrt_plugin_stereo_camera_info
+{
+	uint32_t struct_size;
+	//! Human-readable, UTF-8 ("Built-in 3D camera").
+	char display_name[128];
+	//! Stable device key (e.g. the panel serial). The SERVICE hashes it per
+	//! consumer; it is never exported to clients.
+	char device_identity[128];
+	//! The OS's id of the physical device the frames come from, or "".
+	char platform_device_hint[256];
+	//! XRT_PLUGIN_STEREO_CAMERA_* bits.
+	uint32_t flags;
+	//! Native per-eye size.
+	uint32_t eye_width;
+	uint32_t eye_height;
+	/*!
+	 * What the source delivers, Hz — ONLY if the plug-in actually knows it
+	 * (a vendor-provided value, or one it measured on an earlier open). 0 =
+	 * unknown; never a placeholder guess. The service measures the real rate
+	 * over the first frames after each open and reports that to apps.
+	 */
+	float max_frame_rate;
+	//! @ref xrt_plugin_stereo_camera_format the plug-in decodes to.
+	uint32_t native_format;
+
+	/*
+	 * Appended (#1961), gated by @ref struct_size: write it only when
+	 * struct_size covers it. Announced by
+	 * @ref XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID.
+	 */
+
+	/*!
+	 * The screen this camera belongs to: the @ref
+	 * xrt_display_descriptor::monitor_id of the display it is built into or
+	 * mounted on, as this plug-in claimed it. 0 = unknown or not attached to
+	 * a display. Apps see it as XrStereoCameraDisplayDXR::displayId.
+	 */
+	uint64_t monitor_id;
+
+	/*
+	 * Appended (XR_DXR_stereo_camera v7), gated by @ref struct_size like
+	 * monitor_id. Announced by
+	 * @ref XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION.
+	 */
+
+	/*!
+	 * @ref xrt_plugin_stereo_camera_frame_orientation of the delivered frame;
+	 * 0 (UNKNOWN) when the plug-in does not know. Apps see it as
+	 * XrStereoCameraOrientationDXR::frameOrientationDegrees.
+	 */
+	uint32_t frame_orientation;
+};
+
+/*!
+ * RAW calibration of ONE camera — the device behind that camera index (its
+ * device_identity), never "the first calibration on the machine" and never
+ * another device's.
+ */
+struct xrt_plugin_stereo_camera_calibration
+{
+	uint32_t struct_size;
+	//! Per eye, pixels.
+	uint32_t image_width;
+	uint32_t image_height;
+	//! Per eye: fx fy cx cy, pixels.
+	double k[2][4];
+	//! @ref xrt_plugin_stereo_camera_distortion.
+	uint32_t distortion_model;
+	double distortion[2][8];
+	double rotation_right_from_left[3][3];
+	double translation_right_from_left_mm[3];
+};
+
+/*!
+ * One frame handed to the runtime. Planes stay valid until
+ * stereo_camera_release_frame. Always ONE side-by-side image, left eye left.
+ */
+struct xrt_plugin_stereo_camera_frame
+{
+	//! Monotonic per open, from 1.
+	uint64_t sequence;
+	//! os_monotonic_get_ns() domain.
+	int64_t time_ns;
+	//! true = sensor/exposure time; false = arrival time in the plug-in.
+	bool time_is_exposure;
+	//! Full SBS extent (2 * eye_width x eye_height).
+	uint32_t width;
+	uint32_t height;
+	//! @ref xrt_plugin_stereo_camera_format.
+	uint32_t format;
+	const uint8_t *planes[2];
+	uint32_t pitches[2];
+};
+
+//! Opaque plug-in-owned open camera.
+struct xrt_plugin_stereo_camera;
+
+//! Bytes per id of @ref xrt_plugin_iface::get_claimed_cameras (NUL included).
+#define XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX 256
+//! Ids the runtime asks @ref xrt_plugin_iface::get_claimed_cameras for at most.
+#define XRT_PLUGIN_CLAIMED_CAMERAS_MAX 8
+
+
+/*!
+ * @name Per-screen vendor status (ADR-051 D2)
+ *
+ * The vendor summary cell the display dashboard shows for each screen a
+ * plug-in claimed, filled by @ref xrt_plugin_iface::get_screen_status. The
+ * runtime shows these values and strings; it never learns what they mean for
+ * a given vendor. Enum values are stable ABI (appended only).
+ * @{
+ */
+
+//! @ref xrt_plugin_screen_status::tracker — the screen's eye tracker.
+enum xrt_plugin_tracker_state
+{
+	//! The screen has no tracker (or the plug-in does not know of one).
+	XRT_PLUGIN_TRACKER_STATE_NONE = 0,
+	//! A tracker exists and is stopped (nobody asked for it).
+	XRT_PLUGIN_TRACKER_STATE_OFF = 1,
+	//! The tracker is starting (camera warming up).
+	XRT_PLUGIN_TRACKER_STATE_STARTING = 2,
+	//! The tracker is running and delivering.
+	XRT_PLUGIN_TRACKER_STATE_RUNNING = 3,
+	//! The tracker should be running and is not (lost, failed, unplugged).
+	XRT_PLUGIN_TRACKER_STATE_DOWN = 4,
+	//! The vendor cannot report a tracker state for this screen.
+	XRT_PLUGIN_TRACKER_STATE_UNSUPPORTED = 5,
+};
+
+//! @ref xrt_plugin_screen_status::lens — the screen's optical state.
+enum xrt_plugin_lens_state
+{
+	XRT_PLUGIN_LENS_STATE_2D = 0,
+	XRT_PLUGIN_LENS_STATE_3D = 1,
+	XRT_PLUGIN_LENS_STATE_UNKNOWN = 2,
+};
+
+//! @ref xrt_plugin_screen_warning::level values.
+enum xrt_plugin_screen_warning_level
+{
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_INFO = 0,
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_WARN = 1,
+	XRT_PLUGIN_SCREEN_WARNING_LEVEL_CRITICAL = 2,
+};
+
+//! Current @ref xrt_plugin_screen_status::version.
+#define XRT_PLUGIN_SCREEN_STATUS_VERSION 1
+//! Capacity of @ref xrt_plugin_screen_status::warnings.
+#define XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS 8
+
+//! One vendor warning about a screen, shown verbatim (never parsed).
+struct xrt_plugin_screen_warning
+{
+	//! Stable machine code, e.g. "TRACKER_DOWN". UTF-8, NUL-terminated.
+	char code[32];
+	//! @ref xrt_plugin_screen_warning_level value.
+	uint8_t level;
+	//! One user-facing sentence. UTF-8, NUL-terminated, truncated to fit.
+	char text[96];
+};
+
+/*!
+ * Out-param of @ref xrt_plugin_iface::get_screen_status. The caller sets
+ * @ref struct_size and zero-fills the rest before the call; the plug-in MUST
+ * NOT write past `struct_size`. Grows only by appending (and bumping
+ * @ref version); no ABI bump.
+ */
+struct xrt_plugin_screen_status
+{
+	//! `sizeof(struct xrt_plugin_screen_status)` as the CALLER knows it.
+	uint32_t struct_size;
+	//! @ref XRT_PLUGIN_SCREEN_STATUS_VERSION the plug-in filled.
+	uint32_t version;
+	//! Moves whenever anything below may have changed; a poller skips a screen
+	//! whose counter did not move. Bumped on the vendor's own device /
+	//! topology events, never by polling the hardware.
+	uint64_t change_counter;
+	//! The vendor platform is up for this screen.
+	bool ready;
+	//! The vendor positively identified this screen as its hardware.
+	bool verified;
+	//! A valid calibration exists for this screen (vendor-defined meaning).
+	bool calibrated;
+	enum xrt_plugin_tracker_state tracker;
+	enum xrt_plugin_lens_state lens;
+	//! Vendor model name, UTF-8, "" = unknown.
+	char model[32];
+	//! Vendor serial, UTF-8, "" = unknown.
+	char serial[32];
+	//! Valid entries in @ref warnings (<= XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS).
+	uint32_t warning_count;
+	struct xrt_plugin_screen_warning warnings[XRT_PLUGIN_SCREEN_STATUS_MAX_WARNINGS];
+	/*!
+	 * Command line that opens the vendor's own dashboard on this screen, with
+	 * `{serial}` and `{monitor_id}` placeholders the runtime substitutes, e.g.
+	 * `"<exe> --page displays --display {serial}"`. "" = none. The runtime
+	 * launches it on request and never parses it.
+	 */
+	char dashboard_command[160];
+};
+
+/*! @} */
+
 
 /*!
  * The plug-in's vtable. Filled in by the plug-in inside its
@@ -784,7 +1367,813 @@ struct xrt_plugin_iface
 	 * Set to `(uint32_t)offsetof(struct vk_bundle, vkGetInstanceProcAddr)`.
 	 */
 	uint32_t vk_bundle_fn_table_offset;
+
+	/*!
+	 * Create a D3D11 display processor that serves ONLY the 2D→3D lift slots
+	 * (ADR-042, XR_DXR_lift) — the explicit "lift-only" factory.
+	 *
+	 * The runtime's D3D11 service creates exactly one lift DP per process, on
+	 * a dedicated device on the service adapter (@p d3d11_context has
+	 * ID3D11Multithread protection on), from its lift thread, and never asks
+	 * it to weave: no process_atlas, no window (@p window_handle is always
+	 * NULL), no mode requests. So the DP returned here must build NO weaver
+	 * and open NO tracker session — only what its conversion module needs —
+	 * and must fill the lift_* slots of @ref xrt_display_processor_d3d11
+	 * (XRT_DP_D3D11_HAS_LIFT). Same signature as @ref create_dp_d3d11.
+	 *
+	 * Why a separate factory rather than reusing the weaving DP: a conversion
+	 * blocks for tens of ms (seconds for GAUSSIANS), and the weaving DP is
+	 * driven on the service's one shared immediate context under the render
+	 * lock and is recreated on presenter / focus changes. Running lift on it
+	 * would stall every weave for the length of a conversion.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field) ⟹
+	 * the runtime falls back to @ref create_dp_d3d11 with a NULL window and, if
+	 * that DP carries no lift slots, destroys it at once. Appended per ADR-020
+	 * (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump).
+	 */
+	xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift;
+
+	/*!
+	 * Report the plug-in's generic platform state (ADR-045): whether the
+	 * vendor platform it drives is installed, running, and has its display
+	 * attached — plus a short vendor-written hint for the user.
+	 *
+	 * **Callable before `probe()` succeeds, and without an instance.** The
+	 * loader calls it right after a successful negotiation and before
+	 * `probe()`, so a plug-in that is about to decline can still say why;
+	 * it calls it again on every re-probe, and the runtime's diagnostics
+	 * (`displayxr-cli`, the service tray) call it at any time afterwards,
+	 * including while the plug-in is the active one. The answer is
+	 * therefore about the plug-in's process-wide view of its platform, not
+	 * about one instance.
+	 *
+	 * Contract:
+	 *   - Cheap and non-blocking: presence checks only (a registry value, a
+	 *     named object, an EDID table lookup). MUST return within the same
+	 *     ~100 ms budget as `probe()` and MUST NOT wait for the vendor
+	 *     platform to become ready. Thread-safe: may be called from any
+	 *     thread, concurrently with the plug-in's other entry points.
+	 *   - The runtime sets `out_status->struct_size` to its own
+	 *     `sizeof(struct xrt_plugin_platform_status)` and zero-fills the
+	 *     rest before the call; the plug-in MUST NOT write past that offset.
+	 *   - Returns `true` if `out_status` was filled. `false` (or a NULL
+	 *     slot, or a plug-in whose `struct_size` predates this field) means
+	 *     "not reported": the runtime records
+	 *     @ref XRT_PLUGIN_PLATFORM_STATE_UNKNOWN and carries on exactly as
+	 *     before — the state is advisory and never gates loading.
+	 *
+	 * The runtime never interprets the hint; it only displays it. It does
+	 * interpret the state and @ref XRT_PLUGIN_PLATFORM_FLAG_FALLBACK, and
+	 * only generically (selection never re-routes away from an active
+	 * non-fallback plug-in — "no live swap", ADR-045).
+	 *
+	 * Optional. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump).
+	 */
+	bool (*get_platform_state)(struct xrt_plugin_platform_status *out_status);
+
+	/*!
+	 * @name Stereo camera source (ADR-043, XR_DXR_stereo_camera)
+	 *
+	 * Optional, all-or-nothing: the runtime uses the camera slots only when
+	 * @ref struct_size covers @ref stereo_camera_close and every one of them
+	 * is non-NULL. Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) AFTER
+	 * @ref get_platform_state (ADR-045), the last member before this block.
+	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA.
+	 *
+	 * Threading: enumerate / get_calibration are cheap and callable from any
+	 * thread. wait_frame / release_frame are called from ONE runtime-owned
+	 * camera thread per open camera. Nothing throws across this boundary.
+	 * @{
+	 */
+
+	/*!
+	 * Fill up to @p capacity entries of @p out (each with struct_size preset
+	 * by the runtime) and return the number of cameras. @p capacity 0 / NULL
+	 * @p out = count query. Stable indices for the plug-in instance's life.
+	 *
+	 * Called again during the plug-in's life (#1961): on a client's enumerate
+	 * (at most once a second) and every ~2 s while a client listens for
+	 * camera events — so keep it cheap and quiet (log only when the set
+	 * changes). The runtime keys cameras by device_identity: a device that
+	 * appears may be appended at any time; one the plug-in stops listing is
+	 * reported UNAVAILABLE and never opened (keeping a gone device's entry at
+	 * its index, as an append-only registry does, is equally fine — its open
+	 * just waits / fails). Never move an identity to another index while it
+	 * is listed, and never give one index to another device.
+	 */
+	uint32_t (*stereo_camera_enumerate)(struct xrt_plugin_instance *inst,
+	                                    uint32_t capacity,
+	                                    struct xrt_plugin_stereo_camera_info *out);
+
+	/*!
+	 * RAW calibration of camera @p index — of THAT camera's device (its
+	 * device_identity), not of whichever device is active. Return
+	 * XRT_ERROR_FEATURE_NOT_SUPPORTED when it cannot be resolved — the camera
+	 * must then not report XRT_PLUGIN_STEREO_CAMERA_CALIBRATED.
+	 */
+	xrt_result_t (*stereo_camera_get_calibration)(struct xrt_plugin_instance *inst,
+	                                              uint32_t index,
+	                                              struct xrt_plugin_stereo_camera_calibration *out);
+
+	/*!
+	 * Open camera @p index. Doubles as a tracker keep-alive: while any camera
+	 * is open, a SHARED_WITH_EYE_TRACKING source keeps its tracker running.
+	 * Must never open / reconfigure / re-time the device away from the tracker.
+	 */
+	xrt_result_t (*stereo_camera_open)(struct xrt_plugin_instance *inst,
+	                                   uint32_t index,
+	                                   struct xrt_plugin_stereo_camera **out_cam);
+
+	/*!
+	 * Block up to @p timeout_ns for the next frame. Returns an @ref
+	 * xrt_plugin_stereo_camera_wait. On OK the frame's planes stay valid until
+	 * @ref stereo_camera_release_frame. Must not wait on a wake object shared
+	 * with other readers of the vendor channel (poll it instead; ADR-043).
+	 */
+	uint32_t (*stereo_camera_wait_frame)(struct xrt_plugin_stereo_camera *cam,
+	                                     int64_t timeout_ns,
+	                                     struct xrt_plugin_stereo_camera_frame *out);
+
+	//! Release the frame of the last OK wait_frame.
+	void (*stereo_camera_release_frame)(struct xrt_plugin_stereo_camera *cam);
+
+	//! Close; drops the keep-alive when it was the last open camera.
+	void (*stereo_camera_close)(struct xrt_plugin_stereo_camera *cam);
+
+	/*! @} */
+
+	/*!
+	 * Report the display info of ONE monitor this plug-in won in the
+	 * per-monitor registry (multi-screen M1, `XR_DXR_display_info` v22
+	 * `xrEnumerateDisplaysDXR`). Same out struct and the same field meanings
+	 * as @ref get_display_info, but keyed by the monitor instead of the head
+	 * device: physical size, nominal viewer (display-centred, metres), native
+	 * pixels, recommended view scale (0 = let the runtime derive), desktop
+	 * origin, eye-tracking modes supported/default for THAT monitor.
+	 *
+	 * Contract:
+	 *   - @p display is the descriptor the runtime built for this monitor
+	 *     (the one `probe_displays` saw). @p physical carries what the
+	 *     descriptor does not (EDID millimetres, the connector's device
+	 *     mode); it may be NULL, and its fields are 0 when unknown.
+	 *   - The runtime sets `out_info->struct_size` and zero-fills the rest;
+	 *     the plug-in MUST NOT write past `struct_size`.
+	 *   - Cheap and non-blocking (it runs on `xrEnumerateDisplaysDXR` and in
+	 *     diagnostics), callable from any thread, with @p inst NULL for a
+	 *     plug-in that has no instance state.
+	 *   - Return false for a monitor the plug-in cannot describe; the runtime
+	 *     then derives defaults from EDID (no eye tracking, view scale 1).
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the runtime uses @ref get_display_info for the active plug-in's
+	 * panel and EDID-derived defaults for every other monitor. Appended per
+	 * ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) AFTER the stereo camera block.
+	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR.
+	 */
+	bool (*get_display_info_for_monitor)(struct xrt_plugin_instance *inst,
+	                                     const struct xrt_display_descriptor *display,
+	                                     const struct xrt_display_physical *physical,
+	                                     struct xrt_plugin_display_info *out_info);
+
+	/*!
+	 * Create a Vulkan display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M2, ADR-047 D2: a window that
+	 * spans several screens is woven per segment by each screen's own DP).
+	 *
+	 * Same contract as @ref create_dp_vk (`xrt_dp_factory_vk_fn_t`), plus:
+	 *   - @p inst is this plug-in's instance (NULL for a plug-in without
+	 *     instance state).
+	 *   - @p binding names the screen (monitor id, desktop rect, native px,
+	 *     mm, serial, vendor display id); never NULL. The DP should answer
+	 *     `get_display_dimensions` / `get_display_pixel_info` for THAT screen,
+	 *     with `out_screen_left/top` = the binding's desktop origin.
+	 *   - @p window_handle is NULL on desktop Linux: a segment DP is
+	 *     windowless and gets its phase from `set_present_origin` (ADR-033).
+	 *     On Windows (ADR-047 Amendments 2 + 5) it is the session's real HWND
+	 *     for the DP of the screen holding the MAJORITY of the window and
+	 *     NULL for every other one, exactly as for
+	 *     @ref create_dp_d3d11_for_screen (the runtime may also ask for a
+	 *     windowless DP for the system-default screen).
+	 *   - The compositor calls it with a canvas that is the segment (a
+	 *     sub-rect of the target) and a pre-cropped atlas holding exactly that
+	 *     segment's views; the DP MUST confine its output — render area,
+	 *     viewport AND scissor — to the canvas (multi-screen plan risk 7), and
+	 *     must not assume it is the first writer to the target this frame.
+	 *   - Several instances may coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view, never a @ref create_dp_vk DP: that DP describes the
+	 * plug-in's one panel and is not bound by the canvas / not-first-writer
+	 * contract above, so it could wipe the segment woven before it.
+	 * Appended per ADR-020 (append-only within a major; gated by
+	 * @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_display_info_for_monitor. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_vk_for_screen)(struct xrt_plugin_instance *inst,
+	                                        void *vk_bundle,
+	                                        void *vk_cmd_pool,
+	                                        void *window_handle,
+	                                        int32_t target_format,
+	                                        const struct xrt_screen_binding *binding,
+	                                        struct xrt_display_processor **out_xdp);
+
+	/*!
+	 * Create a D3D11 display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M6, ADR-047 D2 on Windows): the
+	 * in-process D3D11 compositor weaves a window that spans several
+	 * monitors per segment, each by its own screen's DP, into the one
+	 * presented back buffer.
+	 *
+	 * Same contract as @ref create_dp_d3d11 (`xrt_dp_factory_d3d11_fn_t`),
+	 * plus everything @ref create_dp_vk_for_screen promises:
+	 *   - @p binding names the screen; never NULL. Vendor DPs resolve it to
+	 *     their own display identity (`binding->display_id`, else their
+	 *     per-monitor claim) and bind their weaver to THAT display.
+	 *   - @p window_handle: the session's real HWND for the DP of the screen
+	 *     that holds the MAJORITY of the window (it keeps the vendor's drag
+	 *     phase-snap), NULL for every other screen's DP, which is windowless
+	 *     and gets its phase from
+	 *     @ref xrt_display_processor_d3d11::set_present_origin plus the
+	 *     canvas offset. A DP must weave with a NULL window.
+	 *   - The compositor binds the back buffer, then calls
+	 *     @ref xrt_display_processor_d3d11::process_atlas with
+	 *     `canvas = the segment` and a pre-cropped atlas holding exactly that
+	 *     segment's views; the DP MUST confine its output — viewport AND
+	 *     scissor — to the canvas, and must not assume it is the first
+	 *     writer to the back buffer this frame.
+	 *   - Several instances coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view (never a @ref create_dp_d3d11 DP, for the reason given on
+	 * @ref create_dp_vk_for_screen). Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_vk_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_d3d11_for_screen)(struct xrt_plugin_instance *inst,
+	                                           void *d3d11_device,
+	                                           void *d3d11_context,
+	                                           void *window_handle,
+	                                           const struct xrt_screen_binding *binding,
+	                                           struct xrt_display_processor_d3d11 **out_xdp);
+
+	/*!
+	 * Create a Metal display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen on macOS, ADR-047 D2): the
+	 * in-process Metal compositor weaves a window that spans several
+	 * displays per segment, each by its own screen's DP, into the one
+	 * CAMetalLayer drawable.
+	 *
+	 * Same contract as @ref create_dp_metal (`xrt_dp_factory_metal_fn_t`),
+	 * plus everything @ref create_dp_vk_for_screen promises. What a plug-in
+	 * implements:
+	 *   - @p inst is this plug-in's instance (NULL for a plug-in without
+	 *     instance state).
+	 *   - @p binding names the screen; never NULL. `desktop_*` is the
+	 *     display's `CGDisplayBounds` in top-down POINTS; `native_pixel_*`
+	 *     is its current mode in backing px; `desktop_scale` its backing
+	 *     scale; `device_name` the CoreGraphics display UUID. Vendor DPs
+	 *     resolve it to their own display identity (`binding->display_id`,
+	 *     else their per-monitor claim) and bind their weaver to THAT
+	 *     display. The DP should answer `get_display_dimensions` /
+	 *     `get_display_pixel_info` for that screen.
+	 *   - @p window_handle is NULL today: every per-screen DP is windowless
+	 *     and gets its phase from
+	 *     @ref xrt_display_processor_metal::set_present_origin (backing px
+	 *     relative to that display's `CGDisplayBounds` origin, computed by
+	 *     the runtime per frame) plus the canvas offset — it must not try to
+	 *     derive the origin from a window. The session's own NSView stays
+	 *     with the primary screen's @ref create_dp_metal DP. A DP must weave
+	 *     with a NULL view.
+	 *   - The compositor calls @ref xrt_display_processor_metal::process_atlas
+	 *     on the shared command buffer with `canvas = the segment` (drawable
+	 *     px) and a pre-cropped atlas holding exactly that segment's views.
+	 *     The DP encodes its own render pass, so it MUST confine its output —
+	 *     viewport AND scissor rect — to the canvas, and must not assume it
+	 *     is the first writer to the target this frame: use
+	 *     `MTLLoadActionLoad`, never `MTLLoadActionClear`, on the target.
+	 *   - Several instances coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view (never a @ref create_dp_metal DP, for the reason given on
+	 * @ref create_dp_vk_for_screen). Appended per ADR-020 (append-only
+	 * within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_d3d11_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_metal_for_screen)(struct xrt_plugin_instance *inst,
+	                                           void *metal_device,
+	                                           void *command_queue,
+	                                           void *window_handle,
+	                                           const struct xrt_screen_binding *binding,
+	                                           struct xrt_display_processor_metal **out_xdp);
+
+	/*!
+	 * Create a D3D12 display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M6, ADR-047 D2 on Windows): the
+	 * in-process D3D12 compositor weaves a window that spans several
+	 * monitors per segment, each by its own screen's DP, into the one
+	 * presented back buffer. The D3D12 twin of
+	 * @ref create_dp_d3d11_for_screen.
+	 *
+	 * Same contract as @ref create_dp_d3d12 (`xrt_dp_factory_d3d12_fn_t`),
+	 * plus everything @ref create_dp_d3d11_for_screen promises, in D3D12
+	 * terms:
+	 *   - @p binding names the screen; never NULL.
+	 *   - @p window_handle: the session's real HWND for the majority
+	 *     screen's DP, NULL for every other screen's DP, which is windowless
+	 *     and gets its phase from
+	 *     @ref xrt_display_processor_d3d12::set_present_origin plus the
+	 *     canvas offset. A DP must weave with a NULL window.
+	 *   - The compositor records every segment onto ONE command list:
+	 *     @ref xrt_display_processor_d3d12::process_atlas gets
+	 *     `canvas = the segment`, a pre-cropped plain 2D atlas holding
+	 *     exactly that segment's views (COMMON state, its own SRV
+	 *     descriptor), and the shared back buffer. A command list carries no
+	 *     state a DP could inherit, so the DP itself MUST confine its output
+	 *     — viewport AND scissor — to the canvas, and must not assume it is
+	 *     the first writer to the back buffer this frame.
+	 *   - Several instances coexist in one process, one per screen.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view. Appended per ADR-020 (append-only within a major; gated
+	 * by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_metal_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_d3d12_for_screen)(struct xrt_plugin_instance *inst,
+	                                           void *d3d12_device,
+	                                           void *d3d12_command_queue,
+	                                           void *window_handle,
+	                                           const struct xrt_screen_binding *binding,
+	                                           struct xrt_display_processor_d3d12 **out_xdp);
+
+	/*!
+	 * Vendor summary for ONE screen this plug-in claimed (ADR-051 D2): fill
+	 * @p out for the monitor @p monitor_id (an
+	 * @ref xrt_display_descriptor::monitor_id this plug-in returned a claim
+	 * for). The caller sets `out->struct_size` and zero-fills the rest; the
+	 * plug-in writes nothing past it and sets `out->version`.
+	 *
+	 * PASSIVE: this call must not create or touch a tracker, lens, display or
+	 * weaver handle, must not create a per-call vendor instance, and must
+	 * return in < 20 ms. It may be polled every 2 s by the service and by
+	 * diagnostic processes. Bump @ref xrt_plugin_screen_status::change_counter
+	 * on the vendor's own device / topology events so a poller can skip an
+	 * unchanged screen.
+	 *
+	 * @p inst may be NULL (a plug-in whose probe keeps no instance state).
+	 * Returns XRT_SUCCESS when @p out was filled, an error for a monitor the
+	 * plug-in did not claim; the runtime then shows "no vendor status".
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ "no vendor status" — never an error. Appended per ADR-020
+	 * (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_d3d12_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS.
+	 */
+	xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst,
+	                                  uint64_t monitor_id,
+	                                  struct xrt_plugin_screen_status *out);
+
+	/*!
+	 * Create an OpenGL display processor for ONE screen this plug-in won in
+	 * the per-monitor registry (multi-screen M6, ADR-047 D2 on Windows): the
+	 * in-process GL compositor weaves a window that spans several monitors
+	 * per segment, each by its own screen's DP, into the one window
+	 * framebuffer. The GL twin of @ref create_dp_d3d11_for_screen.
+	 *
+	 * Same contract as @ref create_dp_gl (`xrt_dp_factory_gl_fn_t`) — the
+	 * compositor's GL context is CURRENT on the calling thread, and every
+	 * later call into the DP happens with that same context current — plus
+	 * everything @ref create_dp_d3d11_for_screen promises, in GL terms:
+	 *   - @p binding names the screen; never NULL.
+	 *   - @p window_handle: the session's real window (HWND) for the screen
+	 *     holding the majority of the window, NULL for every other screen's
+	 *     DP, which is windowless and gets its phase from
+	 *     @ref xrt_display_processor_gl::set_present_origin plus the canvas
+	 *     offset. A DP must weave with a NULL window.
+	 *   - @ref xrt_display_processor_gl::process_atlas gets
+	 *     `canvas = the segment` (window client-area px, TOP-LEFT origin
+	 *     like every backend), a pre-cropped `GL_TEXTURE_2D` holding exactly
+	 *     that segment's views, and the window framebuffer bound as the draw
+	 *     framebuffer with `glViewport` AND `glScissor` (GL_SCISSOR_TEST on)
+	 *     already set to the segment — in GL's BOTTOM-left framebuffer
+	 *     coordinates, i.e. y = target_height − canvas_y − canvas_height.
+	 *     The DP must keep its output inside that rect (do not reset the
+	 *     viewport to the whole target, do not disable the scissor) and must
+	 *     not assume it is the first writer to the framebuffer this frame.
+	 *   - Several instances coexist in one process, one per screen, on ONE
+	 *     GL context.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * ⟹ the plug-in's screens other than the session's primary one get a
+	 * flat 2D view. Appended per ADR-020 (append-only within a major; gated
+	 * by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref get_screen_status. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN.
+	 */
+	xrt_result_t (*create_dp_gl_for_screen)(struct xrt_plugin_instance *inst,
+	                                        void *window_handle,
+	                                        const struct xrt_screen_binding *binding,
+	                                        struct xrt_display_processor_gl **out_xdp);
+
+	/*!
+	 * The settings this plug-in reads through
+	 * @ref xrt_plugin_host_iface::get_setting (ADR-054 decision 7, the one
+	 * options contract), for `displayxr-cli dp options <id>`: key, type,
+	 * default and one line of help per setting
+	 * (`xrt/xrt_component_settings.h`). Pure, callable from any thread,
+	 * with no instance (it is called on a negotiated-only plug-in).
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * declares nothing — the store's keys are still listed. Appended per
+	 * ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after
+	 * @ref create_dp_gl_for_screen. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS.
+	 */
+	xrt_component_describe_settings_fn_t describe_settings;
+
+	/*!
+	 * The capture devices this plug-in's display owns — above all the camera
+	 * its EYE TRACKER reads (ADR-043 Amendment 5). The service's own UVC
+	 * stereo webcam source (Amendment 4, util/u_stereo_uvc.h) never claims a
+	 * device listed here, whatever the user's stereo-cameras.json matches:
+	 * the denylist wins over every config entry, explicit VID:PID included.
+	 *
+	 * Fill up to @p capacity ids (@p out_ids may be NULL when @p capacity is
+	 * 0) and return how many the plug-in claims (it may exceed @p capacity;
+	 * the extra are dropped). Each id is NUL-terminated, at most
+	 * @ref XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX bytes, in the same forms as
+	 * @ref xrt_plugin_stereo_camera_info::platform_device_hint:
+	 *   - a USB `"vvvv:pppp"` (hex VID:PID) — the preferred form: it names
+	 *     every unit of that model and needs no enumeration; or
+	 *   - the OS device id (Windows: the device interface / Media Foundation
+	 *     symbolic link; Linux: `/dev/videoN`).
+	 *
+	 * Unlike the stereo camera slots this is a DECLARATION, not a resolution:
+	 * list the camera(s) the tracker may use even when none is attached or
+	 * the tracker is not running, and every candidate when several could be
+	 * it (a denylist does not need the ambiguity rule a hint does).
+	 *
+	 * Contract: pure and cheap (the service calls it on every camera rescan,
+	 * every ~2 s while a client listens); callable from any thread, with
+	 * @p inst NULL for a plug-in without instance state; MUST NOT open,
+	 * activate or start any capture device.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * declares nothing; the runtime still refuses its own conservative
+	 * built-in list (u_stereo_uvc_builtin_tracker_refusal) and every plug-in
+	 * camera's platform_device_hint. Appended per ADR-020 (append-only within
+	 * a major; gated by @ref struct_size; no XRT_PLUGIN_API_VERSION_CURRENT
+	 * bump) after @ref describe_settings. Announced by
+	 * @ref XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS.
+	 */
+	uint32_t (*get_claimed_cameras)(struct xrt_plugin_instance *inst,
+	                                uint32_t capacity,
+	                                char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]);
+
+	/*!
+	 * The display's VIEWER POLICY (ADR-054 §4.1 / N6 Part 2): may the views on
+	 * this display follow a viewer measured by someone else — a
+	 * viewer-tracking provider (`xrt_tracking_plugin.h`) — when the display
+	 * does not track the viewer itself? One of @ref xrt_plugin_viewer_policy:
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_OWN: the display tracks (or decides)
+	 *     the viewer itself; a provider is never used on it.
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK: when it does not track
+	 *     (`supported_eye_tracking_modes == 0`), the trunk may drive its views
+	 *     from the best enabled provider, and composes the advertised
+	 *     `XR_DXR_display_info` tracking capability accordingly.
+	 *   - @ref XRT_PLUGIN_VIEWER_POLICY_FIXED: never viewer-coupled (an
+	 *     N-view panel whose optics supply the parallax); views stay nominal
+	 *     whatever providers are installed.
+	 * A display that DOES track always wins on its own screen, whatever this
+	 * slot says: the trunk never splices a second eye source into a screen
+	 * whose weave uses tracked eyes.
+	 *
+	 * @p display names the monitor (a descriptor the runtime built, as in
+	 * @ref get_display_info_for_monitor), or NULL for the plug-in's active
+	 * panel. Pure and cheap, any thread, @p inst may be NULL.
+	 *
+	 * Optional. NULL (or a plug-in whose `struct_size` predates this field)
+	 * reads as @ref XRT_PLUGIN_VIEWER_POLICY_FIXED, so no installed display
+	 * changes behaviour. An unknown return value reads as FIXED too. Appended
+	 * per ADR-020 (append-only within a major; gated by @ref struct_size; no
+	 * XRT_PLUGIN_API_VERSION_CURRENT bump) after @ref get_claimed_cameras.
+	 * Announced by @ref XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY.
+	 */
+	uint32_t (*get_viewer_policy)(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display);
 };
+
+/*!
+ * Values of @ref xrt_plugin_iface::get_viewer_policy. Stable (they cross the
+ * plug-in ABI); 0 is deliberately not a value, so a zero-filled answer is
+ * "unknown" and reads as FIXED.
+ */
+enum xrt_plugin_viewer_policy
+{
+	XRT_PLUGIN_VIEWER_POLICY_OWN = 1,         //!< the display owns the viewer (it tracks)
+	XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK = 2, //!< views may follow a viewer-tracking provider's viewer
+	XRT_PLUGIN_VIEWER_POLICY_FIXED = 3,       //!< never viewer-coupled
+};
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_viewer_policy (ADR-054 N6 Part 2), so a plug-in built
+ * against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_viewer_policy (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_viewer_policy(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_viewer_policy) + sizeof(iface->get_viewer_policy) &&
+	       iface->get_viewer_policy != NULL;
+}
+
+/*!
+ * The viewer policy of @p iface for @p display (NULL = its active panel), with
+ * the absent-slot / unknown-value rule applied: FIXED unless the plug-in says
+ * OWN or EXTERNAL_OK.
+ */
+static inline uint32_t
+xrt_plugin_iface_viewer_policy(const struct xrt_plugin_iface *iface,
+                               struct xrt_plugin_instance *inst,
+                               const struct xrt_display_descriptor *display)
+{
+	if (!xrt_plugin_iface_has_viewer_policy(iface)) {
+		return XRT_PLUGIN_VIEWER_POLICY_FIXED;
+	}
+	const uint32_t p = iface->get_viewer_policy(inst, display);
+	return (p == XRT_PLUGIN_VIEWER_POLICY_OWN || p == XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK)
+	           ? p
+	           : (uint32_t)XRT_PLUGIN_VIEWER_POLICY_FIXED;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_claimed_cameras (ADR-043 Amendment 5), so a plug-in
+ * built against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_claimed_cameras
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_claimed_cameras(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_claimed_cameras) + sizeof(iface->get_claimed_cameras) &&
+	       iface->get_claimed_cameras != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::describe_settings (N3c), so a plug-in built against an
+ * older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::describe_settings (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_describe_settings(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, describe_settings) + sizeof(iface->describe_settings) &&
+	       iface->describe_settings != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_d3d11_lift (ADR-042), so a plug-in built against
+ * an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_platform_state and this header defines
+ * @ref xrt_plugin_platform_state / @ref xrt_plugin_platform_status (ADR-045),
+ * so a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_HAS_PLATFORM_STATE 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries the stereo camera slots
+ * (ADR-043), so a plug-in built against an older runtime header can
+ * #ifdef-guard filling them.
+ */
+#define XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA 1
+
+/*!
+ * Defined when @ref xrt_plugin_stereo_camera_info carries @ref
+ * xrt_plugin_stereo_camera_info::monitor_id (#1961), so a plug-in built
+ * against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_MONITOR_ID 1
+
+/*!
+ * Defined when @ref xrt_plugin_stereo_camera_info carries @ref
+ * xrt_plugin_stereo_camera_info::frame_orientation (XR_DXR_stereo_camera v7)
+ * and this header defines @ref xrt_plugin_stereo_camera_frame_orientation, so a
+ * plug-in built against an older runtime header can #ifdef-guard filling it.
+ */
+#define XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION 1
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_display_info_for_monitor and this header defines
+ * @ref xrt_display_physical (multi-screen M1), so a plug-in built against an older runtime header can
+ * #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::get_display_info_for_monitor (and its struct_size covers
+ * the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_display_info_for_monitor(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, get_display_info_for_monitor) +
+	                                 sizeof(iface->get_display_info_for_monitor) &&
+	       iface->get_display_info_for_monitor != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_vk_for_screen and this header defines @ref
+ * xrt_screen_binding (multi-screen M2), so a plug-in built against an older
+ * runtime header can #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::create_dp_vk_for_screen
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_vk_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_vk_for_screen) +
+	                                 sizeof(iface->create_dp_vk_for_screen) &&
+	       iface->create_dp_vk_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_d3d11_for_screen (multi-screen M6, Windows), so
+ * a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::create_dp_d3d11_for_screen (and its struct_size covers the
+ * slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_d3d11_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_for_screen) +
+	                                 sizeof(iface->create_dp_d3d11_for_screen) &&
+	       iface->create_dp_d3d11_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_metal_for_screen (multi-screen on macOS), so a
+ * plug-in built against an older runtime header can #ifdef-guard
+ * implementing it (pair it with XRT_DP_METAL_HAS_PRESENT_ORIGIN).
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::create_dp_metal_for_screen (and its struct_size covers the
+ * slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_metal_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_metal_for_screen) +
+	                                 sizeof(iface->create_dp_metal_for_screen) &&
+	       iface->create_dp_metal_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_d3d12_for_screen (multi-screen M6, Windows
+ * D3D12), so a plug-in built against an older runtime header can
+ * #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref
+ * xrt_plugin_iface::create_dp_d3d12_for_screen (and its struct_size covers the
+ * slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_d3d12_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d12_for_screen) +
+	                                 sizeof(iface->create_dp_d3d12_for_screen) &&
+	       iface->create_dp_d3d12_for_screen != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::get_screen_status and this header defines @ref
+ * xrt_plugin_screen_status (ADR-051 D2), so a plug-in built against an older
+ * runtime header can #ifdef-guard implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::get_screen_status (and
+ * its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_get_screen_status(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >=
+	           offsetof(struct xrt_plugin_iface, get_screen_status) + sizeof(iface->get_screen_status) &&
+	       iface->get_screen_status != NULL;
+}
+
+/*!
+ * Defined when @ref xrt_plugin_iface carries @ref
+ * xrt_plugin_iface::create_dp_gl_for_screen (multi-screen M6, Windows OpenGL),
+ * so a plug-in built against an older runtime header can #ifdef-guard
+ * implementing it.
+ */
+#define XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN 1
+
+/*!
+ * True when @p iface implements @ref xrt_plugin_iface::create_dp_gl_for_screen
+ * (and its struct_size covers the slot).
+ */
+static inline bool
+xrt_plugin_iface_has_create_dp_gl_for_screen(const struct xrt_plugin_iface *iface)
+{
+	return iface != NULL &&
+	       iface->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_gl_for_screen) +
+	                                 sizeof(iface->create_dp_gl_for_screen) &&
+	       iface->create_dp_gl_for_screen != NULL;
+}
+
+/*!
+ * True when @p iface fills the whole stereo camera slot set (and its
+ * struct_size covers it).
+ */
+static inline bool
+xrt_plugin_iface_has_stereo_camera(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL || iface->struct_size < offsetof(struct xrt_plugin_iface, stereo_camera_close) +
+	                                              sizeof(iface->stereo_camera_close)) {
+		return false;
+	}
+	return iface->stereo_camera_enumerate != NULL && iface->stereo_camera_get_calibration != NULL &&
+	       iface->stereo_camera_open != NULL && iface->stereo_camera_wait_frame != NULL &&
+	       iface->stereo_camera_release_frame != NULL && iface->stereo_camera_close != NULL;
+}
 
 
 /*

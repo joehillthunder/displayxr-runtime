@@ -45,6 +45,7 @@
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_display_zones.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "cursor_depth_zones.h" // XR_DXR_cursor_depth on display zones (runtime#1949)
 
 #include <cmath>
 #include <csignal>
@@ -58,6 +59,8 @@
 #include <unistd.h>
 
 #include "view_params.h"
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "projection_depth.h"
 #include "atlas_capture.h"
@@ -66,6 +69,10 @@
 
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
+
+#include "color_policy.h"
+#include <vk_frame_ring.h> // dxr::VkFrameRing — INV-4.10 frame-submit discipline
+#include "vk_clear.h"
 
 // ============================================================================
 // Logging
@@ -98,6 +105,14 @@
 // ============================================================================
 
 static const uint32_t kNumZones = 2;
+
+// XR_DXR_cursor_depth (ADR-046, runtime#1949): the runtime draws the depth
+// cursor in the 3D zone under the pointer. The hint rides that zone's
+// zone-scoped locate (cursor_depth_zones.h). Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// DISPLAYXR_CURSOR_DEPTH_UV=u,v scripts a WINDOW-normalised pointer.
+static bool g_hasCursorDepthExt = false;
+static uint32_t g_cursorDepthSpecVersion = 0;
+static dxr_zones_cursor::ZoneCursor g_zoneCursor;
 static const float kZoneVirtualDisplayHeight = 0.30f;
 
 struct DisplayZone {
@@ -213,6 +228,12 @@ static NSView *g_metalView = nil;
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
+// Smooth 2D<->3D transition (displayxr-common mode_switch.h): a normalised
+// 0..1 disparity scale applied to every rig's ipdFactor (see the main loop).
+static dxr::ModeSwitch g_modeSwitch;
+static float g_modeRamp = 1.0f;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18°) → 36° vFOV
 
 // Borderless fullscreen state
@@ -488,20 +509,76 @@ static const uint32_t gridVertSpv[] = {
     0x00010038,
 };
 
-// Grid fragment shader: pass-through color
+// Grid fragment shader: pass-through vertex colour. Same `uLinearize` rule as
+// the cube FS: the grid colour is authored display-referred, so it must be
+// decoded when the attachment will encode on write -- otherwise the grid
+// brightens on an `_SRGB` swapchain while the textured cube stays put.
+//
+// GLSL source (regenerate via `glslangValidator -V grid.frag -o grid_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
+//   layout(location = 0) in vec4 inColor;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       vec3 col = inColor.rgb;
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       outColor = vec4(col, inColor.a);
+//   }
 static const uint32_t gridFragSpv[] = {
-    0x07230203,0x00010000,0x000d000a,0x0000000d,0x00000000,0x00020011,0x00000001,0x0006000b,
-    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-    0x0007000f,0x00000004,0x00000004,0x6e69616d,0x00000000,0x00000009,0x0000000b,0x00030010,
-    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,0x00000004,0x6e69616d,
-    0x00000000,0x00050005,0x00000009,0x4374756f,0x726f6c6f,0x00000000,0x00040005,0x0000000b,
-    0x6f436e69,0x00726f6c,0x00040047,0x00000009,0x0000001e,0x00000000,0x00040047,0x0000000b,
-    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
-    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000004,0x00040020,0x00000008,
-    0x00000003,0x00000007,0x0004003b,0x00000008,0x00000009,0x00000003,0x00040020,0x0000000a,
-    0x00000001,0x00000007,0x0004003b,0x0000000a,0x0000000b,0x00000001,0x00050036,0x00000002,
-    0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003d,0x00000007,0x0000000c,
-    0x0000000b,0x0003003e,0x00000009,0x0000000c,0x000100fd,0x00010038,
+    0x07230203,0x00010000,0x0008000b,0x00000033,0x00000000,0x00020011,
+    0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
+    0x00000000,0x0003000e,0x00000000,0x00000001,0x0007000f,0x00000004,
+    0x00000004,0x6e69616d,0x00000000,0x0000000c,0x00000028,0x00030010,
+    0x00000004,0x00000007,0x00030003,0x00000002,0x000001c2,0x00040005,
+    0x00000004,0x6e69616d,0x00000000,0x00030005,0x00000009,0x006c6f63,
+    0x00040005,0x0000000c,0x6f436e69,0x00726f6c,0x00050005,0x00000010,
+    0x6e694c75,0x69726165,0x0000657a,0x00050005,0x00000028,0x4374756f,
+    0x726f6c6f,0x00000000,0x00040047,0x0000000c,0x0000001e,0x00000000,
+    0x00040047,0x00000010,0x00000001,0x00000000,0x00040047,0x00000028,
+    0x0000001e,0x00000000,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,
+    0x00000006,0x00000003,0x00040020,0x00000008,0x00000007,0x00000007,
+    0x00040017,0x0000000a,0x00000006,0x00000004,0x00040020,0x0000000b,
+    0x00000001,0x0000000a,0x0004003b,0x0000000b,0x0000000c,0x00000001,
+    0x00020014,0x0000000f,0x00030031,0x0000000f,0x00000010,0x0004002b,
+    0x00000006,0x00000014,0x3d6147ae,0x0004002b,0x00000006,0x00000017,
+    0x3f870a3d,0x0004002b,0x00000006,0x0000001a,0x4019999a,0x0006002c,
+    0x00000007,0x0000001b,0x0000001a,0x0000001a,0x0000001a,0x0004002b,
+    0x00000006,0x0000001e,0x414eb852,0x0004002b,0x00000006,0x00000022,
+    0x3d25aee6,0x0006002c,0x00000007,0x00000023,0x00000022,0x00000022,
+    0x00000022,0x00040017,0x00000024,0x0000000f,0x00000003,0x00040020,
+    0x00000027,0x00000003,0x0000000a,0x0004003b,0x00000027,0x00000028,
+    0x00000003,0x00040015,0x0000002a,0x00000020,0x00000000,0x0004002b,
+    0x0000002a,0x0000002b,0x00000003,0x00040020,0x0000002c,0x00000001,
+    0x00000006,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,
+    0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
+    0x0004003d,0x0000000a,0x0000000d,0x0000000c,0x0008004f,0x00000007,
+    0x0000000e,0x0000000d,0x0000000d,0x00000000,0x00000001,0x00000002,
+    0x0003003e,0x00000009,0x0000000e,0x000300f7,0x00000012,0x00000000,
+    0x000400fa,0x00000010,0x00000011,0x00000012,0x000200f8,0x00000011,
+    0x0004003d,0x00000007,0x00000013,0x00000009,0x00060050,0x00000007,
+    0x00000015,0x00000014,0x00000014,0x00000014,0x00050081,0x00000007,
+    0x00000016,0x00000013,0x00000015,0x00060050,0x00000007,0x00000018,
+    0x00000017,0x00000017,0x00000017,0x00050088,0x00000007,0x00000019,
+    0x00000016,0x00000018,0x0007000c,0x00000007,0x0000001c,0x00000001,
+    0x0000001a,0x00000019,0x0000001b,0x0004003d,0x00000007,0x0000001d,
+    0x00000009,0x00060050,0x00000007,0x0000001f,0x0000001e,0x0000001e,
+    0x0000001e,0x00050088,0x00000007,0x00000020,0x0000001d,0x0000001f,
+    0x0004003d,0x00000007,0x00000021,0x00000009,0x000500bc,0x00000024,
+    0x00000025,0x00000021,0x00000023,0x000600a9,0x00000007,0x00000026,
+    0x00000025,0x00000020,0x0000001c,0x0003003e,0x00000009,0x00000026,
+    0x000200f9,0x00000012,0x000200f8,0x00000012,0x0004003d,0x00000007,
+    0x00000029,0x00000009,0x00050041,0x0000002c,0x0000002d,0x0000000c,
+    0x0000002b,0x0004003d,0x00000006,0x0000002e,0x0000002d,0x00050051,
+    0x00000006,0x0000002f,0x00000029,0x00000000,0x00050051,0x00000006,
+    0x00000030,0x00000029,0x00000001,0x00050051,0x00000006,0x00000031,
+    0x00000029,0x00000002,0x00070050,0x0000000a,0x00000032,0x0000002f,
+    0x00000030,0x00000031,0x0000002e,0x0003003e,0x00000028,0x00000032,
+    0x000100fd,0x00010038,
 };
 
 // Textured cube vertex shader: push constants (MVP + model), outputs UV/normal/tangent
@@ -598,15 +675,53 @@ static const uint32_t cubeTexturedVertSpv[] = {
 
 // Textured cube fragment shader: lighting matches cube_handle_gl_macos /
 // cube_handle_metal_macos — lightDir = normalize(0.3, 0.5, 1.0), 0.8·diffuse,
-// 0.3 + 0.15·ao ambient. Regenerate via `glslangValidator -V cube.frag -o
-// cube_frag.spv` from the GLSL source documented in
-// test_apps/cube_handle_vk_win/vk_renderer.cpp (kept in sync with this).
+// 0.3 + 0.15·ao ambient.
+//
+// ADR-021 / INV-4.6: the `uLinearize` specialization constant (SpecId 0) adds
+// the standard sRGB EOTF to the emitted colour. The basecolor/AO textures are
+// DISPLAY-REFERRED (VK_FORMAT_R8G8B8A8_UNORM). The colour swapchain is `_SRGB`
+// (dxr::ChooseColorSwapchainFormat), whose attachment encodes on write, so
+// emitting those numbers raw would encode them twice (washed out). Decoding
+// here makes the round-trip an identity. Specialized at pipeline-creation time
+// from dxr::RenderSceneLinear(); see color_policy.h. Same rule as the Windows
+// VK cube apps (#1650).
+//
+// GLSL source (regenerate via `glslangValidator -V cube.frag -o cube_frag.spv`):
+//   #version 450
+//   layout(constant_id = 0) const bool uLinearize = false;
+//   layout(set = 0, binding = 0) uniform sampler2D uBasecolorTex;
+//   layout(set = 0, binding = 1) uniform sampler2D uNormalTex;
+//   layout(set = 0, binding = 2) uniform sampler2D uAOTex;
+//   layout(location = 0) in vec2 fragUV;
+//   layout(location = 1) in vec3 fragWorldNormal;
+//   layout(location = 2) in vec3 fragWorldTangent;
+//   layout(location = 0) out vec4 outColor;
+//   void main() {
+//       vec3 baseColor = texture(uBasecolorTex, fragUV).rgb;
+//       vec3 normalMap = texture(uNormalTex, fragUV).rgb * 2.0 - 1.0;
+//       float ao = texture(uAOTex, fragUV).r;
+//       vec3 N = normalize(fragWorldNormal);
+//       vec3 T = normalize(fragWorldTangent);
+//       vec3 B = cross(N, T);
+//       mat3 TBN = mat3(T, B, N);
+//       vec3 normal = normalize(TBN * normalMap);
+//       vec3 lightDir = normalize(vec3(0.3, 0.5, 1.0));
+//       float diffuse = max(dot(normal, lightDir), 0.0) * 0.8 * ao;
+//       float ambient = 0.3 + 0.15 * ao;
+//       vec3 col = baseColor * (diffuse + ambient);
+//       if (uLinearize) {
+//           col = mix(pow((col + 0.055) / 1.055, vec3(2.4)),
+//                     col / 12.92,
+//                     lessThanEqual(col, vec3(0.04045)));
+//       }
+//       outColor = vec4(col, 1.0);
+//   }
 static const uint32_t cubeTexturedFragSpv[] = {
-    0x07230203,0x00010000,0x0008000b,0x0000006f,0x00000000,0x00020011,
+    0x07230203,0x00010000,0x0008000b,0x00000089,0x00000000,0x00020011,
     0x00000001,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,
     0x00000000,0x0003000e,0x00000000,0x00000001,0x0009000f,0x00000004,
     0x00000004,0x6e69616d,0x00000000,0x00000011,0x0000002c,0x00000030,
-    0x00000065,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
+    0x00000083,0x00030010,0x00000004,0x00000007,0x00030003,0x00000002,
     0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
     0x00000009,0x65736162,0x6f6c6f43,0x00000072,0x00060005,0x0000000d,
     0x73614275,0x6c6f6365,0x6554726f,0x00000078,0x00040005,0x00000011,
@@ -620,14 +735,16 @@ static const uint32_t cubeTexturedFragSpv[] = {
     0x00000039,0x004e4254,0x00040005,0x0000004b,0x6d726f6e,0x00006c61,
     0x00050005,0x00000050,0x6867696c,0x72694474,0x00000000,0x00040005,
     0x00000055,0x66666964,0x00657375,0x00040005,0x0000005e,0x69626d61,
-    0x00746e65,0x00050005,0x00000065,0x4374756f,0x726f6c6f,0x00000000,
-    0x00040047,0x0000000d,0x00000021,0x00000000,0x00040047,0x0000000d,
-    0x00000022,0x00000000,0x00040047,0x00000011,0x0000001e,0x00000000,
-    0x00040047,0x00000017,0x00000021,0x00000001,0x00040047,0x00000017,
-    0x00000022,0x00000000,0x00040047,0x00000023,0x00000021,0x00000002,
-    0x00040047,0x00000023,0x00000022,0x00000000,0x00040047,0x0000002c,
-    0x0000001e,0x00000001,0x00040047,0x00000030,0x0000001e,0x00000002,
-    0x00040047,0x00000065,0x0000001e,0x00000000,0x00020013,0x00000002,
+    0x00746e65,0x00030005,0x00000064,0x006c6f63,0x00050005,0x0000006b,
+    0x6e694c75,0x69726165,0x0000657a,0x00050005,0x00000083,0x4374756f,
+    0x726f6c6f,0x00000000,0x00040047,0x0000000d,0x00000021,0x00000000,
+    0x00040047,0x0000000d,0x00000022,0x00000000,0x00040047,0x00000011,
+    0x0000001e,0x00000000,0x00040047,0x00000017,0x00000021,0x00000001,
+    0x00040047,0x00000017,0x00000022,0x00000000,0x00040047,0x00000023,
+    0x00000021,0x00000002,0x00040047,0x00000023,0x00000022,0x00000000,
+    0x00040047,0x0000002c,0x0000001e,0x00000001,0x00040047,0x00000030,
+    0x0000001e,0x00000002,0x00040047,0x0000006b,0x00000001,0x00000000,
+    0x00040047,0x00000083,0x0000001e,0x00000000,0x00020013,0x00000002,
     0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,
     0x00040017,0x00000007,0x00000006,0x00000003,0x00040020,0x00000008,
     0x00000007,0x00000007,0x00090019,0x0000000a,0x00000006,0x00000001,
@@ -650,73 +767,95 @@ static const uint32_t cubeTexturedFragSpv[] = {
     0x0006002c,0x00000007,0x00000054,0x00000051,0x00000052,0x00000053,
     0x0004002b,0x00000006,0x0000005a,0x3f4ccccd,0x0004002b,0x00000006,
     0x0000005f,0x3e99999a,0x0004002b,0x00000006,0x00000060,0x3e19999a,
-    0x00040020,0x00000064,0x00000003,0x00000013,0x0004003b,0x00000064,
-    0x00000065,0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,
-    0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,
-    0x00000007,0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,
-    0x00000021,0x00000022,0x00000007,0x0004003b,0x00000008,0x0000002a,
-    0x00000007,0x0004003b,0x00000008,0x0000002f,0x00000007,0x0004003b,
-    0x00000008,0x00000033,0x00000007,0x0004003b,0x00000038,0x00000039,
-    0x00000007,0x0004003b,0x00000008,0x0000004b,0x00000007,0x0004003b,
-    0x00000008,0x00000050,0x00000007,0x0004003b,0x00000021,0x00000055,
-    0x00000007,0x0004003b,0x00000021,0x0000005e,0x00000007,0x0004003d,
-    0x0000000b,0x0000000e,0x0000000d,0x0004003d,0x0000000f,0x00000012,
-    0x00000011,0x00050057,0x00000013,0x00000014,0x0000000e,0x00000012,
-    0x0008004f,0x00000007,0x00000015,0x00000014,0x00000014,0x00000000,
-    0x00000001,0x00000002,0x0003003e,0x00000009,0x00000015,0x0004003d,
-    0x0000000b,0x00000018,0x00000017,0x0004003d,0x0000000f,0x00000019,
-    0x00000011,0x00050057,0x00000013,0x0000001a,0x00000018,0x00000019,
-    0x0008004f,0x00000007,0x0000001b,0x0000001a,0x0000001a,0x00000000,
-    0x00000001,0x00000002,0x0005008e,0x00000007,0x0000001d,0x0000001b,
-    0x0000001c,0x00060050,0x00000007,0x0000001f,0x0000001e,0x0000001e,
-    0x0000001e,0x00050083,0x00000007,0x00000020,0x0000001d,0x0000001f,
-    0x0003003e,0x00000016,0x00000020,0x0004003d,0x0000000b,0x00000024,
-    0x00000023,0x0004003d,0x0000000f,0x00000025,0x00000011,0x00050057,
-    0x00000013,0x00000026,0x00000024,0x00000025,0x00050051,0x00000006,
-    0x00000029,0x00000026,0x00000000,0x0003003e,0x00000022,0x00000029,
-    0x0004003d,0x00000007,0x0000002d,0x0000002c,0x0006000c,0x00000007,
-    0x0000002e,0x00000001,0x00000045,0x0000002d,0x0003003e,0x0000002a,
-    0x0000002e,0x0004003d,0x00000007,0x00000031,0x00000030,0x0006000c,
-    0x00000007,0x00000032,0x00000001,0x00000045,0x00000031,0x0003003e,
-    0x0000002f,0x00000032,0x0004003d,0x00000007,0x00000034,0x0000002a,
-    0x0004003d,0x00000007,0x00000035,0x0000002f,0x0007000c,0x00000007,
-    0x00000036,0x00000001,0x00000044,0x00000034,0x00000035,0x0003003e,
-    0x00000033,0x00000036,0x0004003d,0x00000007,0x0000003a,0x0000002f,
-    0x0004003d,0x00000007,0x0000003b,0x00000033,0x0004003d,0x00000007,
-    0x0000003c,0x0000002a,0x00050051,0x00000006,0x0000003e,0x0000003a,
-    0x00000000,0x00050051,0x00000006,0x0000003f,0x0000003a,0x00000001,
-    0x00050051,0x00000006,0x00000040,0x0000003a,0x00000002,0x00050051,
-    0x00000006,0x00000041,0x0000003b,0x00000000,0x00050051,0x00000006,
-    0x00000042,0x0000003b,0x00000001,0x00050051,0x00000006,0x00000043,
-    0x0000003b,0x00000002,0x00050051,0x00000006,0x00000044,0x0000003c,
-    0x00000000,0x00050051,0x00000006,0x00000045,0x0000003c,0x00000001,
-    0x00050051,0x00000006,0x00000046,0x0000003c,0x00000002,0x00060050,
-    0x00000007,0x00000047,0x0000003e,0x0000003f,0x00000040,0x00060050,
-    0x00000007,0x00000048,0x00000041,0x00000042,0x00000043,0x00060050,
-    0x00000007,0x00000049,0x00000044,0x00000045,0x00000046,0x00060050,
-    0x00000037,0x0000004a,0x00000047,0x00000048,0x00000049,0x0003003e,
-    0x00000039,0x0000004a,0x0004003d,0x00000037,0x0000004c,0x00000039,
-    0x0004003d,0x00000007,0x0000004d,0x00000016,0x00050091,0x00000007,
-    0x0000004e,0x0000004c,0x0000004d,0x0006000c,0x00000007,0x0000004f,
-    0x00000001,0x00000045,0x0000004e,0x0003003e,0x0000004b,0x0000004f,
-    0x0003003e,0x00000050,0x00000054,0x0004003d,0x00000007,0x00000056,
-    0x0000004b,0x0004003d,0x00000007,0x00000057,0x00000050,0x00050094,
-    0x00000006,0x00000058,0x00000056,0x00000057,0x0007000c,0x00000006,
-    0x00000059,0x00000001,0x00000028,0x00000058,0x0000003d,0x00050085,
-    0x00000006,0x0000005b,0x00000059,0x0000005a,0x0004003d,0x00000006,
-    0x0000005c,0x00000022,0x00050085,0x00000006,0x0000005d,0x0000005b,
-    0x0000005c,0x0003003e,0x00000055,0x0000005d,0x0004003d,0x00000006,
-    0x00000061,0x00000022,0x00050085,0x00000006,0x00000062,0x00000060,
-    0x00000061,0x00050081,0x00000006,0x00000063,0x0000005f,0x00000062,
-    0x0003003e,0x0000005e,0x00000063,0x0004003d,0x00000007,0x00000066,
-    0x00000009,0x0004003d,0x00000006,0x00000067,0x00000055,0x0004003d,
-    0x00000006,0x00000068,0x0000005e,0x00050081,0x00000006,0x00000069,
-    0x00000067,0x00000068,0x0005008e,0x00000007,0x0000006a,0x00000066,
-    0x00000069,0x00050051,0x00000006,0x0000006b,0x0000006a,0x00000000,
-    0x00050051,0x00000006,0x0000006c,0x0000006a,0x00000001,0x00050051,
-    0x00000006,0x0000006d,0x0000006a,0x00000002,0x00070050,0x00000013,
-    0x0000006e,0x0000006b,0x0000006c,0x0000006d,0x0000001e,0x0003003e,
-    0x00000065,0x0000006e,0x000100fd,0x00010038
+    0x00020014,0x0000006a,0x00030031,0x0000006a,0x0000006b,0x0004002b,
+    0x00000006,0x0000006f,0x3d6147ae,0x0004002b,0x00000006,0x00000072,
+    0x3f870a3d,0x0004002b,0x00000006,0x00000075,0x4019999a,0x0006002c,
+    0x00000007,0x00000076,0x00000075,0x00000075,0x00000075,0x0004002b,
+    0x00000006,0x00000079,0x414eb852,0x0004002b,0x00000006,0x0000007d,
+    0x3d25aee6,0x0006002c,0x00000007,0x0000007e,0x0000007d,0x0000007d,
+    0x0000007d,0x00040017,0x0000007f,0x0000006a,0x00000003,0x00040020,
+    0x00000082,0x00000003,0x00000013,0x0004003b,0x00000082,0x00000083,
+    0x00000003,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,
+    0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
+    0x0004003b,0x00000008,0x00000016,0x00000007,0x0004003b,0x00000021,
+    0x00000022,0x00000007,0x0004003b,0x00000008,0x0000002a,0x00000007,
+    0x0004003b,0x00000008,0x0000002f,0x00000007,0x0004003b,0x00000008,
+    0x00000033,0x00000007,0x0004003b,0x00000038,0x00000039,0x00000007,
+    0x0004003b,0x00000008,0x0000004b,0x00000007,0x0004003b,0x00000008,
+    0x00000050,0x00000007,0x0004003b,0x00000021,0x00000055,0x00000007,
+    0x0004003b,0x00000021,0x0000005e,0x00000007,0x0004003b,0x00000008,
+    0x00000064,0x00000007,0x0004003d,0x0000000b,0x0000000e,0x0000000d,
+    0x0004003d,0x0000000f,0x00000012,0x00000011,0x00050057,0x00000013,
+    0x00000014,0x0000000e,0x00000012,0x0008004f,0x00000007,0x00000015,
+    0x00000014,0x00000014,0x00000000,0x00000001,0x00000002,0x0003003e,
+    0x00000009,0x00000015,0x0004003d,0x0000000b,0x00000018,0x00000017,
+    0x0004003d,0x0000000f,0x00000019,0x00000011,0x00050057,0x00000013,
+    0x0000001a,0x00000018,0x00000019,0x0008004f,0x00000007,0x0000001b,
+    0x0000001a,0x0000001a,0x00000000,0x00000001,0x00000002,0x0005008e,
+    0x00000007,0x0000001d,0x0000001b,0x0000001c,0x00060050,0x00000007,
+    0x0000001f,0x0000001e,0x0000001e,0x0000001e,0x00050083,0x00000007,
+    0x00000020,0x0000001d,0x0000001f,0x0003003e,0x00000016,0x00000020,
+    0x0004003d,0x0000000b,0x00000024,0x00000023,0x0004003d,0x0000000f,
+    0x00000025,0x00000011,0x00050057,0x00000013,0x00000026,0x00000024,
+    0x00000025,0x00050051,0x00000006,0x00000029,0x00000026,0x00000000,
+    0x0003003e,0x00000022,0x00000029,0x0004003d,0x00000007,0x0000002d,
+    0x0000002c,0x0006000c,0x00000007,0x0000002e,0x00000001,0x00000045,
+    0x0000002d,0x0003003e,0x0000002a,0x0000002e,0x0004003d,0x00000007,
+    0x00000031,0x00000030,0x0006000c,0x00000007,0x00000032,0x00000001,
+    0x00000045,0x00000031,0x0003003e,0x0000002f,0x00000032,0x0004003d,
+    0x00000007,0x00000034,0x0000002a,0x0004003d,0x00000007,0x00000035,
+    0x0000002f,0x0007000c,0x00000007,0x00000036,0x00000001,0x00000044,
+    0x00000034,0x00000035,0x0003003e,0x00000033,0x00000036,0x0004003d,
+    0x00000007,0x0000003a,0x0000002f,0x0004003d,0x00000007,0x0000003b,
+    0x00000033,0x0004003d,0x00000007,0x0000003c,0x0000002a,0x00050051,
+    0x00000006,0x0000003e,0x0000003a,0x00000000,0x00050051,0x00000006,
+    0x0000003f,0x0000003a,0x00000001,0x00050051,0x00000006,0x00000040,
+    0x0000003a,0x00000002,0x00050051,0x00000006,0x00000041,0x0000003b,
+    0x00000000,0x00050051,0x00000006,0x00000042,0x0000003b,0x00000001,
+    0x00050051,0x00000006,0x00000043,0x0000003b,0x00000002,0x00050051,
+    0x00000006,0x00000044,0x0000003c,0x00000000,0x00050051,0x00000006,
+    0x00000045,0x0000003c,0x00000001,0x00050051,0x00000006,0x00000046,
+    0x0000003c,0x00000002,0x00060050,0x00000007,0x00000047,0x0000003e,
+    0x0000003f,0x00000040,0x00060050,0x00000007,0x00000048,0x00000041,
+    0x00000042,0x00000043,0x00060050,0x00000007,0x00000049,0x00000044,
+    0x00000045,0x00000046,0x00060050,0x00000037,0x0000004a,0x00000047,
+    0x00000048,0x00000049,0x0003003e,0x00000039,0x0000004a,0x0004003d,
+    0x00000037,0x0000004c,0x00000039,0x0004003d,0x00000007,0x0000004d,
+    0x00000016,0x00050091,0x00000007,0x0000004e,0x0000004c,0x0000004d,
+    0x0006000c,0x00000007,0x0000004f,0x00000001,0x00000045,0x0000004e,
+    0x0003003e,0x0000004b,0x0000004f,0x0003003e,0x00000050,0x00000054,
+    0x0004003d,0x00000007,0x00000056,0x0000004b,0x0004003d,0x00000007,
+    0x00000057,0x00000050,0x00050094,0x00000006,0x00000058,0x00000056,
+    0x00000057,0x0007000c,0x00000006,0x00000059,0x00000001,0x00000028,
+    0x00000058,0x0000003d,0x00050085,0x00000006,0x0000005b,0x00000059,
+    0x0000005a,0x0004003d,0x00000006,0x0000005c,0x00000022,0x00050085,
+    0x00000006,0x0000005d,0x0000005b,0x0000005c,0x0003003e,0x00000055,
+    0x0000005d,0x0004003d,0x00000006,0x00000061,0x00000022,0x00050085,
+    0x00000006,0x00000062,0x00000060,0x00000061,0x00050081,0x00000006,
+    0x00000063,0x0000005f,0x00000062,0x0003003e,0x0000005e,0x00000063,
+    0x0004003d,0x00000007,0x00000065,0x00000009,0x0004003d,0x00000006,
+    0x00000066,0x00000055,0x0004003d,0x00000006,0x00000067,0x0000005e,
+    0x00050081,0x00000006,0x00000068,0x00000066,0x00000067,0x0005008e,
+    0x00000007,0x00000069,0x00000065,0x00000068,0x0003003e,0x00000064,
+    0x00000069,0x000300f7,0x0000006d,0x00000000,0x000400fa,0x0000006b,
+    0x0000006c,0x0000006d,0x000200f8,0x0000006c,0x0004003d,0x00000007,
+    0x0000006e,0x00000064,0x00060050,0x00000007,0x00000070,0x0000006f,
+    0x0000006f,0x0000006f,0x00050081,0x00000007,0x00000071,0x0000006e,
+    0x00000070,0x00060050,0x00000007,0x00000073,0x00000072,0x00000072,
+    0x00000072,0x00050088,0x00000007,0x00000074,0x00000071,0x00000073,
+    0x0007000c,0x00000007,0x00000077,0x00000001,0x0000001a,0x00000074,
+    0x00000076,0x0004003d,0x00000007,0x00000078,0x00000064,0x00060050,
+    0x00000007,0x0000007a,0x00000079,0x00000079,0x00000079,0x00050088,
+    0x00000007,0x0000007b,0x00000078,0x0000007a,0x0004003d,0x00000007,
+    0x0000007c,0x00000064,0x000500bc,0x0000007f,0x00000080,0x0000007c,
+    0x0000007e,0x000600a9,0x00000007,0x00000081,0x00000080,0x0000007b,
+    0x00000077,0x0003003e,0x00000064,0x00000081,0x000200f9,0x0000006d,
+    0x000200f8,0x0000006d,0x0004003d,0x00000007,0x00000084,0x00000064,
+    0x00050051,0x00000006,0x00000085,0x00000084,0x00000000,0x00050051,
+    0x00000006,0x00000086,0x00000084,0x00000001,0x00050051,0x00000006,
+    0x00000087,0x00000084,0x00000002,0x00070050,0x00000013,0x00000088,
+    0x00000085,0x00000086,0x00000087,0x0000001e,0x0003003e,0x00000083,
+    0x00000088,0x000100fd,0x00010038,
 };
 
 // ============================================================================
@@ -751,10 +890,20 @@ struct VkRenderer {
     VkBuffer gridVertexBuffer = VK_NULL_HANDLE;
     VkDeviceMemory gridVertexMemory = VK_NULL_HANDLE;
     int gridVertexCount = 0;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    VkFence frameFence = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE; // init-time uploads only
+    // INV-4.10 / #1917: N frames in flight, ONE vkQueueSubmit per frame (every
+    // zone of a frame goes into the same command buffer), never a wait on the
+    // frame just submitted. Owns the per-frame command buffers and fences
+    // (and the blocking one-off path, submitImmediate()).
+    dxr::VkFrameRing ring;
     float cubeRotation = 0.0f;
+
+    // ADR-021 / INV-4.6: does this renderer emit SCENE-LINEAR? Latched once, at
+    // InitializeVkRenderer(), from dxr::RenderSceneLinear() -- the pipelines bake
+    // the matching `uLinearize` specialization constant, so the per-frame clear
+    // colour must follow the SAME latched decision rather than re-reading the
+    // environment and drifting out of step with the baked shaders.
+    bool sceneLinear = false;
     SwapchainFramebuffers swapchainFBs;
     VkRenderPass renderPassLoad = VK_NULL_HANDLE;
     // Texture resources
@@ -1127,6 +1276,34 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     renderer.graphicsQueue = graphicsQueue;
     g_physDevice = physDevice;
 
+    // ADR-021 / INV-4.6: decide ONCE, here, whether the fragment shaders emit
+    // scene-linear. This runs after CreateSwapchains() noted the colour format,
+    // so dxr::RenderSceneLinear() is authoritative: `_SRGB` swapchain => the
+    // attachment encodes on write => the shaders must hand it decoded (linear)
+    // values, or the authored display-referred colour gets encoded twice and
+    // washes out. DXR_TRUE_LINEAR overrides in both directions (see
+    // color_policy.h). Same shape as the Windows VK cube apps (#1650).
+    renderer.sceneLinear = dxr::RenderSceneLinear();
+    const VkBool32 specLinearize = renderer.sceneLinear ? VK_TRUE : VK_FALSE;
+    VkSpecializationMapEntry specEntry = {};
+    specEntry.constantID = 0;  // layout(constant_id = 0) const bool uLinearize
+    specEntry.offset = 0;
+    specEntry.size = sizeof(VkBool32);
+    VkSpecializationInfo fragSpec = {};
+    fragSpec.mapEntryCount = 1;
+    fragSpec.pMapEntries = &specEntry;
+    fragSpec.dataSize = sizeof(specLinearize);
+    fragSpec.pData = &specLinearize;
+
+    // One-off init line (never per frame) so a washed-out capture can be told
+    // apart from a mis-selected swapchain format without a rebuild.
+    LOG_WARN("[color] colorFormat=%d sceneLinear=%s (%s)",
+             (int)colorFormat,
+             renderer.sceneLinear ? "yes" : "no",
+             renderer.sceneLinear
+                 ? "fragment shaders decode authored colour; the attachment re-encodes"
+                 : "fragment shaders write authored display-referred bytes raw");
+
     // Render pass
     VkAttachmentDescription attachments[2] = {};
     attachments[0].format = colorFormat;
@@ -1152,12 +1329,31 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     subpass.pColorAttachments = &colorRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
+    // A framebuffer set's one depth image is shared by every frame, and with
+    // several frames in flight (VkFrameRing) the previous frame's pass may
+    // still be writing it: order this pass's attachment writes after any
+    // earlier ones. The old per-frame fence wait gave this ordering implicitly.
+    VkSubpassDependency dep = {};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                       VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                       VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dep.dstStageMask = dep.srcStageMask;
+    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo rpInfo = {};
     rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpInfo.attachmentCount = 2;
     rpInfo.pAttachments = attachments;
     rpInfo.subpassCount = 1;
     rpInfo.pSubpasses = &subpass;
+    rpInfo.dependencyCount = 1;
+    rpInfo.pDependencies = &dep;
     VK_CHECK(vkCreateRenderPass(device, &rpInfo, nullptr, &renderer.renderPass));
 
     // Create second render pass with LOAD instead of CLEAR (for second eye in SBS)
@@ -1271,6 +1467,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = cubeFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.stride = sizeof(CubeVertex);
@@ -1320,6 +1517,7 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
         stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
         stages[1].module = gridFrag;
         stages[1].pName = "main";
+        stages[1].pSpecializationInfo = &fragSpec;
 
         VkVertexInputBindingDescription binding = {};
         binding.stride = sizeof(GridVertex);
@@ -1443,17 +1641,13 @@ static bool InitializeVkRenderer(VkRenderer& renderer, VkDevice device, VkPhysic
     poolInfo.queueFamilyIndex = queueFamilyIndex;
     VK_CHECK(vkCreateCommandPool(device, &poolInfo, nullptr, &renderer.commandPool));
 
-    VkCommandBufferAllocateInfo allocInfo = {};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = renderer.commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(device, &allocInfo, &renderer.commandBuffer));
-
-    VkFenceCreateInfo fenceInfo = {};
-    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &renderer.frameFence));
+    // Frame ring (default 3 in flight; DXR_VK_FRAMES_IN_FLIGHT overrides).
+    // Grid / cube MVPs are push constants, so the ring owns no UBO.
+    if (!renderer.ring.init(device, physDevice, graphicsQueue, queueFamilyIndex,
+                            dxr::VkFrameRing::Config{})) {
+        LOG_ERROR("VkFrameRing init failed");
+        return false;
+    }
 
     // Load textures and create descriptor set
     {
@@ -1546,25 +1740,30 @@ struct EyeRenderParams {
 // Generalized scene render: cube + grid into any framebuffer set with an
 // explicit clear color and a per-call rotation offset (XR_DXR_display_zones:
 // each zone renders into its own swapchain with its own spin phase and
-// premultiplied background).
+// premultiplied background). RECORDS ONLY, into the ring's open frame — the
+// caller brackets every pass of a frame with ring.beginFrame()/endFrame(), so a
+// frame is one vkQueueSubmit however many zones it draws (INV-4.10).
 static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers& fb,
     uint32_t imageIndex, const EyeRenderParams* eyes, int eyeCount,
     const float clearColor[4], float rotationOffset)
 {
-    VkDevice device = renderer.device;
-    vkWaitForFences(device, 1, &renderer.frameFence, VK_TRUE, UINT64_MAX);
-    vkResetFences(device, 1, &renderer.frameFence);
-
-    VkCommandBuffer cmd = renderer.commandBuffer;
-    vkResetCommandBuffer(cmd, 0);
-
-    VkCommandBufferBeginInfo beginInfo = {};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
+    VkCommandBuffer cmd = renderer.ring.current();
+    if (cmd == VK_NULL_HANDLE) return;
 
     VkClearValue clearValues[2] = {};
     clearValues[0].color = VkClearColorValue{{clearColor[0], clearColor[1], clearColor[2], clearColor[3]}};
+    // ADR-021 / INV-4.6: VkClearColorValue is taken in the attachment's OWN
+    // space, so an `_SRGB` attachment encodes it -- the display-referred
+    // background / per-zone tint would come out visibly brighter than the cube drawn over it.
+    // Decode it off the SAME latched flag the pipelines were specialized with.
+    // Alpha (and so premultiplication) is linear in both spaces and is never
+    // converted.
+    if (renderer.sceneLinear) {
+        for (int i = 0; i < 3; i++) {
+            clearValues[0].color.float32[i] =
+                dxr::DisplayReferredToSceneLinear(clearValues[0].color.float32[i]);
+        }
+    }
     clearValues[1].depthStencil = {1.0f, 0};
 
     VkRenderPassBeginInfo rpBegin = {};
@@ -1635,13 +1834,14 @@ static void RenderSceneToFramebuffer(VkRenderer& renderer, SwapchainFramebuffers
     }
 
     vkCmdEndRenderPass(cmd);
-    vkEndCommandBuffer(cmd);
+}
 
-    VkSubmitInfo submitInfo = {};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer.graphicsQueue, 1, &submitInfo, renderer.frameFence);
+// ONE submit for the frame, no wait. Must precede xrReleaseSwapchainImage (the
+// runtime composes on the same queue).
+static void EndRingFrame(VkRenderer& renderer)
+{
+    VkResult r = renderer.ring.endFrame();
+    if (r != VK_SUCCESS) LOG_WARN("VkFrameRing::endFrame: vkQueueSubmit failed (%d)", (int)r);
 }
 
 static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
@@ -1656,8 +1856,10 @@ static void RenderScene(VkRenderer& renderer, uint32_t imageIndex,
     }();
     const float clearTransparent[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     const float clearOpaque[4] = {0.05f, 0.05f, 0.1f, 1.0f};
+    if (renderer.ring.beginFrame() == VK_NULL_HANDLE) return;
     RenderSceneToFramebuffer(renderer, renderer.swapchainFBs, imageIndex, eyes, eyeCount,
                              transparent_bg ? clearTransparent : clearOpaque, 0.0f);
+    EndRingFrame(renderer);
 }
 
 static void CleanupVkRenderer(VkRenderer& renderer) {
@@ -1673,7 +1875,7 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
         if (fb.depthMemory) vkFreeMemory(renderer.device, fb.depthMemory, nullptr);
     }
 
-    if (renderer.frameFence) vkDestroyFence(renderer.device, renderer.frameFence, nullptr);
+    renderer.ring.destroy(); // after vkDeviceWaitIdle above; frees its pool/fences
     if (renderer.commandPool) vkDestroyCommandPool(renderer.device, renderer.commandPool, nullptr);
     if (renderer.gridVertexBuffer) vkDestroyBuffer(renderer.device, renderer.gridVertexBuffer, nullptr);
     if (renderer.gridVertexMemory) vkFreeMemory(renderer.device, renderer.gridVertexMemory, nullptr);
@@ -1755,6 +1957,35 @@ static void CleanupVkRenderer(VkRenderer& renderer) {
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
+// Test knob: place the window's CONTENT rect at x,y,w,h in top-down global
+// points (origin = the main display's top-left, the CGDisplayBounds /
+// XrDisplayDesktopPositionDXR space), e.g. to put it on a given display or
+// make it straddle two without dragging. Read from @p env_name; false when
+// unset or malformed. Same knob as cube_handle_metal_macos.
+static bool ApplyTestWindowRect(const char *env_name) {
+    const char *e = getenv(env_name);
+    if (e == nullptr || g_window == nil) {
+        return false;
+    }
+    int x = 0, y = 0, w = 0, h = 0;
+    if (sscanf(e, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+        LOG_WARN("%s='%s' ignored (want x,y,w,h in top-down points)", env_name, e);
+        return false;
+    }
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary == nil) {
+        return false;
+    }
+    const CGFloat bottom = primary.frame.size.height - (CGFloat)y - (CGFloat)h;
+    NSRect content = NSMakeRect((CGFloat)x, bottom, (CGFloat)w, (CGFloat)h);
+    NSRect frame = [g_window frameRectForContentRect:content];
+    // setFrame:display: does not run constrainFrameRect, so a window may
+    // straddle displays exactly where asked.
+    [g_window setFrame:frame display:YES];
+    LOG_INFO("%s: content rect -> %d,%d %dx%d pt (top-down)", env_name, x, y, w, h);
+    return true;
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop) {
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -1768,19 +1999,39 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         // top-left, XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up
         // space. (0,0) = primary — the titled window is auto-constrained below
         // the menu bar, so it is always a safe create position.
-        NSRect frame = NSMakeRect(100, 100, width, height);
-        NSScreen *primary = [NSScreen screens].firstObject;
-        if (primary != nil) {
-            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+        // Resolve the NSScreen that holds the panel's top-left, and put the
+        // WHOLE window (title bar included) inside its visibleFrame. Placing
+        // the content top AT the panel top pushes the title bar off-screen,
+        // and AppKit then re-constrains the window onto [NSScreen mainScreen]
+        // -- whichever screen has focus at launch, i.e. often the laptop.
+        // Same fix as cube_handle_metal_macos.
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *target = nil;
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                          primary.frame.size.height - (CGFloat)screenTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { target = s; break; }
+            }
+        }
+        if (target != nil) {
+            const NSRect vf = target.visibleFrame; // below that screen's menu bar
+            const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+            const CGFloat titleH = wf.size.height - (CGFloat)height;
+            frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+        }
 
         g_window = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
+        if (target != nil) {
+            // Global coordinates, title bar on-screen: no re-constrain.
+            [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+        }
 
         [g_window setTitle:@"Vulkan Cube — VK Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
@@ -1802,8 +2053,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
 
         // HUD now lives as an XR_EXT_window_space_layer composed by the runtime.
 
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        // Ordering front may re-constrain the frame onto one display; put
+        // the test rect back once the window is on screen.
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
 
         // Pump events so the window appears
         NSEvent *event;
@@ -2138,6 +2393,10 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0) {
             g_hasDisplayZonesExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            g_hasCursorDepthExt = true;
+            g_cursorDepthSpecVersion = ext.extensionVersion;
+        }
     }
 
     if (!hasVulkan) {
@@ -2180,6 +2439,15 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (g_hasDisplayZonesExt) {
         enabledExtensions.push_back(XR_DXR_DISPLAY_ZONES_EXTENSION_NAME);
     }
+    if (g_hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            g_hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s (v%u)", g_hasCursorDepthExt ? "ENABLED" : "off", g_cursorDepthSpecVersion);
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(createInfo.applicationInfo.applicationName, "VkCubeZonesMacOS", XR_MAX_APPLICATION_NAME_SIZE);
@@ -2541,6 +2809,7 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     XR_CHECK(xrCreateSession(xr.instance, &sessionInfo, &xr.session));
     LOG_INFO("Session created%s", xr.hasCocoaWindowBinding ? " (with external window)" : "");
+    g_zoneCursor.init(g_hasCursorDepthExt ? g_cursorDepthSpecVersion : 0, (__bridge void *)g_metalView, 0.06f);
 
     // Enumerate available rendering modes and store names
     if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
@@ -2607,7 +2876,22 @@ static bool CreateSwapchains(AppXrSession& xr) {
     std::vector<int64_t> formats(formatCount);
     XR_CHECK(xrEnumerateSwapchainFormats(xr.session, formatCount, &formatCount, formats.data()));
 
-    int64_t selectedFormat = formats[0];
+    // ADR-021 / INV-4.6: request an honest `_SRGB` colour swapchain. The runtime
+    // lists B8G8R8A8_UNORM first, and since #1623 vk_native treats a UNORM
+    // swapchain as holding LINEAR values and encodes it on output, so this
+    // app's display-referred bytes would be encoded a second time (washed out).
+    // dxr::ChooseColorSwapchainFormat() takes the advertised `_SRGB` sibling of
+    // formats[0] (channel order kept); DXR_SWAPCHAIN_ENCODING=unorm restores the
+    // old choice for A/B. Noting it is what makes dxr::RenderSceneLinear() --
+    // and therefore the shaders' `uLinearize` -- follow the swapchain.
+    const dxr::ColorFormatChoice colorChoice =
+        dxr::ChooseColorSwapchainFormat(formats, dxr::ColorEncodingPreferenceFromEnvironment());
+    int64_t selectedFormat = colorChoice.format;
+    dxr::NoteColorSwapchainFormat(selectedFormat);
+    if (colorChoice.fellBack) {
+        LOG_WARN("[color] no `_SRGB` swapchain format satisfied the request; using %lld",
+                 (long long)selectedFormat);
+    }
     LOG_INFO("Selected swapchain format: %lld", (long long)selectedFormat);
 
     // Single SBS swapchain at native display resolution
@@ -2739,7 +3023,7 @@ struct HudVkUploader {
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
-    VkCommandPool cmdPool = VK_NULL_HANDLE;
+    dxr::VkFrameRing* ring = nullptr; // uploads go through ring->submitImmediate()
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
     uint8_t* stagingMapped = nullptr;
@@ -2765,13 +3049,13 @@ static bool VkFindMemoryTypeForHud(VkPhysicalDevice phys, uint32_t typeBits,
 }
 
 static bool InitializeHudVkUploader(HudVkUploader& up,
-    VkDevice device, VkPhysicalDevice phys, VkQueue queue, VkCommandPool pool,
+    VkDevice device, VkPhysicalDevice phys, VkQueue queue, dxr::VkFrameRing* ring,
     uint32_t width, uint32_t height)
 {
     up.device = device;
     up.physDevice = phys;
     up.queue = queue;
-    up.cmdPool = pool;
+    up.ring = ring;
     up.width = width;
     up.height = height;
     up.stagingSize = (VkDeviceSize)width * (VkDeviceSize)height * 4;
@@ -2825,54 +3109,38 @@ static bool UploadHudPixels(HudVkUploader& up, VkImage hudImage,
         }
     }
 
-    VkCommandBufferAllocateInfo ca = {};
-    ca.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ca.commandPool = up.cmdPool;
-    ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    ca.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(up.device, &ca, &cmd) != VK_SUCCESS) return false;
+    // A HUD upload is a one-off (only when the HUD text changes — see the
+    // caller), so it takes the ring's one sanctioned blocking path: its own
+    // command buffer + fence, allocated once. The wait also keeps the single
+    // staging buffer safe to rewrite next time.
+    VkResult r = up.ring->submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = hudImage;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
 
-    VkCommandBufferBeginInfo bi = {};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {up.width, up.height, 1};
+        vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkImageMemoryBarrier b = {};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = hudImage;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    VkBufferImageCopy region = {};
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageExtent = {up.width, up.height, 1};
-    vkCmdCopyBufferToImage(cmd, up.stagingBuffer, hudImage,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(up.queue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(up.queue);
-    vkFreeCommandBuffers(up.device, up.cmdPool, 1, &cmd);
-    return true;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+    });
+    return r == VK_SUCCESS;
 }
 
 static bool EndFrame(AppXrSession& xr, XrTime displayTime,
@@ -3074,8 +3342,14 @@ static bool CreateAndFillStrip(AppXrSession& xr, VkDevice device, VkCommandPool 
     wi.timeout = XR_INFINITE_DURATION;
     xrWaitSwapchainImage(g_strip.swapchain, &wi);
 
+    // ADR-021 / INV-4.6: the strip is a Local2D swapchain in the colour
+    // swapchain's format (`_SRGB`), and vkCmdClearColorImage takes its value in
+    // the image's own space -- an `_SRGB` image encodes it. The amber is authored
+    // display-referred, so convert it by the strip's own format (the image is
+    // what encodes; nothing is drawn into it). Alpha is never converted.
     const float amber[4] = {1.0f, 0.667f, 0.0f, 1.0f};
-    ClearImageToColor(device, pool, queue, imgs[idx].image, amber);
+    const VkClearColorValue amberClear = dxr::VkDisplayReferredClearColor((VkFormat)sci.format, amber);
+    ClearImageToColor(device, pool, queue, imgs[idx].image, amberClear.float32);
 
     XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(g_strip.swapchain, &ri);
@@ -3235,13 +3509,29 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
 
+    // XR_DXR_cursor_depth (#1949): pick the topmost 3D zone under the pointer.
+    {
+        XrRect2Di rects[kNumZones];
+        float rots[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) {
+            rects[zi] = g_zonesArr[zi].rect;
+            rots[zi] = renderer.cubeRotation + g_zonesArr[zi].spinPhase;
+        }
+        g_zoneCursor.begin((int32_t)g_windowW, (int32_t)g_windowH, rects, rots, kNumZones);
+    }
+
+    // INV-4.10: every zone's pass is recorded into ONE ring frame and submitted
+    // once; each zone swapchain is released only after that submit.
+    bool zoneAcquired[kNumZones] = {};
+    renderer.ring.beginFrame();
+
     for (uint32_t zi = 0; zi < kNumZones; zi++) {
         DisplayZone& z = g_zonesArr[zi];
 
         rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
-        rigStructs[zi].ipdFactor = z.ipdFactor;
+        rigStructs[zi].ipdFactor = z.ipdFactor * g_modeRamp;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
@@ -3260,7 +3550,13 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
         uint32_t viewCountOutput = 0;
         XrView zoneViews[8];
         for (uint32_t vi = 0; vi < 8; vi++) zoneViews[vi] = {XR_TYPE_VIEW};
+        // XR_DXR_cursor_depth (#1949): the hint rides only the locate of the
+        // zone under the pointer; its canvas is the zone rect.
+        g_zoneCursor.chain(zi, locateInfo, viewState);
         XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOutput, zoneViews);
+        if (XR_SUCCEEDED(lr)) {
+            g_zoneCursor.afterLocate(zi, zoneViews, viewCountOutput);
+        }
         if (XR_FAILED(lr) || viewCountOutput == 0) {
             static bool warned = false;
             if (!warned) {
@@ -3321,10 +3617,17 @@ static void RenderZonesFrame(AppXrSession& xr, VkRenderer& renderer, const XrFra
 
         RenderSceneToFramebuffer(renderer, g_zoneFbs[zi], imageIndex, eyes.data(), (int)n,
                                  z.clearColor, z.spinPhase);
-
-        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        xrReleaseSwapchainImage(z.swapchain, &ri);
+        zoneAcquired[zi] = true;
     }
+
+    EndRingFrame(renderer);
+    for (uint32_t zi = 0; zi < kNumZones; zi++) {
+        if (!zoneAcquired[zi]) continue;
+        XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+        xrReleaseSwapchainImage(g_zonesArr[zi].swapchain, &ri);
+    }
+
+    g_zoneCursor.end(); // pointer over no 3D zone: the OS cursor is the cursor
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
@@ -3525,6 +3828,7 @@ int main() {
     VkRenderer vkRenderer = {};
     if (!InitializeVkRenderer(vkRenderer, vkDevice, physDevice, graphicsQueue, queueFamilyIndex, colorFormat)) {
         CleanupOpenXR(xr);
+        vkRenderer.ring.destroy(); // a partial init may have created it; free before the device
         vkDestroyDevice(vkDevice, nullptr);
         vkDestroyInstance(vkInstance, nullptr);
         return 1;
@@ -3566,7 +3870,7 @@ int main() {
             }
             if (InitializeHudRenderer(hudRenderer, HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT) &&
                 InitializeHudVkUploader(hudUploader, vkDevice, physDevice,
-                    graphicsQueue, vkRenderer.commandPool,
+                    graphicsQueue, &vkRenderer.ring,
                     HUD_PIXEL_WIDTH, HUD_PIXEL_HEIGHT)) {
                 hudReady = true;
                 LOG_INFO("HUD window-space layer ready (%ux%u, %u images, format %lld)",
@@ -3625,26 +3929,39 @@ int main() {
         if (vkRenderer.cubeRotation > 2.0f * 3.14159265f)
             vkRenderer.cubeRotation -= 2.0f * 3.14159265f;
 
-        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
-        // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeDXR and let the
-        // XrEventDataRenderingModeChangedDXR event update xr.currentModeIndex.
-        // Render paths and HUD read xr.currentModeIndex directly.
-        if (g_input.cycleRenderingModeRequested) {
-            g_input.cycleRenderingModeRequested = false;
-            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-                xr.renderingModeCount > 0) {
-                uint32_t next = (xr.currentModeIndex + 1) % xr.renderingModeCount;
-                xr.pfnRequestDisplayRenderingModeEXT(xr.session, next);
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() (README "Smooth 2D<->3D
+        // transitions"). Zones carry their own ipdFactor (zone A 1.0, zone B
+        // 0.6) on top of the user-tuned main rig, so the sequencer runs as a
+        // normalised SCALE (steadyIpd = 1): g_modeRamp multiplies every rig's
+        // ipdFactor below. The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates xr.currentModeIndex.
+        {
+            int32_t want = -1;
+            if (g_input.cycleRenderingModeRequested) {
+                g_input.cycleRenderingModeRequested = false;
+                want = dxr::ModeSwitch::cycleTarget(xr.currentModeIndex, xr.renderingModeCount);
             }
-        }
-        if (g_input.absoluteRenderingModeRequested >= 0) {
-            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
-            g_input.absoluteRenderingModeRequested = -1;
-            if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE &&
-                target < xr.renderingModeCount) {
-                xr.pfnRequestDisplayRenderingModeEXT(xr.session, target);
+            if (g_input.absoluteRenderingModeRequested >= 0) {
+                want = g_input.absoluteRenderingModeRequested;
+                g_input.absoluteRenderingModeRequested = -1;
             }
+            if (xr.sessionRunning) {
+                const int32_t knob = g_modeSwitchKnob.poll(deltaTime, xr.currentModeIndex, xr.renderingModeCount,
+                                                           xr.renderingModeViewCounts);
+                if (knob >= 0) want = knob;
+            }
+            const bool canRequest = xr.session != XR_NULL_HANDLE && xr.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                deltaTime, canRequest ? want : -1, xr.renderingModeCount, xr.renderingModeViewCounts,
+                xr.currentModeIndex, 1.0f);
+            g_modeRamp = f.ipd;
+            if (f.fire && canRequest)
+                xr.pfnRequestDisplayRenderingModeEXT(xr.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ramp=%.4f fire=%d mode=%u current=%u", deltaTime, f.ipd,
+                         (int)f.fire, f.mode, xr.currentModeIndex);
         }
 
         // Handle eye tracking mode toggle (T key)
@@ -3762,7 +4079,7 @@ int main() {
                         rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
                         if (rigCamera) {
                             cameraRig.pose = rigPose;
-                            cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            cameraRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                             cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                             cameraRig.verticalFov =
@@ -3773,7 +4090,7 @@ int main() {
                             displayRig.pose = rigPose;
                             displayRig.virtualDisplayHeight =
                                 g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-                            displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                            displayRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                             displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                             displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
                             locateInfo.next = &displayRig;
@@ -3954,10 +4271,23 @@ int main() {
                 }
 
                 // Render HUD into the window-space layer swapchain (when visible).
+                // INV-4.10: re-render + upload only when the HUD text changed.
+                // Otherwise the layer keeps showing the swapchain's last
+                // released image (OpenXR composes the most recently released
+                // one), so an unchanged HUD costs no acquire, no upload and no
+                // blocking submit.
                 bool hudSubmitted = false;
                 if (hudReady && g_input.hudVisible && rendered && frameState.shouldRender) {
+                    static std::wstring s_hudUploadedKey;
+                    static bool s_hudHasImage = false;
+                    std::wstring hudKey = g_hudSessionText + L'\x1f' + g_hudModeText + L'\x1f' +
+                        g_hudPerfText + L'\x1f' + g_hudDisplayText + L'\x1f' + g_hudEyeText +
+                        L'\x1f' + g_hudCameraText + L'\x1f' + g_hudStereoText + L'\x1f' +
+                        g_hudHelpText;
                     uint32_t hudIndex = 0;
-                    if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
+                    if (s_hudHasImage && hudKey == s_hudUploadedKey) {
+                        hudSubmitted = true;
+                    } else if (AcquireHudSwapchainImage(hudSwapchain, hudIndex)) {
                         uint32_t rowPitch = 0;
                         const void* pixels = RenderHudAndMap(hudRenderer, &rowPitch,
                             g_hudSessionText, g_hudModeText, g_hudPerfText, g_hudDisplayText,
@@ -3965,6 +4295,8 @@ int main() {
                         if (pixels) {
                             if (UploadHudPixels(hudUploader, hudVkImages[hudIndex], pixels, rowPitch)) {
                                 hudSubmitted = true;
+                                s_hudHasImage = true;
+                                s_hudUploadedKey = std::move(hudKey);
                             }
                             UnmapHud(hudRenderer);
                         }
@@ -4121,8 +4453,8 @@ int main() {
     LOG_INFO("=== Shutting down ===");
 
     if (hudReady) {
-        // HUD uploader uses vkRenderer.commandPool — clean up before
-        // CleanupVkRenderer destroys the pool.
+        // HUD uploader submits through vkRenderer.ring — clean up before
+        // CleanupVkRenderer destroys it.
         CleanupHudVkUploader(hudUploader);
         CleanupHudRenderer(hudRenderer);
     }

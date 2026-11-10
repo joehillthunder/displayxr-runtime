@@ -11,12 +11,14 @@
 
 #include "util/u_logging.h"
 
+#include <stdint.h>
 #include <string.h>
 
 // Pre-compiled SPIR-V (GLSL source in shaders_local2d/, regen cmd in its README).
 #include "shaders_local2d/fst_vert.h"
 #include "shaders_local2d/masked_composite_frag.h"
 #include "shaders_local2d/local2d_flatten_frag.h"
+#include "shaders_local2d/clamped_copy_frag.h"
 
 // Must match the masked_composite.frag push_constant block.
 struct composite_push
@@ -350,6 +352,141 @@ vk_local2d_composite_init(struct vk_local2d_composite *lc,
 	return true;
 }
 
+bool
+vk_local2d_composite_init_srgb_flatten(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat srgb_fmt)
+{
+	if (!lc->initialized) {
+		return false;
+	}
+	if (lc->flatten_srgb_premul_pipe != VK_NULL_HANDLE && lc->flatten_srgb_fmt == srgb_fmt) {
+		return true;
+	}
+
+	// Same blend states as the scratch_fmt flatten — only the attachment format
+	// (and so the render pass the pipelines are compatible with) differs.
+	VkPipelineColorBlendAttachmentState premul_blend = {
+	    .blendEnable = VK_TRUE,
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+	                      VK_COLOR_COMPONENT_A_BIT,
+	    .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .colorBlendOp = VK_BLEND_OP_ADD,
+	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+	    .alphaBlendOp = VK_BLEND_OP_ADD,
+	};
+	VkPipelineColorBlendAttachmentState unpremul_blend = premul_blend;
+	unpremul_blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+
+	if (make_render_pass(vk, srgb_fmt, VK_ATTACHMENT_LOAD_OP_LOAD, &lc->flatten_srgb_rp) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->flatten_frag_mod, lc->flatten_layout, lc->flatten_srgb_rp,
+	                  &premul_blend, &lc->flatten_srgb_premul_pipe) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->flatten_frag_mod, lc->flatten_layout, lc->flatten_srgb_rp,
+	                  &unpremul_blend, &lc->flatten_srgb_unpremul_pipe) != VK_SUCCESS) {
+		U_LOG_E("[local2d] _SRGB flatten (format %d) creation failed", (int)srgb_fmt);
+		if (lc->flatten_srgb_premul_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->flatten_srgb_premul_pipe, NULL);
+			lc->flatten_srgb_premul_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->flatten_srgb_unpremul_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->flatten_srgb_unpremul_pipe, NULL);
+			lc->flatten_srgb_unpremul_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->flatten_srgb_rp != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, lc->flatten_srgb_rp, NULL);
+			lc->flatten_srgb_rp = VK_NULL_HANDLE;
+		}
+		return false;
+	}
+	lc->flatten_srgb_fmt = srgb_fmt;
+	return true;
+}
+
+bool
+vk_local2d_composite_init_clamped_copy(struct vk_local2d_composite *lc, struct vk_bundle *vk)
+{
+	if (!lc->initialized) {
+		return false;
+	}
+	if (lc->clamped_copy_pipe != VK_NULL_HANDLE) {
+		return true;
+	}
+
+	VkPushConstantRange push = {
+	    .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+	    .offset = 0,
+	    .size = sizeof(float) * 8,
+	};
+	VkPipelineLayoutCreateInfo pl_ci = {
+	    .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+	    .setLayoutCount = 1,
+	    .pSetLayouts = &lc->flatten_dsl,
+	    .pushConstantRangeCount = 1,
+	    .pPushConstantRanges = &push,
+	};
+	VkPipelineColorBlendAttachmentState no_blend = {
+	    .blendEnable = VK_FALSE,
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+	                      VK_COLOR_COMPONENT_A_BIT,
+	};
+	if (make_shader(vk, clamped_copy_frag_spv, sizeof(clamped_copy_frag_spv), &lc->clamped_copy_frag_mod) !=
+	        VK_SUCCESS ||
+	    vk->vkCreatePipelineLayout(vk->device, &pl_ci, NULL, &lc->clamped_copy_layout) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->clamped_copy_frag_mod, lc->clamped_copy_layout, lc->flatten_rp,
+	                  &no_blend, &lc->clamped_copy_pipe) != VK_SUCCESS) {
+		U_LOG_E("[local2d] clamped-copy pipeline creation failed");
+		if (lc->clamped_copy_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->clamped_copy_pipe, NULL);
+			lc->clamped_copy_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->clamped_copy_layout != VK_NULL_HANDLE) {
+			vk->vkDestroyPipelineLayout(vk->device, lc->clamped_copy_layout, NULL);
+			lc->clamped_copy_layout = VK_NULL_HANDLE;
+		}
+		if (lc->clamped_copy_frag_mod != VK_NULL_HANDLE) {
+			vk->vkDestroyShaderModule(vk->device, lc->clamped_copy_frag_mod, NULL);
+			lc->clamped_copy_frag_mod = VK_NULL_HANDLE;
+		}
+		return false;
+	}
+	return true;
+}
+
+bool
+vk_local2d_composite_init_snapshot(struct vk_local2d_composite *lc, struct vk_bundle *vk, VkFormat fmt)
+{
+	if (!lc->initialized) {
+		return false;
+	}
+	if (lc->snapshot_pipe != VK_NULL_HANDLE && lc->snapshot_fmt == fmt) {
+		return true;
+	}
+
+	// REPLACE: the snapshot is a copy, so blending is off and all four
+	// channels are written verbatim.
+	VkPipelineColorBlendAttachmentState replace_blend = {
+	    .blendEnable = VK_FALSE,
+	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT |
+	                      VK_COLOR_COMPONENT_A_BIT,
+	};
+	if (make_render_pass(vk, fmt, VK_ATTACHMENT_LOAD_OP_DONT_CARE, &lc->snapshot_rp) != VK_SUCCESS ||
+	    make_pipeline(vk, lc->vert_mod, lc->flatten_frag_mod, lc->flatten_layout, lc->snapshot_rp, &replace_blend,
+	                  &lc->snapshot_pipe) != VK_SUCCESS) {
+		U_LOG_E("[local2d] weave snapshot draw (format %d) creation failed", (int)fmt);
+		if (lc->snapshot_pipe != VK_NULL_HANDLE) {
+			vk->vkDestroyPipeline(vk->device, lc->snapshot_pipe, NULL);
+			lc->snapshot_pipe = VK_NULL_HANDLE;
+		}
+		if (lc->snapshot_rp != VK_NULL_HANDLE) {
+			vk->vkDestroyRenderPass(vk->device, lc->snapshot_rp, NULL);
+			lc->snapshot_rp = VK_NULL_HANDLE;
+		}
+		return false;
+	}
+	lc->snapshot_fmt = fmt;
+	return true;
+}
+
 void
 vk_local2d_composite_begin_frame(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 {
@@ -663,6 +800,66 @@ vk_local2d_composite_raster_mask_zones(struct vk_local2d_composite *lc,
 	vk->vkCmdEndRenderPass(cmd);
 }
 
+// The flatten draw, parameterised on the render pass + pipeline pair so the
+// scratch_fmt flatten and the #1795 `_SRGB` flatten share one body.
+static void
+flatten_draw_impl(struct vk_local2d_composite *lc,
+                  struct vk_bundle *vk,
+                  VkCommandBuffer cmd,
+                  VkRenderPass rp,
+                  VkPipeline premul_pipe,
+                  VkPipeline unpremul_pipe,
+                  VkFramebuffer scratch_fb,
+                  uint32_t fb_w,
+                  uint32_t fb_h,
+                  VkImageView src_view,
+                  int32_t dst_x,
+                  int32_t dst_y,
+                  uint32_t dst_w,
+                  uint32_t dst_h,
+                  float src_x,
+                  float src_y,
+                  float src_w,
+                  float src_h,
+                  bool unpremultiplied)
+{
+	if (!lc->initialized || rp == VK_NULL_HANDLE || premul_pipe == VK_NULL_HANDLE ||
+	    unpremul_pipe == VK_NULL_HANDLE || scratch_fb == VK_NULL_HANDLE || src_view == VK_NULL_HANDLE ||
+	    dst_w == 0 || dst_h == 0) {
+		return;
+	}
+
+	VkDescriptorSet set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_linear, &src_view, 1);
+	if (set == VK_NULL_HANDLE) {
+		return;
+	}
+
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = rp,
+	    .framebuffer = scratch_fb,
+	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	// Viewport restricts output to the clipped dest sub-rect; uv [0,1] over it
+	// maps through src_rect into the source layer.
+	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
+	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, unpremultiplied ? unpremul_pipe : premul_pipe);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->flatten_layout, 0, 1, &set, 0,
+	                            NULL);
+
+	struct flatten_push pc = {.src_rect = {src_x, src_y, src_w, src_h}};
+	vk->vkCmdPushConstants(cmd, lc->flatten_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+
+	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	vk->vkCmdEndRenderPass(cmd);
+}
+
 void
 vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   struct vk_bundle *vk,
@@ -681,40 +878,104 @@ vk_local2d_composite_flatten_draw(struct vk_local2d_composite *lc,
                                   float src_h,
                                   bool unpremultiplied)
 {
-	if (!lc->initialized || scratch_fb == VK_NULL_HANDLE || src_view == VK_NULL_HANDLE || dst_w == 0 ||
-	    dst_h == 0) {
+	flatten_draw_impl(lc, vk, cmd, lc->flatten_rp, lc->flatten_premul_pipe, lc->flatten_unpremul_pipe, scratch_fb,
+	                  fb_w, fb_h, src_view, dst_x, dst_y, dst_w, dst_h, src_x, src_y, src_w, src_h,
+	                  unpremultiplied);
+}
+
+void
+vk_local2d_composite_flatten_draw_srgb(struct vk_local2d_composite *lc,
+                                       struct vk_bundle *vk,
+                                       VkCommandBuffer cmd,
+                                       VkFramebuffer scratch_fb,
+                                       uint32_t fb_w,
+                                       uint32_t fb_h,
+                                       VkImageView src_view,
+                                       int32_t dst_x,
+                                       int32_t dst_y,
+                                       uint32_t dst_w,
+                                       uint32_t dst_h,
+                                       float src_x,
+                                       float src_y,
+                                       float src_w,
+                                       float src_h,
+                                       bool unpremultiplied)
+{
+	flatten_draw_impl(lc, vk, cmd, lc->flatten_srgb_rp, lc->flatten_srgb_premul_pipe,
+	                  lc->flatten_srgb_unpremul_pipe, scratch_fb, fb_w, fb_h, src_view, dst_x, dst_y, dst_w, dst_h,
+	                  src_x, src_y, src_w, src_h, unpremultiplied);
+}
+
+void
+vk_local2d_composite_snapshot_draw(struct vk_local2d_composite *lc,
+                                   struct vk_bundle *vk,
+                                   VkCommandBuffer cmd,
+                                   VkFramebuffer scratch_fb,
+                                   uint32_t region_w,
+                                   uint32_t region_h,
+                                   VkImageView src_view,
+                                   uint32_t src_w,
+                                   uint32_t src_h,
+                                   const VkRect2D *rects,
+                                   uint32_t rect_count)
+{
+	if (!lc->initialized || lc->snapshot_pipe == VK_NULL_HANDLE || scratch_fb == VK_NULL_HANDLE ||
+	    src_view == VK_NULL_HANDLE || region_w == 0 || region_h == 0 || src_w == 0 || src_h == 0) {
+		return;
+	}
+	const VkRect2D whole = {{0, 0}, {region_w, region_h}};
+	if (rects == NULL) {
+		rects = &whole;
+		rect_count = 1;
+	}
+	if (rect_count == 0) {
 		return;
 	}
 
-	VkDescriptorSet set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_linear, &src_view, 1);
+	// POINT sampler: 1:1, so each fragment centre lands on a texel centre and
+	// the fetch is that texel exactly — never a filtered neighbour.
+	VkDescriptorSet set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_point, &src_view, 1);
 	if (set == VK_NULL_HANDLE) {
 		return;
 	}
 
 	VkRenderPassBeginInfo rp_bi = {
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-	    .renderPass = lc->flatten_rp,
+	    .renderPass = lc->snapshot_rp,
 	    .framebuffer = scratch_fb,
-	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	    .renderArea = whole,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 
-	// Viewport restricts output to the clipped dest sub-rect; uv [0,1] over it
-	// maps through src_rect into the source layer.
-	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
+	// The viewport spans the region and src_rect maps it onto the SAME pixels
+	// of the (larger) source: uv = (x + 0.5) / region_w ->
+	// src_uv = (x + 0.5) / src_w, the centre of source texel x.
+	VkViewport vp = {0.0f, 0.0f, (float)region_w, (float)region_h, 0.0f, 1.0f};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
-	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-	                      unpremultiplied ? lc->flatten_unpremul_pipe : lc->flatten_premul_pipe);
-	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->flatten_layout, 0, 1, &set, 0,
-	                            NULL);
-
-	struct flatten_push pc = {.src_rect = {src_x, src_y, src_w, src_h}};
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->snapshot_pipe);
+	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->flatten_layout, 0, 1, &set, 0, NULL);
+	struct flatten_push pc = {
+	    .src_rect = {0.0f, 0.0f, (float)region_w / (float)src_w, (float)region_h / (float)src_h},
+	};
 	vk->vkCmdPushConstants(cmd, lc->flatten_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
 
-	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	for (uint32_t i = 0; i < rect_count; i++) {
+		// Clamp to the region (a scissor outside the framebuffer is invalid).
+		int32_t x0 = rects[i].offset.x < 0 ? 0 : rects[i].offset.x;
+		int32_t y0 = rects[i].offset.y < 0 ? 0 : rects[i].offset.y;
+		int64_t x1 = (int64_t)rects[i].offset.x + rects[i].extent.width;
+		int64_t y1 = (int64_t)rects[i].offset.y + rects[i].extent.height;
+		if (x1 > (int64_t)region_w)
+			x1 = region_w;
+		if (y1 > (int64_t)region_h)
+			y1 = region_h;
+		if (x1 <= x0 || y1 <= y0) {
+			continue;
+		}
+		VkRect2D sc = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+		vk->vkCmdSetScissor(cmd, 0, 1, &sc);
+		vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+	}
 	vk->vkCmdEndRenderPass(cmd);
 }
 
@@ -821,6 +1082,122 @@ vk_local2d_composite_draw(struct vk_local2d_composite *lc,
 	vk->vkCmdEndRenderPass(cmd);
 }
 
+bool
+vk_local2d_composite_clamped_copy(struct vk_local2d_composite *lc,
+                                  struct vk_bundle *vk,
+                                  VkCommandBuffer cmd,
+                                  VkFramebuffer fb,
+                                  uint32_t fb_w,
+                                  uint32_t fb_h,
+                                  VkImageView src_view,
+                                  uint32_t src_w_px,
+                                  uint32_t src_h_px,
+                                  const VkRect2D *clears,
+                                  uint32_t clear_count,
+                                  const struct vk_local2d_clamped_copy *copies,
+                                  uint32_t copy_count)
+{
+	if (!lc->initialized || lc->clamped_copy_pipe == VK_NULL_HANDLE || fb == VK_NULL_HANDLE ||
+	    src_view == VK_NULL_HANDLE || src_w_px == 0 || src_h_px == 0 || (clear_count == 0 && copy_count == 0)) {
+		return false;
+	}
+
+	// Render area = bounding box of everything touched, clamped to the target.
+	int64_t x0 = INT32_MAX, y0 = INT32_MAX, x1 = INT32_MIN, y1 = INT32_MIN;
+	for (uint32_t i = 0; i < clear_count; i++) {
+		x0 = clears[i].offset.x < x0 ? clears[i].offset.x : x0;
+		y0 = clears[i].offset.y < y0 ? clears[i].offset.y : y0;
+		int64_t ex = (int64_t)clears[i].offset.x + clears[i].extent.width;
+		int64_t ey = (int64_t)clears[i].offset.y + clears[i].extent.height;
+		x1 = ex > x1 ? ex : x1;
+		y1 = ey > y1 ? ey : y1;
+	}
+	for (uint32_t i = 0; i < copy_count; i++) {
+		x0 = copies[i].dst_x < x0 ? copies[i].dst_x : x0;
+		y0 = copies[i].dst_y < y0 ? copies[i].dst_y : y0;
+		int64_t ex = (int64_t)copies[i].dst_x + copies[i].dst_w;
+		int64_t ey = (int64_t)copies[i].dst_y + copies[i].dst_h;
+		x1 = ex > x1 ? ex : x1;
+		y1 = ey > y1 ? ey : y1;
+	}
+	x0 = x0 < 0 ? 0 : x0;
+	y0 = y0 < 0 ? 0 : y0;
+	x1 = x1 > (int64_t)fb_w ? (int64_t)fb_w : x1;
+	y1 = y1 > (int64_t)fb_h ? (int64_t)fb_h : y1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	if (copy_count > 0) {
+		set = alloc_image_set(lc, vk, lc->flatten_dsl, lc->sampler_linear, &src_view, 1);
+		if (set == VK_NULL_HANDLE) {
+			return false;
+		}
+	}
+
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = lc->flatten_rp,
+	    .framebuffer = fb,
+	    .renderArea = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+
+	if (clear_count > 0) {
+		VkClearAttachment att = {
+		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		    .colorAttachment = 0,
+		    .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}},
+		};
+		VkClearRect crs[64];
+		uint32_t done = 0;
+		while (done < clear_count) {
+			uint32_t n = 0;
+			for (; n < 64 && done + n < clear_count; n++) {
+				crs[n] = (VkClearRect){.rect = clears[done + n], .baseArrayLayer = 0, .layerCount = 1};
+			}
+			vk->vkCmdClearAttachments(cmd, 1, &att, n, crs);
+			done += n;
+		}
+	}
+
+	if (copy_count > 0) {
+		vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->clamped_copy_pipe);
+		vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, lc->clamped_copy_layout, 0, 1, &set,
+		                            0, NULL);
+		const float iw = 1.0f / (float)src_w_px;
+		const float ih = 1.0f / (float)src_h_px;
+		for (uint32_t i = 0; i < copy_count; i++) {
+			const struct vk_local2d_clamped_copy *cp = &copies[i];
+			if (cp->dst_w == 0 || cp->dst_h == 0 || cp->src_w == 0 || cp->src_h == 0) {
+				continue;
+			}
+			VkViewport vp = {
+			    (float)cp->dst_x, (float)cp->dst_y, (float)cp->dst_w, (float)cp->dst_h, 0.0f, 1.0f};
+			vk->vkCmdSetViewport(cmd, 0, 1, &vp);
+			VkRect2D scissor = {{cp->dst_x, cp->dst_y}, {cp->dst_w, cp->dst_h}};
+			vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
+			const float push[8] = {
+			    (float)cp->src_x * iw,
+			    (float)cp->src_y * ih,
+			    (float)cp->src_w * iw,
+			    (float)cp->src_h * ih,
+			    ((float)cp->src_x + 0.5f) * iw,
+			    ((float)cp->src_y + 0.5f) * ih,
+			    ((float)(cp->src_x + (int32_t)cp->src_w) - 0.5f) * iw,
+			    ((float)(cp->src_y + (int32_t)cp->src_h) - 0.5f) * ih,
+			};
+			vk->vkCmdPushConstants(cmd, lc->clamped_copy_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+			                       sizeof(push), push);
+			vk->vkCmdDraw(cmd, 3, 1, 0, 0);
+		}
+	}
+
+	vk->vkCmdEndRenderPass(cmd);
+	return true;
+}
+
 void
 vk_local2d_composite_fini(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 {
@@ -837,8 +1214,14 @@ vk_local2d_composite_fini(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 	} while (0)
 
 	DESTROY(vkDestroyPipeline, lc->composite_pipe);
+	DESTROY(vkDestroyPipeline, lc->clamped_copy_pipe);
+	DESTROY(vkDestroyPipelineLayout, lc->clamped_copy_layout);
+	DESTROY(vkDestroyShaderModule, lc->clamped_copy_frag_mod);
 	DESTROY(vkDestroyPipeline, lc->flatten_premul_pipe);
 	DESTROY(vkDestroyPipeline, lc->flatten_unpremul_pipe);
+	DESTROY(vkDestroyPipeline, lc->flatten_srgb_premul_pipe);
+	DESTROY(vkDestroyPipeline, lc->flatten_srgb_unpremul_pipe);
+	DESTROY(vkDestroyPipeline, lc->snapshot_pipe);
 	DESTROY(vkDestroyPipelineLayout, lc->composite_layout);
 	DESTROY(vkDestroyPipelineLayout, lc->flatten_layout);
 	DESTROY(vkDestroyDescriptorSetLayout, lc->composite_dsl);
@@ -846,6 +1229,8 @@ vk_local2d_composite_fini(struct vk_local2d_composite *lc, struct vk_bundle *vk)
 	DESTROY(vkDestroyDescriptorPool, lc->desc_pool);
 	DESTROY(vkDestroyRenderPass, lc->composite_rp);
 	DESTROY(vkDestroyRenderPass, lc->flatten_rp);
+	DESTROY(vkDestroyRenderPass, lc->flatten_srgb_rp);
+	DESTROY(vkDestroyRenderPass, lc->snapshot_rp);
 	DESTROY(vkDestroyRenderPass, lc->mask_rp);
 	DESTROY(vkDestroySampler, lc->sampler_point);
 	DESTROY(vkDestroySampler, lc->sampler_linear);

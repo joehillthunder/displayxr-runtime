@@ -60,7 +60,11 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.0.0
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h), the XR_DXR_cursor_depth
+    # app helper (ADR-046 Amendment 2) - same pin as the aggregate test_apps build.
+    # v2.30.0: dxr::ModeSwitch::step() (common/mode_switch.h), the one-call smooth
+    # 2D<->3D sequencer every platform's apps use (displayxr-common#73).
+    GIT_TAG v2.30.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

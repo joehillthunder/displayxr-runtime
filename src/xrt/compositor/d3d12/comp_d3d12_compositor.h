@@ -19,10 +19,28 @@
 // Forward declarations
 struct comp_d3d12_compositor;
 struct xrt_system_devices;
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+struct u_cursor_draw_request;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/*!
+ * #2362: wait out a hub-route frame whose CPU idle-wait was deferred (an app
+ * release fence was consumed). Call before releasing anything the last frame's
+ * GPU work may still read (swapchain images). Free when nothing is pending.
+ */
+void
+comp_d3d12_compositor_drain_deferred(struct comp_d3d12_compositor *c);
+
+/*!
+ * #2362: the app's currently published release-fence value, for the swapchain
+ * to record at xrReleaseSwapchainImage; 0 when no fence is consumed.
+ */
+uint64_t
+comp_d3d12_compositor_sample_release_value(struct comp_d3d12_compositor *c);
 
 /*!
  * Create a native D3D12 compositor.
@@ -49,6 +67,12 @@ extern "C" {
  *
  * @return XRT_SUCCESS on success, error code otherwise.
  *
+ * @param windowless_dp_entry #2370: the session screen's DP registry entry
+ *        (`const struct xrt_dp_registry_entry *`, owned by the system
+ *        compositor info) — the source of the hub's windowless DP when a
+ *        texture session takes the client-presents strategy (`DXR_HUB=1`).
+ *        NULL keeps every texture session on this tier's own legs.
+ *
  * @ingroup comp_d3d12
  */
 xrt_result_t
@@ -62,6 +86,7 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
                              bool transparent_background,
                              int32_t display_screen_left,
                              int32_t display_screen_top,
+                             const void *windowless_dp_entry,
                              struct xrt_compositor_native **out_xc);
 
 /*!
@@ -77,6 +102,24 @@ comp_d3d12_compositor_create(struct xrt_device *xdev,
 bool
 comp_d3d12_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
+ *
+ * @param xc          The compositor.
+ * @param target_ns   When the pixels will be seen (monotonic ns).
+ * @param out_eye_pos Output eye positions (N-view).
+ * @return true if valid positions were produced.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos);
 
 /*!
  * Get the display dimensions from the display processor.
@@ -119,6 +162,37 @@ comp_d3d12_compositor_get_window_metrics(struct xrt_compositor *xc,
  */
 void
 comp_d3d12_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers and
+ * before the display processor. Called by the state tracker only on a frame
+ * whose locate chained XrCursorDepthDrawInfoDXR and reported willDraw; a
+ * compositor never handed a request does no cursor work at all.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): at the NEXT layer_commit only,
+ * copy a cursor-sized patch out of the two outermost views of the frame's
+ * first projection layer into a staging buffer; a later commit that finds the
+ * copy finished (polled, never waited on) block-matches it on the CPU
+ * (u_cursor_measure_run) and publishes the result. Called by the state
+ * tracker only on a frame whose locate chained the measured-disparity source;
+ * a compositor never handed a request allocates and copies nothing.
+ */
+void
+comp_d3d12_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7: the newest finished measurement (thread-safe).
+ * @return out->valid.
+ */
+bool
+comp_d3d12_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
 
 /*!
  * XR_DXR_depth_budget: the latest budget the render thread computed.
@@ -180,6 +254,46 @@ comp_d3d12_compositor_set_content_mask(struct xrt_compositor *xc,
  */
 bool
 comp_d3d12_compositor_request_display_mode(struct xrt_compositor *xc, bool enable_3d);
+
+/*!
+ * Multi-screen M6 (ADR-047 D2 on Windows, D3D12): hand the compositor the
+ * system's screen list, so a window that spans several monitors is woven per
+ * segment, each by its own screen's display processor, into the one back
+ * buffer. Call once at session creation. @p pinned_display_id is the session's
+ * `XrSessionDisplayBindingDXR` (0 = none); a pinned session is never
+ * segmented. A window on the primary screen only keeps the single-DP path
+ * byte for byte. The D3D12 twin of comp_d3d11_compositor_set_screens.
+ *
+ * @ingroup comp_d3d12
+ */
+struct xrt_screen_list;
+void
+comp_d3d12_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 (Windows D3D12): the segment table the last weave took, with
+ * each segment's eyes predicted NOW (the primary from the session's DP, the
+ * others from their segment DP), for xrLocateViews to frame per-segment
+ * views. Thread-safe against the weave. `out->count == 0` = one view set.
+ *
+ * @ingroup comp_d3d12
+ */
+bool
+comp_d3d12_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 (Windows D3D12): which views of the next frame belong to
+ * which window segment — what the app's last xrLocateViews handed out. The
+ * renderer paints each segment's views into that segment's rect of every tile
+ * (a mosaic) and the segment path crops them out per screen. Thread-safe.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 /*!
  * Select the eye-tracking control mode (MANAGED=0 / MANUAL=1) on the display

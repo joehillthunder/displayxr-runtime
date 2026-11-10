@@ -13,11 +13,13 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
 
 #include "xrt/xrt_display_processor_metal.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_plugin.h" // xrt_screen_binding (multi-screen on macOS)
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
@@ -28,7 +30,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_metal, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_metal() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
+// ADR-050 test double: a phase lattice for the runtime-owned macOS placement.
+// 0 (default) = the snap_window_rect slot stays NULL, like any DP without a
+// lens lattice. N > 1 = snap horizontal displacement to whole multiples of N
+// backing px (the shape of the VK test double), so the runtime's snapped
+// drag, the L/T resize's size absorption and the Retina reachable-lattice
+// search can be exercised without hardware.
+#define debug_get_num_option_sim_display_metal_snap_period() sim_display_setting_num("METAL_SNAP_PERIOD", 0)
 
 
 /*
@@ -176,6 +186,8 @@ struct sim_display_processor_metal
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
+	//! Holds a reference on the webcam tracker (#1855); see sim_display_webcam_tracking_apply.
+	bool webcam_ref;
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
@@ -188,6 +200,23 @@ struct sim_display_processor_metal
 	uint32_t zone_last_mask_w, zone_last_mask_h;
 	uint64_t zone_last_seq;
 	bool zone_active; //!< A client mask is currently published (not cleared).
+
+	//! Multi-screen (macOS): this instance was created for ONE screen
+	//! (`create_dp_metal_for_screen`); then it describes THAT screen and
+	//! confines its draw to the canvas it is handed (load, not clear; viewport
+	//! AND scissor = canvas). The unbound DP — every session's own DP — keeps
+	//! the process-wide panel and the pre-segments full-target clear.
+	bool screen_bound;
+	uint64_t screen_monitor_id;
+	int32_t screen_left, screen_top;   //!< the screen's desktop origin (points)
+	uint32_t screen_px_w, screen_px_h; //!< its native backing px
+	float screen_w_m, screen_h_m;
+
+	//! set_present_origin: the window's content-view origin on the bound
+	//! screen (backing px). Stored for parity with the VK/D3D11 DPs; sim's
+	//! Metal backend has no phase-sensitive mode (#817), so nothing reads it.
+	bool have_present_origin;
+	int32_t present_origin_x, present_origin_y;
 };
 
 static inline struct sim_display_processor_metal *
@@ -271,9 +300,14 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	    .tile_rows = (float)tile_rows,
 	};
 
+	// A screen-bound DP (multi-screen) is not the first writer to the target:
+	// it weaves one segment of a window another DP also writes, so it loads
+	// the target and confines itself to its canvas (scissor below).
+	const bool bound_canvas = sdp->screen_bound && canvas_width > 0 && canvas_height > 0;
+
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
 	pass.colorAttachments[0].texture = target_tex;
-	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].loadAction = bound_canvas ? MTLLoadActionLoad : MTLLoadActionClear;
 	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
 
@@ -298,6 +332,25 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 	    .zfar = 1.0,
 	};
 	[encoder setViewport:vp];
+	if (bound_canvas) {
+		// Clamp the scissor to the target (Metal rejects an out-of-bounds rect).
+		int64_t x0 = canvas_offset_x < 0 ? 0 : canvas_offset_x;
+		int64_t y0 = canvas_offset_y < 0 ? 0 : canvas_offset_y;
+		int64_t x1 = (int64_t)canvas_offset_x + (int64_t)canvas_width;
+		int64_t y1 = (int64_t)canvas_offset_y + (int64_t)canvas_height;
+		if (x1 > (int64_t)target_tex.width) {
+			x1 = (int64_t)target_tex.width;
+		}
+		if (y1 > (int64_t)target_tex.height) {
+			y1 = (int64_t)target_tex.height;
+		}
+		if (x1 <= x0 || y1 <= y0) {
+			[encoder endEncoding];
+			return;
+		}
+		MTLScissorRect sc = {(NSUInteger)x0, (NSUInteger)y0, (NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0)};
+		[encoder setScissorRect:sc];
+	}
 
 	// Draw fullscreen triangle (3 vertices, no VBO)
 	[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
@@ -305,35 +358,150 @@ sim_dp_metal_process_atlas(struct xrt_display_processor_metal *xdp,
 }
 
 
-// #856: panel geometry -> compositor computes window-scoped Kooima.
-SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp_metal, xrt_display_processor_metal)
+// #856: panel geometry -> compositor computes window-scoped Kooima. A
+// screen-bound instance (multi-screen) answers for ITS screen; the unbound one
+// for the process-wide panel at the desktop origin, as before.
+static bool
+sim_dp_metal_get_display_dimensions(struct xrt_display_processor_metal *xdp, float *out_width_m, float *out_height_m)
+{
+	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
+	if (out_width_m == NULL || out_height_m == NULL) {
+		return false;
+	}
+	if (sdp->screen_bound) {
+		*out_width_m = sdp->screen_w_m;
+		*out_height_m = sdp->screen_h_m;
+	} else {
+		sim_display_get_panel_metrics(out_width_m, out_height_m, NULL, NULL);
+	}
+	return (*out_width_m > 0.0f && *out_height_m > 0.0f);
+}
+
+static bool
+sim_dp_metal_get_display_pixel_info(struct xrt_display_processor_metal *xdp,
+                                    uint32_t *out_pixel_width,
+                                    uint32_t *out_pixel_height,
+                                    int32_t *out_screen_left,
+                                    int32_t *out_screen_top)
+{
+	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
+	if (out_pixel_width == NULL || out_pixel_height == NULL) {
+		return false;
+	}
+	int32_t left = 0, top = 0;
+	if (sdp->screen_bound) {
+		*out_pixel_width = sdp->screen_px_w;
+		*out_pixel_height = sdp->screen_px_h;
+		left = sdp->screen_left;
+		top = sdp->screen_top;
+	} else {
+		sim_display_get_panel_metrics(NULL, NULL, out_pixel_width, out_pixel_height);
+	}
+	if (out_screen_left != NULL) {
+		*out_screen_left = left;
+	}
+	if (out_screen_top != NULL) {
+		*out_screen_top = top;
+	}
+	return (*out_pixel_width > 0 && *out_pixel_height > 0);
+}
+
+/*!
+ * Multi-screen: the window's content-view origin on the bound screen, in that
+ * screen's backing px (relative to its CGDisplayBounds origin). Kept for
+ * parity with the VK/D3D11 DPs; no Metal sim mode is phase-sensitive (#817),
+ * so nothing reads it.
+ */
+static void
+sim_dp_metal_set_present_origin(struct xrt_display_processor_metal *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
+	sdp->have_present_origin = true;
+	sdp->present_origin_x = panel_x;
+	sdp->present_origin_y = panel_y;
+}
+
+/*!
+ * ADR-050 test double (SIM_DISPLAY_METAL_SNAP_PERIOD > 1 only): preserve the
+ * phase of a vertical lattice of that period — snap the horizontal
+ * displacement from the gesture-start origin to whole periods; y passes
+ * through (a vertical lenticular's phase does not depend on y).
+ */
+static bool
+sim_dp_metal_snap_window_rect(struct xrt_display_processor_metal *xdp,
+                              int32_t origin_x,
+                              int32_t origin_y,
+                              int32_t target_x,
+                              int32_t target_y,
+                              int32_t *out_x,
+                              int32_t *out_y)
+{
+	(void)xdp;
+	(void)origin_y;
+	const int32_t period = (int32_t)debug_get_num_option_sim_display_metal_snap_period();
+	if (out_x == NULL || out_y == NULL || period <= 1) {
+		return false;
+	}
+	const int32_t dx = target_x - origin_x;
+	const int32_t n = dx >= 0 ? (dx + period / 2) / period : -((-dx + period / 2) / period);
+	*out_x = origin_x + n * period;
+	*out_y = target_y;
+	return true;
+}
+
+/*!
+ * Seed the per-instance screen from a binding (multi-screen). Physical size
+ * from the EDID mm, else the process-wide panel's; pixels from the device
+ * mode, else the desktop size; origin = the screen's desktop origin. Same rules
+ * as the VK/D3D11 DPs.
+ */
+static void
+sim_dp_metal_bind_screen(struct sim_display_processor_metal *sdp, const struct xrt_screen_binding *b)
+{
+	if (b == NULL || b->struct_size < offsetof(struct xrt_screen_binding, desktop_scale)) {
+		return;
+	}
+	float def_w_m = 0.0f, def_h_m = 0.0f;
+	uint32_t def_px_w = 0, def_px_h = 0;
+	sim_display_get_panel_metrics(&def_w_m, &def_h_m, &def_px_w, &def_px_h);
+
+	sdp->screen_bound = true;
+	sdp->screen_monitor_id = b->monitor_id;
+	sdp->screen_left = b->desktop_left;
+	sdp->screen_top = b->desktop_top;
+	sdp->screen_px_w = b->native_pixel_width != 0 ? b->native_pixel_width : b->desktop_width;
+	sdp->screen_px_h = b->native_pixel_height != 0 ? b->native_pixel_height : b->desktop_height;
+	if (sdp->screen_px_w == 0 || sdp->screen_px_h == 0) {
+		sdp->screen_px_w = def_px_w;
+		sdp->screen_px_h = def_px_h;
+	}
+	if (b->physical_width_mm != 0 && b->physical_height_mm != 0) {
+		sdp->screen_w_m = (float)b->physical_width_mm / 1000.0f;
+		sdp->screen_h_m = (float)b->physical_height_mm / 1000.0f;
+	} else {
+		sdp->screen_w_m = def_w_m;
+		sdp->screen_h_m = def_h_m;
+	}
+}
+
+//! N6 Part 1 (#2144): the synthetic viewer (nominal / fake-tracking sway,
+//! is_tracking, the opt-in webcam override through its ring — #1855; a
+//! screen-bound segment DP stays nominal) evaluated at the caller's target.
+static bool
+sim_dp_metal_get_eye_positions_at(struct xrt_display_processor_metal *xdp,
+                                  int64_t target_ns,
+                                  struct xrt_eye_positions *out)
+{
+	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
+	return sim_display_eyes_at(out, sim_display_get_view_count(), sdp->nominal_x_m, sdp->nominal_y_m,
+	                           sdp->nominal_z_m, sdp->ipd_m, target_ns, sdp->screen_bound ? NULL : &sdp->webcam_ref);
+}
 
 static bool
 sim_dp_metal_get_predicted_eye_positions(struct xrt_display_processor_metal *xdp,
                                          struct xrt_eye_positions *out)
 {
-	struct sim_display_processor_metal *sdp = sim_dp_metal(xdp);
-	float half_ipd = sdp->ipd_m / 2.0f;
-	uint32_t vc = sim_display_get_view_count();
-
-	if (vc == 1) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 1;
-	} else if (vc >= 4) {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[2] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->eyes[3] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->count = 4;
-	} else {
-		out->eyes[0] = (struct xrt_eye_position){sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->eyes[1] = (struct xrt_eye_position){sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 2;
-	}
-	out->timestamp_ns = os_monotonic_get_ns();
-	out->valid = true;
-	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
-	return true;
+	return sim_dp_metal_get_eye_positions_at(xdp, (int64_t)os_monotonic_get_ns(), out);
 }
 
 static void
@@ -347,6 +515,7 @@ sim_dp_metal_destroy(struct xrt_display_processor_metal *xdp)
 	sdp->sampler = nil;
 	sdp->device = nil;
 
+	sim_display_webcam_tracking_release(&sdp->webcam_ref);
 	free(sdp);
 }
 
@@ -554,7 +723,15 @@ static bool
 sim_dp_metal_get_scanout_caps(struct xrt_display_processor_metal *xdp, struct xrt_dp_scanout_caps *out_caps)
 {
 	(void)xdp;
-	return sim_scanout_fill_caps(out_caps, "Metal");
+	if (!sim_scanout_fill_caps(out_caps, "Metal")) {
+		return false;
+	}
+	// Multi-screen per-segment 1:1 gate: every Metal sim output survives a
+	// display-server resample — INTERLACED falls back to anaglyph on this
+	// backend (#817) — so the flag is always set. (The VK DP clears it in
+	// INTERLACED; port that rule if a real Metal interlace ever lands.)
+	out_caps->flags = XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE;
+	return true;
 }
 
 
@@ -564,10 +741,15 @@ sim_dp_metal_get_scanout_caps(struct xrt_display_processor_metal *xdp, struct xr
  *
  */
 
-xrt_result_t
-sim_display_processor_metal_create(enum sim_display_output_mode mode,
-                                   void *metal_device,
-                                   struct xrt_display_processor_metal **out_xdp)
+/*!
+ * Create a sim Metal DP, optionally bound to one screen (multi-screen).
+ * @p binding NULL = the unbound session DP (process-wide panel, today's DP).
+ */
+static xrt_result_t
+sim_display_processor_metal_create_bound(enum sim_display_output_mode mode,
+                                         void *metal_device,
+                                         const struct xrt_screen_binding *binding,
+                                         struct xrt_display_processor_metal **out_xdp)
 {
 	if (out_xdp == NULL) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -588,6 +770,7 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_metal_destroy;
 	sdp->base.process_atlas = sim_dp_metal_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_metal_get_predicted_eye_positions;
+	sdp->base.get_eye_positions_at = sim_dp_metal_get_eye_positions_at; // N6 Part 1 (#2144)
 	sdp->base.get_display_dimensions = sim_dp_metal_get_display_dimensions;   // #856
 	sdp->base.get_display_pixel_info = sim_dp_metal_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_metal_is_alpha_native;
@@ -596,6 +779,13 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	sdp->base.publish_local_zone_mask = sim_dp_metal_publish_local_zone_mask; // #224 / ADR-027
 	sdp->base.clear_local_zone_mask = sim_dp_metal_clear_local_zone_mask;     // #224 / ADR-027
 	sdp->base.get_scanout_caps = sim_dp_metal_get_scanout_caps;
+	sdp->base.set_present_origin = sim_dp_metal_set_present_origin; // multi-screen (macOS)
+	// ADR-050: NULL unless the test double is asked for — sim's Metal
+	// backend has no lens lattice, so by default a drag is atomic but unsnapped.
+	if (debug_get_num_option_sim_display_metal_snap_period() > 1) {
+		sdp->base.snap_window_rect = sim_dp_metal_snap_window_rect;
+	}
+	sim_dp_metal_bind_screen(sdp, binding);
 
 	// #224 / ADR-027 zone test double config (shared parser).
 	sim_zone_config_from_env(&sdp->zone_cfg, "Metal");
@@ -625,8 +815,22 @@ sim_display_processor_metal_create(enum sim_display_output_mode mode,
 	        mode == SIM_DISPLAY_OUTPUT_INTERLACED      ? "Interlaced (anaglyph fallback)" :
 	        mode == SIM_DISPLAY_OUTPUT_PASSTHROUGH     ? "Passthrough" : "Blend");
 
+	if (sdp->screen_bound) {
+		U_LOG_W("sim_display Metal: DP bound to screen 0x%016llx (%ux%u px, %.3f x %.3f m, origin %d,%d)",
+		        (unsigned long long)sdp->screen_monitor_id, sdp->screen_px_w, sdp->screen_px_h, sdp->screen_w_m,
+		        sdp->screen_h_m, sdp->screen_left, sdp->screen_top);
+	}
+
 	*out_xdp = &sdp->base;
 	return XRT_SUCCESS;
+}
+
+xrt_result_t
+sim_display_processor_metal_create(enum sim_display_output_mode mode,
+                                   void *metal_device,
+                                   struct xrt_display_processor_metal **out_xdp)
+{
+	return sim_display_processor_metal_create_bound(mode, metal_device, NULL, out_xdp);
 }
 
 
@@ -648,4 +852,27 @@ sim_display_dp_factory_metal(void *metal_device,
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 
 	return sim_display_processor_metal_create(mode, metal_device, out_xdp);
+}
+
+
+/*!
+ * Multi-screen (macOS): one Metal DP per screen a spanning window covers —
+ * matches `xrt_plugin_iface::create_dp_metal_for_screen`. Windowless (NULL
+ * view); the binding seeds the instance's screen.
+ */
+xrt_result_t
+sim_display_dp_factory_metal_for_screen(struct xrt_plugin_instance *inst,
+                                        void *metal_device,
+                                        void *command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_metal **out_xdp)
+{
+	(void)inst;
+	(void)command_queue;
+	(void)window_handle;
+	if (binding == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return sim_display_processor_metal_create_bound(sim_display_get_output_mode(), metal_device, binding, out_xdp);
 }

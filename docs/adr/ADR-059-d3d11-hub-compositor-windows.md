@@ -1,0 +1,432 @@
+---
+status: Accepted
+date: 2026-10-24
+source: "#2317"
+---
+# ADR-059: One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
+
+**Status:** Accepted (David, 2026-10-24; proposed the same day). Phase 1 of epic #2317 landed
+default-OFF behind `DXR_HUB=1` (PR #2321) with its A/B harness (PR #2323). Defaults have since
+flipped per API, each behind the acceptance gates below:
+
+- **In-process D3D11, cross-adapter (hybrid) box:** the hub is the default since step 2 (PR #2363);
+  `DXR_HUB=0` is the kill switch (`hub placement: hub=0 reason=disabled_by_env`). **On a single
+  adapter too since Amendment 4** (the #2371 gate had passed; the flip lagged it by a week), with
+  DIRECT ingress. Before that a single adapter declined with `reason=same_adapter_opt_in` and the
+  session took the tier's own ADR-039 split, which copies every frame through the staged bridge.
+- **In-process D3D12, hybrid box:** the #1264 reroute onto the hub is the default since #2375
+  (PR #2381, `reason=hybrid_reroute_default_on`). `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is the route's
+  own kill switch; with it unset, `DXR_HUB=0` kills the route too; `DXR_SPLIT_D3D12_ROUTE=own`
+  keeps the own-legs arm. On a single adapter the tier already rode this fill arm (ADR-039, #1264).
+- **In-process Vulkan:** the fill arm that lived in `comp_vk_native_split.cpp` *is* the hub
+  (extracted into `compositor/hub_d3d11/` by PR #2321), so the VK tier's output-device split runs
+  on it wherever the split engages. The VK tier does not read `DXR_HUB`; its kill switch is the
+  split's, `DXR_WEAVE_ON_SCANOUT=0`. On a single adapter its ingress is DIRECT by default since
+  #2563 (runtime v2.66.1); `DXR_HUB_INGRESS=xbridge` forces the staged bridge.
+- **OpenGL:** an opt-in shim (P3, PR #2366), exactly `DXR_HUB=1` on every topology; otherwise
+  `hub placement: hub=0 reason=not_requested`.
+- **Texture-class sessions:** the client-presents strategy (Amendment 3, PR #2380), only with
+  `DXR_HUB=1` (`reason=shared_texture_session` for every texture session it does not take).
+
+Related: [ADR-001](ADR-001-native-compositors-per-graphics-api.md) (amended, not
+superseded), [ADR-035](ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md)
+D3, [ADR-037](ADR-037-adapter-placement-policy-hybrid-devices.md),
+[ADR-039](ADR-039-one-fill-engine-for-every-tier.md),
+[ADR-055](ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md).
+
+## Context
+
+### The question
+
+Would Monado's shape — one compositor, per-API client shims that import swapchain images into
+it — beat DisplayXR's five native in-process compositors, now that iGPUs handle interop? The
+mac/arch charter (2026-10-23) recommended one hub per platform in that platform's native API,
+asked the win box to measure before any ADR, and left two things open: whether the Windows hub
+should be D3D11 or D3D12, and whether the handoff costs latency.
+
+### What exists already (the proposal is more than half built)
+
+- **The service is a hub.** ADR-035 D3 landed (#964): one always-on D3D11 pipeline; the
+  per-client path survives only behind `DXR_LEGACY_STANDALONE=1`.
+- **In-process, the hub exists too, housed in the Vulkan tree.** `comp_vk_native_split.cpp`
+  plus `compositor/xbridge/` is Vulkan-free D3D11 code (the "d3d11 fill arm"). Vulkan renders
+  *into* a same-adapter NT-shared D3D11 deposit (an `ID3D11Fence` imported as a timeline
+  semaphore, GPU-side waits, zero copies) and the arm weaves with the D3D11 display processor
+  and presents. The in-process D3D12 compositor reroutes onto the same arm by default on a
+  single adapter (#1264, measured 8–9 ms → 1.4 ms weave fires). On `main` the only Windows API
+  outside the arm is OpenGL.
+- **"Native single-device D3D11" does not exist on `main`.** The in-process D3D11 tier engages
+  its own xbridge fill arm by default even on one adapter (ADR-039 same-adapter engage), i.e.
+  two transport copies per frame. The baseline the charter called "today's same-context weave"
+  is already a separate-device, fence-synchronised path.
+- **The browser present-owner route (`XR_DXR_weave`)** is already hub-shaped and service-only.
+- **Unity D3D12 standalone** already runs the session on a provider-owned D3D12 device with an
+  NT-shared bridge texture and a shared fence (one `CopyTextureRegion` per slice per frame and a
+  CPU fence block); Unity's own device is used only under the shell. **Unreal** defaults to one
+  tile copy per frame since plug-in 0.9.0 and has **no cross-queue fence** at release.
+
+### What the duplication costs (audit of `main` 6b206f0aa)
+
+In-process compositors total 113.7k lines (d3d11 22.7k, d3d12 21.6k, gl 11.8k, vk_native
+45.2k, metal 12.5k); the IPC client shims total 9.8k. On the Windows backends features land as
+one multi-backend train (zones, late weave, split, segments: 0–4 days apart), so the cost is
+not lag but **N parallel copies**: the late-weave gate ×5, repaint thread ×4, DComp set-up ×5,
+placement/window-metrics ×6, zone mask rasterisers ×6. `comp_base` is used by no native
+compositor. The genuine drifters are Metal (no repaint, no late weave, no present-wait; depth
+budget 47 days late) and GL (no depth budget, no split) — a Windows hub fixes GL only.
+
+### Vendor side (Leia plug-in `origin/main` 44e26fd, SR SDK)
+
+The D3D11 DP is the only mature variant (~35 slots: phase snap, `set_window`, overlay_2d, lift
+×5, atlas-encoding query); D3D12 has 21 slots and none of those; VK fills none of its header's
+newer slots; GL lags most. SR's D3D11 and GL weavers latch late automatically; the VK weaver
+needs a submit hook; **SR's D3D12 late latching is a literal stub**. WGC desktop capture is
+D3D11 internally but already shared to every variant by NT handle. A D3D11-only Windows hub
+makes ~15k of 41.5k Leia Windows lines dead (the D3D12/GL/VK DPs and the bundled VK weaver
+selector that carried the SR 1.36 regression). A D3D12 hub would retire the one mature variant.
+
+### Consumers
+
+| consumer | needs | D3D11 hub + D3D12 shim | D3D12 hub + D3D11 shim |
+|---|---|---|---|
+| Unity (standalone D3D12) | `ID3D12Resource` on its device; render-target state at acquire/release; `arraySize=2`; zones; Local2D | low–medium: it already does this pattern itself; the lift path proves D3D11→D3D12 opening; the shim could drop Unity's own bridge copy and CPU block | low |
+| Unreal (in-process D3D12) | raw resources on UE's device; **no release fence today** | medium–high until the plug-in signals a fence from UE's queue | low (status quo) |
+| Browser (`XR_DXR_weave`) | keyed mutex, legacy DXGI handles (low-integrity sandbox, #743), service D3D11 | lowest: unchanged | high: no D3D12 keyed mutex; NT-only handles |
+
+### Options considered
+
+1. **Status quo** — five native compositors (ADR-001). Keeps N copies; GL never gets the split.
+2. **Vulkan hub (Monado's shape).** Loses on Windows: the iGPU weave split needs D3D12
+   cross-adapter heaps (VK external memory is same-device), transparency is DComp/DXGI, WGC is
+   D3D11, Chromium/ANGLE is D3D11, and ADR-001's Intel VK interop failures are documented
+   (`VK_ERROR_FORMAT_NOT_SUPPORTED`, DEVICE_LOST on Iris Xe without a drain, no D3D12_FENCE
+   import on Intel UHD).
+3. **D3D12 hub.** Strictly worse for the vendor (stub late latching, immature DP) and breaks the
+   browser's keyed-mutex + legacy-handle contract.
+4. **D3D11 hub — this ADR.** Formalises the fill arm the runtime has already converged on.
+
+## Decision
+
+1. **On Windows there is one hub compositor, in D3D11**, `compositor/hub_d3d11/comp_hub_d3d11`
+   (extracted from `comp_vk_native_split` in #2321 P1a, a pure move). The hub owns weave,
+   present, late-weave pacing, repaint and the output-device split. The in-process D3D11, D3D12
+   and Vulkan compositors become **import shims**: they render on the app's device into an
+   atlas the hub can open (same-adapter NT share + `ID3D11Fence`, GPU-side waits only —
+   ADR-055; cross-adapter via `comp_xbridge`), and hand it over once per frame. OpenGL follows
+   through a new WGL interop shim (Phase 3). Metal and desktop Linux/Android keep their native
+   compositors — this ADR is Windows-only.
+2. **The vendor weaver contract on Windows is the D3D11 DP.** The D3D12, GL and VK DP variants
+   stop being load-bearing once every in-process API rides the hub; retirement is the vendor's
+   call after one release at the new default.
+3. **The hub is the same code in-process and in the service.** The service's
+   `comp_d3d11_service` converges onto `comp_hub_d3d11` **last** (Phase 5): it is 39k lines and
+   the lift host, and the in-process arm is the small, clean seed.
+4. **Defaults flip per API, gated by measurement, never by fiat.** Each API gets a default-on
+   with a kill switch and one `hub placement:` WARN line per session naming the rung
+   (`hub=1 … ingress=direct|xbridge` or `hub=0 reason=<token>` from a closed set) — the #1264 /
+   ADR-039 pattern. The native weave/present legs stay one release, then are deleted.
+5. **Fallback is a named rung, not a failure.** Where interop is unproven for a (vendor × API ×
+   adapter) cell (ADR-037 §3a), the hub refuses at create or retires mid-session with a reason
+   and the native leg composes the frame.
+6. **ADR-001 is amended, not superseded.** Its reasons 1 (vendor D3D11 late latching), 6
+   (format fidelity), 7 (DXGI present semantics) and 8 (single-API captures) are *why the hub is
+   D3D11*; its reason 3 (interop is a driver lottery) is why decision 5 exists.
+
+## Measurements (hybrid laptop, leia-sr 2.17.0, hub build `v2.53.0-7-g745765ed1`)
+
+`scripts/perf-ladder/run_hub_ab.ps1` (#2323): n=3 × 20 s per arm, interleaved, AC power,
+60 Hz panel, untracked. Every run proves its path from its own log or is refused. **R** =
+weave→scanout residual (`DXR_WEAVE_LATENCY_CSV`), **D** = scanout − promised display time,
+**p2d** = PresentMon present→display. Noise band on R: ±1.66 ms.
+
+**Same adapter (everything on the Intel iGPU) — the charter's Q1, "handoff cost on one GPU":**
+
+| app / arm | R p50 / p95 (ms) | D p50 (ms) | p2d p50 (ms) | app GPU % | CPU % | present mode |
+|---|---|---|---|---|---|---|
+| d3d11 native (own xbridge arm, 2 copies) | 16.60 / 16.63 | +0.05 | 16.00 | 12.4 | 17.1 | Independent Flip |
+| d3d11 **hub, DIRECT ingress (0 copies)** | 16.59 / 16.64 | +0.04 | 15.97 | 11.3 | 17.3 | Independent Flip |
+| d3d11 hub, xbridge ingress | 16.60 / 16.64 | +0.04 | 16.11 | 11.7 | 17.0 | Independent Flip |
+| d3d12 native | 16.60 / 16.65 | +0.12 | 16.15 | 10.8 | 12.9 | Independent Flip |
+| d3d12 hub (reroute, 3-copy ingress) | 16.60 / 16.63 | −0.75 | 16.16 | **19.5** | **22.7** | Independent Flip |
+| vk native (kill switch) | no R (Intel VK lacks present_wait) | — | **33.19** | 12.5 | 15.4 | **Composed: Copy with GPU GDI** |
+| vk hub | 16.60 / 16.63 | −0.78 | 16.16 | 14.0 | 18.0 | Independent Flip |
+
+**Default topology (RTX renders, Intel scans out):**
+
+| app / arm | R p50 / p95 (ms) | D p50 (ms) | p2d p50 (ms) | GPU iGPU / dGPU % | CPU % |
+|---|---|---|---|---|---|
+| d3d11 native (own split) | 16.60 / 16.64 | +0.06 | 16.03 | 8.3 / 8.4 | 18.9 |
+| d3d11 hub (ingress=xbridge) | 16.60 / 16.64 | +0.05 | 16.11 | 7.5 / 8.4 | 18.2 |
+| d3d12 native (own split) | 16.61 / 16.64 | +0.11 | 16.15 | 6.1 / 9.0 | 16.7 |
+| vk native (kill switch) | 16.59 / 16.69 | — | 14.70 | 4.5 / 19.7 | **181.5** |
+| vk hub | 16.61 / 16.64 | −0.74 | 16.20 | 7.2 / 7.4 | 15.4 |
+
+Readings:
+
+- **The handoff costs nothing measurable.** D3D11 hub-DIRECT vs native: R within 0.01 ms, D
+  within 0.01 ms, GPU 1.1 points *lower*, no frame of pipelining (R stays one refresh, p2d
+  stays 16 ms). The ingress mode (DIRECT vs xbridge) is also within noise.
+- **Latency is neutral for every API on both topologies.** The one real latency gain is
+  Vulkan on a single adapter: native presents through a composed GDI copy (one extra frame);
+  the hub gets independent flip, **−17 ms**.
+- **The D3D12 reroute's extra copies show up as GPU/CPU, not latency** (+8.7 / +9.8 points):
+  the hub's xbridge ingress copies three times even on one adapter. Phase 2 gives D3D12 and VK
+  the DIRECT ingress the D3D11 shim already has.
+- **Split, late weave and repaint survive the hub**: hybrid `ingress=xbridge` with identical
+  R; R = one refresh everywhere; the frame-divisor test gives 30 weaves + 30 repaints on both.
+- **Two findings outside the hub, filed separately:** the Vulkan kill-switch path spins ~1.8
+  cores on the default topology; D rows on fill-arm sites read −0.75 ms where native reads
+  +0.05 (prediction-feed bias in the arm's display-time feed).
+- **Not measured:** a Leia desktop (single dGPU driving the panel) — this box is the hybrid
+  laptop; the GL hub arm (Phase 3); the D3D12 hub on the hybrid topology (the reroute gate
+  also demands `DXR_APP_FRAME_DIVISOR ≥ 2`, which is not a fair arm); tracked viewers.
+
+Prior data the decision also rests on: #1264 (D3D12 → D3D11 arm 8–9 ms → 1.4 ms weave fires);
+ADR-037/#918 (all-scanout 16.0 ms, all-dGPU 42.1 ms, split 16.6 ms motion-to-photon);
+`docs/architecture/service-one-pipeline.md` (forced-IPC handle cube 16.6 ms pipeline vs
+30.3 ms legacy).
+
+## Consequences
+
+**Positive**
+
+- One late-weave gate, one repaint thread, one DComp/waitable presenter, one placement, one
+  mask rasteriser, one capture site on Windows — instead of four or five of each.
+- Every Windows app gets the vendor's most mature weaver (D3D11, automatic late latching).
+- GL apps gain the output-device split for the first time (Phase 3).
+- Vulkan apps on an iGPU-only machine gain a frame.
+- The vendor ships one weaver per platform.
+
+**Costs and risks, with the design answer**
+
+- **ADR-001's interop lottery returns for GL and for VK on Intel.** → decision 5: per-API
+  gates, named rungs, native leg kept one release. GL is last (Phase 3) and needs a
+  LUID-matched interop device (`GL_EXT_memory_object_win32`, #1159).
+- **Unreal's missing release fence becomes a race on a separate hub device.** → the Unreal
+  plug-in signals from UE's queue before Phase 4 flips its default; the shim requires it.
+- **The IPC client shims are not the model** (`client_d3d12` has no effective sync, #2320;
+  `client_vk` drains the queue every frame; `client_gl` `glFinish`es and copies). → the
+  in-process deposits are the model; #2320 adopts the same fence.
+- **Colour honesty (ADR-044) moves to the import boundary** — typeless/`_SRGB` pairs across
+  D3D11↔D3D12, Vulkan's no-blit-through-`_SRGB` rule, Unity's two-slice array. → Phase 4
+  verification list; the ADR-044 oracle (`DXR_ATLAS_CAPTURE_RAW_ALPHA=1`) is part of every gate.
+- **Late latching needs exactly one weave per presented frame** on the immediate context, and
+  the D3D11 weaver self-disables on too many frames in flight. → already the hub's contract
+  (verified in #2321 review).
+- **Mid-session retire is the delicate path** (one weaver per HWND; swapchain re-create on the
+  same HWND; the fresh DP must be re-told 3D/eye mode/frame timing). → fixed and re-validated
+  in #2321; retire stays a transitional mechanism until planes ride the hub (Phase 2).
+- **Vulkan's present_wait extras do not follow a VK app onto the hub, by design** (#2342). The hub
+  presents through DXGI on its own `comp_d3d11_target`, so the `vk_native` target is never created
+  on a hub route, and every pacing helper it carries is bypassed:
+  - The **adaptive grid lead** (`comp_late_weave_adapt.h`, #2068) learns a composited Linux
+    desktop's latch-before-vblank. Its own header says the vblank IS the deadline under DXGI flip,
+    so it has nothing to learn on Windows.
+  - The **present_wait depth floor** (`comp_late_weave_depth.h`, #2119) exists because a composited
+    surface shows a commit two refreshes late. The hub's DXGI path has the #850 late-weave governor
+    instead: depth on the frame-latency waitable, raised by saturation, capped by
+    `DXR_LATE_WEAVE_MAX_LATENCY`. That is the same lever, DXGI-native, and the same governor the
+    native D3D11 leg runs.
+  - The **#867 lookahead** is already the hub's: VK's `predict_frame` / `wait_frame` read
+    `comp_hub_d3d11_get_predicted_lookahead_ns` and mark its ledger (#2336 / #2327), through the
+    same `late_weave_lookahead_ns` formula.
+  - **Lazy transparency** (`comp_lazy_transparency.h`) is desktop-Linux-only and never ran on the
+    Windows VK split.
+
+  The native Windows VK leg's **present_wait tier itself** is bypassed too. On a dGPU whose driver
+  exposes `VK_KHR_present_wait` (NVIDIA, AMD), native VK paces its late weave by waiting for each
+  present to reach glass. Under the hub that VK pacer does not run: the hub paces with the DXGI
+  path's own equivalent, the frame-latency waitable plus DXGI frame-statistics scanout waits and
+  the #850 governor, which is the native D3D11 leg's pacer. On an Intel iGPU, VK has no
+  `VK_KHR_present_wait` at all, so the native leg has no late-weave R and presents through a
+  composed GDI copy; there the hub gets independent flip (−17 ms, measured above).
+
+  Neither case loses a function against native VK on Windows, so nothing is ported. The dGPU
+  case, where native VK's present_wait pacing is replaced by DXGI's, is a measurement for the
+  single-dGPU desktop run. The `[WITNESS]` / R / D harness
+  vk arms (`run_hub_ab.ps1 -Apps vk`) are the check.
+- **Metal is untouched** — the biggest drifter is out of scope here; macOS keeps its native
+  compositor by the same "hub in the platform's native API" rule.
+
+## Phasing
+
+See #2317 for the checklist. Status per phase:
+
+- **P1 — done** (PR #2321, harness PR #2323): extraction, D3D11 shim, D rows, harness.
+- **P2 — landed** (P2a DIRECT ingress for the D3D12 reroute and the Vulkan deposit; P2b planes
+  through the hub, PR #2335; P2c the hub as the one implementation, PR #2345 and Amendment 2):
+  planes through the hub, DIRECT ingress for every shim, one late-weave gate/repaint/presenter/
+  placement/mask/capture, colour at the boundary.
+- **P3 — landed** (PR #2366): the GL shim, opt-in (`DXR_HUB=1`).
+- **P4 — partial:** Unity engine repeats ran for the D3D12 flip (#2375); the Unreal check is
+  deferred (see the table below).
+- **P5 — in progress:** the hybrid defaults flipped for D3D11 (PR #2363) and D3D12 (#2375,
+  PR #2381), each with a kill switch. Open: the single-adapter D3D11 default, a GL default,
+  retiring the native legs after one release, and converging the service onto the hub library.
+
+## Acceptance for flipping a default (per API)
+
+Harness run on the hybrid laptop **and** a single-dGPU Leia desktop: R and D within the noise
+band of native, no added frame of pipelining, app GPU and CPU not worse than native by more
+than the copy count predicts (DIRECT ingress: not worse at all), 60/60/0 witness rates, split
+engaged on the hybrid, repaint cadence preserved under the frame divisor, the full test matrix
+(zones, Local2D, cursor, transparency, capture, multi-screen segments, the ADR-044 oracle,
+`displayxr-cli selftest`) green, and — for Unity, Unreal and the browser — the Phase 4 checks.
+
+| route | topology | default | evidence | open |
+|---|---|---|---|---|
+| D3D11 in-process | hybrid | hub (#2363, `DXR_HUB=0` kills) | #2363 harness + tracked-viewer eyeball (#2375) | single-dGPU desktop (#2371) |
+| D3D12 in-process (the #1264 reroute) | hybrid | hub (#2375). Kill: `DXR_SPLIT_D3D12_HYBRID_REROUTE` set to a false spelling; unset, `DXR_HUB=0` kills it too (`hub_disabled_by_env`); any non-false value of the route knob engages it even under `DXR_HUB=0` | #2374 harness (n=3, full rate); #2376 fallback to own-legs; #2375 hybrid-laptop gates passed: rep-3 repeat, soak, refusal/retire, events, Unity engine repeats, reduced test matrix, tracked-viewer eyeball | single-dGPU desktop (#2371); Unreal engine check: same-adapter hybrid laptop A/B done (#2518: staged ingress stalled the #2362 drain on ~96 % of frames, DIRECT ingress is the D3D12 reroute's default on one adapter since then; a tracked-viewer full-panel run on DIRECT is still open); mode switch PARTIAL (2D→3D and 1/2/3 keys unexercised); eye-tracking state change unexercised; ADR-044 raw-alpha oracle OPEN |
+
+### A passed gate opens its flip
+
+Each gate exists to unblock specific defaults. When the gate's issue closes, the flips it unblocks
+are opened as PRs in the same week, or the gate issue says why not. This rule is here because the
+single-dGPU gate (#2371) closed on 2026-11-02 and two of its three flips did not follow: the VK
+deposit stayed on staged ingress until a station at 8K lost 20 fps to it (#2563), and the D3D11
+single-adapter default waited for Amendment 4. Only D3D12's (#2518) had landed, also after a field
+report. Track the unblocked defaults here:
+
+| gate | defaults it unblocks | landed |
+|---|---|---|
+| single-dGPU desktop run (#2371, accepted 2026-11-02) | D3D12 reroute DIRECT ingress on one adapter | #2523 (v2.62.0) |
+| | VK deposit DIRECT ingress on one adapter | #2563 (v2.66.1) |
+| | D3D11 hub on one adapter (`same_adapter_needs_opt_in` off) | Amendment 4 |
+| GL hub validation (open) | GL hub default (today exactly `DXR_HUB=1`) | — |
+| #2337 (GPU-wait the in-flight slot) | cross-adapter DIRECT-equivalent freshness | — |
+
+## Amendment 1 (2026-10-24) — bridge ingress is one frame stale; direct ingress is a frame fresher
+
+The measurements above said the DIRECT and xbridge ingress modes were "within noise". That is
+true of the residual R (weave→scanout) and false of content age. Once the hub pairs each weave
+with the predicted display time of the frame it actually shows (#2336, the fix for #2327), every
+xbridge arm reads D ≈ +16.7 ms — one refresh — while DIRECT reads +0.03 ms: `comp_xbridge_pick_slot`
+selects the newest slot whose cross-adapter copy has *completed* on a CPU check, which right after a
+submit is the previous frame. The shipped D3D11 and D3D12 own-split routes use the same pick, so the
+hybrid-topology motion-to-photon figures in ADR-037 and in the table above carry one frame of transport
+latency the old D rows hid. Tracked as #2337 (experiment: GPU-wait the in-flight slot on the app-frame
+weave). Consequence for this ADR: on a single adapter the shims take DIRECT ingress (#2336, a default
+change on the already-default hub routes, gated on the single-dGPU desktop run and the engine checks);
+cross-adapter stays xbridge until #2337 is settled.
+
+## Amendment 2 (2026-10-25) — P2c: the hub is the one implementation for its routes
+
+#2342 (P2c) moves the remaining per-route copies on the hub routes into `comp_hub_d3d11`. The native
+legs keep their own copies until P5 deletes them.
+
+- **Ring producers' planes ride DIRECT.** A ring producer that declares
+  `comp_hub_d3d11_info::ring_direct_planes` keeps its Local2D, backdrop and mask planes on DIRECT
+  ingress. The hub reads them in place, and the frame's recipe is snapshotted beside its slot.
+  The single-buffered planes get the atlas's two edges:
+  - write → read: the producer writes them before the deposit signal;
+  - read → rewrite: a submit that rewrites a plane GPU-waits for the consumer fence's *latest*
+    value (`comp_hub_d3d11_get_plane_release_value`).
+
+  Both ring producers declare it, so the P2a `reason=plane_content` move to xbridge remains only
+  as a fallback, for a producer that does not declare it and for every keyed-mutex VK deposit.
+  Such a deposit has no consumer fence to order a plane rewrite on, so its planes keep xbridge's
+  copies under the documented timing-only contract (#1274).
+  On D3D12 the plane copies ride a trailing command list, so only that list waits on the hub,
+  never the frame's CPU wait.
+- **Per-segment zone publish and clear** run in the hub on every route, which is the native
+  #2218 #4 rule. The D3D11 shim's `segments_planes` refusal is retired.
+- **One repaint pacer and admission.** `comp_hub_d3d11_repaint_pace_hold` / `_wait`, then
+  `comp_hub_d3d11_repaint`, give every hub route the native D3D11 leg's pacing (scanout wait plus the
+  #884 late sleep) and its #1339 admission. The pacer hold is lifetime-safe against a retire. Before
+  this, all three routes skipped pacing, so `DXR_WEAVE_REPAINT_FORCE=1` gave 0 repaints/s on the
+  hub (#2321 surprise 6). `DXR_LATE_WEAVE` is read once for every hub route, by the hub's target.
+- **One consumer per capture trigger.** On a hub route a full (post-compose) `u_capture_intent`
+  is handed to the hub, which writes the DP input to `displayxr_atlas[.<exe>].png` and the
+  post-weave back buffer to `…woven.png` (the service twin's names). A projection-only trigger
+  stays with the tier's own projection-done point (pre-window-space, HUD-free). The hub takes it
+  only when that point was skipped.
+- **Colour at the import boundary** (ADR-044 §1). Every hub view of a producer surface uses the
+  non-decoding UNORM member of its family; crops are raw copies.
+- **VK present_wait extras.** None is lost relative to native VK on Windows. The present_wait
+  tier itself, which native VK uses on dGPUs, is replaced by the DXGI pacer; see *Consequences*.
+
+## Amendment 3 (2026-10-26) — client-presents: texture-class sessions on the hub (#2370)
+
+The hub gains a third presenter strategy (ADR-035 D3), **client-presents**, for texture-class
+(`_texture`) sessions. It has no hub swapchain and no hub `Present`. The hub composites and crops as
+on the swapchain strategy. A windowless primary DP weaves into the **caller's** shared texture,
+which the hub opens on its own device. The caller presents.
+
+- **Device placement follows the presenter.** The hub device is created on the caller's adapter (by
+  LUID), not on the scanout adapter. The caller presents, so the weave goes where the present is:
+  there is no egress copy, and DIRECT is the only ingress. A ring frame that asks for xbridge stays
+  DIRECT.
+- **Phase** follows ADR-060 R2. The DP is created windowless through `create_dp_d3d11_for_screen`.
+  It is kept only when the plug-in hints windowless phase and the instance declares
+  `XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN`. Every weave feeds it `set_present_origin(target
+  − screen origin)`, and the segment manager does the same on the split path. The rule lives in
+  one place, `util/comp_dp_windowless_d3d11.h`, shared with the native D3D11 texture path.
+- **Handoff.** After the weave and composite the hub signals its DIRECT consumer fence and flushes.
+  The tier GPU-waits that fence on the caller's context (D3D11) or queue (D3D12) at the end of the
+  frame submit. The texture contract is unchanged ("after `xrEndFrame`, use the texture"), and
+  there is no CPU wait (ADR-055).
+- **Capture:** `…woven.png` is the caller's texture.
+- **Witness:** `[WITNESS] site=d3d11-hub-client`, where "present" means a handoff.
+
+### One policy, one token
+
+Client-presents is **default OFF**: only `DXR_HUB=1` engages it, on either tier. Every texture
+session it does not take is refused with the one closed token `shared_texture_session`, behind one
+WARN naming the rung. The tier's own legs then compose exactly as before. The refusal rungs are the
+same on both tiers. Under `DXR_HUB=1` both tiers print `hub placement: hub=0 reason=shared_texture_session`
+(the D3D12 tier prints no `hub placement:` line otherwise, unchanged):
+
+| Rung | D3D11 | D3D12 |
+|---|---|---|
+| `DXR_HUB` not `1` | silent (pre-#2370 line) | silent (no `hub placement:` line, as before) |
+| transparent session | refused | refused |
+| PQ atlas requested | refused | n/a (the tier has no PQ atlas) |
+| no target | not bound to a v9 texture target | no `windowHandle` |
+| no registry entry / handle / factory | refused | refused |
+| no windowless DP with the flag | refused (in the hub's Stage A) | refused (in the hub's Stage A) |
+| DIRECT wiring or fence bind fails | refused | refused |
+
+### Known limitations (follow-ups)
+
+- **No repaint.** A re-weave between app frames would write the texture while the caller may be
+  reading it, and the caller has no fence it could wait on between frames. `comp_hub_d3d11_repaint`
+  returns `NOT_ADMITTED` and the tiers keep their replay disarmed. The fix is an app-visible release
+  fence in a later revision of the ADR-060 binding (#2378).
+- **D3D12 has no v9 target binding yet.** On D3D12 the target is the `windowHandle`'s whole client
+  area. A sub-rect target therefore phases from the client-area corner, and no
+  `XrWin32TextureTargetStateDXR` is produced (#2382).
+- **OpenGL texture mode** is not carried. The GL shim (#2366) landed without it: a GL session
+  with a shared texture is refused (`shared_texture_session`) and stays on the GL compositor's own
+  legs.
+
+## Amendment 4 (2026-11-07) — one adapter never copies a frame by default
+
+**Field data.** A single-GPU Leia station (RTX A4000, 8K panel, runtime v2.65.0) ran Media Player
+Pro (VK) with its panels up at 40 fps: the VK deposit's default staged ingress copied the 8K atlas
+plus every Local2D plane through the bridge on that one GPU, and the copy engine saturated
+(123–152 %). `DXR_HUB_INGRESS=direct` gave 60/56 fps with the copy engine at 0, and a live DeckLink
+feed held 60. On an RTX 3080 the same session held 60 either way, but the copy engine read 43 %
+staged against 6 % DIRECT — the cost was there, just absorbed. Turning the split off instead
+(`DXR_SPLIT_SAME_ADAPTER=0`) is not the answer: it dropped 7.4 % of live frames against 1.4 %.
+
+**Decision.** On a single adapter no in-process route copies a full frame by default:
+
+- **VK:** DIRECT ingress by default (#2563).
+- **D3D12:** DIRECT ingress by default (#2523).
+- **D3D11:** the hub engages on one adapter by default (`same_adapter_needs_opt_in = false`), so
+  the tier's own ADR-039 split, which bridged every frame, is no longer the single-adapter default.
+  `DXR_HUB=0` restores it.
+- **GL:** unchanged — no same-adapter split, so no copy; its hub stays opt-in.
+
+**Visibility.** Every bridge created on one adapter logs one `SAME-ADAPTER BRIDGE` WARN, and the
+`[RENDER]` row carries `xb_same_adapter`, so a session that still lands on the copying path (a kill
+switch, a refusal, a texture-class session) is visible in the log instead of only on a GPU counter.
+`scripts/measure_hub_ingress.ps1` measures fps plus the app's GPU 3D and COPY engine load per
+environment arm, with the route lines from the log; use it for any change to these defaults.
+
+## References
+
+- Epic #2317; PRs #2321 (hub extraction + `DXR_HUB=1` shim + D rows), #2323 (A/B harness),
+  #2319 (doc corrections from the audit); bug #2320.
+- `docs/architecture/service-one-pipeline.md`, `docs/reference/motion-to-photon-levers.md`,
+  `docs/reference/adapter-selection.md`, `docs/specs/runtime/swapchain-model.md`.

@@ -291,6 +291,23 @@ client_gl_win32_compositor_create(struct xrt_compositor_native *xcn, void *hDC, 
 
 	c->base.base.base.destroy = client_gl_win32_compositor_destroy;
 
+	// #1956: on the WGL_NV_DX_interop2 path a depth image is a GL-native depth
+	// texture copied into a colour-family interop texture at release
+	// (comp_gl_d3d11_depth.h). That backs GL_DEPTH_COMPONENT32F and
+	// GL_DEPTH_COMPONENT16 exactly; the stencil families have no RENDER_TARGET
+	// member to stage through, so they are dropped here rather than offered
+	// and then failed at xrCreateSwapchain.
+	if (swapchain_create_fn == client_gl_d3d11_swapchain_create) {
+		const uint32_t before = c->base.base.base.info.format_count;
+		const uint32_t kept = client_gl_d3d11_filter_formats(c->base.base.base.info.formats, before);
+		if (kept != before) {
+			U_LOG_W(
+			    "GL client (WGL_NV_DX_interop2): %u stencil depth format(s) not offered over IPC (#1956)",
+			    before - kept);
+		}
+		c->base.base.base.info.format_count = kept;
+	}
+
 	// #573 — transparent compositing output. If the service created a shared output
 	// texture for this (transparent) client, hand the shared texture + service→client
 	// fence to the render-API-agnostic presenter, which stands up a transparent

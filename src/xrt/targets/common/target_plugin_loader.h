@@ -39,6 +39,11 @@
 
 #include "xrt/xrt_plugin.h"
 
+// The class-agnostic half (ADR-054 N2): the manifest-kind router, the
+// Android file-name parse, the #328 core-DLL pin and the POSIX discovery
+// roots live there now, under their `target_plugin_` names.
+#include "target_component_loader.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -75,16 +80,39 @@ struct target_plugin_desc
 	char version[64];
 	char binary_path[512];
 	uint32_t probe_order; /* lower wins; missing defaults to 100 */
+	/*! `Enabled` (Windows: HKCU over HKLM; POSIX: the manifest's `enabled`);
+	 * true when absent (N3b, ADR-054 verb `enable|disable`). A disabled
+	 * plug-in is listed but never tried by any scan. */
+	bool enabled;
+	/*!
+	 * Where @ref enabled came from, for `displayxr-cli dp list` (the same
+	 * vocabulary as the input provider's, input-provider-discovery.md §6):
+	 *  - "user": a per-user HKCU `Enabled` is in force, whatever its value;
+	 *  - "machine": disabled by HKLM `Enabled` = 0;
+	 *  - "manifest": disabled by the POSIX manifest's `"enabled": false`;
+	 *  - "default": enabled with no per-user value — which includes an
+	 *    explicit HKLM `Enabled` = 1 / `"enabled": true`, because the shared
+	 *    row reader records the value, not its presence.
+	 */
+	char enabled_source[12];
+	/*! ADR-054 N4b: `enum target_component_provenance` of the binary, as
+	 * @ref target_plugin_enumerate classified it (a lister checks explicitly;
+	 * the verdict is cached per file for the process). */
+	uint32_t provenance;
+	char provenance_reason[160]; //!< one line: why that verdict
+	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
 };
 
 /*!
  * Enumerate registered plug-ins from the platform's discovery root
  * WITHOUT loading them. Writes up to @p max descriptors to @p out and
  * returns the count (0 if the discovery root is absent / empty). The
- * order is unspecified — callers that care sort by `probe_order`.
+ * order is the loader's own (ProbeOrder ascending, then id). Disabled
+ * plug-ins are listed (with `enabled` false); malformed rows are not.
  *
  * This re-reads the discovery root every call (it is not cached like the
- * active-plug-in path); cheap enough for an interactive `dp list`.
+ * active-plug-in path); cheap enough for an interactive `dp list`. It also
+ * runs the N4b provenance check on every listed binary (cached per file).
  */
 int
 target_plugin_enumerate(struct target_plugin_desc *out, int max);
@@ -95,31 +123,57 @@ target_plugin_enumerate(struct target_plugin_desc *out, int max);
  * and returns true iff a non-empty override is configured; otherwise
  * writes an empty string and returns false.
  *
- * Windows: `REG_SZ` `PreferredPlugin` at the discovery root key
- * `HKLM\Software\DisplayXR\DisplayProcessors`. POSIX: the
- * `XRT_PREFERRED_PLUGIN_ID` env var, else a `preferred` file in the
- * per-user manifest dir.
+ * Windows: `REG_SZ` `PreferredPlugin` at the discovery root
+ * `Software\DisplayXR\DisplayProcessors` — HKCU first (per user, what
+ * `displayxr-cli dp use <id>` writes without admin), then the HKLM 64-bit
+ * view (`--machine`); N3b. POSIX: the `XRT_PREFERRED_PLUGIN_ID` env var,
+ * else a `preferred` file in the per-user manifest dir.
  */
 bool
 target_plugin_get_preferred(char *out, size_t cap);
 
 /*!
- * Set the `PreferredPlugin` override to @p id (a plug-in discovery id).
- * Takes effect for processes that begin discovery AFTER the write — the
- * loader is one-shot per process, so a running service must be restarted.
+ * The display-processor class's row in the shared component loader (ADR-054
+ * N2): what the one options contract keys on (`target_component_get_setting`,
+ * `displayxr-cli dp options|set|unset`, N3c). Static, never NULL.
+ */
+const struct target_component_class *
+target_plugin_component_class(void);
+
+struct target_component_setting_desc;
+
+/*!
+ * The settings plug-in @p id declares (N3c): its manifest `settings_schema`
+ * (POSIX) merged with the binary's `describe_settings` slot, which means
+ * loading + negotiating the registered binary (no probe) and unloading it
+ * again — the same exposure as `dp list`'s status snapshot. Returns the
+ * count written to @p out (up to @p max); 0 for an unregistered id or a
+ * binary that declares nothing.
+ */
+int
+target_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
+
+/*!
+ * Set the MACHINE-WIDE `PreferredPlugin` override to @p id (a plug-in
+ * discovery id). Takes effect for processes that begin discovery AFTER the
+ * write — the loader is one-shot per process, so a running service must be
+ * restarted (live re-select is #2051).
  *
- * Windows writes HKLM and therefore requires administrator rights;
- * returns @ref XRT_ERROR_NOT_AUTHORIZED on access-denied,
- * @ref XRT_ERROR_IPC_FAILURE on other write failures, and
- * @ref XRT_SUCCESS on success.
+ * Windows writes the HKLM 64-bit view and therefore requires administrator
+ * rights (`displayxr-cli dp use --machine`; the per-user HKCU value, which
+ * wins, is written by the CLI itself); returns @ref XRT_ERROR_NOT_AUTHORIZED
+ * on access-denied, @ref XRT_ERROR_IPC_FAILURE on other write failures, and
+ * @ref XRT_SUCCESS on success. POSIX has no machine store: this writes the
+ * per-user `preferred` file.
  */
 xrt_result_t
 target_plugin_set_preferred(const char *id);
 
 /*!
- * Clear the `PreferredPlugin` override (restore normal `ProbeOrder`
- * discovery). Idempotent — clearing an unset override is @ref XRT_SUCCESS.
- * Same elevation / restart caveats as @ref target_plugin_set_preferred.
+ * Clear the machine-wide `PreferredPlugin` override (restore normal
+ * `ProbeOrder` discovery). Idempotent — clearing an unset override is
+ * @ref XRT_SUCCESS. Same elevation / restart caveats as
+ * @ref target_plugin_set_preferred.
  */
 xrt_result_t
 target_plugin_clear_preferred(void);
@@ -177,6 +231,20 @@ struct target_plugin_discovery_summary
 	char best_rejected_id[64];
 	//! Why it was rejected — ABI mismatch text where known.
 	char best_rejected_reason[128];
+	//! N3b (ADR-054 verb `enable|disable`): better-ranked plug-ins the
+	//! first-call discovery SKIPPED because they are disabled (`Enabled` = 0 /
+	//! `"enabled": false`), plus a disabled `PreferredPlugin`. Not a fault —
+	//! the user asked for it — but `displayxr-cli selftest` says so, because
+	//! "sim-display is active" on a box with a vendor panel otherwise reads as
+	//! a mystery. Ids in the order they were skipped; at most 8 are kept.
+	int skipped_disabled_count;
+	char skipped_disabled_ids[8][64];
+	//! REGISTRATION id (registry subkey / manifest id) of the winner; ""
+	//! when none is active. Distinct from `iface->id`, the binary's own: one
+	//! DLL registered under two ids (CI's `sim-display` + `sim-display-alt`)
+	//! is two rows with one `iface->id`, and `Enabled` / `PreferredPlugin`
+	//! name a ROW.
+	char active_id[64];
 };
 
 /*!
@@ -185,6 +253,109 @@ struct target_plugin_discovery_summary
  */
 void
 target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out);
+
+/*!
+ * Outcome of the loader's most recent attempt at one registered plug-in
+ * (ADR-045). Recorded per entry so diagnostics can say WHY a plug-in is not
+ * the active one without re-loading anything.
+ */
+enum target_plugin_load_result
+{
+	TARGET_PLUGIN_RESULT_NOT_ATTEMPTED = 0,  //!< a better-ranked plug-in won first
+	TARGET_PLUGIN_RESULT_ACTIVE,             //!< the active plug-in
+	TARGET_PLUGIN_RESULT_CLAIMED,            //!< probe succeeded; loaded, not the active one
+	TARGET_PLUGIN_RESULT_DECLINED,           //!< loaded, probe declined (not my hardware / platform)
+	TARGET_PLUGIN_RESULT_BINARY_MISSING,     //!< registered Binary does not exist (orphan entry)
+	TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING, //!< binary exists, a library it imports does not
+	TARGET_PLUGIN_RESULT_LOAD_FAILED,        //!< any other load failure
+	TARGET_PLUGIN_RESULT_PATH_REFUSED,       //!< dev/build-tree path refused (#952)
+	TARGET_PLUGIN_RESULT_NO_ENTRY_POINT,     //!< no xrtPluginNegotiate export
+	TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED,   //!< negotiate returned an error
+	TARGET_PLUGIN_RESULT_ABI_MISMATCH,       //!< ADR-020 rule 3 reject
+	TARGET_PLUGIN_RESULT_PROBE_FAILED,       //!< probe returned a hard error
+	TARGET_PLUGIN_RESULT_UNTRUSTED,          //!< provenance UNVERIFIED with the gate enforcing (ADR-054 N4b)
+	TARGET_PLUGIN_RESULT_DISABLED,           //!< `Enabled` = 0 / manifest `"enabled": false` — never tried (N3b)
+};
+
+/*!
+ * Per-registered-plug-in record kept by the loader (ADR-045): the last load
+ * outcome plus the platform state the plug-in reported through
+ * `xrt_plugin_iface::get_platform_state` at that attempt. All strings UTF-8.
+ */
+struct target_plugin_status
+{
+	char id[64];
+	char display_name[128]; //!< discovery-root DisplayName (never hardcoded)
+	char version[64];       //!< discovery-root Version
+	uint32_t probe_order;
+	enum target_plugin_load_result result;
+	//! OS error of a failed load (Win32 error code), 0 if none.
+	uint32_t os_error;
+	//! @ref xrt_plugin_platform_state; UNKNOWN when not reported.
+	uint32_t platform_state;
+	//! `XRT_PLUGIN_PLATFORM_FLAG_*`.
+	uint32_t platform_flags;
+	//! Vendor-written hint, shown verbatim.
+	char hint[XRT_PLUGIN_PLATFORM_HINT_MAX];
+	//! Loader-written detail for a failure (ABI text, dlerror, ...); "" if none.
+	char reason[160];
+	//! A FALLBACK plug-in (same rule as @ref target_plugin_iface_is_fallback).
+	bool fallback;
+	//! `XRT_STATUS_API_BIT_*` DP factories the iface offers, recorded before
+	//! probe() — so known for a plug-in that then DECLINED too; 0 if never loaded.
+	uint32_t dp_apis;
+	//! ADR-054 N4b: `enum target_component_provenance` of the binary at the
+	//! last attempt (UNKNOWN when the file could not even be found).
+	uint32_t provenance;
+	//! Leaf certificate CN when SIGNED; "" otherwise.
+	char signer[128];
+	//! One line: why that provenance verdict (incl. the allowlist row to write).
+	char provenance_reason[224]; //!< mirrors target_component_entry (PR B widened it: the elevated-host reason + digest is > 160)
+};
+
+/*!
+ * Copy the loader's per-plug-in records (one per registered plug-in it has
+ * seen this process, in first-seen order) into @p out; returns the count.
+ * The active plug-in's platform state is re-queried live (the slot is cheap
+ * and thread-safe by contract), so a vendor plug-in that later reports
+ * NO_DISPLAY shows it. Safe from any thread; never loads anything.
+ */
+int
+target_plugin_get_status(struct target_plugin_status *out, int max);
+
+/*!
+ * The first registered plug-in (in first-seen / probe order) that offers a
+ * Metal DP factory but no Vulkan one, from what the loader recorded before each
+ * probe() — a plug-in that loaded and declined counts. Never loads anything.
+ * Fallback plug-ins are skipped. Returns false (and "") when there is none.
+ */
+bool
+target_plugin_find_metal_only(char *out_id, size_t cap);
+
+//! Short stable name for a @ref target_plugin_load_result ("ACTIVE", ...).
+const char *
+target_plugin_load_result_str(enum target_plugin_load_result r);
+
+//! Short stable name for an @ref xrt_plugin_platform_state ("READY", ...).
+const char *
+target_plugin_platform_state_str(uint32_t state);
+
+/*!
+ * Live platform state of the active plug-in (`get_platform_state`, struct_size
+ * gated). Returns false (and fills UNKNOWN) when none is active or it does not
+ * report one. Thread-safe.
+ */
+bool
+target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out);
+
+/*!
+ * Is @p iface a FALLBACK plug-in (ADR-045 D3)? True when it reports
+ * `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`; for a plug-in that does not report
+ * platform state, true only for the runtime's own simulation plug-in id
+ * (`sim-display`) — never decided by a vendor id.
+ */
+bool
+target_plugin_iface_is_fallback(const struct xrt_plugin_iface *iface);
 
 /*!
  * Returns the @ref xrt_plugin_instance handle returned by the active
@@ -203,6 +374,11 @@ target_plugin_get_active_instance(void);
  * (lower ProbeOrder) plug-in than the currently active one is now
  * registered (or no plug-in was active before), swap it in and return
  * its iface. Otherwise returns the unchanged current iface.
+ *
+ * No live swap (ADR-045 D3): when the active plug-in is NOT a fallback
+ * (@ref target_plugin_iface_is_fallback), this returns it unchanged without
+ * re-probing anything — a vendor plug-in that loses its display reports
+ * NO_DISPLAY and stays selected.
  *
  * Concretely: addresses issue #342 — the service starts mid-install
  * with only `sim-display` registered (ProbeOrder 200) and bakes its
@@ -224,43 +400,27 @@ target_plugin_get_active_instance(void);
 const struct xrt_plugin_iface *
 target_plugin_refresh_active(void);
 
-#if defined(_WIN32)
-/*!
- * Pin the runtime core DLL (DisplayXRClient.dll) into the process by
- * absolute path so plug-in DLL imports of it resolve independent of
- * cwd/PATH (issue #328). Idempotent, one-shot. Shared with the
- * input-provider loader (`target_input_plugin_loader.c`), whose DLLs
- * carry the same import.
- */
-void
-target_plugin_preload_runtime_core_dll(void);
-#endif
-
-#if !defined(_WIN32) && !defined(__ANDROID__)
-#include <limits.h>
-/*!
- * Assemble the POSIX plug-in discovery roots (env override + per-user +
- * system dirs) in priority order; returns the count. Each root is a
- * PATH_MAX-sized buffer. Shared with the input-provider loader, which
- * scans the SAME roots for `*-input-provider.json` manifests
- * (docs/specs/runtime/input-provider-discovery.md §3).
- */
-int
-target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots);
-#endif
-
 /* Forward declarations — full defs in xrt/xrt_compositor.h and
  * os/os_display_edid.h; the .c includes those, the header stays lean. */
 struct xrt_dp_factory_registry;
 struct os_display_edid_list;
+struct os_display_edid_monitor;
 
 /*!
  * Map an enumerated EDID monitor list (`os_display_edid_enumerate`) into the
  * vendor-neutral @ref xrt_display_descriptor array handed to
  * `probe_displays()`. Assigns each monitor a stable-for-this-boot
- * `monitor_id` (hashed from EDID manufacturer/product + screen position),
+ * `monitor_id` (hashed from EDID manufacturer/product + screen position, plus
+ * the DRM connector / RandR output name where the platform has one),
  * converts `refresh_hz`→`refresh_mhz`, and maps `is_primary`→`flags` bit 0.
- * Writes up to @p max descriptors and returns the count.
+ * Writes up to @p max descriptors and returns the count. Also keeps the full
+ * monitor records (connector, mm, device mode) in a runtime-private side
+ * table keyed by monitor id; the descriptor struct (plug-in ABI) is unchanged.
+ *
+ * A monitor whose EDID reads back empty on an output and rect the previous
+ * call knew with a real EDID keeps that identity for up to
+ * @ref TARGET_EDID_CARRY_WINDOW_NS (@ref target_plugin_edid_carry), and a
+ * follow-up re-enumeration is requested so the real EDID is read again.
  *
  * Issue #69 / ADR-015.
  */
@@ -270,12 +430,48 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
                                 uint32_t max);
 
 /*!
+ * How long a monitor whose EDID reads back empty may keep the identity last
+ * read on the same output and desktop rect (ADR-051 D6). Covers a cable
+ * reseat, where the compositor still lists the output before the kernel's
+ * EDID is readable again; past it the monitor is treated as what it reads
+ * as (a new, EDID-less display).
+ */
+#define TARGET_EDID_CARRY_WINDOW_NS (30ull * 1000ull * 1000ull * 1000ull)
+
+//! What @ref target_plugin_edid_carry decided for one fresh record.
+enum target_edid_carry
+{
+	TARGET_EDID_CARRY_NONE = 0, //!< Not a candidate: real EDID, or another output / rect.
+	TARGET_EDID_CARRY_KEPT,     //!< @p cur borrowed @p prev's identity.
+	TARGET_EDID_CARRY_EXPIRED,  //!< Same output and rect, but the window is over.
+};
+
+/*!
+ * The mid-reseat identity rule (pure; used by
+ * @ref target_plugin_build_descriptors). When @p cur has an all-zero EDID
+ * triple (manufacturer, product, serial) and @p prev -- the record last built
+ * for a monitor -- had a non-zero one on the same output (RandR output name
+ * or DRM connector, whichever both carry) and the same desktop rect, and
+ * @p now_ns is within @ref TARGET_EDID_CARRY_WINDOW_NS of @p prev_read_ns
+ * (when @p prev's EDID was last actually read), copy @p prev's EDID-side
+ * fields into @p cur: the triple, and the connector / mm / device mode /
+ * display name / join where @p cur has none. Its monitor id and screen key
+ * then come out as before. Nothing is copied unless KEPT.
+ */
+enum target_edid_carry
+target_plugin_edid_carry(const struct os_display_edid_monitor *prev,
+                         uint64_t prev_read_ns,
+                         struct os_display_edid_monitor *cur,
+                         uint64_t now_ns);
+
+/*!
  * Build the per-monitor DP factory registry (issue #69 / ADR-015). Loads
  * every registered plug-in (reusing the already-active one), asks each for
  * its `probe_displays()` claims — or, for a plug-in without `probe_displays`
  * whose binary `probe()` succeeded, synthesizes a single
  * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (single-display
- * back-compat) — then resolves per monitor (highest confidence wins; ties by
+ * back-compat; off-Windows the ACTIVE plug-in's lands on its panel's monitor
+ * once @ref target_plugin_note_active_panel has run) — then resolves per monitor (highest confidence wins; ties by
  * ascending ProbeOrder) into @p out_registry. A monitor no plug-in claims
  * gets no entry.
  *
@@ -285,14 +481,157 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
  * for the process lifetime (rebuilt when @ref target_plugin_refresh_active
  * swaps in a better plug-in). Mutex-guarded like the refresh path.
  *
- * Off-Windows the EDID enumerator yields no monitors, so a 0-length
- * descriptor list resolves to an empty registry (`entry_count == 0`),
- * signalling callers to use the scalar `dp_factory_*` fields.
+ * Windows and desktop Linux enumerate monitors (Linux: RandR joined to DRM
+ * sysfs, multi-screen M0) and load every registered plug-in as a claim
+ * source; macOS and Android yield no monitors, so a 0-length descriptor list
+ * resolves to an empty registry (`entry_count == 0`), signalling callers to
+ * use the scalar `dp_factory_*` fields.
  */
 void
 target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
                                uint32_t descriptor_count,
                                struct xrt_dp_factory_registry *out_registry);
+
+/*!
+ * The runtime-private record behind a monitor id from the last
+ * @ref target_plugin_build_descriptors: the descriptor the plug-ins saw and
+ * the full EDID/placement record (mm, connector, output name, device mode).
+ * Either out-param may be NULL. False when the id is unknown (or the
+ * platform enumerates no monitors). Multi-screen M1: feeds the per-screen
+ * info that `xrEnumerateDisplaysDXR` reports.
+ */
+bool
+target_plugin_get_monitor_record(uint64_t monitor_id,
+                                 struct xrt_display_descriptor *out_desc,
+                                 struct os_display_edid_monitor *out_mon);
+
+/*!
+ * The stable screen key of a monitor from the last
+ * @ref target_plugin_build_descriptors (display dashboard phase 7):
+ * `"<PNP>-<PROD>-<SERIAL>"`, `"@<device>"`-qualified when the serial is 0 or
+ * two monitors would collide; `"<PNP>-<vendor serial>"` when a plug-in's
+ * claim carries a vendor serial (#2250 —
+ * `target_screen_keys_build_ex`; known after the first
+ * @ref target_plugin_resolve_displays, then remembered across re-probes). The
+ * identity a per-screen display-processor preference is stored under — unlike
+ * the per-boot monitor id it survives a reboot. @p out_device (may be NULL)
+ * receives the OS device name used to qualify it. False when the id is unknown.
+ */
+bool
+target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap);
+
+/*!
+ * The EDID-form ("legacy", pre-#2250) key of a monitor whose current key is
+ * the vendor-serial form. True — and @p out_key filled — only when it differs
+ * from @ref target_plugin_get_monitor_key's; else false and @p out_key = "".
+ * A preference stored under it still applies (and is re-keyed, per user).
+ */
+bool
+target_plugin_get_monitor_legacy_key(uint64_t monitor_id, char *out_key, size_t key_cap);
+
+/*!
+ * Let this process re-key a per-user per-screen preference stored under a
+ * monitor's legacy key (#2250) — rewrite the user's settings file during
+ * @ref target_plugin_resolve_displays. Off by default: only displayxr-service
+ * and the CLI (`dp use/reset --screen`, `displays --claims`) turn it on; an
+ * app's in-process runtime never rewrites the file, it only WARNs once.
+ */
+void
+target_plugin_set_screen_key_rekey(bool allowed);
+
+/*!
+ * One plug-in that claimed a monitor (at any confidence) in the last
+ * @ref target_plugin_resolve_displays: a plug-in that can drive it.
+ */
+struct target_plugin_screen_candidate
+{
+	char plugin_id[64];  //!< The claiming plug-in's id.
+	uint32_t confidence; //!< `enum xrt_display_claim_confidence` value of its claim.
+};
+
+/*!
+ * Every plug-in whose `probe_displays` claimed @p monitor_id in the last
+ * @ref target_plugin_resolve_displays, in source order (ascending ProbeOrder),
+ * winner or not (display dashboard: the per-screen selector's options).
+ * Writes up to @p max entries and their count to @p out_count. False when the
+ * id is unknown, no resolve has run, or the last resolve asked only the active
+ * plug-in (the POSIX claim-source shortcut), so the list would be incomplete.
+ */
+bool
+target_plugin_get_monitor_candidates(uint64_t monitor_id,
+                                     struct target_plugin_screen_candidate *out,
+                                     uint32_t max,
+                                     uint32_t *out_count);
+
+struct xrt_plugin_display_info;
+struct os_display_edid_monitor;
+struct os_display_panel_hint;
+
+/*!
+ * Which descriptor a plug-in WITHOUT `probe_displays` gets its synthesized
+ * back-compat claim on. Pure — the policy behind the loader's synthesized
+ * claim, exposed so it can be pinned by tests.
+ *
+ * The primary monitor (flags bit 0), else descriptor 0. Off-Windows, when
+ * @p panel describes the plug-in's panel (non-zero pixel size), the monitor
+ * that panel matches instead, by the ADR-033 rules: a non-(0,0) origin inside
+ * a monitor whose own origin is known, then the connector's device mode, then
+ * the pixel size, ties broken on physical size. The loader passes the ACTIVE
+ * plug-in's noted panel (@ref target_plugin_note_active_panel) and nothing
+ * for any other plug-in. Windows always gets the primary.
+ *
+ * @param monitors Per-descriptor enumeration records (mm, device mode,
+ *                 origin_unknown), aligned with @p descs; NULL, or NULL
+ *                 entries, for "not known".
+ * @param panel    The plug-in's panel; NULL = not known.
+ */
+uint32_t
+target_plugin_backcompat_claim_index(const struct xrt_display_descriptor *descs,
+                                     uint32_t n,
+                                     const struct os_display_edid_monitor *const *monitors,
+                                     const struct os_display_panel_hint *panel);
+
+/*!
+ * Record what the ACTIVE plug-in reported about its panel
+ * (`get_display_info`: pixel size, physical size, desktop origin). Called
+ * wherever the runtime pulls that info (the builder at system create, and the
+ * display-info apply path on refresh). Off-Windows it steers the active
+ * plug-in's back-compat display claim — the one synthesized when it has no
+ * `probe_displays` — onto the monitor that matches the panel by the ADR-033
+ * rules, instead of the primary monitor. No effect on Windows, and none on a
+ * plug-in that implements `probe_displays`.
+ */
+void
+target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi);
+
+/*!
+ * Release the plug-in instances that were loaded ONLY as display-claim sources
+ * (not the active plug-in), and drop the cached source set so the next
+ * resolve re-collects. Called at xrt_instance teardown, after the system (and
+ * with it the registry that referenced those sources) is gone.
+ *
+ * macOS/Linux only. Windows has always kept its claim sources for the process
+ * lifetime and is unchanged here; Android has no claim-only sources.
+ */
+void
+target_plugin_release_claim_sources(void);
+
+/*!
+ * Display hotplug (ADR-047 Amendment 8): make the next
+ * @ref target_plugin_resolve_displays consult every loadable plug-in, loading
+ * the ones that are not display-claim sources yet — typically a vendor
+ * plug-in whose `probe()` declined at instance create because its panel was
+ * not attached. Existing sources are never re-probed or released (a live
+ * segment DP may come from them). A no-op when PreferredPlugin pins the active
+ * plug-in and it alone decided the last resolve (#1874), and before the first
+ * resolve (which collects from scratch).
+ *
+ * macOS, Linux and Windows (#2305). Android: returns 0 (one plug-in).
+ *
+ * @return the number of plug-ins newly added as claim sources.
+ */
+uint32_t
+target_plugin_rescan_claim_sources(void);
 
 #ifdef __cplusplus
 }

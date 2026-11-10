@@ -1061,6 +1061,8 @@ TEST_CASE("comp_layer_view_camera: no backend gates its draw on the return value
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    // #1581: D3D12 resolves the same cameras for its quad draw.
 	    "d3d12/comp_d3d12_renderer.cpp",
+	    // #1581: vk_native too, once it learned to draw quads (#1623).
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : backends) {
@@ -1132,8 +1134,13 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 		const char *rel;
 		uint32_t allowed_flag_reads;
 	} backends[] = {
-	    {"gl/comp_gl_compositor.cpp", 0},
-	    {"metal/comp_metal_compositor.m", 0},
+	    // #1786: GL's one allowance is the SAME Local2D / window-space
+	    // channel D3D11's is (its own premul/straight decision, deliberately
+	    // not comp_layer_blend_mode() -- see comp_d3d11_renderer.cpp).
+	    {"gl/comp_gl_compositor.cpp", 1},
+	    // #1788: Metal's one allowance is the same Local2D / window-space
+	    // channel as D3D11/D3D12/GL (#1581, #1786).
+	    {"metal/comp_metal_compositor.m", 1},
 	    // The Local2D / window-space channel, above.
 	    {"d3d11/comp_d3d11_renderer.cpp", 1},
 	    /*
@@ -1152,6 +1159,9 @@ TEST_CASE("comp_layer_blend_mode: no backend reimplements the blend rule (#1621)
 	    // #1581: D3D12's one allowance is the SAME Local2D / window-space
 	    // channel D3D11's is — render_window_space_layer(), ported from it.
 	    {"d3d12/comp_d3d12_renderer.cpp", 1},
+	    // #1623: vk_native's zone arm reads only the UNPREMULTIPLIED bit
+	    // (ADR-027's own rule), never the source-alpha one.
+	    {"vk_native/comp_vk_native_renderer.c", 0},
 	};
 
 	for (const auto &backend : backends) {
@@ -1562,6 +1572,8 @@ TEST_CASE("comp_layer_tile_blend_mode: asking for a mode is what spends the base
  *
  * METAL is the one quad-drawing backend still outside this guard: its #1590 leg
  * is open, and a test that fails for a known-open leg is noise, not a guard.
+ * vk_native joined with #1623, which is where it learned to draw (and cull) a
+ * quad at all.
  * D3D12 joined with #1581, which is where it learned to draw a quad at all; GL
  * joined with #1581's GL leg, which is where it learned to CULL one — before
  * that its quad pass drew back-faces, and the CTS QuadOcclusion case showed a
@@ -1574,6 +1586,7 @@ TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules 
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
 	    "gl/comp_gl_compositor.cpp",
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : backends) {
@@ -1604,6 +1617,8 @@ TEST_CASE("the quad-drawing paths consult the shared facing and painter's rules 
 	    "d3d11_service/comp_d3d11_service.cpp",
 	    "d3d12/comp_d3d12_renderer.cpp",
 	    "gl/comp_gl_compositor.cpp",
+	    // #1623: one draw loop for projection, zones and quads, like D3D12/GL.
+	    "vk_native/comp_vk_native_renderer.c",
 	};
 
 	for (const char *rel : subrect_backends) {
@@ -1777,8 +1792,15 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	    "knows which render target this frame paints (#1610)");
 	CHECK(d3d12_body.find("equirect2_pso_for(") != std::string::npos);
 
+	// layer_view_resource() is the same decision plus the compose shadow of a
+	// display-encoded image (XR_DXR_swapchain_color_encoding); it must itself
+	// defer to layer_source_format() for every other source.
 	INFO("the D3D12 equirect2 draw must take its source SRV format from layer_source_format() (#1589/#1694)");
-	CHECK(d3d12_body.find("layer_source_format(") != std::string::npos);
+	CHECK((d3d12_body.find("layer_source_format(") != std::string::npos ||
+	       d3d12_body.find("layer_view_resource(") != std::string::npos));
+	INFO("layer_view_resource() must defer to layer_source_format() for every source without a compose shadow");
+	// Raw body: code_only() reads its `*out_format = ...` line as a comment continuation.
+	CHECK(function_body(d3d12, "layer_view_resource").find("layer_source_format(") != std::string::npos);
 
 	/*
 	 * ...and the GL-specific half. Three things this leg can get wrong that
@@ -1817,6 +1839,73 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	CHECK(gl_body.find("GL_FRAMEBUFFER_SRGB") == std::string::npos);
 
 	/*
+	 * ...and the vk_native half (#1602 on Vulkan). vk_native draws every layer
+	 * type in ONE loop in draw_zones_pass(), so the per-layer decisions for an
+	 * equirect2 view live in a named helper, compose_equirect2_view(), and the
+	 * frustum enters through the shared packer in comp_vk_native_equirect2.h
+	 * (the HLSL cbuffer does not fit the 128-byte push block, so the tangents
+	 * are folded into the inverse model-view there). What the other legs pin
+	 * in one body is therefore pinned here across those three places:
+	 *
+	 *  - the helper takes visibility from is_layer_view_visible_n(), hands the
+	 *    packer THIS view's camera FOV, and resolves the blend mode through
+	 *    comp_layer_subrect_blend_mode() — and does NOT reach for the
+	 *    first-in-tile gate or the quad's back-face predicate;
+	 *  - the packer is where angle_left / angle_down become the ray basis;
+	 *  - the OPAQUE_COVER fold is the loop's single call, shared by every
+	 *    layer type the pass draws;
+	 *  - the GLSL lives in shaders/equirect2.frag (a third LANGUAGE-level
+	 *    expression beside the HLSL and GL's twin, not a copy in the C file),
+	 *    and it DISCARDS outside the section.
+	 */
+	const std::string vk = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_renderer.c");
+	const std::string vk_view = code_only(function_body(vk, "compose_equirect2_view"));
+	INFO("vk_native has no compose_equirect2_view() — did the equirect2 draw move, or get dropped?");
+	REQUIRE_FALSE(vk_view.empty());
+
+	INFO("the vk_native equirect2 view must take per-eye visibility from is_layer_view_visible_n() (#1580)");
+	CHECK(vk_view.find("is_layer_view_visible_n(") != std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must pack its rays through comp_vk_native_equirect2_pack(), from THIS "
+	    "view's camera FOV (#1580)");
+	CHECK(vk_view.find("comp_vk_native_equirect2_pack(") != std::string::npos);
+	CHECK(vk_view.find("&cam->fov") != std::string::npos);
+	INFO("the vk_native equirect2 view must resolve its blend mode through comp_layer_subrect_blend_mode()");
+	CHECK(vk_view.find("comp_layer_subrect_blend_mode(") != std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must NOT reach comp_layer_tile_blend_mode() — a sphere section is never "
+	    "the tile's base (#1598)");
+	CHECK(vk_view.find("comp_layer_tile_blend_mode(") == std::string::npos);
+	INFO(
+	    "the vk_native equirect2 view must NOT apply comp_layer_quad_is_front_facing() — CTS Equirect2 1-4 "
+	    "stand inside the sphere");
+	CHECK(vk_view.find("comp_layer_quad_is_front_facing(") == std::string::npos);
+
+	const std::string vk_pack =
+	    read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_equirect2.h");
+	INFO("the vk_native packer must build the ray basis from the FOV's tangents");
+	CHECK(code_only(vk_pack).find("angle_left") != std::string::npos);
+	CHECK(code_only(vk_pack).find("angle_down") != std::string::npos);
+
+	const std::string vk_pass = code_only(function_body(vk, "draw_zones_pass"));
+	REQUIRE_FALSE(vk_pass.empty());
+	INFO("vk_native's compose loop must call compose_equirect2_view() and fold OPAQUE_COVER for every layer");
+	CHECK(vk_pass.find("compose_equirect2_view(") != std::string::npos);
+	CHECK(vk_pass.find("comp_layer_blend_fold_opaque_cover(") != std::string::npos);
+
+	INFO(
+	    "vk_native's renderer must not carry a C-string copy of the ray/sphere march — it is SPIR-V "
+	    "compiled from shaders/equirect2.frag");
+	CHECK(vk.find("sphere_intersect") == std::string::npos);
+	for (const char *frag : {"/vk_native/shaders/equirect2.frag", "/vk_native/shaders/equirect2_array.frag"}) {
+		const std::string glsl = code_only(read_whole_file(std::string(DXR_COMP_SRC_DIR) + frag));
+		INFO(frag << " must march the sphere and DISCARD outside the section — under the blending-off "
+		          << "state an unflagged layer gets, writing transparent black erases the tile");
+		CHECK(glsl.find("sphere_intersect(") != std::string::npos);
+		CHECK(glsl.find("discard;") != std::string::npos);
+	}
+
+	/*
 	 * A sphere SECTION is a sub-rect contributor, so a frame carrying one owes
 	 * a LINEAR blend and must not take the #1589 fast path — which would
 	 * compose it in encoded space. Both same-loop backends decide that in one
@@ -1831,6 +1920,9 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	} fast_path_owners[] = {
 	    {"d3d12/comp_d3d12_renderer.cpp", "renderer_frame_takes_fast_path"},
 	    {"gl/comp_gl_compositor.cpp", "gl_frame_takes_fast_path"},
+	    // vk_native counts contributors through compose_pass_draws_layer(),
+	    // which is also what routes a layer into the draw loop at all.
+	    {"vk_native/comp_vk_native_renderer.c", "compose_pass_draws_layer"},
 	};
 	for (const auto &owner : fast_path_owners) {
 		const std::string src = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + owner.rel);
@@ -1855,8 +1947,8 @@ TEST_CASE("the equirect2 draw consults the shared rules on every backend that ha
 	 *
 	 * GL is deliberately NOT in this list: it cannot compile HLSL, so its GLSL
 	 * twin (VS_EQUIRECT2 / FS_EQUIRECT2_*) is a second LANGUAGE rather than a
-	 * second copy, and it does name `sphere_intersect`. vk_native is a third
-	 * such expression, in shaders/layer.comp's `do_equirect2` compute squash.
+	 * second copy, and it does name `sphere_intersect`. vk_native's is SPIR-V
+	 * compiled from vk_native/shaders/equirect2.frag, pinned above.
 	 */
 	const char *const shader_consumers[] = {
 	    "d3d11/comp_d3d11_renderer.cpp",

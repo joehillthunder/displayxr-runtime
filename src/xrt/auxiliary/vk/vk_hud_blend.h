@@ -13,7 +13,8 @@
  * the source image (HUD swapchain image), its dimensions, and the
  * destination rect on the swapchain. Image views and descriptor sets
  * are cached by VkImage so an OpenXR swapchain with rotating per-frame
- * images doesn't pay setup cost beyond first sight of each image.
+ * images doesn't pay setup cost beyond first sight of each image. A
+ * destroyed source image must be removed with vk_hud_blend_forget_image().
  *
  * @author David Fattal
  * @ingroup aux_vk
@@ -28,7 +29,8 @@ extern "C" {
 #endif
 
 // Each window-space layer is its own OpenXR swapchain, and swapchains rotate
-// through ~3 images; the image cache is keyed by VkImage and never evicts. So
+// through ~3 images; the image cache is keyed by VkImage and only evicts what
+// vk_hud_blend_forget_image() is told about. So
 // the bound must cover (max concurrent window-space layers) × (images/swapchain),
 // not just the 1-2 layers an undersized cache happened to allow. 64 ≈ 21 layers ×
 // 3 images — generous headroom for realistic per-depth-plane 2D UI (see issue #389
@@ -43,7 +45,8 @@ extern "C" {
 struct vk_hud_blend
 {
 	VkRenderPass render_pass;
-	VkPipeline pipeline;
+	VkPipeline pipeline;        //!< Straight-alpha colour blend (src SRC_ALPHA).
+	VkPipeline pipeline_premul; //!< Premultiplied colour blend (src ONE), #1786.
 	VkPipelineLayout pipe_layout;
 	VkDescriptorSetLayout desc_layout;
 	VkDescriptorPool desc_pool;
@@ -55,6 +58,7 @@ struct vk_hud_blend
 	//! Lookup is O(N) but N is bounded (≤ swapchain image count).
 	struct {
 		VkImage image;
+		VkFormat format; //!< View format the entry was created with (#1795).
 		VkImageView view;
 		VkDescriptorSet desc_set;
 	} cached_images[VK_HUD_BLEND_MAX_IMAGES];
@@ -82,6 +86,25 @@ bool
 vk_hud_blend_init(struct vk_hud_blend *blend,
                    struct vk_bundle *vk,
                    VkFormat target_fmt);
+
+/*!
+ * Like vk_hud_blend_init(), choosing whether the HUD's alpha is composited
+ * into the target too (#1780).
+ *
+ * With @p write_alpha false (vk_hud_blend_init) the target's alpha channel is
+ * left untouched. With it true the HUD is composited "over" in alpha as well
+ * (src ONE, dst ONE_MINUS_SRC_ALPHA, all channels written), so the stamped
+ * region gets at least the HUD's coverage. Use that when the target's alpha
+ * is the window's transparency (a transparent session's atlas); it matches
+ * the D3D11 window-space blend (#225).
+ *
+ * @ingroup aux_vk
+ */
+bool
+vk_hud_blend_init_ex(struct vk_hud_blend *blend,
+                     struct vk_bundle *vk,
+                     VkFormat target_fmt,
+                     bool write_alpha);
 
 /*!
  * Record alpha-blended HUD draw commands.
@@ -118,6 +141,61 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
                    uint32_t dst_h);
 
 /*!
+ * vk_hud_blend_draw_no_layout(), choosing the colour blend per draw (#1786).
+ *
+ * @p premultiplied false is the straight-alpha blend every other draw uses
+ * (colour src SRC_ALPHA, dst ONE_MINUS_SRC_ALPHA). True treats the source as
+ * premultiplied (colour src ONE, dst ONE_MINUS_SRC_ALPHA). The alpha blend is
+ * whatever the blend was initialized with, in both cases.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
+                               struct vk_bundle *vk,
+                               VkCommandBuffer cmd,
+                               VkFramebuffer fb,
+                               uint32_t fb_w,
+                               uint32_t fb_h,
+                               VkImage hud_image,
+                               int32_t dst_x,
+                               int32_t dst_y,
+                               uint32_t dst_w,
+                               uint32_t dst_h,
+                               bool premultiplied);
+
+/*!
+ * vk_hud_blend_draw_no_layout_ex(), sampling the source through a view of
+ * @p src_view_fmt instead of the legacy hard-coded R8G8B8A8_UNORM (#1795).
+ *
+ * Pass the swapchain's DECLARED format to read it honestly: an `_SRGB`
+ * source then decodes to linear on sample, a UNORM source reads the linear
+ * values it holds, and a B8G8R8A8 source is no longer read with R and B
+ * swapped. Honest sampling only belongs in a target that blends in linear
+ * and encodes on write (an `_SRGB` attachment); an encoded UNORM target
+ * keeps the legacy view. VK_FORMAT_UNDEFINED selects the legacy view.
+ *
+ * The view must be legal for the image: its own creation format always is;
+ * a sibling needs VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
+                                struct vk_bundle *vk,
+                                VkCommandBuffer cmd,
+                                VkFramebuffer fb,
+                                uint32_t fb_w,
+                                uint32_t fb_h,
+                                VkImage hud_image,
+                                VkFormat src_view_fmt,
+                                int32_t dst_x,
+                                int32_t dst_y,
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                bool premultiplied);
+
+/*!
  * Draw without managing target image layout transitions or framebuffer
  * caching. Use this when blending into a non-swapchain target (e.g. an
  * atlas image) where the caller manages layout transitions outside the
@@ -149,6 +227,24 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
                               int32_t dst_y,
                               uint32_t dst_w,
                               uint32_t dst_h);
+
+/*!
+ * Drop the cached view(s) + descriptor set(s) for a HUD source image (#1782).
+ *
+ * The cache is keyed by the raw VkImage handle, and drivers hand a destroyed
+ * image's handle value to the next image they create. An entry that outlives
+ * its image is then returned for an unrelated image, and the draw samples a
+ * view of freed memory (on NVIDIA: VK_ERROR_DEVICE_LOST, Xid 109). Whoever
+ * destroys a HUD source image must forget it here before the next draw that
+ * could see the reused handle.
+ *
+ * The caller must ensure no submitted command buffer still uses the entry.
+ * No-op if @p hud_image is not cached.
+ *
+ * @ingroup aux_vk
+ */
+void
+vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkImage hud_image);
 
 /*!
  * Destroy HUD blend resources.

@@ -10,6 +10,8 @@
 #pragma once
 
 #include "xrt/xrt_defines.h"
+#include "xrt/xrt_limits.h"
+#include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
 
 #include <stdint.h>
@@ -20,6 +22,7 @@ struct comp_vk_native_renderer;
 struct comp_vk_native_compositor;
 struct comp_layer_accum;
 struct comp_vk_deposit;
+struct xrt_swapchain;
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +44,24 @@ struct comp_vk_native_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3: per-segment views. 0 = one view set fills every tile
+	 * (the only case before M3). Otherwise the projection layer carries one
+	 * view set per window segment and each tile is a MOSAIC: local view j of
+	 * segment k is placed at that segment's rect inside tile j, so cropping
+	 * a segment's rect out of every tile (comp_vk_native_segments) yields
+	 * exactly that segment's own views. Quads, equirects and zones are not
+	 * routed.
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (== @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!
@@ -172,6 +193,48 @@ int32_t
 comp_vk_native_renderer_get_format(struct comp_vk_native_renderer *renderer);
 
 /*!
+ * The private linear-blend compose target (#1610), for a pass that must blend
+ * in linear light after the projection pass has published the atlas (#1795:
+ * window-space layers).
+ *
+ * The image is B8G8R8A8_UNORM + MUTABLE_FORMAT, sized to the allocated atlas,
+ * usable as TRANSFER_SRC, TRANSFER_DST and COLOR_ATTACHMENT; @p out_view is
+ * its `_SRGB` view, so a render pass on it blends in linear and encodes on
+ * write, and a raw vkCmdCopyImage moves the encoded bytes to and from the
+ * atlas. Its layout on return is unspecified: the caller transitions from
+ * UNDEFINED and overwrites it.
+ *
+ * Returns false â€” keep the encoded-space path â€” under the legacy colour
+ * hatch (the view would be UNORM) or when the target cannot be created.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_get_linear_compose_target(struct comp_vk_native_renderer *renderer,
+                                                  uint64_t *out_image,
+                                                  uint64_t *out_view,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height);
+
+/*!
+ * #2340 — record, into @p cmd, an in-place re-encode of the composed atlas from
+ * sRGB to SMPTE ST 2084 PQ (1.0 linear = 203 cd/m^2, primaries passed through),
+ * for a display processor that accepted @ref XRT_ATLAS_ENCODING_PQ. The Vulkan
+ * twin of the D3D11 compositor's comp_d3d11_renderer_encode_atlas_pq().
+ *
+ * Requires the A2B10G10R10 atlas (DXR_ATLAS_FORMAT=rgb10a2): any other format,
+ * or a pass that cannot be built, records nothing and returns false. The atlas
+ * is expected in SHADER_READ_ONLY_OPTIMAL and is left there.
+ *
+ * @param renderer The renderer.
+ * @param cmd      VkCommandBuffer in the recording state.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_encode_atlas_pq(struct comp_vk_native_renderer *renderer, void *cmd);
+
+/*!
  * Resize the renderer's atlas texture.
  *
  * @param renderer The renderer.
@@ -292,6 +355,87 @@ comp_vk_native_renderer_get_cmd_pool(struct comp_vk_native_renderer *renderer);
 void
 comp_vk_native_renderer_set_transparent(struct comp_vk_native_renderer *renderer,
                                          bool transparent_background);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor - where the sprite's corners land in
+ * each view's tile and which image to sample. Zero-initialised = no cursor.
+ */
+struct u_cursor_draw_request;
+
+struct comp_vk_native_cursor_draw
+{
+	//! Draw at the next comp_vk_native_renderer_draw only.
+	bool active;
+	//! Views mapped below; view i is drawn into atlas tile i.
+	uint32_t view_count;
+	/*!
+	 * Per view, the sprite's corners in TILE-NORMALISED coordinates (origin
+	 * top-left, y down), in texture order (0,0), (0,1), (1,0), (1,1) - the
+	 * u_cursor_draw_corners() output.
+	 */
+	float corners[XRT_MAX_VIEWS][4][2];
+	/*!
+	 * The draw's clip in each tile, tile-normalised (x, y, w, h; origin
+	 * top-left): the whole tile, or a zone's sub-rect in a zones frame (#1949)
+	 * so the cursor never spills out of its zone.
+	 */
+	float clip[4];
+	//! The app's sprite swapchain (sampled at @ref image_index, array layer
+	//! 0) or NULL for the renderer's default-look image.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The source holds premultiplied alpha (the default look) rather than
+	//! straight (the app's sprite, per the spec).
+	bool premultiplied;
+	/*!
+	 * ADR-046 Amendment 2 B.7 crosstalk softening, resolved once per frame
+	 * (u_cursor_draw_soften_sized): blur radius in panel px and opacity.
+	 * (0, 1) = on the glass, drawn by the crisp pipeline, bit-identical.
+	 */
+	float blur_px;
+	float alpha;
+	//! The panel px that 0..1 of a tile spans (the canvas, or the window for
+	//! a zone request) - what the blur pad is converted against.
+	float tile_px_w, tile_px_h;
+	//! #1952: the state tracker's request, for the renderer to report what
+	//! it did (u_cursor_draw_report_drew / _refused). Only its report
+	//! fields are used here.
+	const struct u_cursor_draw_request *req;
+	//! #1952: run every check, draw nothing (the request is report-only).
+	bool report_only;
+};
+
+/*!
+ * Hand the renderer the cursor to draw at its NEXT draw (consumed there).
+ *
+ * The draw forces the compose render pass for that frame (the blit fast path
+ * cannot blend) and draws one alpha-blended quad per view tile AFTER every
+ * layer the pass composes (projection, quad, equirect2) and before the atlas
+ * is published - blending in linear light through the pass's private `_SRGB`
+ * target, sampling the sprite as its declared format, so the atlas stays
+ * ENCODED and is never double-encoded. Nothing is built unless this is called.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_renderer_set_cursor(struct comp_vk_native_renderer *renderer,
+                                   const struct comp_vk_native_cursor_draw *cursor);
+
+/*!
+ * Upload the default look's pixels (premultiplied, sRGB-ENCODED RGBA8, top
+ * row first): staged now, copied into the renderer's own sprite image by the
+ * next draw. Call only when the look's image changed.
+ *
+ * @return false if the image or its staging could not be created.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_renderer_set_cursor_default_image(struct comp_vk_native_renderer *renderer,
+                                                 const uint8_t *rgba,
+                                                 uint32_t width,
+                                                 uint32_t height);
 
 #ifdef __cplusplus
 }

@@ -16,8 +16,32 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		shaders/zone_blit.vert
 		shaders/zone_blit.frag
 		shaders/zone_blit_array.frag
+		shaders/zone_blit_soft.frag
+		shaders/zone_blit_soft_array.frag
+		shaders/equirect2.vert
+		shaders/equirect2.frag
+		shaders/equirect2_array.frag
 		shaders/alpha_probe.comp
+		shaders/atlas_pq.vert
+		shaders/atlas_pq.frag
 		)
+
+	# Multi-screen segment manager (ADR-047 D2), its own library so the
+	# desktop-Linux service's XR_DXR_weave engine (comp_multi, #2218 item 6)
+	# links it without the whole in-process compositor — the comp_d3d11_segs
+	# pattern.
+	add_library(comp_vk_segs STATIC comp_vk_native_segments.c comp_vk_native_segments.h)
+	target_link_libraries(
+		comp_vk_segs
+		PUBLIC xrt-interfaces
+		PRIVATE comp_util aux_vk aux_util aux_os
+		)
+	target_include_directories(comp_vk_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+	# ...and the macOS service's Vulkan (MoltenVK) weave backend.
+	if(TARGET comp_multi AND (XRT_FEATURE_COMP_MULTI_WEAVE_LINUX OR APPLE))
+		target_link_libraries(comp_multi PRIVATE comp_vk_segs)
+		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_SEGMENTS)
+	endif()
 
 	add_library(
 		comp_vk_native STATIC
@@ -28,10 +52,9 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		comp_vk_native_compositor.h
 		comp_vk_native_deposit.cpp
 		comp_vk_native_deposit.h
+		comp_vk_native_equirect2.h
 		comp_vk_native_renderer.c
 		comp_vk_native_renderer.h
-		comp_vk_native_split.cpp
-		comp_vk_native_split.h
 		comp_vk_native_swapchain.c
 		comp_vk_native_swapchain.h
 		comp_vk_native_target.cpp
@@ -49,17 +72,22 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		# carries the canonical `weave placement:` formatter and the scanout
 		# adapter resolver; comp_xbridge is now LINKED, not merely included —
 		# this compositor HAS a split, and the D3D11 ends of the transport are
-		# exactly what the VK-0 deposit hands it. comp_d3d11 provides the
-		# scanout-adapter DXGI swapchain (comp_d3d11_target), reused verbatim.
+		# exactly what the VK-0 deposit hands it. The split itself (the D3D11
+		# fill arm) is comp_hub_d3d11 since #2317 P1a, linked below on every
+		# platform (stubs off Windows).
 		target_link_libraries(comp_vk_native PRIVATE aux_d3d)
 		target_include_directories(
 			comp_vk_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../xbridge
 			)
 		if(XRT_HAVE_D3D11)
 			# comp_xbridge and comp_d3d11 are themselves built only under this
-			# condition, and comp_vk_native_split.cpp compiles to its
-			# honest-NO stubs without it.
+			# condition, and comp_hub_d3d11 compiles to its honest-NO stubs
+			# without it.
 			target_link_libraries(comp_vk_native PRIVATE comp_xbridge comp_d3d11)
+			# Multi-screen M6 under the split (ADR-047 Amendment 1): the
+			# D3D11 segment manager segments a spanning window on the
+			# scanout adapter, as the in-process D3D11 compositor does.
+			target_link_libraries(comp_vk_native PRIVATE comp_d3d11_segs)
 		endif()
 	endif()
 
@@ -68,11 +96,17 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		PUBLIC xrt-interfaces
 		PRIVATE
 			comp_util
+			comp_vk_segs
+			# #2317 P1a: the D3D11 fill arm the VK-1 split drives (stubs off
+			# Windows / without D3D11).
+			comp_hub_d3d11
 			aux_vk
 			aux_util
 			aux_os
 			aux_math
 			xrt-external-stb
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look.
+			comp_cursor_look
 		)
 
 	target_include_directories(comp_vk_native PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
@@ -103,6 +137,19 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			comp_vk_native_window_xcb.h)
 		target_include_directories(comp_vk_native PRIVATE ${XCB_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${XCB_LIBRARIES})
+		if(XCB_SHAPE_FOUND)
+			# Empty input region for the adopt-own-window child (#2322).
+			target_compile_definitions(comp_vk_native PRIVATE XRT_HAVE_XCB_SHAPE=1)
+			target_include_directories(comp_vk_native PRIVATE ${XCB_SHAPE_INCLUDE_DIRS})
+			target_link_libraries(comp_vk_native PRIVATE ${XCB_SHAPE_LIBRARIES})
+		endif()
+
+		# #902 present-feedback feeder: the desktop-Linux source for the vblank
+		# grid late weave aims at (X11 Present CompleteNotify, encoded in-tree —
+		# no libxcb-present — and native-Wayland wp_presentation, below).
+		target_sources(comp_vk_native PRIVATE
+			comp_vk_native_present_feedback.c
+			comp_vk_native_present_feedback.h)
 	endif()
 
 	if(XRT_HAVE_XLIB_XRANDR)
@@ -133,6 +180,41 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 		target_include_directories(comp_vk_native PRIVATE ${WAYLAND_INCLUDE_DIRS})
 		target_link_libraries(comp_vk_native PRIVATE ${WAYLAND_LIBRARIES})
 
+		# #902: wp_presentation glue for the present-feedback feeder, generated
+		# from the vendored XML (src/external/wayland-protocols) the same way
+		# the service window's protocols are (../CMakeLists.txt). Without
+		# wayland-scanner the feeder still builds, X11-only.
+		find_program(DXR_WAYLAND_SCANNER NAMES wayland-scanner)
+		if(XRT_HAVE_XCB AND DXR_WAYLAND_SCANNER)
+			set(_vkpf_xml "${PROJECT_SOURCE_DIR}/src/external/wayland-protocols/presentation-time.xml")
+			set(_vkpf_gen "${CMAKE_CURRENT_BINARY_DIR}/wayland-protocols")
+			set(_vkpf_hdr "${_vkpf_gen}/presentation-time-client-protocol.h")
+			set(_vkpf_src "${_vkpf_gen}/presentation-time-protocol.c")
+			add_custom_command(
+				OUTPUT "${_vkpf_hdr}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkpf_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" client-header "${_vkpf_xml}" "${_vkpf_hdr}"
+				DEPENDS "${_vkpf_xml}"
+				VERBATIM
+				)
+			add_custom_command(
+				OUTPUT "${_vkpf_src}"
+				COMMAND ${CMAKE_COMMAND} -E make_directory "${_vkpf_gen}"
+				COMMAND "${DXR_WAYLAND_SCANNER}" private-code "${_vkpf_xml}" "${_vkpf_src}"
+				DEPENDS "${_vkpf_xml}"
+				VERBATIM
+				)
+			target_sources(comp_vk_native PRIVATE "${_vkpf_hdr}" "${_vkpf_src}")
+			target_include_directories(comp_vk_native PRIVATE "${_vkpf_gen}")
+			# Source-local, not a target define: only the feeder TU reads it, and
+			# a target-wide define here is exactly what the vk_bundle note above
+			# warns about for VK_USE_PLATFORM_*.
+			set_source_files_properties(
+				comp_vk_native_present_feedback.c PROPERTIES COMPILE_DEFINITIONS
+									     DXR_HAVE_WP_PRESENTATION
+				)
+		endif()
+
 		if(XRT_HAVE_DBUS)
 			# Wayland window-geometry provider (#817): Wayland never exposes a
 			# surface's absolute position, so windowed weaving reads it from
@@ -141,15 +223,20 @@ if((WIN32 OR APPLE OR ANDROID OR (XRT_HAVE_LINUX AND XRT_HAVE_XCB)) AND XRT_HAVE
 			# Wayland path stays display-scoped, exactly as before.
 			target_sources(comp_vk_native PRIVATE
 				comp_vk_native_wl_geom.c
-				comp_vk_native_wl_geom.h)
+				comp_vk_native_wl_geom.h
+				comp_vk_native_wl_move_sync.c
+				comp_vk_native_wl_move_sync.h)
 			target_include_directories(comp_vk_native SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
 			target_link_libraries(comp_vk_native PRIVATE ${DBUS_LIBRARIES})
 		endif()
 	endif()
 
-	# Qwerty include path for runtime-side 2D/3D toggle polling
+	# Qwerty for runtime-side 2D/3D toggle polling and the XCB window's input
+	# (qwerty_process_xcb). Link the driver, not just its include path: an
+	# IPC-only runtime (build_linux.sh --service) has no target_lists to bring
+	# the symbols in, and comp_vk_native sits after it on the link line (#2355).
 	if(XRT_BUILD_DRIVER_QWERTY)
-		target_link_libraries(comp_vk_native PRIVATE drv_qwerty_includes)
+		target_link_libraries(comp_vk_native PRIVATE drv_qwerty drv_qwerty_includes)
 		target_compile_definitions(comp_vk_native PRIVATE XRT_BUILD_DRIVER_QWERTY)
 	endif()
 endif()

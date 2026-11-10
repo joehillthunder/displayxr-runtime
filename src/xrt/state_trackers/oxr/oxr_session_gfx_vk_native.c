@@ -17,12 +17,15 @@
 
 #include <stdlib.h>
 
+#include "util/comp_dp_factory.h"
+#include "util/u_vk_queue_lock.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
 
 #include "xrt/xrt_instance.h"
 #include "xrt/xrt_config_have.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_gfx_vk.h"
 
 #include "vk/vk_helpers.h"
@@ -96,6 +99,11 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	// Set system devices for qwerty driver support
 	comp_metal_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
 
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: the VK-via-Metal route runs comp_metal's policy.
+	comp_metal_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
+#endif
+
 	// Set system compositor info for display dimensions
 	if (sys->xsysc != NULL) {
 		comp_metal_compositor_set_sys_info(&xcn->base, &sys->xsysc->info);
@@ -165,6 +173,30 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	sess->compositor = &xcvk->base;
 	sess->create_swapchain = oxr_swapchain_vk_create;
 
+	/*
+	 * sess->xcn IS a comp_metal compositor on this route (the comp_vk_client
+	 * wrapper only lives in sess->compositor), so every per-compositor query
+	 * the state tracker routes on is_metal_native_compositor — eye positions,
+	 * window metrics, display-mode requests, zones, segments, set_screens,
+	 * placement, snap — must take the Metal branch. Without the flag those
+	 * dispatchers fell through to the in-process multi-compositor branch
+	 * (xmcc != NULL on macOS) and cast this comp_metal to a multi_compositor:
+	 * the SIGBUS in multi_compositor_get_predicted_eye_positions at the first
+	 * xrLocateViews, intermittent because it read whatever lay at that offset.
+	 * Others (capture, weave, workspace) classify a session with NO native
+	 * flag as an IPC client and would have called comp_ipc_client_* on it.
+	 *
+	 * The flag names the COMPOSITOR, not the app's graphics API: code that
+	 * needs the app API reads sess->gfx_ext (VULKAN here), and the swapchains
+	 * are client_vk ones (sess->create_swapchain above).
+	 */
+	sess->is_metal_native_compositor = true;
+	sess->is_vk_via_metal = true;
+
+	// Same as the Metal-native path: no multi-compositor event system here.
+	sess->compositor_visible = true;
+	sess->compositor_focused = true;
+
 	// Propagate native compositor's visibility/focus flags to the client wrapper.
 	// oxr_session_create_impl reads these from sess->compositor->info to drive
 	// the SYNCHRONIZED → VISIBLE → FOCUSED state transitions.
@@ -174,6 +206,86 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
 	U_LOG_W("Using Metal native compositor for Vulkan app (VK → Metal via MoltenVK)");
 
 	return XR_SUCCESS;
+}
+
+/*
+ * DXR_MACOS_VK_VIA_METAL: unset (auto) = decide from the active DP's factories;
+ * 1 = always present VK apps through comp_metal; 0 = never (keep vk_native even
+ * for a Metal-only DP, i.e. run unwoven — the pre-routing behaviour).
+ */
+DEBUG_GET_ONCE_TRISTATE_OPTION(macos_vk_via_metal, "DXR_MACOS_VK_VIA_METAL")
+
+bool
+oxr_vk_route_via_metal(struct oxr_system *sys)
+{
+#if defined(XRT_OS_MACOS)
+	static bool logged = false;
+
+	const void *dp_vk = NULL;
+	const void *dp_metal = NULL;
+	const char *metal_only = "";
+	if (sys->xsysc != NULL) {
+		dp_vk = sys->xsysc->info.dp_factory_vk;
+		dp_metal = sys->xsysc->info.dp_factory_metal;
+		metal_only = sys->xsysc->info.metal_only_plugin_id;
+	}
+
+	bool route = false;
+	const char *why = NULL;
+	switch (debug_get_tristate_option_macos_vk_via_metal()) {
+	case DEBUG_TRISTATE_ON:
+		route = true;
+		why = "forced by DXR_MACOS_VK_VIA_METAL=1";
+		break;
+	case DEBUG_TRISTATE_OFF:
+		route = false;
+		why = "forced off by DXR_MACOS_VK_VIA_METAL=0";
+		break;
+	default:
+		/*
+		 * ANY registered display plug-in that can weave only with Metal —
+		 * not just the active one. A plug-in that declined at start (no
+		 * panel attached yet) still counts: with display hotplug (ADR-047
+		 * Amendment 7) its panel can arrive mid-session and be woven in a
+		 * segment, which only comp_metal does on macOS; a session started
+		 * on vk_native would never light it up. A box with only VK-capable
+		 * plug-ins (sim-display) keeps vk_native.
+		 */
+		if (metal_only[0] != '\0') {
+			route = true;
+			why = "a registered display plug-in weaves with Metal only";
+		} else if (dp_vk == NULL && dp_metal != NULL) {
+			route = true;
+			why = "active display processor offers a Metal weaver but no Vulkan one";
+		} else {
+			route = false;
+			why = dp_vk != NULL ? "every registered display plug-in offers a Vulkan weaver"
+			                    : "no display processor factory for either API";
+		}
+		break;
+	}
+
+	// The Metal route also needs the Metal compositor itself to be usable
+	// (in-process, not disabled by OXR_ENABLE_METAL_NATIVE_COMPOSITOR=0).
+	if (route && !oxr_metal_native_compositor_supported(sys, NULL)) {
+		route = false;
+		why = "Metal native compositor unavailable (service mode or disabled)";
+	}
+
+	if (!logged) {
+		logged = true;
+		U_LOG_W(
+		    "macOS Vulkan app route: %s (%s; active dp_factory_vk=%s dp_factory_metal=%s; Metal-only "
+		    "plug-in registered: %s)",
+		    route ? "Metal compositor (VK -> comp_vk_client -> comp_metal)" : "vk_native compositor", why,
+		    dp_vk != NULL ? "yes" : "no", dp_metal != NULL ? "yes" : "no",
+		    metal_only[0] != '\0' ? metal_only : "none");
+	}
+	return route;
+#else
+	(void)sys;
+	return false;
+#endif
 }
 
 #endif /* XRT_HAVE_METAL_NATIVE_COMPOSITOR && XR_USE_GRAPHICS_API_VULKAN */
@@ -264,6 +376,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 bool window_is_wayland,
                                 void *shared_texture_handle,
                                 bool transparent_background,
+                                uint64_t bound_display_id,
                                 struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -283,8 +396,9 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	int32_t display_screen_left = 0;
 	int32_t display_screen_top = 0;
 	if (sys->xsysc != NULL) {
-		dp_factory_vk = sys->xsysc->info.dp_factory_vk;
-		dp_factory_d3d11 = sys->xsysc->info.dp_factory_d3d11;
+		// #2218: a session bound to a display takes that monitor's plug-in (both arms).
+		dp_factory_vk = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_VK);
+		dp_factory_d3d11 = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_D3D11);
 		display_screen_left = sys->xsysc->info.display_screen_left;
 		display_screen_top = sys->xsysc->info.display_screen_top;
 	}
@@ -433,6 +547,10 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	    // The deposit's same-adapter sync rung needs the submit-time
 	    // keyed-mutex handshake, which is invalid without the extension.
 	    sess->sys->vk.win32_keyed_mutex_enabled,
+	    // #2393: vulkan_enable1 = the app created the device. Needed at create
+	    // (the weave-thread ownership is decided there), not only at the
+	    // set_vk_device_origin call below.
+	    !sys->inst->extensions.KHR_vulkan_enable2,
 	    &xcn);
 	if (xret != XRT_SUCCESS) {
 		return oxr_error(log, XR_ERROR_INITIALIZATION_FAILED,
@@ -449,9 +567,15 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	comp_vk_native_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
 #endif
 
-	// Set system compositor info (display dimensions, nominal viewer, legacy flags)
+	// Set system compositor info (display dimensions, nominal viewer, legacy flags).
+	// #2305: copied under the display-hotplug sweep's lock — the sweep may be
+	// rewriting xsysc->info on its own thread right now.
 	if (sess->sys->xsysc != NULL) {
-		comp_vk_native_compositor_set_sys_info(&xcn->base, &sess->sys->xsysc->info);
+		struct xrt_system_compositor_info *sys_info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		if (sys_info != NULL && oxr_system_get_info(sess->sys, sys_info)) {
+			comp_vk_native_compositor_set_sys_info(&xcn->base, sys_info);
+		}
+		free(sys_info);
 	}
 
 	// Set the compositor directly — no client wrapper needed
@@ -472,11 +596,32 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
 	 * consequence once so this is discoverable rather than silent. (The
 	 * enable2-but-family-saturated case logs its own line in oxr_vulkan.c.)
 	 */
-	if (sess->sys->vulkan_runtime_queue_family < 0 && !sys->inst->extensions.KHR_vulkan_enable2) {
-		U_LOG_W("#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
-		        "the runtime has no queue of its own and weave rate cannot be decoupled from render "
-		        "rate (#868 repaint disabled). Port the app to XR_KHR_vulkan_enable2 "
-		        "(xrCreateVulkanDeviceKHR).");
+	const bool app_created_device = !sys->inst->extensions.KHR_vulkan_enable2;
+	comp_vk_native_compositor_set_vk_device_origin(&xcn->base, app_created_device,
+	                                               sys->vulkan_queue_lock_injected && !app_created_device);
+	if (sess->sys->vulkan_runtime_queue_family < 0 && app_created_device) {
+		bool ql_live = false;
+		bool repaint_on = false;
+		bool shared = comp_vk_native_compositor_get_queue_lock_state(&xcn->base, &ql_live, &repaint_on);
+		if (shared) {
+			// The app brought VK_LAYER_DXR_queue_lock into its own chain
+			// (named it, or DXR_VK_QUEUE_LOCK=1 + the implicit manifest):
+			// the repaint shares the app's queue, serialised by the layer.
+			U_LOG_W(
+			    "#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
+			    "the runtime has no queue of its own; VK_LAYER_DXR_queue_lock is live on it, so the "
+			    "#868 repaint shares the app's queue (layer tier; route in the #886 line above).");
+		} else {
+			U_LOG_W(
+			    "#886: this Vulkan app uses XR_KHR_vulkan_enable1 — the app created the VkDevice, so "
+			    "the runtime has no queue of its own and weave rate cannot be decoupled from render "
+			    "rate (#868 repaint disabled%s). Fix: " U_VK_QL_ENABLE1_HINT
+			    ", or port the app to "
+			    "XR_KHR_vulkan_enable2 (xrCreateVulkanDeviceKHR).",
+			    ql_live
+			        ? "; the queue-lock layer is live but DXR_VK_QUEUE_MODE / DXR_WEAVE_REPAINT excludes it"
+			        : "");
+		}
 	}
 
 	// Native compositor is always visible and focused

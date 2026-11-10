@@ -437,6 +437,8 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrRequestEyeTrackingModeDXR, DXR_display_info);
 	ENTRY_IF_EXT(xrRequestDisplayRenderingModeDXR, DXR_display_info);
 	ENTRY_IF_EXT(xrEnumerateDisplayRenderingModesDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrEnumerateDisplaysDXR, DXR_display_info);
+	ENTRY_IF_EXT(xrCreateDisplaySpaceDXR, DXR_display_info);
 #endif
 
 #ifdef OXR_HAVE_DXR_view_rig
@@ -476,6 +478,9 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrAcquireWorkspaceWakeupEventDXR, DXR_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceClientStyleDXR, DXR_spatial_workspace);
 	ENTRY_IF_EXT(xrSetWorkspaceInputGrabDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrEnumerateWorkspaceScreensDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrSetWorkspaceClientWindowPlacementDXR, DXR_spatial_workspace);
+	ENTRY_IF_EXT(xrGetWorkspaceClientWindowPlacementDXR, DXR_spatial_workspace);
 #endif
 
 #ifdef OXR_HAVE_DXR_atlas_capture
@@ -489,6 +494,7 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 #ifdef OXR_HAVE_DXR_android_surface_binding
 	ENTRY_IF_EXT(xrSetAndroidSurfaceDXR, DXR_android_surface_binding);
 	ENTRY_IF_EXT(xrSetAndroidWindowGeometryDXR, DXR_android_surface_binding);
+	ENTRY_IF_EXT(xrSubmitAndroidInputEventDXR, DXR_android_surface_binding);
 #endif
 
 #ifdef OXR_HAVE_DXR_local_3d_zone
@@ -515,6 +521,50 @@ handle_non_null(struct oxr_instance *inst, struct oxr_logger *log, const char *n
 	ENTRY_IF_EXT(xrWeaveSnapWindowGridDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveSetScreenFlatRegionsDXR, DXR_weave);
 	ENTRY_IF_EXT(xrWeaveExportIpcConnectionDXR, DXR_weave);
+#endif
+#ifdef OXR_HAVE_DXR_lift
+	ENTRY_IF_EXT(xrGetLiftPropertiesDXR, DXR_lift);
+	ENTRY_IF_EXT(xrCreateLiftStreamDXR, DXR_lift);
+	ENTRY_IF_EXT(xrDestroyLiftStreamDXR, DXR_lift);
+	ENTRY_IF_EXT(xrSubmitLiftFrameDXR, DXR_lift);
+	ENTRY_IF_EXT(xrAcquireLiftResultDXR, DXR_lift);
+	ENTRY_IF_EXT(xrAcquireLiftBlobDXR, DXR_lift);
+	ENTRY_IF_EXT(xrSetLiftStreamPriorityDXR, DXR_lift);
+	ENTRY_IF_EXT(xrGetLiftStreamStatsDXR, DXR_lift);
+	ENTRY_IF_EXT(xrEnumerateLiftTasksDXR, DXR_lift);
+	ENTRY_IF_EXT(xrRequestLiftTaskWarmDXR, DXR_lift);
+	ENTRY_IF_EXT(xrEnumerateLiftTaskCandidatesDXR, DXR_lift);
+#endif
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+	ENTRY_IF_EXT(xrEnumerateStereoCamerasDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrGetStereoCameraCalibrationDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrCreateStereoCameraStreamDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrDestroyStereoCameraStreamDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrStartStereoCameraStreamDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrStopStereoCameraStreamDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrGetStereoCameraStreamInfoDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrAcquireStereoCameraFrameDXR, DXR_stereo_camera);
+	ENTRY_IF_EXT(xrGetStereoCameraStreamStatsDXR, DXR_stereo_camera);
+#endif
+
+#ifdef OXR_HAVE_DXR_desktop_control
+	ENTRY_IF_EXT(xrGetDesktopControlStateDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrRequestDesktopControlDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrEnumerateDesktopWindowsDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopPointerDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrPickDesktopDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopTextAtDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrSubmitDesktopActionDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopCaptureStateDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrCaptureDesktopDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopCaptureImageDXR, DXR_desktop_control);
+	ENTRY_IF_EXT(xrGetDesktopClipboardTextDXR, DXR_desktop_control);
+#endif
+
+#ifdef OXR_HAVE_DXR_input_providers
+	ENTRY_IF_EXT(xrEnumerateInputProvidersDXR, DXR_input_providers);
+	ENTRY_IF_EXT(xrSetInputProviderPreferenceDXR, DXR_input_providers);
 #endif
 
 #ifdef OXR_HAVE_DXR_workspace_file_dialog

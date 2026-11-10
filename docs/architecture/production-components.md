@@ -5,7 +5,8 @@ What ships, what runs, and how the pieces connect.
 ## Components
 
 The DisplayXR runtime installer delivers the runtime DLL, the service,
-`displayxr-cli.exe`, `displayxr-control-panel.exe`, and the vendor-neutral
+`displayxr-cli.exe`, `displayxr-dashboard.exe` (the DisplayXR Dashboard, which
+replaced the ImGui Control Panel), and the vendor-neutral
 sim-display plug-in. The workspace controller (reference: DisplayXR Shell) ships
 from `displayxr-shell-pvt` as a **separate** installer; the WebXR bridge is built
 from this repo and installed with the runtime. The MCP adapter and the voice
@@ -141,7 +142,8 @@ The service is the always-on **orchestrator**, and by default it spawns its
 children on demand. The shipped `service.json` defaults are `workspace=auto`
 and `bridge=auto` (`service_config.c:37-38`):
 
-- **`workspace=auto`** — the service installs a `WH_KEYBOARD_LL` Ctrl+Space hook
+- **`workspace=auto`** — the service installs a `WH_KEYBOARD_LL` hook for the launch hotkey
+  (`Ctrl+Shift+Space` by default; `Ctrl+Space` before 2026-10-26)
   on its tray thread and spawns the registered workspace controller when the
   hotkey fires (`service_orchestrator.c:700-779`).
 - **`bridge=auto`** — the service opens the :9014 trampoline at startup and
@@ -163,7 +165,7 @@ Run key with `--autostart` **exits immediately** when `start_on_login=false`
 |---------|------------|
 | Native app calls `xrCreateInstance()` | Nothing new — DLL composites in-process |
 | Chrome opens a WebXR page | Service already running; app connects via IPC |
-| User presses **Ctrl+Space** | Service spawns the registered workspace controller (`workspace=auto`) |
+| User presses the launch hotkey (**Ctrl+Shift+Space** by default) | Service spawns the registered workspace controller (`workspace=auto`) |
 | User launches the workspace controller directly (Start Menu or shortcut) | Fallback path: the controller auto-launches the service if it isn't already running, then activates workspace mode over IPC |
 | User opens a WebXR page with the extension | The extension's first connect to :9014 **is** the launch trigger — the service spawns the bridge (`bridge=auto`); no manual start |
 
@@ -175,7 +177,7 @@ Run key with `--autostart` **exits immediately** when `start_on_login=false`
 | Hybrid entry | `src/xrt/targets/openxr/target.c` | `xrt_instance_create()` — picks native vs IPC |
 | Service entry | `src/xrt/targets/service/main.c` | Service process with tray icon and IPC mainloop |
 | Workspace controller entry | `displayxr-shell-pvt/src/main.c` (private repo) | Reference workspace controller — hotkeys, launcher, 2D capture. This repo builds no shell binary. |
-| Child-process orchestration | `src/xrt/targets/service/service_orchestrator.c` | Spawns and supervises the workspace controller; Ctrl+Space hook |
+| Child-process orchestration | `src/xrt/targets/service/service_orchestrator.c` | Spawns and supervises the workspace controller; launch-hotkey hook |
 | Controller discovery | `src/xrt/targets/service/service_workspace_registry.c` | Enumerates registered workspace controllers and their published actions |
 | Tray UI | `src/xrt/targets/service/service_tray_win.c` | Tray menu, published-actions rendering, Exit |
 | Service config | `src/xrt/targets/service/service_config.c` | `service.json` — `workspace` child mode, `start_on_login` |

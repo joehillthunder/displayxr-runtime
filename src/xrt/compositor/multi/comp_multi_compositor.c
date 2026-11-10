@@ -17,6 +17,7 @@
  */
 
 #include "util/u_logging.h"
+#include "xrt/xrt_display_processor_vk.h" // N6 Part 1 (#2144): the target-time eye slot on the VK variant
 #include "xrt/xrt_session.h"
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_display_metrics.h"
@@ -42,6 +43,10 @@
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_system.h"
+
+#ifdef XRT_OS_MACOS
+#include "xrt/xrt_display_processor_metal.h" // weave Metal backend DP (#759)
+#endif
 
 #ifdef XRT_OS_WINDOWS
 #include "comp_d3d11_window.h"
@@ -117,6 +122,35 @@ run_dp_factory_on_main_thread(void *data)
 	    c->factory(c->vk_bundle, c->vk_cmd_pool, c->window_handle, c->target_format, c->out_xdp);
 }
 #endif
+
+xrt_result_t
+multi_dp_factory_create(xrt_dp_factory_vk_fn_t factory,
+                        void *vk_bundle,
+                        void *vk_cmd_pool,
+                        void *window_handle,
+                        int32_t target_format,
+                        struct xrt_display_processor **out_xdp)
+{
+	if (factory == NULL || out_xdp == NULL) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+#ifdef XRT_OS_ANDROID
+	struct dp_factory_call_ctx ctx = {
+	    .factory = factory,
+	    .vk_bundle = vk_bundle,
+	    .vk_cmd_pool = vk_cmd_pool,
+	    .window_handle = window_handle,
+	    .target_format = target_format,
+	    .out_xdp = out_xdp,
+	    .result = XRT_SUCCESS,
+	};
+	xrt_result_t ret =
+	    android_run_on_main_thread_timeout(run_dp_factory_on_main_thread, &ctx, 2000 * U_TIME_1MS_IN_NS);
+	return ret == XRT_SUCCESS ? ctx.result : ret;
+#else
+	return factory(vk_bundle, vk_cmd_pool, window_handle, target_format, out_xdp);
+#endif
+}
 
 DEBUG_GET_ONCE_LOG_OPTION(app_frame_lag_level, "XRT_APP_FRAME_LAG_LOG_AS_LEVEL", U_LOGGING_DEBUG)
 #define LOG_FRAME_LAG(...) U_LOG_IFL(debug_get_log_option_app_frame_lag_level(), u_log_get_global_level(), __VA_ARGS__)
@@ -552,6 +586,45 @@ multi_compositor_create_semaphore(struct xrt_compositor *xc,
 	return xrt_comp_create_semaphore(&mc->msc->xcn->base, out_handle, out_xcsem);
 }
 
+
+/*!
+ * Take the session-render display processor out of @p mc under
+ * `list_and_timing_lock`, then destroy it with the lock DROPPED (#1007).
+ *
+ * Two constraints meet here:
+ *  - the render thread reads `session_render.display_processor` under the
+ *    lock while @p mc is still in `msc->clients[]` — on Android the
+ *    per-frame convergence pass (`android_window_transition_locked` →
+ *    `multi_compositor_set_window_visible_locked`) calls on_pause/on_resume
+ *    on it. Destroying it in place with the lock dropped was a
+ *    use-after-free: the pointer was freed while still published.
+ *  - the destroy itself must NOT run under the lock: CNSDK core release can
+ *    join a thread that never exits (displayxr-leia-plugin#39), and a hang
+ *    there under `list_and_timing_lock` would freeze every client.
+ *
+ * So unpublish first (pointer NULL + visibility UNKNOWN, under render_lock +
+ * list_and_timing_lock), destroy the private copy after with neither held.
+ * Safe to call when there is no DP.
+ */
+static void
+multi_compositor_detach_and_destroy_dp(struct multi_compositor *mc)
+{
+	// #1005: the render thread uses the DP under render_lock (not
+	// list_and_timing_lock) — take both, in order. Caller must hold neither.
+	os_mutex_lock(&mc->msc->render_lock);
+	os_mutex_lock(&mc->msc->list_and_timing_lock);
+	struct xrt_display_processor *xdp = mc->session_render.display_processor;
+	mc->session_render.display_processor = NULL;
+	mc->session_render.dp_visibility = MULTI_DP_VIS_UNKNOWN;
+	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+	os_mutex_unlock(&mc->msc->render_lock);
+
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+	comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)xdp); // its eyes key (roadmap §5.2)
+#endif
+	xrt_display_processor_destroy(&xdp);
+}
+
 #ifdef XRT_OS_ANDROID
 /*
  * #1039. SINGLE WRITER: this is called from exactly one place — the multi main
@@ -718,6 +791,9 @@ multi_compositor_begin_session(struct xrt_compositor *xc, const struct xrt_begin
 		// is still NULL until the lazy init_session_render) and refuses to take
 		// a lens vote for a session begun while its window is still gone.
 #endif
+		// A new session gets an immediate per-session init attempt (#1006).
+		mc->session_render.init_retry_after_ns = 0;
+		mc->session_render.init_fail_count = 0;
 		multi_system_compositor_update_session_status(mc->msc, true);
 		mc->state.session_active = true;
 	}
@@ -742,9 +818,14 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 		// target we are tearing down, racing vkCreateAndroidSurfaceKHR against
 		// the old swapchain's BufferQueue connection (#528,
 		// VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm).
+		//
+		// #1005: and under render_lock — the frame no longer runs under
+		// list_and_timing_lock, so this is what waits out a frame in flight.
+		os_mutex_lock(&mc->msc->render_lock);
 		os_mutex_lock(&mc->msc->list_and_timing_lock);
 		mc->state.session_active = false;
 		os_mutex_unlock(&mc->msc->list_and_timing_lock);
+		os_mutex_unlock(&mc->msc->render_lock);
 		multi_system_compositor_update_session_status(mc->msc, false);
 
 		// Clean up per-session render resources
@@ -756,6 +837,9 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// the compositor lock. Both must be cleared atomically so the
 			// compositor thread's has_session_render() returns false and
 			// won't attempt re-initialization during teardown.
+			// #1005: render_lock first, so a frame still rendering this
+			// session finishes before its resources are torn down below.
+			os_mutex_lock(&mc->msc->render_lock);
 			os_mutex_lock(&mc->msc->list_and_timing_lock);
 			mc->session_render.initialized = false;
 			mc->session_render.external_window_handle = NULL;
@@ -767,14 +851,25 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// fields — begin_session re-sets it on the next session.
 			mc->session_render.use_macos_surface = false;
 			os_mutex_unlock(&mc->msc->list_and_timing_lock);
+			os_mutex_unlock(&mc->msc->render_lock);
 
 			struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
-			// Wait for any pending GPU work to complete before cleanup
+			// Wait for any pending GPU work to complete before cleanup —
+			// bounded (#1007). If it never lands (wedged device / hung DP),
+			// LEAK this session's Vulkan objects (vk = NULL skips every
+			// destroy below) instead of freeing memory the GPU may still
+			// read, and instead of parking this IPC thread forever.
 			if (vk != NULL && mc->session_render.fenced_buffer >= 0) {
-				vk->vkWaitForFences(vk->device, 1,
-				                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-				                    VK_TRUE, UINT64_MAX);
+				if (multi_wait_fences_bounded(
+				        vk, 1, &mc->session_render.fences[mc->session_render.fenced_buffer],
+				        MULTI_FENCE_DEADLINE_NS, "end_session") == VK_TIMEOUT) {
+					U_LOG_E(
+					    "end_session: GPU work still pending after %d ms - leaking per-session "
+					    "Vulkan objects (#1007)",
+					    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+					vk = NULL;
+				}
 				mc->session_render.fenced_buffer = -1;
 			}
 
@@ -803,8 +898,9 @@ multi_compositor_end_session(struct xrt_compositor *xc)
 			// (this runs on an IPC handler thread with the lock dropped)
 			// — see the note on multi_compositor_set_window_visible_locked.
 #else
-			// Destroy display processor (owns any vendor SDK handles)
-			xrt_display_processor_destroy(&mc->session_render.display_processor);
+			// Destroy display processor (owns any vendor SDK handles).
+			// Unpublished under the lock first (#1007).
+			multi_compositor_detach_and_destroy_dp(mc);
 #endif
 
 			// Destroy fences (generic Vulkan)
@@ -1396,6 +1492,15 @@ multi_compositor_request_display_refresh_rate(struct xrt_compositor *xc, float d
 }
 
 static void
+multi_compositor_destroy(struct xrt_compositor *xc);
+
+bool
+multi_compositor_is(const struct xrt_compositor *xc)
+{
+	return xc != NULL && xc->destroy == multi_compositor_destroy;
+}
+
+static void
 multi_compositor_destroy(struct xrt_compositor *xc)
 {
 	COMP_TRACE_MARKER();
@@ -1417,6 +1522,43 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		mc->state.session_active = false;
 	}
 
+	// #1005: unlist FIRST, under render_lock + list_and_timing_lock. Holding
+	// render_lock means no frame is in flight; once we are off msc->clients
+	// the next frame's snapshot cannot contain us, so everything below runs
+	// with no lock and no frame can touch this client again.
+	os_mutex_lock(&mc->msc->render_lock);
+	os_mutex_lock(&mc->msc->list_and_timing_lock);
+
+	// Remove it from the list of clients.
+	bool was_bridge = mc->xsi.is_bridge_relay;
+	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
+		if (mc->msc->clients[i] == mc) {
+			mc->msc->clients[i] = NULL;
+		}
+	}
+
+	if (was_bridge) {
+		extern bool g_bridge_relay_active;
+		bool any_bridge = false;
+		for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
+			if (mc->msc->clients[i] != NULL && mc->msc->clients[i]->xsi.is_bridge_relay) {
+				any_bridge = true;
+				break;
+			}
+		}
+		g_bridge_relay_active = any_bridge;
+#ifdef XRT_BUILD_DRIVER_QWERTY
+		extern void qwerty_set_bridge_relay_active(bool);
+		qwerty_set_bridge_relay_active(any_bridge);
+#endif
+		if (!any_bridge) {
+			U_LOG_W("Bridge relay session disconnected — legacy sessions revert to compromise scaling");
+		}
+	}
+
+	os_mutex_unlock(&mc->msc->list_and_timing_lock);
+	os_mutex_unlock(&mc->msc->render_lock);
+
 	// The display processor can outlive session_render.initialized: the
 	// Android end_session path deliberately caches it across end->begin
 	// (leia-plugin#39), so a client that ended its session before
@@ -1428,8 +1570,13 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 	// initialized-gated block below destroys it for the still-initialized
 	// case (xrt_display_processor_destroy NULLs the pointer, so at most one
 	// of the two calls acts).
+	//
+	// #1007: never destroy it in place — mc is still in msc->clients[] here,
+	// and the render thread's convergence pass reads the pointer under
+	// list_and_timing_lock. detach_and_destroy unpublishes it under the lock
+	// and destroys it with the lock dropped (CNSDK release can hang, #39).
 	if (!mc->session_render.initialized && mc->session_render.display_processor != NULL) {
-		xrt_display_processor_destroy(&mc->session_render.display_processor);
+		multi_compositor_detach_and_destroy_dp(mc);
 	}
 
 	// Clean up per-session render resources if still initialized
@@ -1446,16 +1593,25 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 
 		struct vk_bundle *vk = comp_target_service_get_vk(mc->msc->target_service);
 
-		// Wait for any pending GPU work to complete before cleanup
+		// Wait for any pending GPU work to complete before cleanup —
+		// bounded (#1007); on expiry leak rather than free in-use objects
+		// (vk = NULL skips every Vulkan destroy below).
 		if (vk != NULL && mc->session_render.fenced_buffer >= 0) {
-			vk->vkWaitForFences(vk->device, 1,
-			                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-			                    VK_TRUE, UINT64_MAX);
+			if (multi_wait_fences_bounded(vk, 1,
+			                              &mc->session_render.fences[mc->session_render.fenced_buffer],
+			                              MULTI_FENCE_DEADLINE_NS, "client destroy") == VK_TIMEOUT) {
+				U_LOG_E(
+				    "multi_compositor_destroy: GPU work still pending after %d ms - leaking "
+				    "per-session Vulkan objects (#1007)",
+				    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+				vk = NULL;
+			}
 			mc->session_render.fenced_buffer = -1;
 		}
 
-		// Destroy display processor (owns any vendor SDK handles)
-		xrt_display_processor_destroy(&mc->session_render.display_processor);
+		// Destroy display processor (owns any vendor SDK handles).
+		// Unpublished under the lock first (#1007).
+		multi_compositor_detach_and_destroy_dp(mc);
 
 		// Destroy composite resources (intermediate pre-display-processing targets)
 		if (vk != NULL && mc->session_render.composite_initialized) {
@@ -1608,37 +1764,6 @@ multi_compositor_destroy(struct xrt_compositor *xc)
 		U_LOG_W("Destroyed self-owned window in compositor destroy");
 	}
 #endif
-
-	os_mutex_lock(&mc->msc->list_and_timing_lock);
-
-	// Remove it from the list of clients.
-	bool was_bridge = mc->xsi.is_bridge_relay;
-	for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
-		if (mc->msc->clients[i] == mc) {
-			mc->msc->clients[i] = NULL;
-		}
-	}
-
-	if (was_bridge) {
-		extern bool g_bridge_relay_active;
-		bool any_bridge = false;
-		for (size_t i = 0; i < MULTI_MAX_CLIENTS; i++) {
-			if (mc->msc->clients[i] != NULL && mc->msc->clients[i]->xsi.is_bridge_relay) {
-				any_bridge = true;
-				break;
-			}
-		}
-		g_bridge_relay_active = any_bridge;
-#ifdef XRT_BUILD_DRIVER_QWERTY
-		extern void qwerty_set_bridge_relay_active(bool);
-		qwerty_set_bridge_relay_active(any_bridge);
-#endif
-		if (!any_bridge) {
-			U_LOG_W("Bridge relay session disconnected — legacy sessions revert to compromise scaling");
-		}
-	}
-
-	os_mutex_unlock(&mc->msc->list_and_timing_lock);
 
 	// Destroy the wait thread, destroy also stops the thread.
 	os_thread_helper_destroy(&mc->wait_thread.oth);
@@ -1989,32 +2114,29 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 		xrt_dp_factory_vk_fn_t factory =
 		    (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 		if (factory != NULL) {
-#ifdef XRT_OS_ANDROID
 			// The Leia CNSDK (and likely other Android vendor DPs) must have their
 			// async init kicked off from a Looper-bearing thread. This code runs on
-			// the comp_multi render worker (no Looper), so marshal the factory call
-			// onto the service main thread, which owns the pumped main Looper. The
-			// call is brief (the init is async on the DP's own thread) and the worker
-			// holds list_and_timing_lock only for that window. (#510 M2)
-			struct dp_factory_call_ctx ctx = {
-			    .factory = factory,
-			    .vk_bundle = vk,
-			    .vk_cmd_pool = (void *)(uintptr_t)mc->session_render.cmd_pool,
-			    .window_handle = mc->session_render.external_window_handle,
-			    .target_format = (int32_t)ct->format,
-			    .out_xdp = &mc->session_render.display_processor,
-			    .result = XRT_SUCCESS,
-			};
-			android_run_on_main_thread_blocking(run_dp_factory_on_main_thread, &ctx);
-			xrt_result_t dp_ret = ctx.result;
-#else
-			xrt_result_t dp_ret = factory(
-			    vk,                                          // vk_bundle
-			    (void *)(uintptr_t)mc->session_render.cmd_pool, // cmd_pool
-			    mc->session_render.external_window_handle,   // window_handle
-			    (int32_t)ct->format,                         // target_format
-			    &mc->session_render.display_processor);      // out_xdp
+			// the comp_multi render worker (no Looper), so on Android
+			// multi_dp_factory_create marshals the call onto the service main
+			// thread (#510 M2), bounded at 2 s (#1007): the render thread holds
+			// render_lock + list_and_timing_lock here, so a wedged main Looper
+			// must not freeze every client.
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(COMP_MULTI_PER_SESSION_TARGET)
+			// #1006 / R2 measurement: a paused shared-surface DP from an
+			// earlier workspace overlay is still alive in this process.
+			if (mc->msc->shared_dp != NULL) {
+				U_LOG_W(
+				    "[#1006] creating a per-session DP while the (paused) shared DP is alive in this "
+				    "process - two vendor cores in one process (R2)");
+			}
 #endif
+			xrt_result_t dp_ret =
+			    multi_dp_factory_create(factory,                                        //
+			                            vk,                                             // vk_bundle
+			                            (void *)(uintptr_t)mc->session_render.cmd_pool, // cmd_pool
+			                            mc->session_render.external_window_handle,      // window_handle
+			                            (int32_t)ct->format,                            // target_format
+			                            &mc->session_render.display_processor);         // out_xdp
 			if (dp_ret != XRT_SUCCESS) {
 				U_LOG_W("Display processor factory failed: %d (continuing without)", dp_ret);
 				mc->session_render.display_processor = NULL;
@@ -2082,6 +2204,26 @@ multi_compositor_init_session_render(struct multi_compositor *mc)
 	return true;
 }
 
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * ADR-053 P5 step C (roadmap §5.2): every eye query comp_multi answers
+ * publishes the answering DP's eyes into the conversion core, keyed by that DP
+ * -- the D3D11 service's per-DP eyes sink. A lifted weave rect names its weave
+ * engine's DP, so its stream reads exactly these.
+ */
+static bool
+eyes_published(const void *dp, bool ok, const struct xrt_eye_positions *eyes)
+{
+	if (ok) {
+		comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)dp, eyes);
+	}
+	return ok;
+}
+#define EYES_PUBLISHED(dp, call) eyes_published((dp), (call), out_eye_pos)
+#else
+#define EYES_PUBLISHED(dp, call) (call)
+#endif
+
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos)
 {
@@ -2090,8 +2232,9 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	}
 
 	if (mc->session_render.initialized && mc->session_render.display_processor != NULL) {
-		return xrt_display_processor_get_predicted_eye_positions(mc->session_render.display_processor,
-		                                                         out_eye_pos);
+		return EYES_PUBLISHED(mc->session_render.display_processor,
+		                      xrt_display_processor_get_predicted_eye_positions(
+		                          mc->session_render.display_processor, out_eye_pos));
 	}
 
 #ifdef COMP_MULTI_HAVE_WEAVE
@@ -2103,12 +2246,77 @@ multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct
 	// the weave itself visibly tracks the head. Same lock-free read trade as
 	// the weave-geometry metrics branch above.
 	if (mc->weave.dp != NULL) {
-		return xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos);
+		return EYES_PUBLISHED(mc->weave.dp,
+		                      xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eye_pos));
+	}
+#if defined(XRT_OS_MACOS) && defined(COMP_MULTI_WEAVE_HAVE_METAL)
+	// The macOS weave's Metal backend keeps its DP apart: `weave.dp` only ever
+	// holds a Vulkan-vtable DP. Read through the backend so the vendor call
+	// runs inside an autorelease pool (this is an IPC pthread with none).
+	if (mc->weave.dp_metal != NULL) {
+		return EYES_PUBLISHED(mc->weave.dp_metal,
+		                      comp_multi_weave_macos_metal_predicted_eyes(mc->weave.dp_metal, out_eye_pos));
+	}
+#endif
+#endif
+
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// A shared-surface client (#59 / #710) has no per-session DP: the ONE shared
+	// DP weaves it, so its eyes are the ones steering this client's weave.
+	// Without this a tracked panel's locates fell back to the nominal viewer.
+	// shared_dp lives until the system compositor is destroyed (lock-free read,
+	// as above).
+	if (mc->msc != NULL && multi_shared_surface_active(mc->msc) && mc->msc->shared_dp != NULL) {
+		return EYES_PUBLISHED(mc->msc->shared_dp, xrt_display_processor_get_predicted_eye_positions(
+		                                              mc->msc->shared_dp, out_eye_pos));
 	}
 #endif
 
 	out_eye_pos->valid = false;
 	return false;
+}
+
+bool
+multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
+                                      int64_t target_ns,
+                                      struct xrt_eye_positions *out_eye_pos)
+{
+	if (mc == NULL || out_eye_pos == NULL) {
+		return false;
+	}
+	if (target_ns <= 0) {
+		// 0 = "latest" (the pre-N6 IPC wire meaning).
+		return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
+	}
+
+	// N6 Part 1 (#2144): the same source order as the "latest" query above,
+	// asking each Vulkan-vtable DP's target-time slot (on the VK variant —
+	// every DP a Vulkan factory hands out is one) when it has it. A DP
+	// without the slot keeps the unchanged "latest" answer; the multi
+	// compositor keeps no ring of its own (the per-frame weave queries live
+	// in the weave engines — Part 1b).
+	struct xrt_display_processor *dp = NULL;
+	if (mc->session_render.initialized && mc->session_render.display_processor != NULL) {
+		dp = mc->session_render.display_processor;
+	}
+#ifdef COMP_MULTI_HAVE_WEAVE
+	if (dp == NULL && mc->weave.dp != NULL) {
+		dp = mc->weave.dp;
+	}
+#endif
+#ifdef COMP_MULTI_SHARED_SURFACE
+	if (dp == NULL && mc->msc != NULL && multi_shared_surface_active(mc->msc) && mc->msc->shared_dp != NULL) {
+		dp = mc->msc->shared_dp;
+	}
+#endif
+	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
+	if (xrt_display_processor_vk_has_eye_positions_at(vdp) &&
+	    xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos) && out_eye_pos->valid) {
+		return true;
+	}
+	// No slot (or it failed; there is no ring here): the DP's own "latest"
+	// answer, unchanged — exactly the pre-N6 behaviour.
+	return multi_compositor_get_predicted_eye_positions(mc, out_eye_pos);
 }
 
 #ifdef XRT_OS_WINDOWS
@@ -2458,6 +2666,54 @@ multi_compositor_get_window_screen_rect(struct multi_compositor *mc,
 bool
 multi_compositor_request_display_mode(struct multi_compositor *mc, bool enable_3d)
 {
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop-Linux XR_DXR_weave present-owner (browser#55 on Linux): it has no
+	// window, so session_render is never initialised and the gate below dropped
+	// every hardware request on the floor — the panel's lens stayed on over a
+	// 2D tab while the browser believed the request had landed. Its DP is the
+	// weave engine's own instance (mc->weave.dp), so the request goes there.
+	//
+	// #710: with the shared spatial surface, a composited (non-weave) client
+	// also has no session_render; only a client that has bound a weave window
+	// is a weave client. Any other request is recorded below as the wish the
+	// shared surface converges on (the weave engine reads the same wish at its
+	// bring-up, so a pre-bind request from a present-owner is not lost).
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.window_bound) {
+		return comp_multi_weave_linux_request_display_mode(mc, enable_3d);
+	}
+#endif
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_MACOS)
+	// The macOS twin (#759): a weave-only present-owner (a browser) has no
+	// session_render either, so a 2D page could never switch the lens off.
+	// Its DP is the weave engine's (vk or Metal backend). Only a client that
+	// has touched the weave service (bind_window comes first) is routed here,
+	// so a shared-surface app keeps its old behaviour.
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.mutex_initialized) {
+		return comp_multi_weave_macos_request_display_mode(mc, enable_3d);
+	}
+#endif
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_ANDROID)
+	// The Android twin: the DisplayXR Browser's weaving session lives in its GPU
+	// process and is a weave-only present-owner, so it has no session_render
+	// either and the gate below dropped every hardware request — a page's
+	// requestRenderingMode / setStereoEnabled(false) never turned the lens off
+	// and no event came back (browser-pvt#334). Its DP is the weave engine's
+	// (mc->weave.dp). Only a client that has touched the weave service (bind
+	// comes first) is routed here, so an app-class session keeps its old path.
+	if (mc != NULL && !mc->session_render.initialized && mc->weave.mutex_initialized) {
+		return comp_multi_weave_android_request_display_mode(mc, enable_3d);
+	}
+#endif
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// D-5 (#967): a shared-surface client has no per-session DP; its wish is
+	// applied to the ONE shared display processor by the render thread
+	// (shared_converge_display_mode_locked), which also emits the hardware
+	// state event once the DP accepted it.
+	if (mc != NULL && multi_shared_surface_active(mc->msc) && !mc->session_render.initialized) {
+		mc->hardware_display_3d = enable_3d;
+		return true;
+	}
+#endif
 	if (mc == NULL || !mc->session_render.initialized) {
 		return false;
 	}
@@ -2549,6 +2805,16 @@ multi_compositor_vtable_request_rendering_mode(struct xrt_compositor *xc,
 void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
 {
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_ANDROID)
+	// A weave-only client (XR_DXR_weave present-owner) has no session_render, so
+	// the gate below dropped its MANAGED/MANUAL request. Its DP is the weave
+	// engine's own instance: hold the mode and apply it there, now if the engine
+	// is up, otherwise at bring-up (comp_multi_weave_android.c).
+	if (mc != NULL && !mc->session_render.initialized) {
+		comp_multi_weave_android_set_eye_tracking_mode(mc, mode);
+		return;
+	}
+#endif
 	if (mc == NULL || !mc->session_render.initialized) {
 		return;
 	}

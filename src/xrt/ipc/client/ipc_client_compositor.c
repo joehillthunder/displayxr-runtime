@@ -25,10 +25,19 @@
 #include "util/u_trace_marker.h"
 #include "util/u_limited_unique_id.h"
 #include "util/u_snap_grid.h"
+#include "util/u_logging.h"
+#include "util/u_cursor_depth.h" // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
+
+#ifdef XRT_OS_WINDOWS
+#include "util/u_capture_intent.h"
+#include "util/u_image_capture.h"
+#include <displayxr_mcp/mcp_capture.h>
+#endif
 
 #include "shared/ipc_protocol.h"
 #include "client/ipc_client.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_lift.h"
 #include "ipc_client_generated.h"
 
 // Phase 2.D: the workspace input-event bridge translates wire events into
@@ -106,10 +115,26 @@ struct ipc_client_compositor
 	//! sentinel and the legacy KeyedMutex path stays in effect.
 	uint64_t workspace_sync_fence_value;
 
+#ifdef XRT_OS_WINDOWS
+	//! #1810: MCP capture_frame request box — the same hand-off the in-process
+	//! compositors install, serviced at the end of layer_commit by asking the
+	//! SERVICE for this client's per-client atlas (see ipc_client_capture_poll).
+	struct mcp_capture_request mcp_capture;
+	//! #1810: per-commit capture intent (MCP request or %TEMP% trigger file).
+	struct u_capture_intent capture_intent;
+	//! True while @ref mcp_capture is installed as the process's handler.
+	bool mcp_capture_installed;
+#endif
+
 #ifdef IPC_USE_LOOPBACK_IMAGE_ALLOCATOR
 	//! To test image allocator.
 	struct xrt_image_native_allocator loopback_xina;
 #endif
+
+	//! XR_DXR_cursor_depth v7 over IPC: the newest measurement the service
+	//! returned (ADR-046 Amendment 3 point 6). Written and read on the app's
+	//! frame thread only (xrEndFrame / xrLocateViews).
+	struct u_cursor_measure_result cursor_measure_result;
 };
 
 /*!
@@ -221,6 +246,220 @@ comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct 
 }
 
 /*
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3). Same gating contract as
+ * comp_ipc_client_compositor_get_window_metrics. See ipc_client.h.
+ */
+void
+comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+	xrt_result_t xret = ipc_call_compositor_segments_enable(icc->ipc_c, pinned_display_id);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W(
+		    "multi-screen: compositor_segments_enable failed (%d) — this session's window is woven by one DP",
+		    (int)xret);
+	}
+}
+
+bool
+comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics)
+{
+	if (out_metrics == NULL) {
+		return false;
+	}
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	if (xc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	xrt_result_t xret = ipc_call_compositor_get_segment_metrics(icc->ipc_c, out_metrics);
+	if (xret != XRT_SUCCESS || out_metrics->count > XRT_MAX_SEGMENTS) {
+		memset(out_metrics, 0, sizeof(*out_metrics)); // one view set
+		return false;
+	}
+	return out_metrics->count > 0;
+}
+
+/*
+ * XR_DXR_weave v19 (#1884): the per-screen segment table of this session's
+ * last weave. Asked for only by a caller that chained XrWeaveOutputRectPartsDXR
+ * (oxr_weave.c), so a pre-v19 caller sends nothing new.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics)
+{
+	if (out_metrics == NULL) {
+		return XRT_SUCCESS; // nothing to fill
+	}
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	if (xc == NULL) {
+		return XRT_SUCCESS; // no compositor: one eye set
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_SUCCESS;
+	}
+	xrt_result_t xret = ipc_call_weave_get_segments(icc->ipc_c, out_metrics);
+	if (xret != XRT_SUCCESS || out_metrics->count > XRT_MAX_SEGMENTS) {
+		memset(out_metrics, 0, sizeof(*out_metrics)); // one eye set
+	}
+	return xret;
+}
+
+void
+comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return;
+	}
+	(void)ipc_call_compositor_set_view_routing(icc->ipc_c, routing);
+}
+
+/*
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). Only reached on a frame
+ * whose locate armed the runtime-drawn cursor (the state tracker's one bool
+ * test), so a session that never asks sends nothing (ADR-046 §0).
+ */
+bool
+comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	if (xc == NULL || req == NULL) {
+		return false;
+	}
+	if (req->image != NULL) {
+		// The app's sprite swapchain would have to be resolved to its IPC id
+		// through whichever client compositor wraps it; the service draws
+		// only the default look for now. Refuse honestly: willDraw = false,
+		// the app keeps its OS cursor (ADR-046 Phase 4 follow-up).
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+		return true;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	struct ipc_cursor_draw_request wire;
+	memset(&wire, 0, sizeof(wire));
+	wire.view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < wire.view_count; i++) {
+		wire.view[i][0] = req->view[i].origin[0];
+		wire.view[i][1] = req->view[i].origin[1];
+		wire.view[i][2] = req->view[i].axis_x[0];
+		wire.view[i][3] = req->view[i].axis_x[1];
+		wire.view[i][4] = req->view[i].axis_y[0];
+		wire.view[i][5] = req->view[i].axis_y[1];
+	}
+	wire.hot_u = req->hot_u;
+	wire.hot_v = req->hot_v;
+	wire.size_m = req->size_m;
+	wire.disparity = req->disparity;
+	wire.report_only = req->report_only ? 1 : 0;
+	wire.zone_valid = req->zone_valid ? 1 : 0;
+	wire.zone_id = req->zone_id;
+	wire.zone_rect[0] = req->zone_rect.offset.w;
+	wire.zone_rect[1] = req->zone_rect.offset.h;
+	wire.zone_rect[2] = req->zone_rect.extent.w;
+	wire.zone_rect[3] = req->zone_rect.extent.h;
+
+	struct ipc_cursor_draw_outcome outcome;
+	memset(&outcome, 0, sizeof(outcome));
+	xrt_result_t xret = ipc_call_compositor_set_cursor_draw_request(icc->ipc_c, &wire, &outcome);
+	if (xret != XRT_SUCCESS) {
+		// A dead connection: the commit will fail too. Report it as the
+		// refusal it is rather than leave willDraw true.
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NOT_REACHED);
+		return true;
+	}
+	if (!outcome.answered) {
+		return false; // the service has nothing to report yet (first request)
+	}
+	if (outcome.drew) {
+		u_cursor_draw_report_drew(req);
+	} else {
+		const uint32_t reason = outcome.reason < U_CURSOR_DRAW_REFUSAL_COUNT && outcome.reason != 0
+		                            ? outcome.reason
+		                            : (uint32_t)U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		u_cursor_draw_report_refused(req, (enum u_cursor_draw_refusal)reason);
+	}
+	return true;
+}
+
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). Only reached
+ * on a frame whose locate armed the measured-disparity source (the state
+ * tracker's one bool test), so a session that never asks sends nothing.
+ */
+bool
+comp_ipc_client_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                      const struct u_cursor_measure_request *req)
+{
+	if (xc == NULL || req == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+
+	struct ipc_cursor_measure_request wire;
+	memset(&wire, 0, sizeof(wire));
+	wire.tag = req->tag;
+	wire.u = req->u;
+	wire.v = req->v;
+	wire.height = req->height;
+	wire.view_index[0] = req->view_index[0];
+	wire.view_index[1] = req->view_index[1];
+
+	struct ipc_cursor_measure_result res;
+	memset(&res, 0, sizeof(res));
+	xrt_result_t xret = ipc_call_compositor_set_cursor_measure_request(icc->ipc_c, &wire, &res);
+	if (xret != XRT_SUCCESS) {
+		return false;
+	}
+	if (res.valid && res.tag > icc->cursor_measure_result.tag) {
+		struct u_cursor_measure_result *r = &icc->cursor_measure_result;
+		r->valid = true;
+		r->tag = res.tag;
+		r->confident = res.confident != 0;
+		r->disparity_px = res.disparity_px;
+		r->sub_w = res.sub_w;
+		r->ncc = res.ncc;
+		r->matched = res.matched;
+		r->lr_rejected = res.lr_rejected;
+		r->reused = res.reused != 0;
+	}
+	return true;
+}
+
+bool
+comp_ipc_client_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL) {
+		return false;
+	}
+	*out = icc->cursor_measure_result;
+	return out->valid;
+}
+
+/*
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * out-of-process display processor (#522). Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics: only call when `xc` is an
@@ -301,6 +540,7 @@ comp_ipc_client_compositor_request_rendering_mode(struct xrt_compositor *xc, uin
  */
 bool
 comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
+                                                       int64_t target_ns,
                                                        struct xrt_eye_positions *out_eyes)
 {
 	if (xc == NULL || out_eyes == NULL) {
@@ -312,7 +552,9 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
 		return false;
 	}
 
-	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	// N6 Part 1 (#2144): the server answers for @p target_ns (the frame's
+	// displayTime), from the client's DP's own target-time slot or its ring.
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, target_ns, out_eyes);
 	if (xret != XRT_SUCCESS) {
 		return false;
 	}
@@ -330,6 +572,7 @@ comp_ipc_client_compositor_get_predicted_eye_positions(struct xrt_compositor *xc
  */
 bool
 comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_compositor *xsysc,
+                                                              int64_t target_ns,
                                                               struct xrt_eye_positions *out_eyes)
 {
 	if (xsysc == NULL || out_eyes == NULL) {
@@ -341,12 +584,43 @@ comp_ipc_client_system_compositor_get_predicted_eye_positions(struct xrt_system_
 		return false;
 	}
 
-	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, out_eyes);
+	xrt_result_t xret = ipc_call_compositor_get_predicted_eye_positions(icc->ipc_c, target_ns, out_eyes);
 	if (xret != XRT_SUCCESS) {
 		return false;
 	}
 
 	return out_eyes->valid;
+}
+
+/*
+ * XR_DXR_display_info v25 (XrViewLocateFixedViewerDXR): the service frames
+ * this client's views and hosts the viewer-tracking provider, so the hint has
+ * to cross the wire. Same gating contracts as the eye-position pair above.
+ */
+bool
+comp_ipc_client_compositor_set_fixed_viewer(struct xrt_compositor *xc, bool fixed)
+{
+	if (xc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return false;
+	}
+	return ipc_call_compositor_set_fixed_viewer(icc->ipc_c, fixed) == XRT_SUCCESS;
+}
+
+bool
+comp_ipc_client_system_compositor_set_fixed_viewer(struct xrt_system_compositor *xsysc, bool fixed)
+{
+	if (xsysc == NULL) {
+		return false;
+	}
+	struct ipc_client_compositor *icc = container_of(xsysc, struct ipc_client_compositor, system);
+	if (icc->ipc_c == NULL) {
+		return false;
+	}
+	return ipc_call_compositor_set_fixed_viewer(icc->ipc_c, fixed) == XRT_SUCCESS;
 }
 
 /*
@@ -528,7 +802,8 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
                                                      uint32_t client_h,
-                                                     int32_t display_id)
+                                                     int32_t display_id,
+                                                     const struct xrt_weave_logical_origin *logical)
 {
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -537,7 +812,13 @@ comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
 	if (icc == NULL || icc->ipc_c == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id);
+	// v12 (browser-pvt#180): the logical origin rides the same call, so the
+	// service latches the device + logical pair as one unit. NULL / !valid
+	// clears the service's latch.
+	const bool lv = logical != NULL && logical->valid;
+	return ipc_call_weave_set_window_geometry(icc->ipc_c, origin_x, origin_y, client_w, client_h, display_id,
+	                                          lv ? 1u : 0u, lv ? logical->x : 0, lv ? logical->y : 0,
+	                                          lv ? logical->scale : 0.0f);
 }
 
 /*!
@@ -559,7 +840,10 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
                        bool weave_frame_first,
                        const struct xrt_weave_atlas_layout *layout,
                        uint32_t flat_rect_count,
-                       const struct xrt_rect *flat_rects)
+                       const struct xrt_rect *flat_rects,
+                       bool mono_in_2d,
+                       bool overlay_unchanged,
+                       float overlay_filter_strength)
 {
 	U_ZERO(args);
 	args->rect_x = rect_x;
@@ -613,6 +897,19 @@ weave_pack_submit_args(struct ipc_arg_weave_submit *args,
 		args->flat_rects[i].w = (uint32_t)flat_rects[i].extent.w;
 		args->flat_rects[i].h = (uint32_t)flat_rects[i].extent.h;
 	}
+
+	// v13: one flat view instead of the weave while the hardware is 2D. 0 (a
+	// pre-v13 caller) is byte-for-byte the old behaviour.
+	args->mono_in_2d = mono_in_2d ? 1u : 0u;
+
+	// v14: the overlay atlas is unchanged since the previous submit, so a DP may
+	// reuse its lens prefilter of it. Only meaningful with an overlay; 0 (a
+	// pre-v14 caller) is "may have changed", the old behaviour.
+	args->overlay_unchanged = (have_overlay && overlay_unchanged) ? 1u : 0u;
+
+	// v15: the caller's lens-filter strength for the overlay; negative = not set
+	// (the DP's own default). Only meaningful with an overlay.
+	args->overlay_filter_strength = have_overlay ? overlay_filter_strength : -1.0f;
 }
 
 xrt_result_t
@@ -633,16 +930,26 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        bool mono_in_2d,
+                                        bool overlay_unchanged,
+                                        float overlay_filter_strength,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes)
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_segment_count,
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin)
 {
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
+	}
 	if (xc == NULL || out_have_output == NULL || out_width == NULL || out_height == NULL ||
-	    out_fence_value == NULL || out_eyes == NULL) {
+	    out_fence_value == NULL || out_eyes == NULL || out_lift_cursor_mask == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
+	*out_lift_cursor_mask = 0;
 	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -657,6 +964,9 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_height = 0;
 	*out_fence_value = 0;
 	U_ZERO(out_eyes);
+	if (out_segment_count != NULL) {
+		*out_segment_count = 0;
+	}
 
 	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
 	if (icc == NULL || icc->ipc_c == NULL) {
@@ -666,7 +976,8 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	struct ipc_arg_weave_submit args = {0};
 	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
-	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count, flat_rects);
+	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
+	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
 
 	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
 	uint32_t handle_count = have_overlay ? 2u : 1u;
@@ -688,10 +999,13 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	uint32_t segs = 0;
+	uint32_t lift_cursor_mask = 0;
+	struct ipc_weave_woven_origin origin = {0};
 	// Generated arg order: in args, then in_handles (handles, count), then out
 	// args. This copies the handles, it does not consume them.
-	xrt_result_t xret =
-	    ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes);
+	xrt_result_t xret = ipc_call_weave_submit(icc->ipc_c, &args, handles, handle_count, &have, &w, &h, &fv, &eyes,
+	                                          &segs, &lift_cursor_mask, &origin);
 	if (xret != XRT_SUCCESS) {
 		return xret;
 	}
@@ -700,6 +1014,21 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	if (out_segment_count != NULL) {
+		*out_segment_count = segs;
+	}
+	*out_lift_cursor_mask = lift_cursor_mask;
+	// v12 §5e on Windows (ADR-060 R3): field by field off the wire POD.
+	if (out_origin != NULL) {
+		out_origin->valid = origin.valid != 0;
+		out_origin->x = origin.x;
+		out_origin->y = origin.y;
+		out_origin->logical_valid = origin.valid != 0 && origin.logical_valid != 0;
+		out_origin->logical_x = origin.logical_x;
+		out_origin->logical_y = origin.logical_y;
+		out_origin->logical_scale = origin.logical_scale;
+		out_origin->serial = origin.serial;
+	}
 	return XRT_SUCCESS;
 }
 
@@ -798,6 +1127,56 @@ comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req)
+{
+	if (xc == NULL || req == NULL || req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_cursor_request(icc->ipc_c, req);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info)
+{
+	if (xc == NULL || info == NULL || handle == XRT_GRAPHICS_BUFFER_HANDLE_INVALID) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	xrt_graphics_buffer_handle_t h = handle;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	// DXGI handles carry the low-bit tag across the wire (swapchain_import
+	// convention); NT handles are duplicated into the service.
+	if (info->is_dxgi) {
+		h = (void *)((size_t)h | 1);
+	}
+#endif
+	return ipc_call_weave_cursor_sprite_texture(icc->ipc_c, info, &h, 1);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state)
+{
+	if (xc == NULL || out_state == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	U_ZERO(out_state);
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_weave_cursor_state(icc->ipc_c, out_state);
+}
+
 #ifdef XRT_OS_LINUX_DESKTOP
 static void
 weave_pack_dmabuf(struct ipc_weave_dmabuf *dst, const struct xrt_weave_dmabuf_desc *src)
@@ -844,13 +1223,20 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                const struct xrt_weave_atlas_layout *layout,
                                                uint32_t flat_rect_count,
                                                const struct xrt_rect *flat_rects,
+                                               bool mono_in_2d,
+                                               bool overlay_unchanged,
+                                               float overlay_filter_strength,
                                                int *out_release_fence_fd,
                                                bool *out_have_output,
                                                uint32_t *out_width,
                                                uint32_t *out_height,
                                                uint64_t *out_fence_value,
-                                               struct xrt_eye_positions *out_eyes)
+                                               struct xrt_eye_positions *out_eyes,
+                                               struct xrt_weave_woven_origin *out_origin)
 {
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
+	}
 	if (xc == NULL || in == NULL || out_release_fence_fd == NULL || out_have_output == NULL ||
 	    out_width == NULL || out_height == NULL || out_fence_value == NULL || out_eyes == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -881,7 +1267,8 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 
 	struct ipc_arg_weave_submit args;
 	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, overlay != NULL,
-	                       overlay_rect_count, NULL, weave_frame_first, layout, flat_rect_count, flat_rects);
+	                       overlay_rect_count, NULL, weave_frame_first, layout, flat_rect_count, flat_rects,
+	                       mono_in_2d, overlay_unchanged, overlay_filter_strength);
 
 	struct ipc_arg_weave_dmabuf dmabuf = {0};
 	weave_pack_dmabuf(&dmabuf.input, in);
@@ -904,12 +1291,13 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	struct ipc_weave_woven_origin origin = {0};
 	xrt_graphics_sync_handle_t release[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
 	// Generated arg order: in args, in_handles (copied, not consumed), out args,
 	// then the out handles (the reply's release sync_file, received into
 	// release[] — a new descriptor in this process, or -1).
-	xrt_result_t xret = ipc_call_weave_submit_dmabuf(icc->ipc_c, &args, &dmabuf, handles, handle_count, &have,
-	                                                 &w, &h, &fv, &eyes, release, 1);
+	xrt_result_t xret = ipc_call_weave_submit_dmabuf(icc->ipc_c, &args, &dmabuf, handles, handle_count, &have, &w,
+	                                                 &h, &fv, &eyes, &origin, release, 1);
 	if (xret != XRT_SUCCESS) {
 		// The reply carries the result; a refused submit sends no fence, but
 		// never leak one if a service did.
@@ -924,6 +1312,18 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	if (out_origin != NULL) {
+		// v12 (browser-pvt#180): wire POD -> xrt, field by field (never a
+		// byte copy between the two layouts).
+		out_origin->valid = origin.valid != 0;
+		out_origin->x = origin.x;
+		out_origin->y = origin.y;
+		out_origin->logical_valid = origin.valid != 0 && origin.logical_valid != 0;
+		out_origin->logical_x = origin.logical_x;
+		out_origin->logical_y = origin.logical_y;
+		out_origin->logical_scale = origin.logical_scale;
+		out_origin->serial = origin.serial;
+	}
 	return XRT_SUCCESS;
 }
 
@@ -983,6 +1383,129 @@ comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 #endif // XRT_OS_LINUX_DESKTOP
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * XR_DXR_weave v20: the Android sync_file submit. A call carries one handle
+ * type and the submit's in_handles are AHardwareBuffers, so the acquire
+ * sync_file goes first in its own weave_set_acquire_fence call (only when there
+ * is one), and the service consumes it with the weave_submit_sync right after
+ * it on this same connection. The reply's out handle is the per-frame release
+ * sync_file, present only when @p want_release_fence asked for one and the
+ * service produced it.
+ *
+ * FD ownership: @p acquire_fence_fd is NOT consumed (SCM_RIGHTS installs a copy
+ * in the service; oxr_weave.c closes the original once the whole
+ * xrWeaveSubmitDXR has succeeded). @p out_release_fence_fd is a NEW fd this
+ * process owns, or -1 (= the weave completed synchronously).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+                                             xrt_graphics_buffer_handle_t in_handle,
+                                             int32_t rect_x,
+                                             int32_t rect_y,
+                                             uint32_t rect_w,
+                                             uint32_t rect_h,
+                                             uint32_t rect_count,
+                                             const struct xrt_rect *rects,
+                                             xrt_graphics_buffer_handle_t overlay_handle,
+                                             uint32_t overlay_rect_count,
+                                             const struct xrt_rect *overlay_rects,
+                                             bool weave_frame_first,
+                                             const struct xrt_weave_atlas_layout *layout,
+                                             uint32_t flat_rect_count,
+                                             const struct xrt_rect *flat_rects,
+                                             bool mono_in_2d,
+                                             bool overlay_unchanged,
+                                             float overlay_filter_strength,
+                                             int acquire_fence_fd,
+                                             bool want_release_fence,
+                                             int *out_release_fence_fd,
+                                             bool *out_have_output,
+                                             uint32_t *out_width,
+                                             uint32_t *out_height,
+                                             uint64_t *out_fence_value,
+                                             struct xrt_eye_positions *out_eyes,
+                                             uint32_t *out_segment_count,
+                                             uint32_t *out_lift_cursor_mask)
+{
+	if (xc == NULL || out_release_fence_fd == NULL || out_have_output == NULL || out_width == NULL ||
+	    out_height == NULL || out_fence_value == NULL || out_eyes == NULL || out_lift_cursor_mask == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_release_fence_fd = -1;
+	*out_lift_cursor_mask = 0;
+	if (rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (rect_count > 0 && rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (overlay_rect_count > IPC_WEAVE_SUBMIT_RECTS_MAX || (overlay_rect_count > 0 && overlay_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX || (flat_rect_count > 0 && flat_rects == NULL)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_fence_value = 0;
+	U_ZERO(out_eyes);
+	if (out_segment_count != NULL) {
+		*out_segment_count = 0;
+	}
+
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	struct ipc_arg_weave_submit args = {0};
+	const bool have_overlay = (overlay_handle != XRT_GRAPHICS_BUFFER_HANDLE_INVALID);
+	weave_pack_submit_args(&args, rect_x, rect_y, rect_w, rect_h, rect_count, rects, have_overlay,
+	                       overlay_rect_count, overlay_rects, weave_frame_first, layout, flat_rect_count,
+	                       flat_rects, mono_in_2d, overlay_unchanged, overlay_filter_strength);
+
+	xrt_result_t xret = XRT_SUCCESS;
+	if (acquire_fence_fd >= 0) {
+		// Copies the fd into the service; does not consume ours.
+		xrt_graphics_sync_handle_t acquire[1] = {acquire_fence_fd};
+		xret = ipc_call_weave_set_acquire_fence(icc->ipc_c, acquire, 1);
+		if (xret != XRT_SUCCESS) {
+			return xret;
+		}
+	}
+
+	xrt_graphics_buffer_handle_t handles[2] = {in_handle, overlay_handle};
+	uint32_t handle_count = have_overlay ? 2u : 1u;
+
+	bool have = false;
+	uint32_t w = 0, h = 0;
+	uint64_t fv = 0;
+	struct xrt_eye_positions eyes = {0};
+	uint32_t segs = 0;
+	uint32_t lift_cursor_mask = 0;
+	xrt_graphics_sync_handle_t release[1] = {XRT_GRAPHICS_SYNC_HANDLE_INVALID};
+	xret = ipc_call_weave_submit_sync(icc->ipc_c, &args, want_release_fence ? 1u : 0u, handles, handle_count, &have,
+	                                  &w, &h, &fv, &eyes, &segs, &lift_cursor_mask, release, 1);
+	if (xret != XRT_SUCCESS) {
+		// A refused submit sends no fence, but never leak one if a service did.
+		if (release[0] >= 0) {
+			u_graphics_sync_unref(&release[0]);
+		}
+		return xret;
+	}
+	*out_release_fence_fd = release[0];
+	*out_have_output = have;
+	*out_width = w;
+	*out_height = h;
+	*out_fence_value = fv;
+	*out_eyes = eyes;
+	if (out_segment_count != NULL) {
+		*out_segment_count = segs;
+	}
+	*out_lift_cursor_mask = lift_cursor_mask;
+	return XRT_SUCCESS;
+}
+#endif // XRT_OS_ANDROID
 
 xrt_result_t
 comp_ipc_client_compositor_weave_snap_window_rect(struct xrt_compositor *xc,
@@ -1262,6 +1785,50 @@ comp_ipc_client_compositor_workspace_get_window_pose(struct xrt_compositor *xc,
 }
 
 xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_screens(struct xrt_compositor *xc,
+                                                       struct ipc_workspace_screen_list *out_list)
+{
+	if (xc == NULL || out_list == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_enumerate_screens(icc->ipc_c, out_list);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          const struct ipc_workspace_window_placement *placement)
+{
+	if (xc == NULL || placement == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_window_placement(icc->ipc_c, client_id, placement);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          struct ipc_workspace_window_placement *out_placement)
+{
+	if (xc == NULL || out_placement == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_get_window_placement(icc->ipc_c, client_id, out_placement);
+}
+
+xrt_result_t
 comp_ipc_client_compositor_workspace_set_window_visibility(struct xrt_compositor *xc,
                                                            uint32_t client_id,
                                                            bool visible)
@@ -1484,6 +2051,10 @@ comp_ipc_client_compositor_workspace_enumerate_input_events(struct xrt_composito
 			break;
 		case IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED:
 			out->clientConnected.clientId = (XrWorkspaceClientId)src->u.client_connected.client_id;
+			break;
+		case IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED: // spec_version 25 (ADR-052)
+			out->screensChanged.generation = src->u.screens_changed.generation;
+			out->screensChanged.screenCount = src->u.screens_changed.screen_count;
 			break;
 		default:
 			break;
@@ -1824,6 +2395,22 @@ comp_ipc_client_compositor_workspace_set_overlay(struct xrt_compositor *xc,
 	return ipc_call_workspace_set_overlay(icc->ipc_c, info);
 }
 
+// spec_version 26 (ADR-052 Amendment 2): an overlay composed only by @p screen_id's presenter.
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_overlay_on_screen(struct xrt_compositor *xc,
+                                                            const struct ipc_workspace_overlay_info *info,
+                                                            uint64_t screen_id)
+{
+	if (xc == NULL || info == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	if (icc == NULL || icc->ipc_c == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_call_workspace_set_overlay_on_screen(icc->ipc_c, info, screen_id);
+}
+
 xrt_result_t
 comp_ipc_client_compositor_workspace_acquire_wakeup_event(struct xrt_compositor *xc,
                                                           xrt_graphics_sync_handle_t *out_handle)
@@ -2014,6 +2601,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 	uint32_t image_count;
 	uint64_t size;
 	bool use_dedicated_allocation;
+	bool is_d3d11_texture;
 
 	xret = ipc_call_swapchain_create( //
 	    icc->ipc_c,                   // connection
@@ -2022,6 +2610,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 	    &image_count,                 // out
 	    &size,                        // out
 	    &use_dedicated_allocation,    // out
+	    &is_d3d11_texture,            // out
 	    remote_handles,               // handles
 	    XRT_MAX_SWAPCHAIN_IMAGES);    // handles
 	IPC_CHK_AND_RET(icc->ipc_c, xret, "ipc_call_swapchain_create");
@@ -2041,6 +2630,7 @@ swapchain_server_create(struct ipc_client_compositor *icc,
 		ics->base.images[i].handle = remote_handles[i];
 		ics->base.images[i].size = size;
 		ics->base.images[i].use_dedicated_allocation = use_dedicated_allocation;
+		ics->base.images[i].is_d3d11_texture = is_d3d11_texture;
 	}
 
 	*out_xsc = &ics->base.base;
@@ -2518,6 +3108,88 @@ ipc_compositor_layer_zone_3d(struct xrt_compositor *xc,
 	return XRT_SUCCESS;
 }
 
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #1810 — service a capture request for an IPC client.
+ *
+ * The in-process compositors read their own atlas back; an IPC client owns no
+ * atlas, so before this the MCP @c capture_frame tool answered "not wired" and
+ * the per-exe trigger file sat on disk forever. Both now ask the SERVICE for this
+ * client's per-client atlas — the pre-weave, content-sized buffer its display
+ * processor consumes, encoded bytes as stored (ADR-044 §5), alpha forced opaque
+ * unless DXR_ATLAS_CAPTURE_RAW_ALPHA=1 here — over the existing
+ * workspace_capture_frame call (the xrCaptureAtlasDXR IPC branch), then move the
+ * file to the exact path the in-process compositors would have written, so every
+ * recipe keeps its filename.
+ *
+ * Both MCP modes map to the service's PROJECTION_ONLY stage: that is the only
+ * per-client buffer the service has, and it is everything this client sends the
+ * DP (Local2D / window-space included on the standalone path). Under a
+ * workspace an app may not capture (#960) and this reports failure.
+ *
+ * Runs on the app's thread right after the commit's layer-sync call returned,
+ * once per commit — the same cadence as the in-process u_capture_intent_poll.
+ * The service call is bounded (copy + Map under render_mutex, on an explicit
+ * request only); nothing here waits on another process otherwise.
+ */
+static void
+ipc_client_capture_poll(struct ipc_client_compositor *icc)
+{
+	if (!icc->mcp_capture_installed) {
+		return;
+	}
+
+	u_capture_intent_poll(&icc->capture_intent, &icc->mcp_capture);
+	if (!icc->capture_intent.pending) {
+		return;
+	}
+
+	const char *path = icc->capture_intent.path;
+	bool ok = false;
+
+	// Prefix = the target path minus ".png"; the service appends
+	// "_atlas_<views>_<cols>x<rows>.png" and we rename it onto the target.
+	struct ipc_capture_request req = {0};
+	size_t plen = strlen(path);
+	if (plen > 4 && _stricmp(path + plen - 4, ".png") == 0) {
+		plen -= 4;
+	}
+	if (plen > 0 && plen < sizeof(req.path_prefix)) {
+		memcpy(req.path_prefix, path, plen);
+		req.path_prefix[plen] = '\0';
+		req.flags = IPC_CAPTURE_FLAG_PROJECTION_ONLY |
+		            (u_image_capture_raw_alpha() ? IPC_CAPTURE_FLAG_RAW_ALPHA : 0u);
+
+		struct ipc_capture_result result = {0};
+		xrt_result_t xret = ipc_call_workspace_capture_frame(icc->ipc_c, &req, &result);
+		if (xret == XRT_SUCCESS && (result.views_written & IPC_CAPTURE_FLAG_PROJECTION_ONLY) != 0) {
+			uint32_t cols = result.tile_columns > 0 ? result.tile_columns : 1;
+			uint32_t rows = result.tile_rows > 0 ? result.tile_rows : 1;
+			char written[IPC_CAPTURE_PATH_MAX + 48];
+			snprintf(written, sizeof(written), "%s_atlas_%u_%ux%u.png", req.path_prefix, cols * rows,
+			         cols, rows);
+			ok = MoveFileExA(written, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED) != 0;
+			if (ok) {
+				U_LOG_W("[capture] IPC client atlas -> %s (%ux%u, grid %ux%u, mode=%u, raw_alpha=%d)", path,
+				        result.atlas_width, result.atlas_height, cols, rows, icc->capture_intent.mode,
+				        (int)((req.flags & IPC_CAPTURE_FLAG_RAW_ALPHA) != 0));
+			} else {
+				U_LOG_W("[capture] IPC client atlas: service wrote %s but the move to %s failed (%lu)",
+				        written, path, (unsigned long)GetLastError());
+			}
+		} else {
+			U_LOG_W("[capture] IPC client atlas: service wrote nothing for %s (xret=%d views_written=0x%x) "
+			        "-- an app cannot capture under a workspace controller (#960); see the service log",
+			        path, (int)xret, result.views_written);
+		}
+	} else {
+		U_LOG_W("[capture] IPC client atlas: path too long for the capture request: %s", path);
+	}
+
+	u_capture_intent_complete(&icc->capture_intent, &icc->mcp_capture, ok);
+}
+#endif
+
 static xrt_result_t
 ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -2554,6 +3226,10 @@ ipc_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_
 		u_graphics_sync_unref(&sync_handle);
 	}
 
+#ifdef XRT_OS_WINDOWS
+	ipc_client_capture_poll(icc); // #1810
+#endif
+
 	return xret;
 }
 
@@ -2588,6 +3264,10 @@ ipc_compositor_layer_commit_with_semaphore(struct xrt_compositor *xc,
 
 	// Reset.
 	icc->layers.layer_count = 0;
+
+#ifdef XRT_OS_WINDOWS
+	ipc_client_capture_poll(icc); // #1810
+#endif
 
 	return xret;
 }
@@ -2664,6 +3344,15 @@ ipc_compositor_destroy(struct xrt_compositor *xc)
 
 	os_precise_sleeper_deinit(&icc->sleeper);
 
+#ifdef XRT_OS_WINDOWS
+	// #1810: drop the MCP capture hand-off before its storage can be reused.
+	if (icc->mcp_capture_installed) {
+		mcp_capture_uninstall();
+		mcp_capture_fini(&icc->mcp_capture);
+		icc->mcp_capture_installed = false;
+	}
+#endif
+
 	icc->compositor_created = false;
 }
 
@@ -2705,6 +3394,16 @@ ipc_compositor_init(struct ipc_client_compositor *icc, struct xrt_compositor_nat
 
 	// Using in wait frame.
 	os_precise_sleeper_init(&icc->sleeper);
+
+#ifdef XRT_OS_WINDOWS
+	// #1810: wire the per-app MCP capture_frame tool + the %TEMP% atlas trigger
+	// files for this IPC session, exactly as the in-process compositors do at
+	// create. Windows-only: only the D3D11 service answers the capture call.
+	memset(&icc->capture_intent, 0, sizeof(icc->capture_intent));
+	mcp_capture_init(&icc->mcp_capture);
+	mcp_capture_install(&icc->mcp_capture);
+	icc->mcp_capture_installed = true;
+#endif
 
 	// Fetch info from the compositor, among it the format format list.
 	get_info(&(icc->base.base), &icc->base.base.info);
@@ -2999,4 +3698,41 @@ ipc_client_create_system_compositor(struct ipc_connection *ipc_c,
 	*out_xcs = &c->system;
 
 	return XRT_SUCCESS;
+}
+
+
+/*
+ * XR_DXR_lift bridges (ADR-042) — thin accessors the OpenXR state tracker
+ * (oxr_conv.c, oxr_weave.c) forward-declares, like the weave bridges above:
+ * extract the session's connection (and, for weave rects, forward to
+ * ipc_client_lift.c). Streams belong to the
+ * connection, so a session's streams die with its connection.
+ */
+static struct ipc_connection *
+lift_conn(struct xrt_compositor *xc)
+{
+	if (xc == NULL) {
+		return NULL;
+	}
+	struct ipc_client_compositor *icc = ipc_client_compositor(xc);
+	return icc != NULL ? icc->ipc_c : NULL;
+}
+
+/*!
+ * The session's connection, for oxr_conv.c: every stream call goes straight to
+ * ipc_client_lift.c on it — the same calls an in-process session makes on its
+ * lift-only connection (ADR-049), so one code path serves both.
+ */
+struct ipc_connection *
+comp_ipc_client_compositor_lift_connection(struct xrt_compositor *xc)
+{
+	return lift_conn(xc);
+}
+
+xrt_result_t
+comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
+                                            uint32_t count,
+                                            const struct xrt_lift_weave_rect *rects)
+{
+	return ipc_client_lift_weave_rects(lift_conn(xc), count, rects);
 }

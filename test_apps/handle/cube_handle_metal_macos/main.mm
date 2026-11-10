@@ -28,8 +28,10 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <strings.h> // strcasecmp
 #include <string>
 #include <chrono>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -38,7 +40,8 @@
 // stb_image implementation TU lives in displayxr::common (stb_image_impl_macos.cpp) — declarations only here (#396 W4).
 #include "stb_image.h"
 #include "view_params.h"
-#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -48,7 +51,10 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include "dxr_view_config.h" // #1486 PRIMARY_MULTIVIEW_DXR opt-in
+#include "cursor_depth.h"    // dxr::CursorDepth — XR_DXR_cursor_depth bookkeeping (ADR-046)
+#include "stereo_photo_test.h" // XR_DXR_cursor_depth v7 test content (ADR-046 Amendment 3)
 
 // ============================================================================
 // Logging
@@ -186,6 +192,124 @@ static void mat4_model_from_xr_pose(float m[16], const XrPosef &pose)
     m[12] = pose.position.x;
     m[13] = pose.position.y;
     m[14] = pose.position.z;
+}
+
+// ============================================================================
+// Hands mode (#825 Tier 2) — optional, `--hands` / DXR_HANDS=1.
+//
+// XR_EXT_hand_tracking consumer (port of cube_handle_d3d11_win's): creates a
+// hand tracker per hand, locates all 26 joints at display time every frame,
+// and renders each tracked joint as a tiny marker cube. Drive it with any
+// hand-tracking input provider — sim_input (scripted curl wave,
+// hardware-free), ultraleap, or a camera hand tracker. Composes with
+// --actions (grip markers + joint markers together).
+// ============================================================================
+
+static bool g_hasHandTrackingExt = false;
+static bool g_handsMode = false;
+
+struct HandsState {
+    PFN_xrCreateHandTrackerEXT pfnCreate = nullptr;
+    PFN_xrDestroyHandTrackerEXT pfnDestroy = nullptr;
+    PFN_xrLocateHandJointsEXT pfnLocate = nullptr;
+    XrHandTrackerEXT tracker[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE}; // 0 = left, 1 = right
+
+    // Per-frame results consumed by the renderer.
+    bool active[2] = {false, false};
+    XrHandJointLocationEXT joints[2][XR_HAND_JOINT_COUNT_EXT];
+    uint64_t locateCount = 0;
+};
+static HandsState g_hands;
+
+static bool SetupHands(XrInstance instance, XrSystemId systemId, XrSession session)
+{
+    if (!g_hasHandTrackingExt) {
+        LOG_ERROR("hands: XR_EXT_hand_tracking not available on this runtime");
+        return false;
+    }
+
+    // The runtime only supports hand tracking when a hand-tracking-capable
+    // input provider claimed the roles — surface that verdict up front.
+    XrSystemHandTrackingPropertiesEXT htProps = {XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+    XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES, &htProps};
+    if (XR_SUCCEEDED(xrGetSystemProperties(instance, systemId, &sysProps))) {
+        LOG_INFO("hands: XrSystemHandTrackingPropertiesEXT.supportsHandTracking = %d",
+                 htProps.supportsHandTracking);
+        if (!htProps.supportsHandTracking) {
+            LOG_ERROR("hands: system reports no hand tracking (no provider with hand-tracking "
+                      "devices registered?)");
+            return false;
+        }
+    }
+
+    if (XR_FAILED(xrGetInstanceProcAddr(instance, "xrCreateHandTrackerEXT",
+                                        (PFN_xrVoidFunction *)&g_hands.pfnCreate)) ||
+        XR_FAILED(xrGetInstanceProcAddr(instance, "xrDestroyHandTrackerEXT",
+                                        (PFN_xrVoidFunction *)&g_hands.pfnDestroy)) ||
+        XR_FAILED(xrGetInstanceProcAddr(instance, "xrLocateHandJointsEXT",
+                                        (PFN_xrVoidFunction *)&g_hands.pfnLocate))) {
+        LOG_ERROR("hands: xrGetInstanceProcAddr for XR_EXT_hand_tracking functions failed");
+        return false;
+    }
+
+    for (int hand = 0; hand < 2; hand++) {
+        XrHandTrackerCreateInfoEXT ci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+        ci.hand = hand == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+        ci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+        XrResult cr = g_hands.pfnCreate(session, &ci, &g_hands.tracker[hand]);
+        if (XR_FAILED(cr)) {
+            LOG_ERROR("hands: xrCreateHandTrackerEXT (hand %d) failed: %d", hand, cr);
+            return false;
+        }
+    }
+
+    LOG_INFO("hands: hand trackers created (default joint set, %d joints)", XR_HAND_JOINT_COUNT_EXT);
+    return true;
+}
+
+//! Per-frame: locate all joints of both hands at display time.
+static void UpdateHands(XrSpace baseSpace, XrTime displayTime)
+{
+    for (int hand = 0; hand < 2; hand++) {
+        g_hands.active[hand] = false;
+        if (g_hands.tracker[hand] == XR_NULL_HANDLE) {
+            continue;
+        }
+
+        XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+        li.baseSpace = baseSpace;
+        li.time = displayTime;
+
+        XrHandJointLocationsEXT locations = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+        locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+        locations.jointLocations = g_hands.joints[hand];
+
+        if (XR_FAILED(g_hands.pfnLocate(g_hands.tracker[hand], &li, &locations))) {
+            continue;
+        }
+        g_hands.active[hand] = locations.isActive == XR_TRUE;
+    }
+    g_hands.locateCount++;
+
+    // Throttled progress line (~every 2 s at 60 FPS) for headless-log runs.
+    if (g_hands.locateCount % 120 == 1) {
+        const XrHandJointLocationEXT &lw = g_hands.joints[0][XR_HAND_JOINT_WRIST_EXT];
+        const XrHandJointLocationEXT &rw = g_hands.joints[1][XR_HAND_JOINT_WRIST_EXT];
+        LOG_INFO("hands: locate #%llu L(active=%d wrist %.2f,%.2f,%.2f) R(active=%d wrist %.2f,%.2f,%.2f)",
+                 (unsigned long long)g_hands.locateCount, g_hands.active[0], lw.pose.position.x,
+                 lw.pose.position.y, lw.pose.position.z, g_hands.active[1], rw.pose.position.x,
+                 rw.pose.position.y, rw.pose.position.z);
+    }
+}
+
+static void CleanupHands()
+{
+    for (int hand = 0; hand < 2; hand++) {
+        if (g_hands.tracker[hand] != XR_NULL_HANDLE && g_hands.pfnDestroy != nullptr) {
+            g_hands.pfnDestroy(g_hands.tracker[hand]);
+            g_hands.tracker[hand] = XR_NULL_HANDLE;
+        }
+    }
 }
 
 // ============================================================================
@@ -645,6 +769,7 @@ struct MetalRenderer {
     id<MTLRenderPipelineState> cubePipeline;
     id<MTLRenderPipelineState> gridPipeline;
     id<MTLDepthStencilState>   depthState;
+    id<MTLDepthStencilState>   noDepthState; // XR_DXR_cursor_depth sprite: drawn last, never occluded
 
     id<MTLBuffer>              cubeVertexBuffer;
     id<MTLBuffer>              cubeIndexBuffer;
@@ -808,6 +933,9 @@ static bool InitRenderer(MetalRenderer &r)
         desc.depthCompareFunction = MTLCompareFunctionLess;
         desc.depthWriteEnabled = YES;
         r.depthState = [r.device newDepthStencilStateWithDescriptor:desc];
+        desc.depthCompareFunction = MTLCompareFunctionAlways;
+        desc.depthWriteEnabled = NO;
+        r.noDepthState = [r.device newDepthStencilStateWithDescriptor:desc];
     }
 
     // Sampler
@@ -883,10 +1011,97 @@ static void EnsureDepthTexture(MetalRenderer &r, uint32_t w, uint32_t h)
 // Render scene into swapchain image
 // ============================================================================
 
-static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
-                         const EyeRenderParams *eyes, int eyeCount)
+// ============================================================================
+// XR_DXR_cursor_depth (ADR-046) — reference adoption.
+//
+// The app owns the depth: it answers "ray -> first cube hit" (RayHitCube) and
+// displayxr-common's dxr::CursorDepth does the rest — the pointer as a canvas
+// UV, the footprint rays from the outer eyes of the previous locate, the
+// nearest hit, the struct chain on xrLocateViews, and hiding the OS cursor
+// exactly while the depth cursor replaces it. By default (spec v5) the RUNTIME
+// draws the cursor; DISPLAYXR_CURSOR_DEPTH_DRAW=app draws the crosshair here
+// from the placement instead. Since spec v4 (ADR-046 Amendment 2) a cursor is
+// drawn only while content pops out of the screen under it: over the floor,
+// empty space or anything on/behind the glass, the OS cursor is the cursor.
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0;
+// pick the anchor mode with DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
+// (unset = the runtime default, HYBRID).
+// ============================================================================
+
+static const float kCubeSize = 0.06f;
+static const float kCursorHeight = 0.04f; // fraction of canvas height
+
+struct CursorDepthDraw {
+    bool active = false;
+    XrPosef pose = {{0, 0, 0, 1}, {0, 0, 0}};
+    float height = 0.0f;
+};
+static CursorDepthDraw g_cursorDraw;
+
+// Slab test against the cube as RenderScene places it: centred at
+// (0, size/2, 0), edge `size`, rotated `rot` about +Y (mat4_rotation_y).
+static bool RayHitCube(const XrVector3f &o, const XrVector3f &d, float rot, float &tOut)
 {
-    EnsureDepthTexture(r, (uint32_t)target.width, (uint32_t)target.height);
+    const float c = cosf(rot), s = sinf(rot), h = kCubeSize * 0.5f;
+    // local = R^T (world - centre); R's columns are (c,0,-s), (0,1,0), (s,0,c).
+    const float ox = o.x, oy = o.y - h, oz = o.z;
+    const float lo[3] = {c * ox - s * oz, oy, s * ox + c * oz};
+    const float ld[3] = {c * d.x - s * d.z, d.y, s * d.x + c * d.z};
+    float t0 = 0.0f, t1 = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(ld[i]) < 1e-9f) {
+            if (lo[i] < -h || lo[i] > h) return false;
+            continue;
+        }
+        float ta = (-h - lo[i]) / ld[i], tb = (h - lo[i]) / ld[i];
+        if (ta > tb) std::swap(ta, tb);
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+        if (t0 > t1) return false;
+    }
+    tOut = t0;
+    return true;
+}
+
+static void DrawCursorSprite(MetalRenderer &r, id<MTLRenderCommandEncoder> enc, const float vp_mat[16])
+{
+    // Crosshair + small square, in the sprite's XY plane, unit = sprite height.
+    static const GridVertex lines[] = {
+        {{-0.5f, 0.0f, 0.0f}}, {{-0.15f, 0.0f, 0.0f}}, {{0.15f, 0.0f, 0.0f}}, {{0.5f, 0.0f, 0.0f}},
+        {{0.0f, -0.5f, 0.0f}}, {{0.0f, -0.15f, 0.0f}}, {{0.0f, 0.15f, 0.0f}}, {{0.0f, 0.5f, 0.0f}},
+        {{-0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, -0.15f, 0.0f}}, {{0.15f, 0.15f, 0.0f}},
+        {{0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, 0.15f, 0.0f}}, {{-0.15f, -0.15f, 0.0f}},
+    };
+    float poseMat[16], scale[16], model[16];
+    mat4_model_from_xr_pose(poseMat, g_cursorDraw.pose);
+    mat4_scaling(scale, g_cursorDraw.height);
+    mat4_multiply(model, poseMat, scale);
+
+    GridUniforms uniforms;
+    mat4_multiply(uniforms.mvp, vp_mat, model);
+    uniforms.color[0] = 1.0f;
+    uniforms.color[1] = 0.85f;
+    uniforms.color[2] = 0.1f;
+    uniforms.color[3] = 1.0f;
+
+    [enc setDepthStencilState:r.noDepthState];
+    [enc setRenderPipelineState:r.gridPipeline];
+    [enc setVertexBytes:lines length:sizeof(lines) atIndex:0];
+    [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+    [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+    [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:sizeof(lines) / sizeof(lines[0])];
+    [enc setDepthStencilState:r.depthState];
+}
+
+// depthTarget: nil renders into the app's private depth texture (the
+// default). Non-nil is the XR_KHR_composition_layer_depth swapchain image the
+// app submits (DISPLAYXR_CURSOR_DEPTH_SOURCE=layer), so its depth is STORED.
+static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
+                         const EyeRenderParams *eyes, int eyeCount,
+                         id<MTLTexture> depthTarget = nil)
+{
+    if (depthTarget == nil)
+        EnsureDepthTexture(r, (uint32_t)target.width, (uint32_t)target.height);
 
     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
     rpd.colorAttachments[0].texture = target;
@@ -902,9 +1117,9 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
     rpd.colorAttachments[0].clearColor = transparent_bg
         ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
         : MTLClearColorMake(0.05, 0.05, 0.08, 1.0);
-    rpd.depthAttachment.texture = r.depthTexture;
+    rpd.depthAttachment.texture = depthTarget != nil ? depthTarget : r.depthTexture;
     rpd.depthAttachment.loadAction = MTLLoadActionClear;
-    rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+    rpd.depthAttachment.storeAction = depthTarget != nil ? MTLStoreActionStore : MTLStoreActionDontCare;
     rpd.depthAttachment.clearDepth = 1.0;
 
     id<MTLCommandBuffer> cmdBuf = [r.commandQueue commandBuffer];
@@ -930,7 +1145,7 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
 
         // --- Draw cube ---
         {
-            const float cubeSize = 0.06f;
+            const float cubeSize = kCubeSize;
             const float cubeHeight = cubeSize / 2.0f;
             float model[16], rotation[16], translation[16], scale[16], tmp[16];
             mat4_scaling(scale, cubeSize);
@@ -990,6 +1205,47 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
             }
         }
 
+        // --- Draw hand joint markers (#825 hands mode) ---
+        // A tiny cube at each tracked joint (26/hand), sized by the
+        // runtime-reported joint radius.
+        if (g_handsMode) {
+            const XrSpaceLocationFlags needed =
+                XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
+            for (int hand = 0; hand < 2; hand++) {
+                if (!g_hands.active[hand]) {
+                    continue;
+                }
+                for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+                    const XrHandJointLocationEXT &jl = g_hands.joints[hand][j];
+                    if ((jl.locationFlags & needed) != needed) {
+                        continue;
+                    }
+                    const float scl = jl.radius > 0.001f ? jl.radius : 0.008f;
+                    float model[16], poseMat[16], scale[16];
+                    mat4_scaling(scale, scl);
+                    mat4_model_from_xr_pose(poseMat, jl.pose);
+                    mat4_multiply(model, poseMat, scale);
+
+                    CubeUniforms uniforms;
+                    mat4_multiply(uniforms.mvp, vp_mat, model);
+                    memcpy(uniforms.model, model, sizeof(model));
+
+                    [enc setRenderPipelineState:r.cubePipeline];
+                    [enc setVertexBuffer:r.cubeVertexBuffer offset:0 atIndex:0];
+                    [enc setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+                    [enc setFragmentTexture:r.textures[0] atIndex:0];
+                    [enc setFragmentTexture:r.textures[1] atIndex:1];
+                    [enc setFragmentTexture:r.textures[2] atIndex:2];
+                    [enc setFragmentSamplerState:r.sampler atIndex:0];
+                    [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexCount:36
+                                     indexType:MTLIndexTypeUInt16
+                                   indexBuffer:r.cubeIndexBuffer
+                             indexBufferOffset:0];
+                }
+            }
+        }
+
         // --- Draw grid ---
         {
             const float gridScale = 0.05f;
@@ -1010,6 +1266,11 @@ static void RenderScene(MetalRenderer &r, id<MTLTexture> target,
             [enc setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:1];
 
             [enc drawPrimitives:MTLPrimitiveTypeLine vertexStart:0 vertexCount:r.gridVertexCount];
+        }
+
+        // --- Depth-aware cursor (XR_DXR_cursor_depth): last, never occluded ---
+        if (g_cursorDraw.active) {
+            DrawCursorSprite(r, enc, vp_mat);
         }
     }
 
@@ -1064,11 +1325,12 @@ struct InputState {
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
-// Smooth 2D<->3D disparity ramp. macOS has its own AppXrSession/InputState (not
-// the Windows-only XrSessionManager), so the sequencer is driven inline below
-// rather than through common's XrSessionUpdateModeSwitch helper.
+// Smooth 2D<->3D disparity ramp (displayxr-common mode_switch.h). macOS has its
+// own AppXrSession/InputState, not the Windows-only XrSessionManager, so it calls
+// the platform-neutral dxr::ModeSwitch::step() directly (defaults: 0.18 s).
 static dxr::ModeSwitch g_modeSwitch;
-static bool g_modeSwitchConfigured = false;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
 // HUD window-space layer (XR_EXT_window_space_layer): a fractional-window-space
@@ -1233,6 +1495,36 @@ static void SignalHandler(int)
 static AppDelegate *g_appDelegate = nil;
 static AppWindowDelegate *g_windowDelegate = nil;
 
+// Test knob (multi-screen segments): place the window's CONTENT rect at
+// x,y,w,h in top-down global points (origin = the main display's top-left,
+// the CGDisplayBounds / XrDisplayDesktopPositionDXR space) so a window can be
+// made to straddle two displays without dragging. Read from @p env_name;
+// false when unset or malformed.
+static bool ApplyTestWindowRect(const char *env_name)
+{
+    const char *e = getenv(env_name);
+    if (e == nullptr || g_window == nil) {
+        return false;
+    }
+    int x = 0, y = 0, w = 0, h = 0;
+    if (sscanf(e, "%d,%d,%d,%d", &x, &y, &w, &h) != 4 || w <= 0 || h <= 0) {
+        LOG_WARN("%s='%s' ignored (want x,y,w,h in top-down points)", env_name, e);
+        return false;
+    }
+    NSScreen *primary = [NSScreen screens].firstObject;
+    if (primary == nil) {
+        return false;
+    }
+    const CGFloat bottom = primary.frame.size.height - (CGFloat)y - (CGFloat)h;
+    NSRect content = NSMakeRect((CGFloat)x, bottom, (CGFloat)w, (CGFloat)h);
+    NSRect frame = [g_window frameRectForContentRect:content];
+    // setFrame:display: does not run constrainFrameRect, so a window may
+    // straddle displays exactly where asked.
+    [g_window setFrame:frame display:YES];
+    LOG_INFO("%s: content rect -> %d,%d %dx%d pt (top-down)", env_name, x, y, w, h);
+    return true;
+}
+
 static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLeft, int32_t screenTop)
 {
     @autoreleasepool {
@@ -1247,19 +1539,38 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         // XrDisplayDesktopPositionDXR); flip into AppKit's bottom-up space.
         // (0,0) = primary — the titled window is auto-constrained below the
         // menu bar, so it is always a safe create position.
-        NSRect frame = NSMakeRect(100, 100, width, height);
-        NSScreen *primary = [NSScreen screens].firstObject;
-        if (primary != nil) {
-            CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
-            frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
-        }
         NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
                            NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
+        // Resolve the NSScreen that holds the panel's top-left, and put the
+        // WHOLE window (title bar included) inside its visibleFrame. Placing
+        // the content top AT the panel top pushes the title bar off-screen,
+        // and AppKit then re-constrains the window onto [NSScreen mainScreen]
+        // — whichever screen has focus at launch, i.e. often the laptop.
+        NSRect frame = NSMakeRect(100, 100, width, height);
+        NSScreen *target = nil;
+        NSScreen *primary = [NSScreen screens].firstObject;
+        if (primary != nil) {
+            const NSPoint p = NSMakePoint((CGFloat)screenLeft + 1.0,
+                                          primary.frame.size.height - (CGFloat)screenTop - 1.0);
+            for (NSScreen *s in [NSScreen screens]) {
+                if (NSPointInRect(p, s.frame)) { target = s; break; }
+            }
+        }
+        if (target != nil) {
+            const NSRect vf = target.visibleFrame; // below that screen's menu bar
+            const NSRect wf = [NSWindow frameRectForContentRect:NSMakeRect(0, 0, width, height) styleMask:style];
+            const CGFloat titleH = wf.size.height - (CGFloat)height;
+            frame = NSMakeRect(vf.origin.x, NSMaxY(vf) - titleH - (CGFloat)height, width, height);
+        }
 
         g_window = [[NSWindow alloc] initWithContentRect:frame
                                                styleMask:style
                                                  backing:NSBackingStoreBuffered
                                                    defer:NO];
+        if (target != nil) {
+            // Global coordinates, title bar on-screen: no re-constrain.
+            [g_window setFrame:[g_window frameRectForContentRect:frame] display:NO];
+        }
 
         [g_window setTitle:@"Metal Cube — Metal Native Compositor (External Window)"];
         [g_window setAcceptsMouseMovedEvents:YES];
@@ -1278,8 +1589,12 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         }
 
         [g_window setContentView:g_metalView];
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
         [g_window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        // Ordering front may re-constrain the frame onto one display; put
+        // the test rect back once the window is on screen.
+        (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT");
 
         // Pump events so the window appears
         NSEvent *event;
@@ -1505,6 +1820,32 @@ struct AppXrSession {
     XrSpace localSpace;
     XrSpace viewSpace;
     SwapchainInfo swapchain;
+    // XR_DXR_cursor_depth v2 (ADR-046 3a): DISPLAYXR_CURSOR_DEPTH_SOURCE=layer
+    // submits depth (XR_KHR_composition_layer_depth) and lets the runtime
+    // find the nearest content under the cursor, instead of the hit test.
+    bool cursorDepthFromLayer = false;
+    // XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured shows a synthetic stereo PHOTO instead of the cube and lets the
+    // runtime measure the disparity under the cursor (no hit test, no depth).
+    bool cursorDepthMeasured = false;
+    bool stereoPhoto = false; // the photo, with or without the measured source
+    // XR_DXR_cursor_depth v3: DISPLAYXR_CURSOR_DEPTH_ANCHOR=hybrid|screen|world
+    // chains XrCursorDepthOptionsDXR with that anchor mode. Unset: the struct
+    // is not chained, and the runtime defaults to HYBRID.
+    bool cursorDepthChainOptions = false;
+    XrCursorDepthAnchorModeDXR cursorDepthAnchor =
+        XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
+    // XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B):
+    // DISPLAYXR_CURSOR_DEPTH_DRAW=runtime (default) | app. Runtime: chain
+    // XrCursorDepthDrawInfoDXR and let the runtime draw the cursor; hide the
+    // OS cursor exactly while XrCursorDepthDrawStateDXR::willDraw. App: draw
+    // the crosshair ourselves from the placement (v1-v4 behaviour).
+    bool cursorDepthRuntimeDraw = false;
+    // DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: hand the runtime our own sprite
+    // (a cyan ring with a dot) instead of its default look.
+    bool cursorDepthCustomSprite = false;
+    XrSwapchain cursorSpriteSwapchain = XR_NULL_HANDLE;
+    SwapchainInfo depthSwapchain = {};
     XrViewConfigurationType viewConfigType;
     std::vector<XrViewConfigurationView> configViews;
     XrSessionState sessionState;
@@ -1529,6 +1870,9 @@ struct AppXrSession {
     // XR_DXR_atlas_capture (W6 of #396): runtime-owned 'I'-key atlas capture.
     bool hasAtlasCaptureExt = false;
     bool hasViewRigExt = false;  // XR_DXR_view_rig (#396 W7)
+    bool hasCursorDepthExt = false; // XR_DXR_cursor_depth (ADR-046)
+    uint32_t cursorDepthSpecVersion = 0;
+    bool hasLayerDepthExt = false;  // XR_KHR_composition_layer_depth
     PFN_xrCaptureAtlasDXR pfnCaptureAtlasEXT = nullptr;
 
     // XR_DXR_local_3d_zone (#439 Phase 3, cases 2/3/4)
@@ -1593,6 +1937,14 @@ static bool InitializeOpenXR(AppXrSession &app)
             g_hasMcpToolsExt = true;
         if (strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
             app.hasViewRigExt = true;
+        if (strcmp(e.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0) {
+            app.hasCursorDepthExt = true;
+            app.cursorDepthSpecVersion = e.extensionVersion;
+        }
+        if (strcmp(e.extensionName, XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME) == 0)
+            app.hasLayerDepthExt = true;
+        if (strcmp(e.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+            g_hasHandTrackingExt = true;
     }
 
     if (!hasMetalEnable) {
@@ -1625,6 +1977,96 @@ static bool InitializeOpenXR(AppXrSession &app)
     }
     if (app.hasViewRigExt) {
         enabledExts.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (g_hasHandTrackingExt) {
+        enabledExts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+    }
+    if (app.hasCursorDepthExt) {
+        const char *opt = getenv("DISPLAYXR_CURSOR_DEPTH");
+        if (opt != nullptr && strcmp(opt, "0") == 0) {
+            app.hasCursorDepthExt = false; // opted out: the runtime does no cursor work
+        } else {
+            enabledExts.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+        }
+    }
+    LOG_INFO("XR_DXR_cursor_depth: %s", app.hasCursorDepthExt ? "ENABLED" : "off");
+    if (app.hasCursorDepthExt) {
+        // Opt-in (ADR-046 3a): submit depth and let the runtime find the
+        // nearest point. Needs spec v2 + XR_KHR_composition_layer_depth.
+        const char *src = getenv("DISPLAYXR_CURSOR_DEPTH_SOURCE");
+        if (src != nullptr && strcmp(src, "layer") == 0) {
+            if (app.cursorDepthSpecVersion >= 2 && app.hasLayerDepthExt) {
+                app.cursorDepthFromLayer = true;
+                enabledExts.push_back(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME);
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=layer needs XR_DXR_cursor_depth v2 (have v%u) and "
+                         "XR_KHR_composition_layer_depth (%s) - keeping the app hit test",
+                         app.cursorDepthSpecVersion, app.hasLayerDepthExt ? "present" : "absent");
+            }
+        }
+        if (src != nullptr && strcmp(src, "measured") == 0) {
+            if (app.cursorDepthSpecVersion >= 7) {
+                app.cursorDepthMeasured = true;
+            } else {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_SOURCE=measured needs XR_DXR_cursor_depth v7 (have v%u) - "
+                         "keeping the app hit test",
+                         app.cursorDepthSpecVersion);
+            }
+        }
+        LOG_INFO("XR_DXR_cursor_depth source: %s",
+                 app.cursorDepthFromLayer   ? "SUBMITTED DEPTH (runtime reads it)"
+                 : app.cursorDepthMeasured ? "MEASURED DISPARITY (runtime block-matches the views)"
+                                           : "app hit test");
+
+        // Opt-in (spec v3): pick the anchor mode explicitly.
+        const char *anchor = getenv("DISPLAYXR_CURSOR_DEPTH_ANCHOR");
+        if (anchor != nullptr && anchor[0] != '\0') {
+            bool known = true;
+            if (strcmp(anchor, "hybrid") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
+            } else if (strcmp(anchor, "screen") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR;
+            } else if (strcmp(anchor, "world") == 0) {
+                app.cursorDepthAnchor = XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR;
+            } else {
+                known = false;
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_ANCHOR=%s: expected "
+                         "hybrid|screen|world - not chaining options",
+                         anchor);
+            }
+            if (known && app.cursorDepthSpecVersion < 3) {
+                LOG_WARN("DISPLAYXR_CURSOR_DEPTH_ANCHOR needs "
+                         "XR_DXR_cursor_depth v3 (have v%u) - ignored",
+                         app.cursorDepthSpecVersion);
+            } else if (known) {
+                app.cursorDepthChainOptions = true;
+            }
+        }
+        LOG_INFO(
+            "XR_DXR_cursor_depth anchor: %s",
+            !app.cursorDepthChainOptions
+                ? "runtime default (options not chained)"
+            : app.cursorDepthAnchor == XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR
+                ? "SCREEN"
+            : app.cursorDepthAnchor == XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR
+                ? "WORLD"
+                : "HYBRID");
+
+        // Spec v5: who draws the cursor. Default: the runtime.
+        const char *drawWho = getenv("DISPLAYXR_CURSOR_DEPTH_DRAW");
+        const bool wantApp = drawWho != nullptr && strcmp(drawWho, "app") == 0;
+        if (!wantApp && app.cursorDepthSpecVersion >= 5) {
+            app.cursorDepthRuntimeDraw = true;
+            const char *sprite = getenv("DISPLAYXR_CURSOR_DEPTH_SPRITE");
+            app.cursorDepthCustomSprite = sprite != nullptr && strcmp(sprite, "custom") == 0;
+        } else if (!wantApp) {
+            LOG_WARN("XR_DXR_cursor_depth v%u has no runtime-drawn cursor (needs v5) - drawing it ourselves",
+                     app.cursorDepthSpecVersion);
+        }
+        LOG_INFO("XR_DXR_cursor_depth draw: %s",
+                 !app.cursorDepthRuntimeDraw ? "APP (crosshair from the placement)"
+                 : app.cursorDepthCustomSprite ? "RUNTIME, custom sprite (cyan ring)"
+                                               : "RUNTIME, default look");
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -1776,6 +2218,19 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
         }
     }
 
+    // ADR-050 test knob: DXR_TEST_PLACEMENT_APP_OWNED=1 keeps AppKit's native
+    // window drag / resize (opts out of the runtime-owned placement, spec v8).
+    XrCocoaWindowPlacementInfoDXR placementInfo = {};
+    placementInfo.type = XR_TYPE_COCOA_WINDOW_PLACEMENT_INFO_DXR;
+    {
+        const char *e = getenv("DXR_TEST_PLACEMENT_APP_OWNED");
+        if (e != nullptr && e[0] == '1') {
+            placementInfo.flags = XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR;
+            cocoaBinding.next = &placementInfo;
+            LOG_INFO("DXR_TEST_PLACEMENT_APP_OWNED=1: chaining XrCocoaWindowPlacementInfoDXR (APP_OWNED)");
+        }
+    }
+
     if (app.hasCocoaWindowBinding) {
         metalBinding.next = &cocoaBinding;
         LOG_INFO("Chaining XR_DXR_cocoa_window_binding with NSView %p", cocoaBinding.viewHandle);
@@ -1794,6 +2249,13 @@ static bool CreateSession(AppXrSession &app, MetalRenderer &r)
     if (g_actionsMode && !SetupActions(app.instance, app.session)) {
         LOG_ERROR("actions: setup failed — continuing without actions mode");
         g_actionsMode = false;
+    }
+
+    // #825 hands mode: create the hand trackers right after session
+    // creation. Failure downgrades to the plain cube.
+    if (g_handsMode && !SetupHands(app.instance, app.systemId, app.session)) {
+        LOG_ERROR("hands: setup failed — continuing without hands mode");
+        g_handsMode = false;
     }
 
     // XR_DXR_mcp_tools: declare identity + register agent tools. The appId
@@ -1898,6 +2360,123 @@ static bool CreateSpaces(AppXrSession &app)
     return true;
 }
 
+// ============================================================================
+// Colour swapchain (ADR-044 / INV-4.6)
+// ============================================================================
+//
+// This app authors DISPLAY-REFERRED colour: its shaders, clears and textures
+// produce the bytes it wants on screen. A swapchain's format says what its
+// bytes mean, and the runtime believes it: UNORM holds LINEAR values (which a
+// format-honest compositor encodes once more — washed out), `_SRGB` holds
+// encoded ones. So the app requests BGRA8Unorm_sRGB and renders through a
+// BGRA8Unorm VIEW of the same storage: the pipelines keep their BGRA8Unorm
+// attachments and the authored bytes land unconverted (ADR-044 §2, "display-
+// referred bytes moved without conversion"). No shader or clear-colour change.
+//
+// DXR_SWAPCHAIN_ENCODING=unorm reproduces the old UNORM request (A/B: it
+// washes out on runtime >= the Metal format-honest change, unless
+// DXR_COLOR_LEGACY_UNORM_ENCODED=1 is also set).
+static int64_t ChooseAppColorFormat(const std::vector<int64_t> &formats)
+{
+    const char *enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    const bool forceUnorm = enc != nullptr && strcasecmp(enc, "unorm") == 0;
+    const int64_t preferred[] = {
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm : (int64_t)MTLPixelFormatBGRA8Unorm_sRGB,
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm_sRGB : (int64_t)MTLPixelFormatBGRA8Unorm,
+    };
+    for (int64_t p : preferred) {
+        for (int64_t f : formats) {
+            if (f == p) {
+                return f;
+            }
+        }
+    }
+    return formats.empty() ? 0 : formats[0];
+}
+
+// The texture the app RENDERS into for swapchain image @p tex: a BGRA8Unorm
+// view of an `_SRGB` image (raw bytes, no encode on write), else the image.
+static id<MTLTexture> AppRenderTarget(id<MTLTexture> tex)
+{
+    if (tex != nil && tex.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) {
+        id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+        if (view != nil) {
+            return view;
+        }
+    }
+    return tex;
+}
+
+// ============================================================================
+// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3) test content: a synthetic
+// STEREO PHOTO (test_apps/common/stereo_photo_test.h) in place of the cube -
+// stereo content with no depth, which is what the measured-disparity source is
+// for. DISPLAYXR_CURSOR_DEPTH_SOURCE=measured selects it (and the source);
+// DISPLAYXR_STEREO_PHOTO=1 shows it without the cursor source (a cost
+// baseline); DISPLAYXR_STEREO_PHOTO_ANIMATE=1 pans it a pixel per frame (a
+// playing video: every frame is a new measurement).
+// ============================================================================
+
+struct StereoPhoto
+{
+    uint32_t w = 0, h = 0, pad = 32;
+    int eyes = 0;
+    std::vector<id<MTLTexture>> tex; // (w + pad) x h each, BGRA8Unorm
+};
+static StereoPhoto g_stereoPhoto;
+
+static void EnsureStereoPhoto(id<MTLDevice> dev, uint32_t w, uint32_t h, int eyes)
+{
+    StereoPhoto &sp = g_stereoPhoto;
+    if (sp.w == w && sp.h == h && sp.eyes == eyes && (int)sp.tex.size() == eyes) return;
+    sp.tex.clear();
+    sp.w = w;
+    sp.h = h;
+    sp.eyes = eyes;
+    const uint32_t tw = w + sp.pad;
+    std::vector<uint8_t> px;
+    for (int e = 0; e < eyes; e++) {
+        dxr_test::PhotoFill(e, eyes, w, tw, h, true, px);
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                     width:tw
+                                                                                    height:h
+                                                                                 mipmapped:NO];
+        d.storageMode = MTLStorageModeManaged;
+        d.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+        [t replaceRegion:MTLRegionMake2D(0, 0, tw, h) mipmapLevel:0 withBytes:px.data() bytesPerRow:tw * 4];
+        sp.tex.push_back(t);
+    }
+    LOG_INFO("stereo photo: %d views of %ux%u (foreground +%.1f px crossed, ground %.1f px, stripes period %.0f px)",
+             eyes, w, h, dxr_test::kPhotoForegroundD * w, dxr_test::kPhotoGroundD * w,
+             fmaxf(6.0f, roundf(0.0125f * w)));
+}
+
+// Blit each view's photo into its tile of the swapchain image (instead of the cube).
+static void BlitStereoPhoto(MetalRenderer &r, id<MTLTexture> target, const EyeRenderParams *eyes, int eyeCount,
+                            uint32_t scroll)
+{
+    if (eyeCount < 1) return;
+    EnsureStereoPhoto(r.device, eyes[0].width, eyes[0].height, eyeCount);
+    id<MTLCommandBuffer> cb = [r.commandQueue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    for (int e = 0; e < eyeCount; e++) {
+        const uint32_t w = eyes[e].width < g_stereoPhoto.w ? eyes[e].width : g_stereoPhoto.w;
+        const uint32_t h = eyes[e].height < g_stereoPhoto.h ? eyes[e].height : g_stereoPhoto.h;
+        [blit copyFromTexture:g_stereoPhoto.tex[e]
+                  sourceSlice:0
+                  sourceLevel:0
+                 sourceOrigin:MTLOriginMake(scroll % g_stereoPhoto.pad, 0, 0)
+                   sourceSize:MTLSizeMake(w, h, 1)
+                    toTexture:target
+             destinationSlice:0
+             destinationLevel:0
+            destinationOrigin:MTLOriginMake(eyes[e].viewportX, eyes[e].viewportY, 0)];
+    }
+    [blit endEncoding];
+    [cb commit];
+}
+
 static bool CreateSwapchain(AppXrSession &app)
 {
     // Size swapchain for the maximum atlas across all rendering modes.
@@ -1920,12 +2499,9 @@ static bool CreateSwapchain(AppXrSession &app)
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
     LOG_INFO("Supported swapchain formats:");
-    int64_t selectedFormat = formats[0];
-    for (auto f : formats) {
-        if (f == (int64_t)MTLPixelFormatBGRA8Unorm) {
-            selectedFormat = f;
-        }
-    }
+    // ADR-044: the _SRGB sibling of the BGRA8 pipelines' format (see
+    // ChooseAppColorFormat) — this app's bytes are display-referred.
+    int64_t selectedFormat = ChooseAppColorFormat(formats);
     for (auto f : formats) {
         LOG_INFO("  format %lld%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
@@ -1955,7 +2531,7 @@ static bool CreateSwapchain(AppXrSession &app)
 
     app.swapchain.images.resize(imageCount);
     for (uint32_t i = 0; i < imageCount; i++) {
-        app.swapchain.images[i] = (__bridge id<MTLTexture>)metalImages[i].texture;
+        app.swapchain.images[i] = AppRenderTarget((__bridge id<MTLTexture>)metalImages[i].texture);
         LOG_INFO("Swapchain image %u: MTLTexture %p (%lux%lu)",
                  i, metalImages[i].texture,
                  (unsigned long)app.swapchain.images[i].width,
@@ -1963,6 +2539,32 @@ static bool CreateSwapchain(AppXrSession &app)
     }
 
     LOG_INFO("Swapchain created: %ux%u, %u images", w, h, imageCount);
+
+    // XR_DXR_cursor_depth 3a: a matching depth swapchain the app renders its
+    // depth into and submits via XrCompositionLayerDepthInfoKHR.
+    if (app.cursorDepthFromLayer) {
+        XrSwapchainCreateInfo dci = sci;
+        dci.usageFlags = XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        dci.format = (int64_t)MTLPixelFormatDepth32Float;
+        if (XR_FAILED(xrCreateSwapchain(app.session, &dci, &app.depthSwapchain.swapchain))) {
+            LOG_WARN("Depth swapchain creation failed - falling back to the app hit test");
+            app.cursorDepthFromLayer = false;
+            return true;
+        }
+        uint32_t dCount = 0;
+        XR_CHECK(xrEnumerateSwapchainImages(app.depthSwapchain.swapchain, 0, &dCount, nullptr));
+        std::vector<XrSwapchainImageMetalKHR> dImages(dCount, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+        XR_CHECK(xrEnumerateSwapchainImages(app.depthSwapchain.swapchain, dCount, &dCount,
+                                             (XrSwapchainImageBaseHeader *)dImages.data()));
+        app.depthSwapchain.format = dci.format;
+        app.depthSwapchain.width = w;
+        app.depthSwapchain.height = h;
+        app.depthSwapchain.imageCount = dCount;
+        app.depthSwapchain.images.resize(dCount);
+        for (uint32_t i = 0; i < dCount; i++)
+            app.depthSwapchain.images[i] = (__bridge id<MTLTexture>)dImages[i].texture;
+        LOG_INFO("Depth swapchain created: %ux%u, %u images (XR_DXR_cursor_depth source = layer)", w, h, dCount);
+    }
     return true;
 }
 
@@ -1976,6 +2578,23 @@ struct L2DPanel {
 };
 static L2DPanel g_panel1, g_panel2;
 static XrRect2Di g_panel1Rect, g_panel2Rect;
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session)
+{
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == (int64_t)MTLPixelFormatBGRA8Unorm_sRGB) return f;
+    }
+    return (int64_t)MTLPixelFormatBGRA8Unorm;
+}
+
 
 // Create a window-anchored Local2D panel swapchain and fill it once (static
 // content: acquire/fill/release once; the layer references the released
@@ -1995,7 +2614,7 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    sci.format = PickPanelFormat(app.session);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
@@ -2081,6 +2700,72 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 }
 
 // ============================================================================
+// XR_DXR_cursor_depth v5 — a custom cursor sprite for the runtime to draw
+// ============================================================================
+
+// DISPLAYXR_CURSOR_DEPTH_SPRITE=custom: a 64x64 cyan ring with a centre dot
+// (hotspot = the centre), dark-edged so it reads over the white cube. Filled
+// once (acquire / fill / release); the runtime samples the last released
+// image every frame, as STRAIGHT alpha.
+static bool CreateCursorSprite(AppXrSession &app)
+{
+    const uint32_t S = 64;
+    XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+    sci.format = PickPanelFormat(app.session); // _SRGB when offered: the bytes are display-referred
+    sci.sampleCount = 1;
+    sci.width = S;
+    sci.height = S;
+    sci.faceCount = 1;
+    sci.arraySize = 1;
+    sci.mipCount = 1;
+    if (XR_FAILED(xrCreateSwapchain(app.session, &sci, &app.cursorSpriteSwapchain))) {
+        return false;
+    }
+    uint32_t n = 0;
+    xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, 0, &n, nullptr);
+    std::vector<XrSwapchainImageMetalKHR> imgs(n, {XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR});
+    if (n == 0 || XR_FAILED(xrEnumerateSwapchainImages(app.cursorSpriteSwapchain, n, &n,
+                                                       (XrSwapchainImageBaseHeader *)imgs.data()))) {
+        return false;
+    }
+    XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    uint32_t idx = 0;
+    if (XR_FAILED(xrAcquireSwapchainImage(app.cursorSpriteSwapchain, &ai, &idx))) {
+        return false;
+    }
+    XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    wi.timeout = XR_INFINITE_DURATION;
+    xrWaitSwapchainImage(app.cursorSpriteSwapchain, &wi);
+
+    std::vector<uint8_t> buf((size_t)S * S * 4);
+    auto cover = [](float d, float r0, float r1) { // 1 inside [r0, r1], 1-px soft edges
+        const float a = std::min(d - r0 + 0.5f, r1 - d + 0.5f);
+        return a <= 0.0f ? 0.0f : (a >= 1.0f ? 1.0f : a);
+    };
+    for (uint32_t y = 0; y < S; y++) {
+        for (uint32_t x = 0; x < S; x++) {
+            const float d = hypotf((float)x + 0.5f - S * 0.5f, (float)y + 0.5f - S * 0.5f);
+            const float ring = std::max(cover(d, 21.0f, 27.0f), cover(d, 0.0f, 5.0f)); // cyan
+            const float edge = std::max(cover(d, 19.5f, 28.5f), cover(d, 0.0f, 6.5f)); // dark rim
+            uint8_t *px = &buf[((size_t)y * S + x) * 4];
+            // BGRA, straight alpha: cyan where the ring is, near-black rim.
+            px[0] = (uint8_t)(255.0f * ring);
+            px[1] = (uint8_t)(220.0f * ring);
+            px[2] = 0;
+            px[3] = (uint8_t)(255.0f * std::max(ring, edge));
+        }
+    }
+    id<MTLTexture> tex = (__bridge id<MTLTexture>)imgs[idx].texture;
+    [tex replaceRegion:MTLRegionMake2D(0, 0, S, S) mipmapLevel:0 withBytes:buf.data() bytesPerRow:(size_t)S * 4];
+
+    XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrReleaseSwapchainImage(app.cursorSpriteSwapchain, &ri);
+    LOG_INFO("Cursor sprite swapchain created: %ux%u (cyan ring, hotspot = centre)", S, S);
+    return true;
+}
+
+// ============================================================================
 // #1581 — quad-layer probe texture
 // ============================================================================
 
@@ -2112,7 +2797,9 @@ static bool CreateAndFillQuadTexture(AppXrSession &app, uint32_t size)
 {
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    // ADR-044: display-referred CPU bytes (-replaceRegion: moves them
+    // unconverted) belong in an _SRGB swapchain.
+    sci.format = PickPanelFormat(app.session);
     sci.sampleCount = 1;
     sci.width = size;
     sci.height = size;
@@ -2230,7 +2917,10 @@ static bool CreateAndFillQuadArrayTexture(AppXrSession &app,
   XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
   sci.usageFlags =
       XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-  sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+  // ADR-044: the slice colours are display-referred bytes, so the swapchain
+  // is _SRGB and the clears below go through a BGRA8Unorm view (a clear value
+  // on an _SRGB attachment is LINEAR and would be encoded).
+  sci.format = PickPanelFormat(app.session);
   sci.sampleCount = 1;
   sci.width = kQuadArrayTexSize;
   sci.height = kQuadArrayTexSize;
@@ -2278,11 +2968,12 @@ static bool CreateAndFillQuadArrayTexture(AppXrSession &app,
     // channel order is, so these are written red-first even though the
     // texture is BGRA8Unorm and the constants above are stored BGRA.
     id<MTLCommandBuffer> cmd = [renderer.commandQueue commandBuffer];
+    id<MTLTexture> clearTarget = AppRenderTarget(tex); // raw-byte view of an _SRGB array
     for (uint32_t slice = 0; slice < 2; slice++) {
       const uint8_t *c = (slice == 0) ? kSlice0BGRA : kSlice1BGRA;
       MTLRenderPassDescriptor *rp =
           [MTLRenderPassDescriptor renderPassDescriptor];
-      rp.colorAttachments[0].texture = tex;
+      rp.colorAttachments[0].texture = clearTarget;
       rp.colorAttachments[0].slice = slice;
       rp.colorAttachments[0].level = 0;
       rp.colorAttachments[0].loadAction = MTLLoadActionClear;
@@ -2449,6 +3140,22 @@ int main(int argc, char **argv)
                  "controller markers render as small cubes");
     }
 
+    // #825 hands mode: `--hands` flag or DXR_HANDS=1.
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--hands") == 0) {
+            g_handsMode = true;
+        }
+    }
+    {
+        const char *e = getenv("DXR_HANDS");
+        if (e != NULL && e[0] != '\0' && e[0] != '0') {
+            g_handsMode = true;
+        }
+    }
+    if (g_handsMode) {
+        LOG_INFO("Hands mode ENABLED (--hands): XR_EXT_hand_tracking joint markers");
+    }
+
     // #439 Phase 3 cases 2/3/4 (see the g_l2dPanel globals block).
     {
         const char *e = getenv("DXR_LOCAL2D_PANEL");
@@ -2543,6 +3250,75 @@ int main(int argc, char **argv)
         LOG_ERROR("Failed to create swapchain");
         return 1;
     }
+    if (app.cursorDepthRuntimeDraw && app.cursorDepthCustomSprite && !CreateCursorSprite(app)) {
+        LOG_WARN("Cursor sprite swapchain creation failed - using the runtime's default look");
+        app.cursorDepthCustomSprite = false;
+    }
+
+    // XR_DXR_cursor_depth (ADR-046): the displayxr-common helper. enable(0)
+    // (extension off / opted out) leaves it inert: no structs, no OS cursor.
+    dxr::CursorDepth cursor;
+    cursor.enable(app.hasCursorDepthExt ? app.cursorDepthSpecVersion : 0);
+    cursor.setWindowCocoa((__bridge void *)g_metalView);
+    cursor.setCursorHeight(kCursorHeight);
+    cursor.setWantPlacement(true); // the diagnostics below
+    // The OS-cursor hand-off, as the user sees it: hidden exactly while the
+    // runtime reports willDraw (#1952: also false after a compositor
+    // refusal). First 12 transitions only - never per frame.
+    cursor.onDepthCursorShownChanged([](bool shown) {
+        static int logged = 0;
+        if (logged < 12) {
+            logged++;
+            LOG_INFO("cursor_depth: OS cursor %s", shown ? "HIDDEN (depth cursor drawn)" : "SHOWN");
+        }
+    });
+    if (!app.cursorDepthRuntimeDraw) {
+        cursor.setDrawMode(dxr::CursorDepth::DrawMode::App);
+        cursor.setFootprintBodyOffset(dxr::kCursorCenteredBodyOffset); // our crosshair is centred
+    } else if (app.cursorDepthCustomSprite) {
+        cursor.setSprite(app.cursorSpriteSwapchain, {0.5f, 0.5f}, 0.01f); // ring: hotspot = centre, 1 cm
+    }
+    if (app.cursorDepthChainOptions) cursor.setAnchor(app.cursorDepthAnchor);
+    cursor.useDepthLayer(app.cursorDepthFromLayer);
+    if (!app.cursorDepthMeasured) {
+        cursor.setRayCast([&renderer](const dxr::CursorRay &r) -> std::optional<float> {
+            float t;
+            return RayHitCube(r.origin, r.dir, renderer.cubeRotation, t) ? std::optional<float>(t) : std::nullopt;
+        });
+    }
+    // XR_DXR_cursor_depth v7: the stereo photo (DISPLAYXR_CURSOR_DEPTH_SOURCE=
+    // measured, or DISPLAYXR_STEREO_PHOTO=1 alone as a cost baseline).
+    {
+        const char *sp = getenv("DISPLAYXR_STEREO_PHOTO");
+        app.stereoPhoto = app.cursorDepthMeasured || (sp != nullptr && sp[0] == '1');
+    }
+    const bool stereoPhotoAnimate = []() {
+        const char *e = getenv("DISPLAYXR_STEREO_PHOTO_ANIMATE");
+        return e != nullptr && e[0] == '1';
+    }();
+    // The measured-disparity request: dxr::CursorDepth (displayxr-common
+    // v2.29.0) predates spec v7, so the source struct is chained here, ahead
+    // of the helper: chain() keeps whatever locateInfo.next held as the tail
+    // of the hint's chain, which is where the runtime looks for it.
+    XrCursorDepthSourceDXR measuredSource = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+    measuredSource.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+    // DISPLAYXR_FRAME_STATS=1: frame interval and xrLocateViews / xrEndFrame
+    // CPU time, averaged and logged every 300 frames (the Amendment 3 cost
+    // evidence).
+    const bool frameStats = []() {
+        const char *e = getenv("DISPLAYXR_FRAME_STATS");
+        return e != nullptr && e[0] == '1';
+    }();
+    struct
+    {
+        uint32_t n = 0;
+        double interval_ms = 0, locate_ms = 0, end_ms = 0, end_max_ms = 0;
+        double last_frame = 0;
+    } fstats;
+    if (const char *fx = getenv("DISPLAYXR_CURSOR_DEPTH_UV")) { // scripted cursor for headless verification
+        float fu, fv;
+        if (sscanf(fx, "%f,%f", &fu, &fv) == 2) cursor.setPointerUV(fu, fv);
+    }
 
     // HUD window-space layer swapchain (XR_EXT_window_space_layer).
     XrHudSwapchain hudSwapchain;
@@ -2596,50 +3372,39 @@ int main(int argc, char **argv)
         PumpMacOSEvents();
         PollEvents(app);
 
-        // Rendering mode requests (V=cycle next, 0-8=jump absolute) through the
-        // dxr::ModeSwitch sequencer: it eases g_input.viewParams.ipdFactor around
-        // the switch and fires xrRequestDisplayRenderingModeDXR on the right frame.
-        // The runtime owns the current mode; the XrEventDataRenderingModeChangedDXR
-        // event updates app.currentModeIndex (render paths + HUD read it directly).
-        if (!g_modeSwitchConfigured) {
-            g_modeSwitch.configure(0.18f, dxr::ModeSwitchEasing::SmoothStep);
-            g_modeSwitchConfigured = true;
-        }
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() — the same sequencer the
+        // Windows apps drive via XrSessionUpdateModeSwitch: it eases
+        // g_input.viewParams.ipdFactor around the switch and says on which frame
+        // to call xrRequestDisplayRenderingModeDXR (README "Smooth 2D<->3D
+        // transitions"). The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates app.currentModeIndex.
         {
-            const float steady = g_input.viewParams.steadyIpdFactor;
-            auto vcOf = [&](uint32_t m) -> uint32_t {
-                return (m < app.renderingModeCount && app.renderingModeViewCounts[m] > 0)
-                           ? app.renderingModeViewCounts[m] : 1;
-            };
-            int32_t target = -1;
+            int32_t want = -1;
             if (g_input.cycleRenderingModeRequested) {
                 g_input.cycleRenderingModeRequested = false;
-                if (app.renderingModeCount > 0)
-                    target = (int32_t)((app.currentModeIndex + 1) % app.renderingModeCount);
+                want = dxr::ModeSwitch::cycleTarget(app.currentModeIndex, app.renderingModeCount);
             }
             if (g_input.absoluteRenderingModeRequested >= 0) {
-                int32_t a = g_input.absoluteRenderingModeRequested;
+                want = g_input.absoluteRenderingModeRequested;
                 g_input.absoluteRenderingModeRequested = -1;
-                if ((uint32_t)a < app.renderingModeCount) target = a;
             }
-            if (target >= 0 && app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT) {
-                // currentIpd = on-screen disparity now: last ramp output while a
-                // ramp is in flight, else steady (avoids the first-press snap).
-                const float curIpd = g_modeSwitch.active() ? g_modeSwitch.ipd() : steady;
-                g_modeSwitch.request((uint32_t)target, vcOf((uint32_t)target),
-                                     app.currentModeIndex, vcOf(app.currentModeIndex),
-                                     curIpd, steady);
+            if (app.sessionRunning) {
+                const int32_t knob = g_modeSwitchKnob.poll(dt, app.currentModeIndex, app.renderingModeCount,
+                                                           app.renderingModeViewCounts);
+                if (knob >= 0) want = knob;
             }
-            if (g_modeSwitch.active()) {
-                float ipd = steady; bool fire = false; uint32_t mode = app.currentModeIndex;
-                g_modeSwitch.update(dt, &ipd, &fire, &mode);
-                g_input.viewParams.ipdFactor = ipd;
-                if (fire && mode != app.currentModeIndex && app.session != XR_NULL_HANDLE &&
-                    app.pfnRequestDisplayRenderingModeEXT)
-                    app.pfnRequestDisplayRenderingModeEXT(app.session, mode);
-            } else {
-                g_input.viewParams.ipdFactor = steady;
-            }
+            const bool canRequest = app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                dt, canRequest ? want : -1, app.renderingModeCount, app.renderingModeViewCounts,
+                app.currentModeIndex, g_input.viewParams.steadyIpdFactor);
+            g_input.viewParams.ipdFactor = f.ipd;
+            if (f.fire && canRequest)
+                app.pfnRequestDisplayRenderingModeEXT(app.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ipd=%.4f fire=%d mode=%u current=%u", dt, f.ipd,
+                         (int)f.fire, f.mode, app.currentModeIndex);
         }
 
         UpdateCameraMovement(g_input, dt, app.displayHeightM);
@@ -2763,6 +3528,9 @@ int main(int argc, char **argv)
         if (g_actionsMode) {
             UpdateActions(app.session, app.localSpace, frameState.predictedDisplayTime);
         }
+        if (g_handsMode) {
+            UpdateHands(app.localSpace, frameState.predictedDisplayTime);
+        }
 
         std::vector<XrView> views(app.configViews.size(), {XR_TYPE_VIEW});
         XrViewState viewState = {XR_TYPE_VIEW_STATE};
@@ -2812,8 +3580,79 @@ int main(int argc, char **argv)
             viewState.next = &viewRigRaw;
         }
 
+        // XR_DXR_cursor_depth (ADR-046): pointer UV, the footprint hit test
+        // against the previous locate's views (a frame late, which the
+        // runtime's filter absorbs), and the hint / draw-request / state
+        // structs on both chains. Inert when the extension is off.
+        if (app.cursorDepthMeasured && cursor.enabled()) {
+            measuredSource.next = locateInfo.next;
+            locateInfo.next = &measuredSource;
+        }
+        cursor.chain(locateInfo, viewState);
+
+        // Multi-screen M3 (XR_DXR_display_info v22): when the window spans
+        // displays the runtime hands out one view set per display; which views
+        // belong to which display (and its segment rect) comes back here.
+        XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+        XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+        XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+        viewBindings.bindingCapacityInput = 4;
+        viewBindings.bindings = viewBindingStorage;
+        viewBindings.next = viewState.next;
+        viewActivity.next = &viewBindings;
+        viewState.next = &viewActivity;
+
         uint32_t viewCount = 0;
+        const double tLocate0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
         xrLocateViews(app.session, &locateInfo, &viewState, (uint32_t)views.size(), &viewCount, views.data());
+        if (frameStats) {
+            fstats.locate_ms += (CFAbsoluteTimeGetCurrent() - tLocate0) * 1e3;
+        }
+
+        if (cursor.enabled()) {
+            const bool d3 = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
+            const uint32_t mvc = (app.currentModeIndex < app.renderingModeCount)
+                ? app.renderingModeViewCounts[app.currentModeIndex] : 2;
+            // Hides / shows the OS cursor; remembers the views for next frame.
+            cursor.afterLocate(views.data(), d3 ? (mvc < viewCount ? mvc : viewCount) : 1);
+
+            // App mode: we draw the crosshair from the placement.
+            const XrCursorDepthPlacementDXR &placement = cursor.placement();
+            g_cursorDraw.active = cursor.appShouldDraw();
+            g_cursorDraw.pose = placement.pose;
+            g_cursorDraw.height = placement.height;
+
+            static int willDrawLogged = 0;
+            if (cursor.runtimeDraws() && willDrawLogged < 3 && cursor.pointerInCanvas()) {
+                static int lastWillDraw = -1;
+                if ((int)cursor.drawState().willDraw != lastWillDraw) {
+                    lastWillDraw = (int)cursor.drawState().willDraw;
+                    willDrawLogged++;
+                    LOG_INFO("cursor_depth: runtime willDraw=%s (uv=%.3f,%.3f disparity=%.3f)",
+                             cursor.drawState().willDraw ? "TRUE" : "FALSE", cursor.hint().cursorUV.x,
+                             cursor.hint().cursorUV.y, placement.disparity);
+                }
+            }
+            static int cursorLogged = 0;
+            const bool cursorHasContent = (app.cursorDepthFromLayer || app.cursorDepthMeasured)
+                                              ? placement.targetDisparity != 0.0f
+                                              : cursor.hint().hasContent == XR_TRUE;
+            // Measured source: the answer evolves as readbacks land, so log it
+            // once a second rather than only the first few placements.
+            if (app.cursorDepthMeasured && cursor.pointerInCanvas() && g_frameCounter % 60 == 30) {
+                LOG_INFO("cursor_depth measured: uv=(%.3f,%.3f) target=%.4f disparity=%.4f active=%d willDraw=%d",
+                         cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                         placement.disparity, (int)placement.isActive, (int)cursor.drawState().willDraw);
+            }
+            if (placement.isActive && cursorHasContent && cursorLogged < 3) {
+                cursorLogged++;
+                LOG_INFO("cursor_depth: uv=(%.3f,%.3f) target=%.3f disparity=%.3f h=%.4f pos=(%.3f,%.3f,%.3f)",
+                         cursor.hint().cursorUV.x, cursor.hint().cursorUV.y, placement.targetDisparity,
+                         placement.disparity, placement.height, placement.pose.position.x,
+                         placement.pose.position.y, placement.pose.position.z);
+            }
+        }
 
         // Capture the runtime's resolved CANVAS size (the window client area in
         // meters) — the physical_height_m the Kooima/rig math runs on, which the
@@ -2854,6 +3693,16 @@ int main(int argc, char **argv)
         waitImgInfo.timeout = XR_INFINITE_DURATION;
         xrWaitSwapchainImage(app.swapchain.swapchain, &waitImgInfo);
 
+        // XR_DXR_cursor_depth 3a: the depth image submitted with the layer.
+        id<MTLTexture> depthTarget = nil;
+        if (app.cursorDepthFromLayer) {
+            uint32_t depthIndex = 0;
+            if (XR_SUCCEEDED(xrAcquireSwapchainImage(app.depthSwapchain.swapchain, &acqInfo, &depthIndex))) {
+                xrWaitSwapchainImage(app.depthSwapchain.swapchain, &waitImgInfo);
+                depthTarget = app.depthSwapchain.images[depthIndex];
+            }
+        }
+
         bool rendered = false;
         bool display3D = (app.currentModeIndex < app.renderingModeCount)
             ? app.renderingModeDisplay3D[app.currentModeIndex] : true;
@@ -2873,8 +3722,44 @@ int main(int argc, char **argv)
         uint32_t locatedCount = (viewCount > 0) ? viewCount : (uint32_t)eyeCount;
         if (eyeCount > (int)locatedCount) eyeCount = (int)locatedCount;
 
+        // Multi-screen M3: render EVERY view set (the sum is activeViewCount),
+        // each set's local view j into tile j at that display's segment rect
+        // (placed below once the tile size is known). Same recipe as
+        // cube_handle_d3d11_win / cube_handle_vk_linux.
+        const bool routedViews = display3D &&
+                                 app.viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                                 viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
+        if (routedViews) {
+            int routedEyes = 0;
+            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                const int end = (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                if (end > routedEyes) routedEyes = end;
+            }
+            if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+            if (routedEyes > 0) eyeCount = routedEyes;
+        }
+        {
+            static std::string lastBindings;
+            std::string now = routedViews ? "routed" : "single";
+            for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                char buf[160];
+                snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                         (unsigned long long)vb.displayId, vb.firstView, vb.firstView + vb.viewCount - 1,
+                         vb.segmentRect.offset.x, vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                         vb.segmentRect.extent.height);
+                now += buf;
+            }
+            if (now != lastBindings) {
+                LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                         viewActivity.activeViewCount, eyeCount);
+                lastBindings = now;
+            }
+        }
+
         // Dynamic arrays for N-view rendering
         std::vector<XrCompositionLayerProjectionView> projViews(locatedCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+        std::vector<XrCompositionLayerDepthInfoKHR> depthInfos(locatedCount, {XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR});
 
         // Render
         if (frameState.shouldRender && viewCount >= 1) {
@@ -2923,6 +3808,25 @@ int main(int argc, char **argv)
                 if (renderW > maxTileW) renderW = maxTileW;
                 if (renderH > maxTileH) renderH = maxTileH;
             }
+            // XR_DXR_cursor_depth v7 cost runs: DISPLAYXR_STEREO_PHOTO_VIEW=WxH
+            // submits each view at that size (960x1080 = 1080p SBS, 1920x2160 =
+            // 4K SBS), capped by the swapchain's tile. Same canvas, more pixels.
+            if (app.stereoPhoto && display3D) {
+                static uint32_t forceW = 0, forceH = 0;
+                static bool parsed = false;
+                if (!parsed) {
+                    parsed = true;
+                    const char *e = getenv("DISPLAYXR_STEREO_PHOTO_VIEW");
+                    if (e != nullptr && sscanf(e, "%ux%u", &forceW, &forceH) == 2) {
+                        LOG_INFO("stereo photo: forcing %ux%u per view (tile max %ux%u)", forceW, forceH, maxTileW,
+                                 maxTileH);
+                    }
+                }
+                if (forceW > 0 && forceH > 0) {
+                    renderW = forceW < maxTileW ? forceW : maxTileW;
+                    renderH = forceH < maxTileH ? forceH : maxTileH;
+                }
+            }
             g_renderW = renderW;
             g_renderH = renderH;
 
@@ -2935,9 +3839,41 @@ int main(int argc, char **argv)
             const float rigVH =
                 g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
+            // Multi-screen M3: per-view placement under routing — the display's
+            // segment rect (window px) scaled into the tile, edges rounded
+            // independently so two segments sharing a seam share the column.
+            struct ViewPlace {
+                uint32_t tile;
+                int32_t x, y;
+                uint32_t w, h;
+                bool set;
+            };
+            ViewPlace viewPlace[8] = {};
+            if (routedViews && g_windowW > 0 && g_windowH > 0) {
+                const float fx = (float)renderW / (float)g_windowW;
+                const float fy = (float)renderH / (float)g_windowH;
+                for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                    const XrViewDisplayBindingDXR &vb = viewBindingStorage[b];
+                    const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                    const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                    const int32_t x1 =
+                        (int32_t)lroundf((float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                    const int32_t y1 =
+                        (int32_t)lroundf((float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                    const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                    const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                    for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                        const uint32_t i = vb.firstView + j;
+                        if (i >= 8) break;
+                        viewPlace[i] = {j, x0, y0, sw, sh, true};
+                    }
+                }
+            }
+
             rendered = true;
             std::vector<EyeRenderParams> eyeParams(eyeCount);
             for (int eye = 0; eye < eyeCount; eye++) {
+                const bool placed = routedViews && eye < 8 && viewPlace[eye].set;
                 int vi = eye < (int)viewCount ? eye : 0;
                 XrFovf submitFov = views[vi].fov;
                 float nearZ = 0.01f, farZ = 100.0f;
@@ -2952,20 +3888,41 @@ int main(int argc, char **argv)
                 // Tile-aware viewport: place each view in the correct tile position
                 uint32_t tileX = display3D ? (eye % tileColumns) : 0;
                 uint32_t tileY = display3D ? (eye / tileColumns) : 0;
+                uint32_t vpW = renderW;
+                uint32_t vpH = renderH;
+                if (placed) {
+                    tileX = viewPlace[eye].tile % tileColumns;
+                    tileY = viewPlace[eye].tile / tileColumns;
+                }
                 uint32_t vpX = tileX * renderW;
                 uint32_t vpY = tileY * renderH;
+                if (placed) {
+                    // Multi-screen M3: this view's display segment inside its tile.
+                    vpX = (uint32_t)((int32_t)vpX + viewPlace[eye].x);
+                    vpY = (uint32_t)((int32_t)vpY + viewPlace[eye].y);
+                    vpW = viewPlace[eye].w;
+                    vpH = viewPlace[eye].h;
+                }
                 eyeParams[eye].viewportX = vpX;
                 eyeParams[eye].viewportY = vpY;
-                eyeParams[eye].width = renderW;
-                eyeParams[eye].height = renderH;
+                eyeParams[eye].width = vpW;
+                eyeParams[eye].height = vpH;
 
                 projViews[eye].subImage.swapchain = app.swapchain.swapchain;
                 projViews[eye].subImage.imageRect.offset = {(int32_t)vpX, (int32_t)vpY};
-                projViews[eye].subImage.imageRect.extent = {
-                    (int32_t)renderW, (int32_t)renderH};
+                projViews[eye].subImage.imageRect.extent = {(int32_t)vpW, (int32_t)vpH};
                 projViews[eye].subImage.imageArrayIndex = 0;
                 projViews[eye].pose = views[eye < (int)viewCount ? eye : 0].pose;
                 projViews[eye].fov = submitFov;
+
+                // Same rect in the depth swapchain, and the clip planes this
+                // eye's projection used (mat4_from_xr_fov: [0,1], near -> 0).
+                depthInfos[eye].subImage = projViews[eye].subImage;
+                depthInfos[eye].subImage.swapchain = app.depthSwapchain.swapchain;
+                depthInfos[eye].minDepth = 0.0f;
+                depthInfos[eye].maxDepth = 1.0f;
+                depthInfos[eye].nearZ = nearZ;
+                depthInfos[eye].farZ = farZ;
             }
 
             // ADR-041: fill the inactive tail [eyeCount, locatedCount). Each
@@ -2973,7 +3930,22 @@ int main(int argc, char **argv)
             // view 0's, and the runtime discards those pixels.
             DxrAliasInactiveViews(projViews.data(), views.data(), locatedCount, (uint32_t)eyeCount);
 
-            RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount);
+            // XR_KHR_composition_layer_depth is all-or-nothing per layer: the
+            // aliased inactive tail carries view 0's depth like its colour.
+            if (depthTarget != nil) {
+                for (uint32_t i = 0; i < locatedCount; i++) {
+                    if (i >= (uint32_t)eyeCount) depthInfos[i] = depthInfos[0];
+                    depthInfos[i].next = nullptr;
+                    projViews[i].next = &depthInfos[i];
+                }
+            }
+
+            if (app.stereoPhoto) {
+                BlitStereoPhoto(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount,
+                                stereoPhotoAnimate ? (uint32_t)g_frameCounter : 0u);
+            } else {
+                RenderScene(renderer, app.swapchain.images[imageIndex], eyeParams.data(), eyeCount, depthTarget);
+            }
 
             // 'I' key: snapshot the multi-view atlas via the runtime-owned
             // XR_DXR_atlas_capture (W6 of #396) — the runtime does the readback
@@ -3013,6 +3985,9 @@ int main(int argc, char **argv)
         // Release swapchain image
         XrSwapchainImageReleaseInfo relInfo = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(app.swapchain.swapchain, &relInfo);
+        if (depthTarget != nil) {
+            xrReleaseSwapchainImage(app.depthSwapchain.swapchain, &relInfo);
+        }
 
         // Render the HUD into the window-space layer swapchain (when visible).
         bool hudSubmitted = false;
@@ -3294,10 +4269,69 @@ int main(int argc, char **argv)
             endInfo.layerCount = layerCount;
             endInfo.layers = layers;
 
+            const double tEnd0 = frameStats ? CFAbsoluteTimeGetCurrent() : 0.0;
             xrEndFrame(app.session, &endInfo);
+            if (frameStats) {
+                const double now = CFAbsoluteTimeGetCurrent();
+                const double endMs = (now - tEnd0) * 1e3;
+                fstats.end_ms += endMs;
+                fstats.end_max_ms = endMs > fstats.end_max_ms ? endMs : fstats.end_max_ms;
+                if (fstats.last_frame > 0) fstats.interval_ms += (now - fstats.last_frame) * 1e3;
+                fstats.last_frame = now;
+                if (++fstats.n == 300) {
+                    LOG_INFO("frame stats (300 frames): interval %.3f ms, xrLocateViews %.3f ms, xrEndFrame %.3f ms "
+                             "(max %.3f), view %ux%u, photo=%d measured=%d cursorInCanvas=%d",
+                             fstats.interval_ms / 299.0, fstats.locate_ms / 300.0, fstats.end_ms / 300.0,
+                             fstats.end_max_ms, g_renderW, g_renderH, (int)app.stereoPhoto,
+                             (int)app.cursorDepthMeasured, (int)cursor.pointerInCanvas());
+                    fstats = {};
+                    fstats.last_frame = now;
+                }
+            }
         }
 
         g_frameCounter++;
+
+        // Test knob: move the window once, at frame DXR_TEST_WINDOW_MOVE_FRAME
+        // (default 300), to DXR_TEST_WINDOW_RECT2 — exercises a segment table
+        // change (split -> single, or the reverse) in one run.
+        {
+            static long moveFrame = -2;
+            if (moveFrame == -2) {
+                const char *mf = getenv("DXR_TEST_WINDOW_MOVE_FRAME");
+                moveFrame = getenv("DXR_TEST_WINDOW_RECT2") != nullptr ? (mf != nullptr ? atol(mf) : 300) : -1;
+            }
+            if (moveFrame >= 0 && g_frameCounter == moveFrame) {
+                (void)ApplyTestWindowRect("DXR_TEST_WINDOW_RECT2");
+            }
+        }
+
+        // Test knob (ADR-050, app-initiated move): DXR_TEST_APP_MOVE="F,dx,dy"
+        // calls -setFrameOrigin: by (dx,dy) points (AppKit, bottom-up) at frame
+        // F and then every 30 frames, 5 times — a move made OUTSIDE the
+        // runtime's placement path, which the runtime must re-snap on its
+        // next atomic present.
+        {
+            static long amFrame = -2;
+            static double amDx = 0.0, amDy = 0.0;
+            if (amFrame == -2) {
+                amFrame = -1;
+                const char *e = getenv("DXR_TEST_APP_MOVE");
+                long f = 0;
+                if (e != nullptr && sscanf(e, "%ld,%lf,%lf", &f, &amDx, &amDy) == 3 && f >= 0) {
+                    amFrame = f;
+                }
+            }
+            if (amFrame >= 0 && g_window != nil && (long)g_frameCounter >= amFrame &&
+                ((long)g_frameCounter - amFrame) % 30 == 0 && ((long)g_frameCounter - amFrame) / 30 < 5) {
+                NSPoint o = [g_window frame].origin;
+                o.x += amDx;
+                o.y += amDy;
+                [g_window setFrameOrigin:o];
+                LOG_INFO("DXR_TEST_APP_MOVE: frame %llu setFrameOrigin -> %.1f,%.1f",
+                         (unsigned long long)g_frameCounter, o.x, o.y);
+            }
+        }
 
         // FPS tracking
         g_avgFrameTime = g_avgFrameTime * 0.95 + dt * 0.05;
@@ -3424,8 +4458,11 @@ int main(int argc, char **argv)
     if (g_panel2.swapchain != XR_NULL_HANDLE) {
         xrDestroySwapchain(g_panel2.swapchain);
     }
+    if (app.cursorSpriteSwapchain != XR_NULL_HANDLE)
+        xrDestroySwapchain(app.cursorSpriteSwapchain);
     if (app.swapchain.swapchain)
         xrDestroySwapchain(app.swapchain.swapchain);
+    CleanupHands();
     if (app.localSpace)
         xrDestroySpace(app.localSpace);
     if (app.viewSpace)

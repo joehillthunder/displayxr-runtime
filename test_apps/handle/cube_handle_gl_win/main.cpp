@@ -102,7 +102,9 @@ static bool g_l2dActive = false;
 // #491 part 3 — 2D-under backdrop (0=off, 2=opaque, 3=semi-transparent).
 static int g_l2dBackdropVariant = 0;
 static long g_l2dFrameCounter = 0;
-static const long g_l2dActivationFrame = 10;
+// DXR_LOCAL2D_ACTIVATION_FRAME=N overrides (#2317 P3: a mid-session hub retire
+// after N projection-only frames).
+static long g_l2dActivationFrame = 10;
 
 struct L2DPanel {
     XrSwapchain swapchain = XR_NULL_HANDLE;
@@ -437,6 +439,25 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
         stats.fpsAccumulator = 0.0f;
     }
 }
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return unorm;
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == srgb) return f;
+    }
+    return unorm;
+}
+
 
 // #439 Phase 3 — create a window-anchored Local2D panel swapchain and fill it
 // once via glTexSubImage2D (the GL context is current on the render thread).
@@ -453,7 +474,7 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, uint32_t w, uint32_t h, 
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = 0x8058; // GL_RGBA8
+    sci.format = PickPanelFormat(xr.session, 0x8C43 /* GL_SRGB8_ALPHA8 */, 0x8058 /* GL_RGBA8 */);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
@@ -578,7 +599,10 @@ static uint32_t g_quadTexSize = 256;
 static bool CreateAndFillQuadTexture(XrSessionManager& xr, uint32_t size) {
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = 0x8058; // GL_RGBA8
+    // ADR-044 / INV-4.6: the bytes below are display-referred and land by a raw
+    // glTexSubImage2D, so declare them GL_SRGB8_ALPHA8 (UNORM would be encoded
+    // a second time by the format-honest compositor).
+    sci.format = PickPanelFormat(xr.session, 0x8C43 /* GL_SRGB8_ALPHA8 */, 0x8058 /* GL_RGBA8 */);
     sci.sampleCount = 1;
     sci.width = size;
     sci.height = size;
@@ -1470,6 +1494,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         if (e && *e == '1') g_l2dMask = true;
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
+        e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
+        if (e != nullptr && *e != 0) {
+            const long f = strtol(e, nullptr, 10);
+            if (f > 0) g_l2dActivationFrame = f;
+        }
         // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (variant 2); =2 ⟹
         // semi-transparent (variant 3, desktop shows through). Implies the panel path.
         e = getenv("DXR_LOCAL2D_BACKDROP");

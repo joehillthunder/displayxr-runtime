@@ -83,7 +83,7 @@ menu ordering.
 | Type | Meaning |
 |---|---|
 | `lifecycle:enable` | Service applies `SERVICE_CHILD_ENABLE` — controller is always running. |
-| `lifecycle:auto` | Service applies `SERVICE_CHILD_AUTO` — Ctrl+Space spawns on demand. |
+| `lifecycle:auto` | Service applies `SERVICE_CHILD_AUTO` — the launch hotkey (Ctrl+Shift+Space by default) spawns on demand. |
 | `lifecycle:disable` | Service applies `SERVICE_CHILD_DISABLE` — controller never auto-spawns. |
 | `separator` | Renders an `MF_SEPARATOR`. Not a click target. `Label` is ignored. |
 | `controller:<action-name>` | Service runs `CreateProcess` of `Binary` with `--workspace-action <action-name>`. The controller is responsible for singleton-aware forwarding (see below). |
@@ -169,7 +169,10 @@ When the user uninstalls the runtime via Add/Remove Programs:
    (silent uninstall) **before** removing any runtime files.
 3. Each chained workspace app uninstaller removes only the files and
    registry keys it owns — never the runtime's.
-4. The runtime then proceeds with its own cleanup.
+4. The runtime then deletes the `WorkspaceControllers` key **only if it is
+   empty** (`DeleteRegKey /ifempty`): a controller whose uninstaller failed
+   keeps its files and Add/Remove Programs entry, so it keeps its
+   registration too (#1803). It then proceeds with its own cleanup.
 
 This pattern mirrors how OS package managers handle dependent
 products. It is the workspace app's responsibility to:
@@ -189,6 +192,282 @@ uninstaller's final
 `DeleteRegKey HKLM "Software\DisplayXR\WorkspaceControllers"` removes
 any orphan registration keys.
 
+## Launch settings (user-customizable)
+
+How the service launches a registered controller is the **user's** setting, not the
+controller's: the runtime knows a controller only by its role and its registration (the
+`<id>` subkey), and the user picks the chord that summons it and whether it may be
+launched at all. Display dashboard phase 8; the dashboard reads and writes these through
+`displayxr-cli`, never the file directly.
+
+**Store.** `service.json` (per-user: `%LOCALAPPDATA%\DisplayXR\service.json`, POSIX
+`$XDG_CONFIG_HOME/displayxr/service.json`) carries a `controllers` map keyed by the
+registration `<id>`:
+
+```json
+{
+  "workspace": "auto",
+  "workspace_binary": "",
+  "start_on_login": true,
+  "controllers": {
+    "shell": { "hotkey": "Ctrl+Shift+F9", "mode": "auto" }
+  }
+}
+```
+
+| key | absent | values |
+|---|---|---|
+| `hotkey` | `Ctrl+Shift+Space` | a combo (below), or `null` = no hotkey (launch from the tray / `workspace launch` only) |
+| `mode` | `auto` | `auto` (on demand) or `disabled` (never launched, no hook) |
+
+An entry exists only while it differs from the defaults (the CLI prunes it back), so
+"an entry exists" is what `source: "user"` reports. The top-level `workspace` keeps its
+old meaning — **the active controller's** mode (`auto` / `disable` / the legacy
+always-on `enable`) — and every writer (CLI, tray menu) keeps it and the active
+controller's `mode` in step. In a hand-edited file where they disagree, the
+per-controller entry wins. `enable` has no per-controller spelling and reports as `auto`.
+
+**Default combo, and upgrades (2026-10-26).** The default is `Ctrl+Shift+Space`
+(`SERVICE_HOTKEY_DEFAULT`). It was `Ctrl+Space` until 2026-10-26 and changed because the
+service's hook sees a key before any application: `Ctrl+Space` is a common application
+binding (editor / IDE completion, "maximize area" in DCC tools, the Windows IME switch), and
+the old default took it from all of them. Because the default is never written to
+`service.json` (a setter prunes an entry equal to it), the change needs no migration step:
+
+| `service.json` before the upgrade | after |
+|---|---|
+| no entry for the controller, or no `hotkey` key (every box that never customised it) | `Ctrl+Shift+Space`, `source: "default"` |
+| `"hotkey": "Ctrl+Space"` (only by hand: the old setters pruned it) | kept — `Ctrl+Space`, `source: "user"` |
+| any other combo, or `null` | unchanged |
+
+To go back to the old combo: `displayxr-cli workspace set <id> --hotkey ctrl+space` (or
+the dashboard's capture box); `workspace reset <id>` returns to the current default.
+
+**Combo grammar.** `[Ctrl+][Shift+][Alt+][Win+]<Key>`, at least one modifier.
+`<Key>` is `Space`, `A`-`Z`, `0`-`9`, `F1`-`F24`, `Tab`, `Enter`, `Backquote`, `Minus`,
+`Equals`, `BracketLeft`, `BracketRight`, `Semicolon`, `Quote`, `Comma`, `Period`, `Slash`,
+`Backslash`, `Insert`, `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `Left`, `Up`,
+`Right`, `Down`. The parser is case-insensitive, takes the modifiers in any order (each
+once) and also accepts `ArrowLeft`/`ArrowUp`/`ArrowRight`/`ArrowDown`; everything is
+stored and reported in the canonical spelling (modifiers in the order above, keys as
+listed). Anything else is rejected. Implementation: `service_hotkey.c`, unit-tested in
+`tests_service_workspace_config`.
+
+**Matching.** (Windows; Linux: see *Linux* below.) The service's `WH_KEYBOARD_LL` hook fires on the configured key with
+**exactly** the configured modifier set down — every required modifier down, every other
+modifier up — so the default `Ctrl+Shift+Space` leaves plain `Ctrl+Space` (an application's
+binding) and the `Win+Space` IME switch untouched, and a user-set `Ctrl+Space` does not
+swallow `Ctrl+Shift+Space`. As before (#344) the hook is installed only in `auto` mode while the controller is
+**not** running; `disabled` or `hotkey: null` installs no hook at all.
+
+**macOS.** The service registers one global Carbon hotkey, **Control+Shift+Space**
+(`controlKey | shiftKey` — Control, not Command, so it is the same physical chord as on
+Windows and Linux), as a toggle: it launches the controller when none is running and
+SIGTERMs it when one is. It is fixed — the per-controller `hotkey` in `service.json` is
+stored and reported but not applied on macOS yet. Until 2026-10-26 it was Control+Space,
+plus a Control+Option+Space fallback for boxes where macOS owns Control+Space ("Select the
+previous input source"); the fallback is gone too, since Control+Shift+Space has no system
+binding and Control+Option+Space is macOS's own "Select next source in Input menu".
+
+**Active controller.** `active_id` is the controller the service spawns — the selection
+rule of *Service-side discovery* below (`service_config_pick_controller`, shared by the
+service and the CLI). Only the active controller is launched by the hotkey or
+`workspace launch`; settings for the others are stored and apply once one is active.
+
+**CLI.**
+
+```
+displayxr-cli workspace list [--json]
+displayxr-cli workspace set <id> --hotkey "<combo>" | --no-hotkey | --mode auto|disabled
+displayxr-cli workspace reset <id>                 # back to Ctrl+Shift+Space, auto
+displayxr-cli workspace launch <id>                # spawn now, through the running service
+displayxr-cli workspace hotkey-suspend on|off      # take the hook out / put it back
+```
+
+`workspace list --json`:
+
+```json
+{ "active_id": "<id>" | null,
+  "dev_override": "<path>" | null,
+  "controllers": [ { "id", "display_name", "vendor", "version", "binary",
+                     "registered": true,
+                     "connected": bool | null, "pid": int | null,
+                     "launch": { "mode": "auto" | "disabled",
+                                 "hotkey": "<combo>" | null,
+                                 "source": "default" | "user" } } ] }
+```
+
+`id` is the registration subkey; `display_name` / `vendor` / `version` / `binary` are the
+registration values verbatim. `connected` / `pid` come from the running service over DIAG
+IPC (a `CONTROLLER`-class client whose executable is the controller's `binary`); both are
+`null` when no service is reachable. `dev_override` is the `workspace_binary` path override,
+when set (no registered controller is then active). `info --json` carries the same objects
+as `workspace_controllers[]`, headless (`connected` / `pid` null). The CLI checks that the
+service pipe exists before connecting, so a settings read never auto-starts the service.
+
+**Live apply.** Three session-free, DIAG-only RPCs (appended to `proto.json`):
+
+| RPC | what the service does |
+|---|---|
+| `system_reload_service_config` | re-reads `service.json` on the tray thread and applies it through the same function the tray menu uses: a changed combo re-installs the hook, a changed mode applies the mode (`disabled` terminates a running controller, exactly as the tray's Disable does); a hotkey change never restarts a running controller. `workspace set` / `reset` call it, and print "applies on next service start" when no service is reachable |
+| `system_workspace_launch(controller)` → `status` | the hotkey's own spawn path. `status`: `0` started, `1` not the active controller, `2` disabled, `3` already running (the orchestrator's child, or a controller started outside it), `4` no controller, `5` no orchestrator |
+| `system_workspace_hotkey_suspend(suspend)` | `true`: take the hook out of the input pipeline so a hotkey-capture box (the dashboard's) sees the **current** combo — config and a running controller untouched; `false`: re-install it from the current config. Not tied to the caller's connection (the caller is a one-shot CLI); it resumes on an explicit `false` or after a **60 s** safety timeout that every `true` re-arms. One WARN on suspend, one on resume with the reason (`explicit` / `timeout`) |
+
+**Advisory to the controller.** The service exports `DISPLAYXR_WORKSPACE_HOTKEY=<combo>`
+(unset when there is none) into the environment the controller is spawned with. While the
+controller runs, dismissing it is the controller's own binding (it owns its toggle chord,
+#344); a controller that wants the summon and dismiss chords to agree reads this variable.
+Nothing requires it to.
+
+**Tray.** The active controller's submenu shows a greyed `Launch hotkey: <combo>` (or
+`none`) line, and the tray tooltip names the combo — never a hard-coded one.
+
+## Linux: orchestration, launch hotkey, lifecycle
+
+The desktop-Linux `displayxr-service` orchestrates the active controller like macOS
+(`service_orchestrator.c`, the shared POSIX block): manifest discovery (*POSIX discovery*
+below), `posix_spawn("<binary> --service-managed")` with the service's environment plus
+`DISPLAYXR_WORKSPACE_SESSION=1` and `DISPLAYXR_WORKSPACE_HOTKEY=<combo>` (unset with no
+hotkey), a `waitpid` watcher that respawns the controller after a crash **only in the
+legacy `enable` mode** (1 s settle; in `auto` an exit or crash returns to the off state and
+the next launch brings it back — Windows and macOS behave the same), and the four DIAG
+providers: `system_workspace_launch` (the dashboard's *Launch now*),
+`system_reload_service_config`, `system_workspace_hotkey_suspend`, and the workspace PID
+provider, so `workspace_activate` is accepted only from the controller the service spawned
+(before this, Linux fell to manual first-claim mode). CONTROLLER-class verification
+compares the peer's executable with the manifest `binary` after `realpath()` of both sides,
+so a manifest may name the binary through a symlink.
+
+**Launch hotkey.** Linux has no `WH_KEYBOARD_LL`; `service_hotkey_linux.c` picks one of two
+backends each time the combo is (re)applied, and re-picks when the extension comes or goes:
+
+1. **GNOME Shell extension** `window-geometry@displayxr.org` **version 13+**
+   (`org.displayxr.WorkspaceHotkey1` on the `org.displayxr.WindowGeometry` bus name;
+   `wayland-window-geometry.md` §10). Works under Wayland *and* X11 GNOME, through
+   mutter's own `grab_accelerator`. The service pushes the combo it resolved from
+   `service.json` in GTK syntax (`Ctrl+Shift+Space` → `<Control><Shift>space`) together with its own
+   systemd user unit (parsed from `/proc/self/cgroup`, `displayxr.service`):
+   `Configure(accelerator, unit)`. `service.json` stays authoritative — the extension only
+   caches the last pushed value. A disabled controller, `hotkey: null` or no registered
+   controller pushes `""`, which releases the grab (no controller, no grab — the combo is
+   never taken from other apps on a box without one).
+2. **X11 root-window grab** (`DISPLAY` set, no `WAYLAND_DISPLAY`, no v13 extension):
+   `xcb_grab_key` of the combo's keysym (with and without CapsLock / NumLock) on the root
+   window, **only while the service process runs**.
+
+Neither → one WARN; *Launch now* and `displayxr-cli workspace launch <id>` still work.
+Matching is the exact modifier set, as on Windows. `Win` is X11 `Mod4` / GTK `<Super>`.
+
+**Lifecycle: the service is not resident, the extension is.** The `.deb`'s service is
+socket-activated and exits 30 s after its last client (`IPC_EXIT_WHEN_IDLE`), because it
+holds a Vulkan device and the display processor (a vendor plug-in may run an eye
+tracker). Keeping it resident just to hold a chord would cost exactly that for every user
+with a controller installed, so the chord lives in the extension instead:
+
+- *Service running* — a press makes the extension emit `Activated`; the service hears it
+  and spawns the controller through the launch path (`ALREADY_RUNNING` is a no-op).
+- *Service not running* — the extension sees that its configuring client's bus connection
+  is gone, so a press also calls `org.freedesktop.systemd1.Manager.StartUnit(unit,
+  "replace")` and remembers the press for 30 s. The starting service connects, pushes its
+  combo (`Configure`), and the reply's `pending = true` makes it spawn the controller. The
+  controller is an IPC client, so the service stays up while it runs and idle-exits 30 s
+  after it closes.
+- *Extension restarted* (shell restart, re-enable; the lock screen too before extension
+  version 14) — it reloads the cached combo from
+  `$XDG_STATE_HOME/displayxr/workspace-hotkey.json`; a running service sees the bus name
+  re-appear and pushes again.
+- *Screen locked* (extension version 14+, #2071) — the extension stays enabled, so the bus
+  name and the client's registration survive the lock, but the **grab is released** while
+  locked (a press is never acted on there, and the bootstrap waits for the unlock) and
+  re-taken on unlock. Nothing for the service to do.
+
+- *Controller just installed, service never ran* (bootstrap) — 5 s after it is enabled,
+  and 2 s after any change in a manifest root it watches (inotify on the roots that exist),
+  the extension lists the manifest roots above (same list, same order) and compares the
+  `*.json` set with the one recorded at the last `Configure`. A different, non-empty set
+  makes it `StartUnit` the service **once** (the last configured unit, else
+  `displayxr.service`); the service connects and pushes the combo — or `""` when it finds
+  no usable controller, which is recorded too, so an unchanged set never starts it again.
+  Cost when nothing changed: a few `readdir`s at login.
+
+Consequences: the X11-only fallback works only while some client keeps the service up
+(set `IPC_EXIT_WHEN_IDLE=0` in a `systemctl --user edit displayxr.service` drop-in to keep
+it resident on such a desktop).
+
+**While the controller runs.** Windows uninstalls the hook while the controller runs
+because the controller registers its own toggle chord (#344). A Wayland client cannot
+grab a chord, so on Linux the grab **stays armed**. A press while the controller runs is
+**forwarded to it by the service** as a controller key over IPC (the configured combo's
+virtual-key code and modifiers, `ipc_server_input_queue_push_controller_key`; modifier bits
+bit0 Shift, bit1 Ctrl, bit2 Alt — no Win bit), through either backend (extension or X11
+grab). That is its dismiss/toggle chord. The extension's `Activated(u timestamp)` signal
+(sender `org.displayxr.WindowGeometry`, path `/org/displayxr/WorkspaceHotkey`, interface
+`org.displayxr.WorkspaceHotkey1`) carries the same press; a controller should act on ONE of
+the two — the forwarded key is the contract, the signal is informational.
+
+**App discovery directories (Linux).** The registered-mode `.displayxr.json` drop-in
+directories (`displayxr-app-manifest.md` §2.2 / §5) on Linux, scanned in this order, the
+first manifest for a given `exe_path` winning:
+
+1. `$XDG_DATA_HOME/DisplayXR/apps/` (default `~/.local/share/DisplayXR/apps/`) — per-user
+2. `/usr/local/share/displayxr/apps/` — locally installed
+3. `/usr/share/displayxr/apps/` — distribution packages (`.deb`)
+
+The casing mirrors the controller roots below (per-user `DisplayXR`, system `displayxr`).
+The runtime does not scan these; workspace controllers do (the DisplayXR Shell's Linux
+port implements it).
+
+## Android workspace controllers (#1006)
+
+Android has no registry, no manifest directory and no orchestrator: the OS launches apps,
+and the runtime's service is a bound `Service`. A workspace controller there is an ordinary
+APK the user (or a launcher) starts, and the runtime recognises it by **package identity**.
+
+**Registration = two facts about the package, both checked at connect by UID.**
+
+1. The manifest declares
+   ```xml
+   <meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>
+   ```
+2. The APK is signed with **the same certificate as the runtime APK**
+   (`PackageManager.checkSignatures(<runtime>, <controller>) == SIGNATURE_MATCH`).
+
+Both together are what a CONTROLLER claim needs (`XR_DXR_spatial_workspace` enabled at
+`xrCreateInstance`); either alone demotes the client to APP, as on every platform (#960).
+The same-signer rule is deliberate: a controller decides what every app on the panel looks
+like, so a third-party controller needs the runtime vendor's signature, not just a manifest
+flag. Dev override, for a controller signed with a local debug key against a released
+runtime: `adb shell setprop debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER 1` (loud by design).
+
+**What the controller must do.**
+
+- Force the IPC path (`<meta-data android:name="com.displayxr.force_ipc" android:value="true"/>`):
+  the overlay lives in the runtime's main-process service, and the slot broker routes a
+  verified controller there.
+- Own a **fullscreen Activity**. Its IPC client publishes the Activity's surface as any
+  client does; that surface becomes the shared output while the overlay is on.
+- Create a session with **no graphics binding** and call `xrActivateSpatialWorkspaceDXR`;
+  place clients with `xrEnumerateWorkspaceClientsDXR` / `xrSetWorkspaceClientWindowPoseDXR`;
+  drive 2D/3D with `xrRequestDisplayRenderingModeDXR` (the controller is the display-mode
+  authority, below). `xrDeactivateSpatialWorkspaceDXR`, or the controller process dying,
+  ends the overlay.
+- Lay windows out against the panel **as currently held**: `XR_DXR_display_info` reports the
+  vendor's natural orientation, and a device can be portrait-native.
+
+**Which apps join.** Every IPC client that connects while the overlay is on (the slot broker
+hands it the main-process service instead of a satellite). Clients already on a satellite stay
+per-window. A joining client keeps its session running while its own Activity is paused behind
+the controller, and should keep rendering while the runtime reports it VISIBLE / FOCUSED even
+with no window of its own — otherwise it shows a frozen frame. **And the OS will freeze it
+anyway** once it is a cached background process (the cached-app freezer): a member that must
+keep animating behind the controller needs to stay visible (split-screen / freeform where the
+device supports it) or run a foreground service of its own. The runtime cannot raise a
+client's importance from the service side.
+
+Reference: `test_apps/workspace/workspace_controller_android` (forced IPC, places every client
+side by side; `debug.dxr.test_controller.active|focus|mode` test knobs). Mechanism:
+[service-architecture.md §7b](../../architecture/service-architecture.md#7b-android-workspace-overlay-mode-adr-036-d4-1006).
+
 ## Service-side discovery
 
 At service startup, the orchestrator (`service_orchestrator.c`):
@@ -204,7 +483,10 @@ At service startup, the orchestrator (`service_orchestrator.c`):
    if not registered.
 4. Else, pick the first enumerated entry.
 5. If no entries exist, the runtime runs in standalone-platform mode
-   — no workspace submenu in the tray, no Ctrl+Space hotkey.
+   — no workspace submenu in the tray, no launch hotkey.
+
+Steps 1, 3 and 4 are `service_config_pick_controller()`, the one selection rule the
+service and `displayxr-cli workspace list` (`active_id`) share.
 
 Tray UI (when one or more controllers are registered) shows the
 active controller's `DisplayName` as the submenu parent. A future
@@ -270,18 +552,152 @@ build-tree dir.
 
 ## Reference implementation
 
-See `displayxr-shell-pvt`'s installer for the canonical
-DisplayXR Shell registration (it does not live in this repo — CI's
-`shell-path-guard` fails any push reintroducing it). Third-party workspace apps should mirror
-its structure:
+Everything a third-party controller needs is in this section; no private
+repository is required. The examples register a fictional controller
+`acme-cockpit` whose binary is `acme-cockpit.exe` / `acme-cockpit`. Replace
+the id, names and paths; keep the structure.
 
-- `.onInit` reads the runtime's `InstallPath`, aborts if missing,
-  sets `$INSTDIR` to the runtime's install directory.
-- Single install section drops the binary, writes a self-uninstaller
-  with a distinct name (avoid colliding with `Uninstall.exe`),
-  populates the registration key, populates the Add/Remove entry.
-- Uninstall section removes only its own files + registry; does not
-  touch the runtime's `$INSTDIR` directory itself.
+### Windows — NSIS installer skeleton
+
+```nsis
+; acme-cockpit.nsi — installs a workspace controller INTO the runtime tree.
+!include "LogicLib.nsh"
+Name "Acme Cockpit"
+OutFile "AcmeCockpitSetup.exe"
+RequestExecutionLevel admin
+SetCompressor /SOLID lzma
+
+!define CTRL_ID   "acme-cockpit"
+!define CTRL_EXE  "acme-cockpit.exe"
+!define ARP_KEY   "Software\Microsoft\Windows\CurrentVersion\Uninstall\AcmeCockpit"
+!define REG_KEY   "Software\DisplayXR\WorkspaceControllers\${CTRL_ID}"
+
+Function .onInit
+  SetRegView 64
+  ; 1. The runtime is a hard prerequisite: its install tree hosts the binary.
+  ReadRegStr $INSTDIR HKLM "Software\DisplayXR\Runtime" "InstallPath"
+  ${If} $INSTDIR == ""
+    MessageBox MB_ICONSTOP|MB_OK "DisplayXR Runtime is not installed. Install it first."
+    Abort
+  ${EndIf}
+FunctionEnd
+
+Section "Install"
+  SetRegView 64
+  ; 2. Files go next to displayxr-service.exe / the runtime DLLs.
+  SetOutPath "$INSTDIR"
+  File "${CTRL_EXE}"
+  ; A self-uninstaller with a DISTINCT name — never Uninstall.exe (that is the runtime's).
+  WriteUninstaller "$INSTDIR\Uninstall-AcmeCockpit.exe"
+  ; 3. Registration. Required: Binary, DisplayName, UninstallString (must honor /S).
+  WriteRegStr   HKLM "${REG_KEY}" "Binary"          "$INSTDIR\${CTRL_EXE}"
+  WriteRegStr   HKLM "${REG_KEY}" "DisplayName"     "Acme Cockpit"
+  WriteRegStr   HKLM "${REG_KEY}" "Vendor"          "Acme"
+  WriteRegStr   HKLM "${REG_KEY}" "Version"         "1.0.0"
+  WriteRegStr   HKLM "${REG_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
+  WriteRegDWORD HKLM "${REG_KEY}" "SupportsFileDialog" 0
+  ; Optional tray actions (see "Optional: published menu actions").
+  WriteRegStr   HKLM "${REG_KEY}\Actions\01-open" "Label" "Open Cockpit"
+  WriteRegStr   HKLM "${REG_KEY}\Actions\01-open" "Type"  "controller:open"
+  ; 4. Own Add/Remove Programs entry — never the runtime's.
+  WriteRegStr   HKLM "${ARP_KEY}" "DisplayName"     "Acme Cockpit"
+  WriteRegStr   HKLM "${ARP_KEY}" "UninstallString" '"$INSTDIR\Uninstall-AcmeCockpit.exe"'
+  WriteRegStr   HKLM "${ARP_KEY}" "Publisher"       "Acme"
+  WriteRegDWORD HKLM "${ARP_KEY}" "NoModify" 1
+  WriteRegDWORD HKLM "${ARP_KEY}" "NoRepair" 1
+SectionEnd
+
+Section "Uninstall"
+  SetRegView 64
+  ; Remove ONLY what this installer wrote. $INSTDIR is the runtime's directory: never RMDir it.
+  Delete "$INSTDIR\${CTRL_EXE}"
+  Delete "$INSTDIR\Uninstall-AcmeCockpit.exe"
+  DeleteRegKey HKLM "${REG_KEY}"
+  DeleteRegKey HKLM "${ARP_KEY}"
+SectionEnd
+```
+
+Rules the skeleton encodes, and why: the runtime's uninstaller runs every
+registered `UninstallString` with `/S` before removing its own files
+(*Cascade uninstall*), so the uninstaller must be silent-capable and must
+not touch the runtime tree; `SetRegView 64` because the service reads the
+64-bit view; the Add/Remove entry is the controller's own so a user can
+remove it without removing the runtime.
+
+**Dev registration without an installer** (elevated prompt; the service
+picks it up at its next spawn):
+
+```bat
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v Binary /t REG_SZ /d "C:\dev\acme\build\acme-cockpit.exe" /f
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v DisplayName /t REG_SZ /d "Acme Cockpit (dev)" /f
+reg add "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /v UninstallString /t REG_SZ /d "cmd /c exit 0" /f
+displayxr-cli workspace list --json
+reg delete "HKLM\Software\DisplayXR\WorkspaceControllers\acme-cockpit" /f   REM to unregister
+```
+
+A dev binary is subject to the provenance gate like any other component
+(`plugin-discovery.md` §4.3): on an enforcing box an unsigned controller
+exe needs the allowlist or `DXR_ALLOW_DEV_PLUGIN_PATHS`.
+
+### macOS / Linux — manifest + package hooks
+
+The manifest (schema above) is a plain file; the installer's only jobs are
+to drop the binary somewhere stable and to write the manifest into a search
+root. `acme-cockpit.json`:
+
+```json
+{
+  "file_format_version": "1.0",
+  "controller": {
+    "id": "acme-cockpit",
+    "binary": "/usr/libexec/acme-cockpit/acme-cockpit",
+    "display_name": "Acme Cockpit",
+    "vendor": "Acme",
+    "version": "1.0.0",
+    "uninstall_string": "",
+    "supports_file_dialog": false,
+    "actions": [ { "label": "Open Cockpit", "type": "controller:open" } ]
+  }
+}
+```
+
+- **Linux `.deb`:** ship the manifest as a package file at
+  `/usr/share/displayxr/WorkspaceControllers/acme-cockpit.json` (root #3) and
+  the binary under `/usr/libexec/<id>/` (or `/usr/bin`). No postinst is
+  needed for registration; dpkg's own file removal unregisters it. Declare
+  `Depends: displayxr-runtime` so the service exists. The binary must accept
+  `--service-managed` (§ *Linux*) and read `DISPLAYXR_WORKSPACE_SESSION` /
+  `DISPLAYXR_WORKSPACE_HOTKEY` from its environment.
+- **macOS `.pkg`:** install the app bundle under `/Applications` and the
+  manifest at `/Library/Application Support/DisplayXR/WorkspaceControllers/acme-cockpit.json`
+  (root #3) with `binary` pointing inside the bundle
+  (`/Applications/Acme Cockpit.app/Contents/MacOS/acme-cockpit`). A
+  `postinstall` that writes the manifest is acceptable when the path must be
+  computed; delete the manifest in your uninstall script.
+- **Dev registration:** put the manifest in a build-tree directory and run the
+  service with `XRT_WORKSPACE_CONTROLLER_PATH=<dir>` (root #1), or drop it in
+  the per-user root #2 — it shadows a system-wide install of the same `id`.
+  `displayxr-cli workspace list --json` shows what the service resolved.
+
+### Conformance checklist
+
+1. Registered key / manifest resolves: `displayxr-cli workspace list --json`
+   lists the id with the right `binary`.
+2. Hotkey spawn: with the default `Ctrl+Shift+Space` (or `displayxr-cli workspace set
+   <id> --hotkey ctrl+shift+f9`), press it, the controller starts with `DISPLAYXR_WORKSPACE_SESSION=1` and, on
+   POSIX, `--service-managed`; a second press dismisses it; `workspace launch
+   <id>` starts it without the hotkey.
+3. Lifecycle: killing the controller leaves the service running; the next
+   hotkey press respawns it; `workspace set <id> --mode disabled` stops the
+   service from spawning it.
+4. Uninstall: Windows `<UninstallString> /S` exits 0 and leaves the runtime
+   tree intact; on POSIX removing the package removes the manifest and the
+   service no longer lists the id.
+5. Event handling per § *Required runtime → controller event handling*.
+
+The reference Android controller (`test_apps/workspace/workspace_controller_android`,
+§ *Android workspace controllers*) is the in-tree example of the controller
+side of the contract.
 
 ## Versioning
 

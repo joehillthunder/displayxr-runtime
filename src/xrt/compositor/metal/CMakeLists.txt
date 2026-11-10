@@ -6,10 +6,52 @@
 #
 
 if(APPLE AND XRT_HAVE_METAL)
+	# Multi-screen segment manager (ADR-047 D2), its own library so the macOS
+	# service's XR_DXR_weave Metal engine (comp_multi, #2218 item 6) links it
+	# without the whole in-process compositor — the comp_vk_segs /
+	# comp_d3d11_segs pattern. MRR like the rest of the library.
+	add_library(comp_metal_segs STATIC comp_metal_segments.m comp_metal_segments.h)
+	target_link_libraries(
+		comp_metal_segs
+		PUBLIC xrt-interfaces
+		PRIVATE
+			comp_util
+			aux_util
+			aux_os
+			xrt-external-stb
+			"-framework Metal"
+			"-framework Foundation"
+			"-framework CoreFoundation"
+		)
+	target_include_directories(comp_metal_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+	if(TARGET comp_multi)
+		target_link_libraries(comp_multi PRIVATE comp_metal_segs)
+		target_compile_definitions(comp_multi PRIVATE COMP_MULTI_WEAVE_HAVE_METAL_SEGMENTS)
+	endif()
+
 	add_library(
 		comp_metal STATIC
 		comp_metal_compositor.m
 		comp_metal_compositor.h
+		comp_metal_placement.m
+		comp_metal_placement.h
+		comp_metal_desktop_bg.m
+		comp_metal_desktop_bg.h
+		comp_metal_alpha_probe.m
+		comp_metal_alpha_probe.h
+		comp_metal_bg_preview.m
+		comp_metal_bg_preview.h
+		)
+
+	# Runtime-owned window placement (ADR-050) holds WEAK references to the
+	# app's window, view and delegate, which only ARC expresses. It includes
+	# nothing from os/os_threading.h (whose inlines are not ARC-clean), so it
+	# alone is compiled with ARC; the rest of the library stays MRR.
+	set_source_files_properties(comp_metal_placement.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+	# #2264: the desktop-capture client and the lazy-transparency probe are
+	# self-contained (no os_threading.h) and ARC like the placement.
+	set_source_files_properties(
+		comp_metal_desktop_bg.m comp_metal_alpha_probe.m comp_metal_bg_preview.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc"
 		)
 
 	target_link_libraries(
@@ -17,6 +59,7 @@ if(APPLE AND XRT_HAVE_METAL)
 		PUBLIC xrt-interfaces
 		PRIVATE
 			comp_util
+			comp_metal_segs
 			aux_util
 			aux_os
 			aux_math
@@ -30,6 +73,8 @@ if(APPLE AND XRT_HAVE_METAL)
 			# itself Vulkan-gated, so this adds no new configuration.
 			aux_vk
 			xrt-external-stb
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look.
+			comp_cursor_look
 			"-framework Metal"
 			"-framework Cocoa"
 			"-framework QuartzCore"

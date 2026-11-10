@@ -85,6 +85,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <strings.h> // strcasecmp
 #include <string>
 #include <chrono>
 #include <vector>
@@ -101,6 +102,8 @@
 extern "C" int stbi_write_png(const char *filename, int w, int h, int comp,
                               const void *data, int stride_in_bytes);
 #include "view_params.h"
+#include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (step() per frame)
+#include "mode_switch_test_knob.h" // DXR_TEST_MODE_TOGGLE_S scripted toggles + ramp trace
 #include "rig_mode.h"
 #include "atlas_capture.h"
 #include "xr_window_space_hud.h"
@@ -1031,6 +1034,12 @@ struct InputState {
 // Cube test apps start with the WSUI HUD hidden — it skews perf comparisons
 // against HUD-less apps (avatar, Unity). Shift+Tab shows it when wanted.
 static InputState g_input = [] { InputState s; s.hudVisible = false; return s; }();
+// Smooth 2D<->3D transition (displayxr-common mode_switch.h): a normalised
+// 0..1 disparity scale applied to every rig's ipdFactor (see the main loop).
+static dxr::ModeSwitch g_modeSwitch;
+static float g_modeRamp = 1.0f;
+// DXR_TEST_MODE_TOGGLE_S: scripted 3D<->2D toggles + per-frame ramp trace.
+static dxr_test::ModeSwitchToggleKnob g_modeSwitchKnob;
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f; // tan(18deg) -> 36deg vFOV
 
 // HUD window-space layer (XR_EXT_window_space_layer): a fractional-window-space
@@ -2063,6 +2072,53 @@ static bool CreateSpaces(AppXrSession &app)
     return true;
 }
 
+// ============================================================================
+// Colour swapchain (ADR-044 / INV-4.6)
+// ============================================================================
+//
+// This app authors DISPLAY-REFERRED colour: its shaders, clears and textures
+// produce the bytes it wants on screen. A swapchain's format says what its
+// bytes mean, and the runtime believes it: UNORM holds LINEAR values (which a
+// format-honest compositor encodes once more — washed out), `_SRGB` holds
+// encoded ones. So the app requests BGRA8Unorm_sRGB and renders through a
+// BGRA8Unorm VIEW of the same storage: the pipelines keep their BGRA8Unorm
+// attachments and the authored bytes land unconverted (ADR-044 §2, "display-
+// referred bytes moved without conversion"). No shader or clear-colour change.
+//
+// DXR_SWAPCHAIN_ENCODING=unorm reproduces the old UNORM request (A/B: it
+// washes out on runtime >= the Metal format-honest change, unless
+// DXR_COLOR_LEGACY_UNORM_ENCODED=1 is also set).
+static int64_t ChooseAppColorFormat(const std::vector<int64_t> &formats)
+{
+    const char *enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    const bool forceUnorm = enc != nullptr && strcasecmp(enc, "unorm") == 0;
+    const int64_t preferred[] = {
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm : (int64_t)MTLPixelFormatBGRA8Unorm_sRGB,
+        forceUnorm ? (int64_t)MTLPixelFormatBGRA8Unorm_sRGB : (int64_t)MTLPixelFormatBGRA8Unorm,
+    };
+    for (int64_t p : preferred) {
+        for (int64_t f : formats) {
+            if (f == p) {
+                return f;
+            }
+        }
+    }
+    return formats.empty() ? 0 : formats[0];
+}
+
+// The texture the app RENDERS into for swapchain image @p tex: a BGRA8Unorm
+// view of an `_SRGB` image (raw bytes, no encode on write), else the image.
+static id<MTLTexture> AppRenderTarget(id<MTLTexture> tex)
+{
+    if (tex != nil && tex.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB) {
+        id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+        if (view != nil) {
+            return view;
+        }
+    }
+    return tex;
+}
+
 static bool CreateSwapchain(AppXrSession &app)
 {
     // Size swapchain for the maximum atlas across all rendering modes.
@@ -2085,12 +2141,9 @@ static bool CreateSwapchain(AppXrSession &app)
     XR_CHECK(xrEnumerateSwapchainFormats(app.session, formatCount, &formatCount, formats.data()));
 
     LOG_INFO("Supported swapchain formats:");
-    int64_t selectedFormat = formats[0];
-    for (auto f : formats) {
-        if (f == (int64_t)MTLPixelFormatBGRA8Unorm) {
-            selectedFormat = f;
-        }
-    }
+    // ADR-044: the _SRGB sibling of the BGRA8 pipelines' format (see
+    // ChooseAppColorFormat) — this app's bytes are display-referred.
+    int64_t selectedFormat = ChooseAppColorFormat(formats);
     for (auto f : formats) {
         LOG_INFO("  format %lld%s", (long long)f, f == selectedFormat ? " (selected)" : "");
     }
@@ -2120,7 +2173,7 @@ static bool CreateSwapchain(AppXrSession &app)
 
     app.swapchain.images.resize(imageCount);
     for (uint32_t i = 0; i < imageCount; i++) {
-        app.swapchain.images[i] = (__bridge id<MTLTexture>)metalImages[i].texture;
+        app.swapchain.images[i] = AppRenderTarget((__bridge id<MTLTexture>)metalImages[i].texture);
         LOG_INFO("Swapchain image %u: MTLTexture %p (%lux%lu)",
                  i, metalImages[i].texture,
                  (unsigned long)app.swapchain.images[i].width,
@@ -2141,6 +2194,23 @@ struct L2DPanel {
 };
 static L2DPanel g_panel1, g_panel2;
 static XrRect2Di g_panel1Rect, g_panel2Rect;
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session)
+{
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == (int64_t)MTLPixelFormatBGRA8Unorm_sRGB) return f;
+    }
+    return (int64_t)MTLPixelFormatBGRA8Unorm;
+}
+
 
 // Create a window-anchored Local2D panel swapchain and fill it once (static
 // content: acquire/fill/release once; the layer references the released
@@ -2160,7 +2230,7 @@ static bool CreateAndFillL2DPanel(AppXrSession &app, uint32_t w, uint32_t h, int
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    sci.format = PickPanelFormat(app.session);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
@@ -2264,7 +2334,7 @@ static bool CreateAndFillStrip(AppXrSession &app)
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-    sci.format = (int64_t)MTLPixelFormatBGRA8Unorm;
+    sci.format = PickPanelFormat(app.session);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
@@ -2373,7 +2443,7 @@ static bool CreateZoneResources(AppXrSession &app, DisplayZone &z, uint32_t view
     }
     z.images.resize(n);
     for (uint32_t i = 0; i < n; i++) {
-        z.images[i] = (__bridge id<MTLTexture>)imgs[i].texture;
+        z.images[i] = AppRenderTarget((__bridge id<MTLTexture>)imgs[i].texture); // same format as the main swapchain
     }
 
     LOG_INFO("[zones] zone %u: rect %d,%d %dx%d -> swapchain %ux%u (%u tiles of %ux%u)",
@@ -2726,7 +2796,7 @@ static void RenderZonesFrame(AppXrSession &app, MetalRenderer &renderer, const X
         rigStructs[zi] = {XR_TYPE_DISPLAY_RIG_DXR};
         rigStructs[zi].pose = {{0, 0, 0, 1}, {0, 0, 0}};
         rigStructs[zi].virtualDisplayHeight = kZoneVirtualDisplayHeight;
-        rigStructs[zi].ipdFactor = z.ipdFactor;
+        rigStructs[zi].ipdFactor = z.ipdFactor * g_modeRamp;
         rigStructs[zi].parallaxFactor = 1.0f;
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
@@ -3211,26 +3281,39 @@ int main(int argc, char **argv)
         PumpMacOSEvents();
         PollEvents(app);
 
-        // Handle rendering mode requests (V=cycle next, 0-8=jump absolute).
-        // Single source of truth: the runtime owns the current mode. Keypresses
-        // are REQUESTS — we call xrRequestDisplayRenderingModeDXR and let the
-        // XrEventDataRenderingModeChangedDXR event update app.currentModeIndex.
-        // Render paths and HUD read app.currentModeIndex directly.
-        if (g_input.cycleRenderingModeRequested) {
-            g_input.cycleRenderingModeRequested = false;
-            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
-                app.renderingModeCount > 0) {
-                uint32_t next = (app.currentModeIndex + 1) % app.renderingModeCount;
-                app.pfnRequestDisplayRenderingModeEXT(app.session, next);
+        // Rendering mode requests (V=cycle next, 0-8=jump absolute) go through
+        // displayxr-common's dxr::ModeSwitch::step() (README "Smooth 2D<->3D
+        // transitions"). Zones carry their own ipdFactor (zone A 1.0, zone B
+        // 0.6) on top of the user-tuned main rig, so the sequencer runs as a
+        // normalised SCALE (steadyIpd = 1): g_modeRamp multiplies every rig's
+        // ipdFactor below. The runtime owns the current mode; the
+        // XrEventDataRenderingModeChangedDXR event updates app.currentModeIndex.
+        {
+            int32_t want = -1;
+            if (g_input.cycleRenderingModeRequested) {
+                g_input.cycleRenderingModeRequested = false;
+                want = dxr::ModeSwitch::cycleTarget(app.currentModeIndex, app.renderingModeCount);
             }
-        }
-        if (g_input.absoluteRenderingModeRequested >= 0) {
-            uint32_t target = (uint32_t)g_input.absoluteRenderingModeRequested;
-            g_input.absoluteRenderingModeRequested = -1;
-            if (app.pfnRequestDisplayRenderingModeEXT && app.session != XR_NULL_HANDLE &&
-                target < app.renderingModeCount) {
-                app.pfnRequestDisplayRenderingModeEXT(app.session, target);
+            if (g_input.absoluteRenderingModeRequested >= 0) {
+                want = g_input.absoluteRenderingModeRequested;
+                g_input.absoluteRenderingModeRequested = -1;
             }
+            if (app.sessionRunning) {
+                const int32_t knob = g_modeSwitchKnob.poll(dt, app.currentModeIndex, app.renderingModeCount,
+                                                           app.renderingModeViewCounts);
+                if (knob >= 0) want = knob;
+            }
+            const bool canRequest = app.session != XR_NULL_HANDLE && app.pfnRequestDisplayRenderingModeEXT;
+            const bool wasActive = g_modeSwitch.active();
+            const dxr::ModeSwitchFrame f = g_modeSwitch.step(
+                dt, canRequest ? want : -1, app.renderingModeCount, app.renderingModeViewCounts,
+                app.currentModeIndex, 1.0f);
+            g_modeRamp = f.ipd;
+            if (f.fire && canRequest)
+                app.pfnRequestDisplayRenderingModeEXT(app.session, f.mode);
+            if (g_modeSwitchKnob.tracing() && (wasActive || g_modeSwitch.active()))
+                LOG_INFO("ModeSwitch trace: dt=%.4f ramp=%.4f fire=%d mode=%u current=%u", dt, f.ipd,
+                         (int)f.fire, f.mode, app.currentModeIndex);
         }
 
         UpdateCameraMovement(g_input, dt, app.displayHeightM);
@@ -3381,7 +3464,7 @@ int main(int argc, char **argv)
             rigPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
             if (rigCamera) {
                 cameraRig.pose = rigPose;
-                cameraRig.ipdFactor = g_input.viewParams.ipdFactor;
+                cameraRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                 cameraRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                 cameraRig.convergenceDiopters = g_input.viewParams.invConvergenceDistance;
                 cameraRig.verticalFov =
@@ -3395,7 +3478,7 @@ int main(int argc, char **argv)
                 displayRig.pose = rigPose;
                 displayRig.virtualDisplayHeight =
                     g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
-                displayRig.ipdFactor = g_input.viewParams.ipdFactor;
+                displayRig.ipdFactor = g_input.viewParams.ipdFactor * g_modeRamp;
                 displayRig.parallaxFactor = g_input.viewParams.parallaxFactor;
                 displayRig.perspectiveFactor = g_input.viewParams.perspectiveFactor;
                 locateInfo.next = &displayRig;

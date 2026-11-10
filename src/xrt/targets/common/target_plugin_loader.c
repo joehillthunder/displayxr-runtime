@@ -2,25 +2,34 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Runtime-side registry-driven loader for vendor plug-in DLLs.
+ * @brief  Runtime-side loader for display-processor plug-ins.
  *
- * Enumerates `HKLM\Software\DisplayXR\DisplayProcessors\*`, sorts by
- * `ProbeOrder`, then `LoadLibraryExW` → `GetProcAddress` → negotiate
- * → probe each in turn. First plug-in whose probe returns
- * `XRT_SUCCESS` wins and is cached. The plug-in's chosen instance
- * handle (returned by `probe()`) is kept alongside the iface so the
- * runtime can hand it back to subsequent vtable calls.
+ * The display-processor class loader (ADR-019/020), written as ADR-054 N2
+ * intends: discovery (registry rows / manifests / Android file names), the
+ * #952 / #328 / #434 load path and the ADR-020 ABI gate are the shared
+ * component loader's (`target_component_loader.h`), driven by this class's
+ * table row (@ref g_dp_class). What is left here is what only this class
+ * knows: the host iface a plug-in receives (incl. the Android JNI
+ * callbacks), what `probe()` means, the ADR-045 per-plug-in status records,
+ * the single-winner selection with its PreferredPlugin / DXR_PLUGIN_EXCLUSIVE
+ * policy, the #342 refresh, the per-monitor display-claim source set (#69 /
+ * ADR-015) and the #461 version-skew tripwire.
  *
- * v1 hosts at most one active plug-in per process; later sequencing
- * steps may relax that for multi-display heterogeneous setups, per
- * `docs/roadmap/vendor-plugin-architecture.md` §3 non-goals.
+ * First plug-in whose probe returns `XRT_SUCCESS` wins and is cached. The
+ * plug-in's chosen instance handle (returned by `probe()`) is kept alongside
+ * the iface so the runtime can hand it back to subsequent vtable calls. v1
+ * hosts at most one ACTIVE plug-in per process; every other registered one
+ * may still be loaded as a display-claim source.
  *
- * Issue #256.
+ * Issue #256; ADR-054 N2.
  *
  * @ingroup target_common
  */
 
 #include "target_plugin_loader.h"
+#include "target_component_loader.h"
+#include "target_screen_pin.h"
+#include "target_display_hotplug.h"
 #include "xrt/xrt_config_have.h"
 
 #ifdef XRT_HAVE_VULKAN
@@ -28,21 +37,24 @@
  * so the declarations cannot silently diverge from the definitions. */
 #include "vk/vk_abi_fingerprint.h"
 #endif
-#include "target_plugin_preload_sanitize.h"
-#include "target_plugin_path_guard.h"
 
 #include "xrt/xrt_plugin.h"
+#include "xrt/xrt_display_status.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
 
 #include "os/os_threading.h"
 #include "os/os_display_edid.h"
+#include "os/os_display_desktop.h"
+#include "os/os_time.h"
 #include "util/u_logging.h"
+#include "util/u_setting.h"
 
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -114,6 +126,34 @@ static char g_last_reject_reason[128] = {0};
  */
 static bool g_last_reject_declined = false;
 
+/*!
+ * N3b: better-ranked plug-ins the first-call discovery skipped because they
+ * are disabled (plus a disabled PreferredPlugin). Reported through
+ * @ref target_plugin_get_discovery_summary so `selftest` can say "sim-display
+ * is active because leia-sr is disabled" instead of leaving a vendor box's
+ * fallback looking like a mystery. Never counted as a reject: a disabled
+ * plug-in is the user's decision, not a misconfiguration.
+ */
+#define TARGET_PLUGIN_MAX_SKIPPED_DISABLED 8
+static int g_skipped_disabled_count = 0;
+static char g_skipped_disabled_ids[TARGET_PLUGIN_MAX_SKIPPED_DISABLED][64];
+//! Registration id of the winning row (see the summary's `active_id`).
+static char g_active_row_id[64] = {0};
+
+static void
+plugin_note_skipped_disabled(const char *id)
+{
+	for (int i = 0; i < g_skipped_disabled_count; i++) {
+		if (strcmp(g_skipped_disabled_ids[i], id) == 0) {
+			return;
+		}
+	}
+	if (g_skipped_disabled_count < TARGET_PLUGIN_MAX_SKIPPED_DISABLED) {
+		snprintf(g_skipped_disabled_ids[g_skipped_disabled_count], sizeof(g_skipped_disabled_ids[0]), "%s", id);
+		g_skipped_disabled_count++;
+	}
+}
+
 static void
 plugin_note_reject(const char *id, uint32_t probe_order)
 {
@@ -132,6 +172,72 @@ plugin_note_reject(const char *id, uint32_t probe_order)
 		         g_last_reject_reason[0] != '\0' ? g_last_reject_reason : "load or probe failed");
 	}
 	g_last_reject_reason[0] = '\0';
+}
+
+/*!
+ * `DXR_DP_NO_FALLBACK=1` — never let a lower-ranked display plug-in stand in
+ * for a better-ranked one that FAILED TO LOAD in this process (#2436).
+ *
+ * The default is to fall through ProbeOrder, which on a vendor box ends at the
+ * sim-display fallback: the app runs, but nothing is woven on the panel, and
+ * the choice is fixed for the life of the process. A host that would rather
+ * fail `xrCreateInstance` than render unwoven sets this. A plug-in that loaded
+ * and DECLINED its probe (not this hardware) is not a failure and still falls
+ * through; a disabled or excluded one was never attempted. Read once.
+ */
+static bool
+plugin_no_fallback(void)
+{
+	static int s_value = -1;
+	if (s_value < 0) {
+		const char *env = getenv("DXR_DP_NO_FALLBACK");
+		s_value = (env != NULL && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+		if (s_value) {
+			U_LOG_W(
+			    "plugin loader: DXR_DP_NO_FALLBACK set — a display plug-in that fails to load will NOT "
+			    "be replaced by a lower-ranked one; discovery stops there instead.");
+		}
+	}
+	return s_value == 1;
+}
+
+/*!
+ * #2436: refuse to continue discovery after a better-ranked plug-in failed to
+ * load, when DXR_DP_NO_FALLBACK asks for it. @p rejected_before is
+ * g_rejected_count before the attempt, so a declined probe never trips it.
+ */
+static bool
+plugin_stop_after_failure(const char *id, int rejected_before)
+{
+	if (g_rejected_count == rejected_before || !plugin_no_fallback()) {
+		return false;
+	}
+	U_LOG_E(
+	    "plugin loader: display plug-in '%s' failed to load (%s) and DXR_DP_NO_FALLBACK is set — "
+	    "refusing to fall back to a lower-ranked plug-in. No display processor is active in this process.",
+	    id, g_best_rejected_reason[0] != '\0' ? g_best_rejected_reason : "load or probe failed");
+	return true;
+}
+
+/*!
+ * #2436: say LOUDLY when the winner is a fallback and a better-ranked
+ * registered plug-in failed to load in this process. The per-attempt WARN
+ * names the failure; this is the one line that says what it cost — the app
+ * renders on the fallback for its whole life, and fixing the cause needs the
+ * app restarted. Silent otherwise (no rejects, or a non-fallback winner).
+ */
+static void
+plugin_report_fallback(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL || g_rejected_count == 0 || !target_plugin_iface_is_fallback(iface)) {
+		return;
+	}
+	U_LOG_E(
+	    "plugin loader: FELL BACK to '%s': the better-ranked display plug-in '%s' failed to load in this "
+	    "process (%s). Content will not be processed for the 3D display. The choice is fixed for this "
+	    "process: restart the app after fixing the cause. Set DXR_DP_NO_FALLBACK=1 to fail instead.",
+	    iface->id != NULL ? iface->id : "?", g_best_rejected_id[0] != '\0' ? g_best_rejected_id : "?",
+	    g_best_rejected_reason[0] != '\0' ? g_best_rejected_reason : "load or probe failed");
 }
 
 /*!
@@ -268,7 +374,336 @@ target_plugin_get_discovery_summary(struct target_plugin_discovery_summary *out)
 	out->best_rejected_order = g_best_rejected_order;
 	snprintf(out->best_rejected_id, sizeof(out->best_rejected_id), "%s", g_best_rejected_id);
 	snprintf(out->best_rejected_reason, sizeof(out->best_rejected_reason), "%s", g_best_rejected_reason);
+	out->skipped_disabled_count = g_skipped_disabled_count;
+	for (int i = 0; i < g_skipped_disabled_count && i < TARGET_PLUGIN_MAX_SKIPPED_DISABLED; i++) {
+		snprintf(out->skipped_disabled_ids[i], sizeof(out->skipped_disabled_ids[i]), "%s",
+		         g_skipped_disabled_ids[i]);
+	}
+	snprintf(out->active_id, sizeof(out->active_id), "%s", g_active_iface != NULL ? g_active_row_id : "");
 }
+
+/*
+ *
+ * Per-plug-in status records + platform state (ADR-045).
+ *
+ */
+
+#define TARGET_PLUGIN_MAX_STATUS 16
+
+/*!
+ * One record per registered plug-in the loader has attempted (or skipped)
+ * this process, keyed by id. Written by every load attempt — first discovery,
+ * each refresh, the display-claim collection — and read by diagnostics
+ * (`displayxr-cli`, the service tray) from other threads, so it has its own
+ * small mutex rather than @ref g_refresh_mutex (a refresh can hold that one
+ * for as long as a slow plug-in probe takes).
+ */
+static struct target_plugin_status g_status[TARGET_PLUGIN_MAX_STATUS];
+static int g_status_count = 0;
+//! Per record: a load of this id has been attempted at least once (the #434
+//! breadcrumb and the #461 skew check WARN only on the first attempt).
+static bool g_status_attempted[TARGET_PLUGIN_MAX_STATUS];
+static struct os_mutex g_status_mutex;
+static int g_status_mutex_initialized = 0;
+
+static void
+status_lock(void)
+{
+	if (g_status_mutex_initialized) {
+		os_mutex_lock(&g_status_mutex);
+	}
+}
+
+static void
+status_unlock(void)
+{
+	if (g_status_mutex_initialized) {
+		os_mutex_unlock(&g_status_mutex);
+	}
+}
+
+//! Find or add the record for @p id. Caller holds the status lock. -1 if full.
+static int
+status_find_or_add_locked(const char *id)
+{
+	for (int i = 0; i < g_status_count; i++) {
+		if (strcmp(g_status[i].id, id) == 0) {
+			return i;
+		}
+	}
+	if (g_status_count >= TARGET_PLUGIN_MAX_STATUS) {
+		return -1;
+	}
+	int i = g_status_count++;
+	memset(&g_status[i], 0, sizeof(g_status[i]));
+	g_status_attempted[i] = false;
+	snprintf(g_status[i].id, sizeof(g_status[i].id), "%s", id);
+	return i;
+}
+
+/*!
+ * Start an attempt at one registered plug-in: refresh its identity fields from
+ * the discovery root. Returns true if this is the FIRST attempt at this id in
+ * this process (callers keep their one-shot WARNs to that attempt).
+ */
+static bool
+status_begin(const char *id, const char *display_name, const char *version, uint32_t probe_order)
+{
+	bool first = true;
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		snprintf(s->display_name, sizeof(s->display_name), "%s", display_name != NULL ? display_name : "");
+		snprintf(s->version, sizeof(s->version), "%s", version != NULL ? version : "");
+		s->probe_order = probe_order;
+		first = !g_status_attempted[i];
+		g_status_attempted[i] = true;
+	}
+	status_unlock();
+	return first;
+}
+
+/*!
+ * Record the outcome of an attempt. Returns true when it DIFFERS from the
+ * previous outcome recorded for this id (or is the first), so a caller can log
+ * a repeated failure at INFO instead of WARN: the service re-probes on world
+ * events and on a slow timer while the fallback is active, and a vendor
+ * plug-in whose platform is absent must cost one WARN per process, not one per
+ * retry.
+ */
+static bool
+status_finish(const char *id, enum target_plugin_load_result result, uint32_t os_error, const char *reason)
+{
+	bool changed = true;
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		changed = !(s->result == result && s->os_error == os_error);
+		s->result = result;
+		s->os_error = os_error;
+		snprintf(s->reason, sizeof(s->reason), "%s", reason != NULL ? reason : "");
+		if (result == TARGET_PLUGIN_RESULT_BINARY_MISSING ||
+		    result == TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING || result == TARGET_PLUGIN_RESULT_LOAD_FAILED ||
+		    result == TARGET_PLUGIN_RESULT_PATH_REFUSED || result == TARGET_PLUGIN_RESULT_NO_ENTRY_POINT ||
+		    result == TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED || result == TARGET_PLUGIN_RESULT_ABI_MISMATCH) {
+			// Never got far enough to ask: a stale state from an
+			// earlier attempt would be a lie.
+			s->platform_state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
+			s->platform_flags = 0;
+			s->hint[0] = '\0';
+		}
+	}
+	status_unlock();
+	return changed;
+}
+
+//! Mark @p id as the active plug-in; any previously ACTIVE record becomes CLAIMED.
+static void
+status_set_active(const char *id)
+{
+	status_lock();
+	for (int i = 0; i < g_status_count; i++) {
+		if (g_status[i].result == TARGET_PLUGIN_RESULT_ACTIVE) {
+			g_status[i].result = TARGET_PLUGIN_RESULT_CLAIMED;
+		}
+	}
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		g_status[i].result = TARGET_PLUGIN_RESULT_ACTIVE;
+	}
+	status_unlock();
+}
+
+/*!
+ * Ask @p iface for its platform state through the struct_size-gated optional
+ * slot. Always fills @p out (UNKNOWN when not reported).
+ */
+static bool
+query_platform_state(const struct xrt_plugin_iface *iface, struct xrt_plugin_platform_status *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->struct_size = (uint32_t)sizeof(*out);
+	if (iface == NULL ||
+	    iface->struct_size <
+	        offsetof(struct xrt_plugin_iface, get_platform_state) + sizeof(iface->get_platform_state) ||
+	    iface->get_platform_state == NULL) {
+		return false;
+	}
+	if (!iface->get_platform_state(out)) {
+		memset(out, 0, sizeof(*out));
+		out->struct_size = (uint32_t)sizeof(*out);
+		return false;
+	}
+	out->hint[sizeof(out->hint) - 1] = '\0';
+	if (out->state > XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE) {
+		out->state = XRT_PLUGIN_PLATFORM_STATE_UNKNOWN;
+	}
+	return true;
+}
+
+/*!
+ * Load-path hook, called after negotiate + the ABI gate and BEFORE probe():
+ * record what the plug-in says about its platform, so a plug-in that is about
+ * to decline can still say why. Logs only on a change of state.
+ */
+static void
+status_record_platform_state(const char *id, const struct xrt_plugin_iface *iface)
+{
+	struct xrt_plugin_platform_status ps;
+	bool reported = query_platform_state(iface, &ps);
+	bool changed = false;
+	// The DP factories the iface offers (plain struct fields — no call, so
+	// valid before probe() and for a plug-in that is about to decline).
+	uint32_t apis = 0;
+	if (iface != NULL) {
+		apis |= iface->create_dp_vk != NULL ? XRT_STATUS_API_BIT_VK : 0u;
+		apis |= iface->create_dp_metal != NULL ? XRT_STATUS_API_BIT_METAL : 0u;
+		apis |= iface->create_dp_gl != NULL ? XRT_STATUS_API_BIT_GL : 0u;
+		apis |= iface->create_dp_d3d11 != NULL ? XRT_STATUS_API_BIT_D3D11 : 0u;
+		apis |= iface->create_dp_d3d12 != NULL ? XRT_STATUS_API_BIT_D3D12 : 0u;
+	}
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		s->dp_apis = apis;
+		changed = s->platform_state != ps.state || strcmp(s->hint, ps.hint) != 0;
+		s->platform_state = ps.state;
+		s->platform_flags = ps.flags;
+		snprintf(s->hint, sizeof(s->hint), "%s", ps.hint);
+	}
+	status_unlock();
+	if (reported && changed) {
+		U_LOG_W("plugin loader:   %s: platform state %s%s%s", id != NULL ? id : "?",
+		        target_plugin_platform_state_str(ps.state), ps.hint[0] != '\0' ? " — " : "", ps.hint);
+	}
+}
+
+bool
+target_plugin_find_metal_only(char *out_id, size_t cap)
+{
+	if (out_id != NULL && cap > 0) {
+		out_id[0] = '\0';
+	}
+	bool found = false;
+	status_lock();
+	for (int i = 0; i < g_status_count && !found; i++) {
+		const struct target_plugin_status *s = &g_status[i];
+		if ((s->platform_flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0 ||
+		    (s->dp_apis & XRT_STATUS_API_BIT_METAL) == 0 || (s->dp_apis & XRT_STATUS_API_BIT_VK) != 0) {
+			continue;
+		}
+		found = true;
+		if (out_id != NULL && cap > 0) {
+			snprintf(out_id, cap, "%s", s->id);
+		}
+	}
+	status_unlock();
+	return found;
+}
+
+const char *
+target_plugin_load_result_str(enum target_plugin_load_result r)
+{
+	switch (r) {
+	case TARGET_PLUGIN_RESULT_NOT_ATTEMPTED: return "NOT_ATTEMPTED";
+	case TARGET_PLUGIN_RESULT_ACTIVE: return "ACTIVE";
+	case TARGET_PLUGIN_RESULT_CLAIMED: return "LOADED";
+	case TARGET_PLUGIN_RESULT_DECLINED: return "DECLINED";
+	case TARGET_PLUGIN_RESULT_BINARY_MISSING: return "BINARY_MISSING";
+	case TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING: return "DEPENDENCY_MISSING";
+	case TARGET_PLUGIN_RESULT_LOAD_FAILED: return "LOAD_FAILED";
+	case TARGET_PLUGIN_RESULT_PATH_REFUSED: return "PATH_REFUSED";
+	case TARGET_PLUGIN_RESULT_NO_ENTRY_POINT: return "NO_ENTRY_POINT";
+	case TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED: return "NEGOTIATE_FAILED";
+	case TARGET_PLUGIN_RESULT_ABI_MISMATCH: return "ABI_MISMATCH";
+	case TARGET_PLUGIN_RESULT_PROBE_FAILED: return "PROBE_FAILED";
+	case TARGET_PLUGIN_RESULT_UNTRUSTED: return "UNTRUSTED";
+	case TARGET_PLUGIN_RESULT_DISABLED: return "DISABLED";
+	}
+	return "?";
+}
+
+const char *
+target_plugin_platform_state_str(uint32_t state)
+{
+	switch (state) {
+	case XRT_PLUGIN_PLATFORM_STATE_UNKNOWN: return "UNKNOWN";
+	case XRT_PLUGIN_PLATFORM_STATE_READY: return "READY";
+	case XRT_PLUGIN_PLATFORM_STATE_PLATFORM_ABSENT: return "PLATFORM_ABSENT";
+	case XRT_PLUGIN_PLATFORM_STATE_PLATFORM_NOT_RUNNING: return "PLATFORM_NOT_RUNNING";
+	case XRT_PLUGIN_PLATFORM_STATE_NO_DISPLAY: return "NO_DISPLAY";
+	case XRT_PLUGIN_PLATFORM_STATE_INCOMPATIBLE: return "INCOMPATIBLE";
+	default: return "UNKNOWN";
+	}
+}
+
+bool
+target_plugin_iface_is_fallback(const struct xrt_plugin_iface *iface)
+{
+	if (iface == NULL) {
+		return false;
+	}
+	struct xrt_plugin_platform_status ps;
+	if (query_platform_state(iface, &ps)) {
+		return (ps.flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0;
+	}
+	// A plug-in too old to report state: only the runtime's OWN simulation
+	// plug-in is a fallback. Never a vendor id.
+	return iface->id != NULL && strcmp(iface->id, "sim-display") == 0;
+}
+
+bool
+target_plugin_query_active_platform_state(struct xrt_plugin_platform_status *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	return query_platform_state(g_active_iface, out);
+}
+
+int
+target_plugin_get_status(struct target_plugin_status *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	const struct xrt_plugin_iface *active = g_active_iface;
+	struct xrt_plugin_platform_status live;
+	bool live_ok = query_platform_state(active, &live);
+
+	status_lock();
+	int n = g_status_count < max ? g_status_count : max;
+	for (int i = 0; i < n; i++) {
+		out[i] = g_status[i];
+		if (live_ok && out[i].result == TARGET_PLUGIN_RESULT_ACTIVE && active != NULL && active->id != NULL &&
+		    strcmp(active->id, out[i].id) == 0) {
+			out[i].platform_state = live.state;
+			out[i].platform_flags = live.flags;
+			snprintf(out[i].hint, sizeof(out[i].hint), "%s", live.hint);
+		}
+		out[i].fallback = (out[i].platform_flags & XRT_PLUGIN_PLATFORM_FLAG_FALLBACK) != 0 ||
+		                  (out[i].platform_state == XRT_PLUGIN_PLATFORM_STATE_UNKNOWN &&
+		                   strcmp(out[i].id, "sim-display") == 0);
+	}
+	status_unlock();
+	return n;
+}
+
+/*!
+ * Log a load-path line at WARN the first time an outcome is seen for a
+ * plug-in, at INFO when it merely repeats (re-probes, ADR-045).
+ */
+#define PLUGIN_LOG_OUTCOME(changed, ...)                                                                               \
+	do {                                                                                                           \
+		if (changed) {                                                                                         \
+			U_LOG_W(__VA_ARGS__);                                                                          \
+		} else {                                                                                               \
+			U_LOG_I(__VA_ARGS__);                                                                          \
+		}                                                                                                      \
+	} while (false)
 
 /*!
  * Max plug-in sources consulted when building the per-display registry
@@ -301,10 +736,86 @@ struct plugin_display_source
 static struct plugin_display_source g_display_sources[TARGET_PLUGIN_MAX_SOURCES];
 static int g_display_source_count = -1;
 
+/*!
+ * POSIX: the cached source set is ONLY the active plug-in, because it claimed
+ * every monitor of the last resolve, so no other plug-in could have changed
+ * the outcome (see @ref ensure_display_sources). Re-checked on every resolve,
+ * since a later descriptor set may hold a monitor it does not claim. Guarded
+ * by @ref g_refresh_mutex.
+ */
+static bool g_display_sources_active_only = false;
+
 
 /*
  *
- * Platform-specific loader.
+ * The class row (ADR-054 §2): what the shared component loader needs to know
+ * about display processors. Discovery, the #952 / #328 / #434 load path and
+ * the ADR-020 ABI gate are its (`target_component_loader.h`); everything from
+ * here down is what only this class knows — the host iface a plug-in gets,
+ * what `probe()` means, the ADR-045 status records, the display-claim source
+ * set, the PreferredPlugin / DXR_PLUGIN_EXCLUSIVE selection policy.
+ *
+ */
+
+static bool
+dp_is_reserved_subkey(const char *name)
+{
+	// Policy lives beside the rows under the same root: the per-screen
+	// `PreferredPlugin\<screen key>` pins (plugin-discovery.md §4) and a
+	// future `Policy\Lock`. Neither is a plug-in and neither may be listed as
+	// a malformed one.
+	static const char *const reserved[] = {"PreferredPlugin", "Policy", NULL};
+	if (name == NULL) {
+		return false;
+	}
+	for (int i = 0; reserved[i] != NULL; i++) {
+		const char *a = name;
+		const char *b = reserved[i];
+		while (*a != '\0' && *b != '\0') {
+			int ca = (*a >= 'A' && *a <= 'Z') ? *a - 'A' + 'a' : *a;
+			int cb = (*b >= 'A' && *b <= 'Z') ? *b - 'A' + 'a' : *b;
+			if (ca != cb) {
+				break;
+			}
+			a++;
+			b++;
+		}
+		if (*a == '\0' && *b == '\0') {
+			return true;
+		}
+	}
+	return false;
+}
+
+static const struct target_component_class g_dp_class = {
+    // "plug-in" rather than "display processor": the shared loader builds
+    // "loading plug-in binary", "no plug-ins to try" and "the plug-in must be
+    // rebuilt" from it, and those are the DP log lines diagnostics grep for.
+    .name = "plug-in",
+    .log_tag = "plugin loader",
+    .entrypoint = XRT_PLUGIN_ENTRYPOINT_NAME,
+    .abi_current = XRT_PLUGIN_API_VERSION_CURRENT,
+    .registry_root = "Software\\DisplayXR\\DisplayProcessors",
+    .manifest_kind = TARGET_PLUGIN_MANIFEST_DISPLAY,
+    .android_prefix = TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY,
+    .is_reserved_subkey = dp_is_reserved_subkey,
+    .read_extra = NULL,
+    .env_class = "DP", // DXR_DP_<ID>_<KEY> (N3c)
+};
+
+//! One per-class entry array, heap-allocated (~11 KB a row).
+static struct target_component_entry *
+dp_entries_alloc(void)
+{
+	return (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(struct target_component_entry));
+}
+
+
+/*
+ *
+ * Platform islands. The only code left that differs per OS: the Android host
+ * callbacks and lib-dir preload, the Windows #461 version-skew tripwire, and
+ * the PreferredPlugin store (registry / per-user file / env).
  *
  */
 
@@ -325,192 +836,6 @@ static int g_display_source_count = -1;
 #endif
 
 /*!
- * Maximum number of plug-ins we enumerate from the registry. 16 is
- * generous — the design admits at most a handful in practice (vendor
- * panels + the sim_display fallback).
- */
-#define MAX_PLUGIN_ENTRIES 16
-
-/*!
- * Registry-derived per-plug-in metadata. Filled in by the enumeration
- * pass, sorted, then iterated by the probe pass.
- */
-struct plugin_entry
-{
-	wchar_t binary_path[MAX_PATH];
-	char id[64];           /* subkey name (UTF-8) */
-	char display_name[128];
-	char vendor[64];
-	char version[64];
-	uint32_t probe_order; /* defaults to 100 when REG value is missing */
-};
-
-
-/*
- *
- * Helpers.
- *
- */
-
-/*
- * (Earlier revisions of this loader called AddDllDirectory(runtime dir)
- * before LoadLibraryExW with LOAD_LIBRARY_SEARCH_USER_DIRS, but that flag
- * is mutually exclusive with LOAD_WITH_ALTERED_SEARCH_PATH per MSDN —
- * combining them returns ERROR_INVALID_PARAMETER for plug-ins that have
- * transitive deps the loader had to actually walk. We rely on
- * LOAD_WITH_ALTERED_SEARCH_PATH alone now: it puts the plug-in DLL's
- * own directory first in the search, and the legacy strategy continues
- * to PATH, so SR DLLs at `C:\Program Files\LeiaSR\Platform\bin` and
- * cjson.dll / vulkan-1.dll alongside the runtime resolve through their
- * existing PATH entries.)
- */
-
-/*!
- * UTF-16 wchar_t string → UTF-8 char buffer. Returns true on success.
- */
-static bool
-wide_to_utf8(const wchar_t *src, char *dst, int dst_size)
-{
-	int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_size, NULL, NULL);
-	if (n <= 0) {
-		if (dst_size > 0) {
-			dst[0] = '\0';
-		}
-		return false;
-	}
-	return true;
-}
-
-/*!
- * Read an optional REG_SZ value into the supplied UTF-8 buffer. On
- * miss, leaves dst as an empty string.
- */
-static void
-read_optional_string(HKEY key, const wchar_t *name, char *dst, int dst_size)
-{
-	wchar_t wbuf[256];
-	DWORD wbuf_bytes = sizeof(wbuf);
-	if (RegGetValueW(key, NULL, name, RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes) == ERROR_SUCCESS) {
-		wide_to_utf8(wbuf, dst, dst_size);
-	} else {
-		if (dst_size > 0) {
-			dst[0] = '\0';
-		}
-	}
-}
-
-/*!
- * Enumerate plug-in subkeys under HKLM\Software\DisplayXR\DisplayProcessors.
- *
- * Returns the number of entries populated (0 if the root key is
- * absent / unreadable). Entries with no Binary value are skipped —
- * they don't satisfy the spec's "required" rule.
- */
-static int
-enumerate_registry(struct plugin_entry *entries, int max)
-{
-	HKEY root;
-	LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-	                           L"Software\\DisplayXR\\DisplayProcessors",
-	                           0, KEY_READ, &root);
-	if (rc != ERROR_SUCCESS) {
-		U_LOG_I("plugin loader: registry root HKLM\\Software\\DisplayXR\\DisplayProcessors absent (rc=%ld) "
-		        "— no plug-ins to try.",
-		        rc);
-		return 0;
-	}
-
-	int count = 0;
-	DWORD index = 0;
-	for (;;) {
-		if (count >= max) {
-			U_LOG_W("plugin loader: more than %d registered plug-ins — truncating.", max);
-			break;
-		}
-
-		wchar_t subkey_name[256];
-		DWORD subkey_name_len = (DWORD)(sizeof(subkey_name) / sizeof(wchar_t));
-		LSTATUS er = RegEnumKeyExW(root, index, subkey_name, &subkey_name_len, NULL, NULL, NULL, NULL);
-		index++;
-		if (er == ERROR_NO_MORE_ITEMS) {
-			break;
-		}
-		if (er != ERROR_SUCCESS) {
-			U_LOG_W("plugin loader: RegEnumKeyEx failed (rc=%ld) at index %lu — stopping enumeration.",
-			        er, (unsigned long)index);
-			break;
-		}
-
-		HKEY sub;
-		if (RegOpenKeyExW(root, subkey_name, 0, KEY_READ, &sub) != ERROR_SUCCESS) {
-			continue;
-		}
-
-		struct plugin_entry *e = &entries[count];
-		memset(e, 0, sizeof(*e));
-
-		/* Binary is required. */
-		DWORD binary_bytes = (DWORD)sizeof(e->binary_path);
-		if (RegGetValueW(sub, NULL, L"Binary", RRF_RT_REG_SZ, NULL, e->binary_path, &binary_bytes) !=
-		    ERROR_SUCCESS) {
-			U_LOG_W("plugin loader: subkey '%ls' missing required 'Binary' value — skipping.",
-			        subkey_name);
-			RegCloseKey(sub);
-			continue;
-		}
-
-		wide_to_utf8(subkey_name, e->id, (int)sizeof(e->id));
-
-		read_optional_string(sub, L"DisplayName", e->display_name, (int)sizeof(e->display_name));
-		read_optional_string(sub, L"Vendor", e->vendor, (int)sizeof(e->vendor));
-		read_optional_string(sub, L"Version", e->version, (int)sizeof(e->version));
-
-		DWORD order = 100;
-		DWORD order_bytes = sizeof(order);
-		if (RegGetValueW(sub, NULL, L"ProbeOrder", RRF_RT_REG_DWORD, NULL, &order, &order_bytes) ==
-		    ERROR_SUCCESS) {
-			e->probe_order = (uint32_t)order;
-		} else {
-			e->probe_order = 100;
-		}
-
-		count++;
-		RegCloseKey(sub);
-	}
-
-	RegCloseKey(root);
-	return count;
-}
-
-/*!
- * ProbeOrder ascending, ties broken by id (#1466) — same shape, same reason as
- * the input loader's comparator: qsort is not stable, so two plug-ins
- * registered at one ProbeOrder would otherwise be ranked by the sort
- * implementation. Which one is probed first decides which DP the runtime ends
- * up on, so it must not vary between runs.
- */
-static int
-compare_by_probe_order(const void *a, const void *b)
-{
-	const struct plugin_entry *ea = (const struct plugin_entry *)a;
-	const struct plugin_entry *eb = (const struct plugin_entry *)b;
-	if (ea->probe_order < eb->probe_order) {
-		return -1;
-	}
-	if (ea->probe_order > eb->probe_order) {
-		return 1;
-	}
-	return strcmp(ea->id, eb->id);
-}
-
-/*!
- * Try one registered plug-in. Returns the iface on success and writes
- * the probed instance handle to *out_inst; returns NULL (and closes
- * the DLL) on any failure. Caller never sees the HMODULE — successful
- * loads intentionally leak it for the process lifetime so the iface's
- * function pointers remain callable.
- */
-/*!
  * Registry↔DLL version-skew tripwire (#461). Installers replace the plug-in
  * DLL and rewrite the registry `Version` in one transaction — EXCEPT when a
  * running process (typically displayxr-service) has the DLL mapped: NSIS
@@ -518,10 +843,11 @@ compare_by_probe_order(const void *a, const void *b)
  * under a new registry version (the v0.14.0 bundle incident). Compare the
  * registry semver against the DLL's embedded VERSIONINFO and WARN loudly on
  * mismatch. Quietly does nothing when the DLL ships no version resource
- * (sim-display today) or the registry value isn't a semver.
+ * (sim-display today), the registry value isn't a semver, or the file is not
+ * there (the load path reports that one).
  */
 static void
-check_registry_dll_version_skew(const struct plugin_entry *e)
+check_registry_dll_version_skew(const struct target_component_entry *e)
 {
 	unsigned reg_major = 0, reg_minor = 0, reg_patch = 0;
 	const char *v = e->version;
@@ -532,8 +858,13 @@ check_registry_dll_version_skew(const struct plugin_entry *e)
 		return; /* empty / non-semver registry Version — nothing to compare */
 	}
 
+	wchar_t wpath[TARGET_COMPONENT_PATH_MAX];
+	if (MultiByteToWideChar(CP_UTF8, 0, e->binary_path, -1, wpath, (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0) {
+		return;
+	}
+
 	DWORD ignored = 0;
-	DWORD size = GetFileVersionInfoSizeW(e->binary_path, &ignored);
+	DWORD size = GetFileVersionInfoSizeW(wpath, &ignored);
 	if (size == 0) {
 		return; /* DLL ships no VERSIONINFO resource — nothing to compare */
 	}
@@ -543,15 +874,14 @@ check_registry_dll_version_skew(const struct plugin_entry *e)
 	}
 	VS_FIXEDFILEINFO *ffi = NULL;
 	UINT ffi_len = 0;
-	if (GetFileVersionInfoW(e->binary_path, 0, size, buf) &&
-	    VerQueryValueW(buf, L"\\", (LPVOID *)&ffi, &ffi_len) && ffi != NULL &&
-	    ffi_len >= sizeof(*ffi)) {
+	if (GetFileVersionInfoW(wpath, 0, size, buf) && VerQueryValueW(buf, L"\\", (LPVOID *)&ffi, &ffi_len) &&
+	    ffi != NULL && ffi_len >= sizeof(*ffi)) {
 		unsigned dll_major = HIWORD(ffi->dwFileVersionMS);
 		unsigned dll_minor = LOWORD(ffi->dwFileVersionMS);
 		unsigned dll_patch = HIWORD(ffi->dwFileVersionLS);
 		if (dll_major != reg_major || dll_minor != reg_minor || dll_patch != reg_patch) {
 			U_LOG_W("plugin loader:   %s: registry Version '%s' != DLL file version "
-			        "%u.%u.%u (%ls) — an installer likely failed to replace a locked "
+			        "%u.%u.%u (%s) — an installer likely failed to replace a locked "
 			        "DLL; reinstall the plug-in with displayxr-service stopped (#461).",
 			        e->id, e->version, dll_major, dll_minor, dll_patch, e->binary_path);
 		}
@@ -559,509 +889,10 @@ check_registry_dll_version_skew(const struct plugin_entry *e)
 	free(buf);
 }
 
-/*!
- * Load + negotiate + ABI-check + probe one registered plug-in. Returns the
- * iface (writing the instance to *out_inst and the negotiated ABI version to
- * *out_version) on success, NULL (and closes the DLL) on any failure. No
- * "active plug-in" logging — callers add their own role-specific line, so
- * this can serve both the single-winner discovery and the load-all display
- * probe (#69). Successful loads intentionally leak the HMODULE for the
- * process lifetime so the iface's function pointers remain callable.
- */
-static const struct xrt_plugin_iface *
-load_and_probe_one(const struct plugin_entry *e,
-                   struct xrt_plugin_instance **out_inst,
-                   uint32_t *out_version)
-{
-	*out_inst = NULL;
-	if (out_version != NULL) {
-		*out_version = 0;
-	}
-
-	// #952: refuse a build-tree/worktree DLL path (the #943 footgun) unless
-	// DXR_ALLOW_DEV_PLUGIN_PATHS is set; warn on other non-install paths.
-	if (target_plugin_path_check(e->binary_path, e->id, "plugin") == TARGET_PLUGIN_PATH_REFUSED) {
-		return NULL;
-	}
-
-	// Pre-load any dependency whose unwind data would crash host-engine
-	// module tracers during this LoadLibrary (issue #434) — loaded from a
-	// path those tracers' filters skip, so the buggy parse never runs.
-	target_plugin_sanitized_preload(e->binary_path);
-
-	// One-shot breadcrumb: a host-side crash during the load below (DLL
-	// notification callbacks run host code) leaves this as the last line
-	// in the per-app log, naming the in-flight binary (issue #434).
-	U_LOG_W("plugin loader:   %s: loading plug-in binary %ls", e->id, e->binary_path);
-
-	// #461: warn if the registry-declared version doesn't match the DLL on
-	// disk (an installer skipped a locked file). Diagnostic only — the ABI
-	// negotiation below remains the actual compatibility gate.
-	check_registry_dll_version_skew(e);
-
-	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-	if (dll == NULL) {
-		U_LOG_W("plugin loader:   %s: LoadLibrary(%ls) failed (err=%lu).", e->id, e->binary_path,
-		        GetLastError());
-		return NULL;
-	}
-
-	xrt_plugin_negotiate_fn_t negotiate =
-	    (xrt_plugin_negotiate_fn_t)(void *)GetProcAddress(dll, XRT_PLUGIN_ENTRYPOINT_NAME);
-	if (negotiate == NULL) {
-		U_LOG_W("plugin loader:   %s: missing entry point '%s' — skipping.", e->id,
-		        XRT_PLUGIN_ENTRYPOINT_NAME);
-		FreeLibrary(dll);
-		return NULL;
-	}
-
-	struct xrt_plugin_host_iface host = {0};
-	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
-	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
-#if defined(XRT_OS_ANDROID)
-	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
-	// (their own statically-linked aux_android copy is never populated).
-	host.get_android_vm = plugin_host_get_android_vm;
-	// Activity when in-process; Service Context when out-of-process (CNSDK only
-	// needs an android.content.Context to bind the on-device tracking service).
-	host.get_android_activity = plugin_host_get_android_activity;
-	// #1037: a Context whose classloader is the runtime APK's, so an
-	// in-process vendor plug-in can resolve vendor Java glue the app does
-	// not ship. Class loading only — see xrt_plugin.h.
-	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
-	host.android_package_is_visible = plugin_host_android_package_is_visible;
-#endif
-
-	struct xrt_plugin_iface *iface = NULL;
-	uint32_t plugin_version = 0;
-	xrt_result_t xret = negotiate(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
-	if (xret != XRT_SUCCESS || iface == NULL) {
-		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id,
-		        (int)xret, (void *)iface);
-		FreeLibrary(dll);
-		return NULL;
-	}
-
-	/* ADR-020 rule 3: reject a major-version mismatch before touching the
-	 * vtable. A plug-in built against a different ABI major lays its vtable
-	 * out at offsets the runtime doesn't agree on — calling through it is
-	 * exactly the corruption this guards against. Skip it (the caller falls
-	 * back to the next plug-in / sim_display); never dispatch. */
-	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
-		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
-		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
-		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		/* #1212: carry the reason to the self-test, so a rejected vendor
-		 * plug-in reads as an ABI mismatch rather than a bare failure. */
-		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
-		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
-		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		FreeLibrary(dll);
-		return NULL;
-	}
-
-	if (iface->probe != NULL) {
-		xret = iface->probe(out_inst);
-		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
-			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
-			/* #1212: a plug-in that LOADED and then said "not my
-			 * hardware" is behaving correctly on a box without that
-			 * panel. Only a failed LOAD is a misconfiguration, so
-			 * mark this so the vendor_dp self-test does not fail a
-			 * dev box that merely has a vendor plug-in registered. */
-			g_last_reject_declined = true;
-			FreeLibrary(dll);
-			return NULL;
-		}
-		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
-			FreeLibrary(dll);
-			return NULL;
-		}
-	}
-
-	if (out_version != NULL) {
-		*out_version = plugin_version;
-	}
-	return iface;
-}
-
-/*!
- * Try one registered plug-in as the single active winner. Thin wrapper over
- * @ref load_and_probe_one that adds the canonical "active plug-in:" log line
- * (parsed by diagnostics). Returns the iface on success, NULL on any failure.
- */
-static const struct xrt_plugin_iface *
-try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
-{
-	uint32_t plugin_version = 0;
-	const struct xrt_plugin_iface *iface = load_and_probe_one(e, out_inst, &plugin_version);
-	if (iface == NULL) {
-		return NULL;
-	}
-
-	U_LOG_W(
-	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' version='%s' "
-	    "plugin_api=%u probe_order=%u path=%ls",
-	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
-	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order,
-	    e->binary_path);
-
-	return iface;
-}
-
-/*!
- * Pin the runtime core DLL (DisplayXRClient.dll) into the process by
- * absolute path before any plug-in is loaded. Runs once.
- *
- * Vendor plug-in DLLs statically import DisplayXRClient.dll, which ships
- * in the runtime install dir. That dir is intentionally NOT on PATH
- * (issue #104), and the per-plug-in LOAD_WITH_ALTERED_SEARCH_PATH below
- * searches only the plug-in's own dir + System32 + cwd + PATH — none of
- * which hold DisplayXRClient.dll except cwd when it happens to equal the
- * runtime dir. So at logon (Run-key launches with cwd=System32) and when
- * the workspace controller spawns the service, that import fails with
- * ERROR_MOD_NOT_FOUND (126) and every plug-in load aborts → no display
- * processor → the service exits (issue #328).
- *
- * Pre-loading DisplayXRClient.dll by absolute path here pins it into the
- * process by base name; the loader then satisfies each plug-in's import
- * from the already-resident module with no disk search, independent of
- * cwd/PATH. The per-plug-in load deliberately keeps
- * LOAD_WITH_ALTERED_SEARCH_PATH so vendor side DLLs (e.g. the SR platform
- * at C:\Program Files\LeiaSR\Platform\bin) still resolve via PATH.
- *
- * No process-wide search-order mutation (cf. target_dll_init.c) — this is
- * the surgical option and leaves PATH resolution intact for vendors.
- */
+//! Nothing to do before discovery on Windows: the shared load path pins the core DLL (#328) per load.
 static void
-preload_runtime_core_dll(void)
+dp_platform_prepare_discovery(void)
 {
-	static int done = 0;
-	if (done) {
-		return;
-	}
-	done = 1;
-
-	// Directory of whatever module this loader code lives in — the
-	// service exe or DisplayXRClient.dll, both of which sit in the
-	// runtime install dir. UNCHANGED_REFCOUNT: we only want its path.
-	HMODULE self = NULL;
-	if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-	                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-	                        (LPCWSTR)(void *)&preload_runtime_core_dll, &self)) {
-		U_LOG_W("plugin loader: GetModuleHandleEx(self) failed (err=%lu) — cannot locate runtime dir to "
-		        "pre-load DisplayXRClient.dll.",
-		        GetLastError());
-		return;
-	}
-
-	wchar_t modpath[MAX_PATH];
-	DWORD len = GetModuleFileNameW(self, modpath, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		U_LOG_W("plugin loader: GetModuleFileName(self) failed/truncated — skipping DisplayXRClient.dll "
-		        "pre-load.");
-		return;
-	}
-
-	// Strip the module filename to leave the runtime dir.
-	wchar_t *slash = wcsrchr(modpath, L'\\');
-	if (slash == NULL) {
-		return;
-	}
-	*slash = L'\0';
-
-	wchar_t corepath[MAX_PATH];
-	if (swprintf_s(corepath, MAX_PATH, L"%s\\DisplayXRClient.dll", modpath) <= 0) {
-		return;
-	}
-
-	// If it is already resident (in-process app target, where the host
-	// loaded it via the OpenXR loader) this just bumps the refcount and
-	// the plug-in import binds to it. Otherwise it loads now so the
-	// import resolves. LOAD_WITH_ALTERED_SEARCH_PATH so the core DLL's
-	// own siblings (cjson.dll, pthreadVC3.dll) resolve from the runtime
-	// dir rather than the host exe dir.
-	if (LoadLibraryExW(corepath, NULL, LOAD_WITH_ALTERED_SEARCH_PATH) == NULL) {
-		U_LOG_W("plugin loader: pre-load of %ls failed (err=%lu); plug-in loads may fail when cwd is not "
-		        "the runtime dir.",
-		        corepath, GetLastError());
-	} else {
-		U_LOG_I("plugin loader: pinned runtime core DLL for plug-in import resolution: %ls", corepath);
-	}
-}
-
-void
-target_plugin_preload_runtime_core_dll(void)
-{
-	/* Shared with the input-provider loader: input-provider DLLs import
-	 * DisplayXRClient.dll exactly like DP plug-ins do, so the #328
-	 * cwd-independent pinning must run before either loader's first
-	 * LoadLibrary. Idempotent (one-shot inside). */
-	preload_runtime_core_dll();
-}
-
-static const struct xrt_plugin_iface *
-discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
-{
-	*out_inst = NULL;
-
-	// Ensure DisplayXRClient.dll is resident before any plug-in import
-	// of it has to resolve (issue #328).
-	preload_runtime_core_dll();
-
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
-	if (n == 0) {
-		return NULL;
-	}
-
-	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
-
-	// DXR_PLUGIN_EXCLUSIVE (#1545): warn once if the pin matches nothing.
-	{
-		const char *ids[MAX_PLUGIN_ENTRIES];
-		for (int i = 0; i < n; i++) {
-			ids[i] = entries[i].id;
-		}
-		plugin_warn_exclusive_miss(ids, n);
-	}
-
-	// PreferredPlugin override (#378): try the user-pinned plug-in before
-	// the ProbeOrder sort. A stale or failed preference falls through to
-	// the normal order, so a bad value can never brick discovery.
-	char preferred[64];
-	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
-		for (int i = 0; i < n; i++) {
-			if (strcmp(entries[i].id, preferred) != 0) {
-				continue;
-			}
-			// An exclusive pin outranks the user preference: the
-			// point is that nothing else is LOADED, and honoring a
-			// preference here would load exactly the DLL the lane
-			// asked to keep out of the process (#1545).
-			if (plugin_id_excluded(entries[i].id)) {
-				break;
-			}
-			// Refresh path: only honor the preference if it is also
-			// strictly-better; the sticky-preference guard in
-			// target_plugin_refresh_active normally prevents reaching
-			// here on a refresh at all.
-			if (entries[i].probe_order >= max_probe_order) {
-				break;
-			}
-			U_LOG_W("plugin loader: PreferredPlugin override — attempting id='%s' first.", preferred);
-			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
-			if (iface != NULL) {
-				g_active_probe_order = entries[i].probe_order;
-				return iface;
-			}
-			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
-			        preferred);
-			break;
-		}
-	}
-
-	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
-	for (int i = 0; i < n; i++) {
-		// Refresh path (#342) passes the active plug-in's ProbeOrder as
-		// max so we only re-attempt strictly-better candidates and never
-		// re-probe the already-active one. First-call path passes
-		// UINT32_MAX, so no entry is skipped.
-		if (entries[i].probe_order >= max_probe_order) {
-			continue;
-		}
-		/* #1545: skipped BEFORE LoadLibrary, and deliberately without
-		 * plugin_note_reject — an excluded plug-in is not a failure. */
-		if (plugin_id_excluded(entries[i].id)) {
-			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
-			continue;
-		}
-		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
-		        entries[i].probe_order, entries[i].binary_path);
-		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
-		if (iface != NULL) {
-			g_active_probe_order = entries[i].probe_order;
-			return iface;
-		}
-		/* #1212: attempted in ascending ProbeOrder and failed, so this is
-		 * by construction a better-ranked plug-in than whatever wins
-		 * below. The self-test's vendor_dp check keys off this. */
-		plugin_note_reject(entries[i].id, entries[i].probe_order);
-	}
-
-	// A refresh (max_probe_order bounded by the current winner) legitimately
-	// attempts nothing when nothing better is registered — that is not a
-	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
-	if (max_probe_order == 0xFFFFFFFFu) {
-		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
-	}
-	return NULL;
-}
-
-/*!
- * Load EVERY registered plug-in and return them as display-claim sources for
- * the per-monitor registry (#69 / ADR-015). Unlike @ref discover_active_plugin
- * (which stops at the first winner), this consults all of them so the
- * fallback (sim_display) and a vendor plug-in can both contribute claims. The
- * already-active plug-in is reused — not loaded twice — and the remainder are
- * loaded via @ref load_and_probe_one (DLL handles leaked, consistent with the
- * single-winner path). Plug-ins whose `probe()` declines contribute nothing.
- * Returns the source count, sorted ascending by ProbeOrder (so a confidence
- * tie resolves to the lower-ProbeOrder plug-in).
- *
- * Caller must hold @ref g_refresh_mutex and have already loaded the active
- * plug-in (so `g_active_*` are set for the reuse path).
- */
-static int
-collect_display_sources_platform(struct plugin_display_source *out, int max)
-{
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
-	if (n == 0) {
-		return 0;
-	}
-	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_probe_order);
-
-	const char *active_id = (g_active_iface != NULL && g_active_iface->id != NULL) ? g_active_iface->id : NULL;
-
-	int count = 0;
-	for (int i = 0; i < n && count < max; i++) {
-		// #1545: THE load site this variable exists for. Claim
-		// collection consults every registered plug-in, so without this
-		// an exclusive lane would still LoadLibrary the vendor DLL (and
-		// its GL ICD) even though it never becomes the active DP.
-		if (plugin_id_excluded(entries[i].id)) {
-			continue;
-		}
-		// Reuse the already-loaded active plug-in rather than loading a
-		// second instance of it.
-		if (active_id != NULL && strcmp(entries[i].id, active_id) == 0) {
-			out[count].iface = g_active_iface;
-			out[count].inst = g_active_instance;
-			out[count].probe_order = g_active_probe_order;
-			count++;
-			continue;
-		}
-
-		uint32_t ver = 0;
-		struct xrt_plugin_instance *inst = NULL;
-		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
-		if (iface == NULL) {
-			continue; // declined / failed → contributes no claims
-		}
-		U_LOG_I("plugin loader: display-claim source id=%s (ProbeOrder=%u)", entries[i].id,
-		        entries[i].probe_order);
-		out[count].iface = iface;
-		out[count].inst = inst;
-		out[count].probe_order = entries[i].probe_order;
-		count++;
-	}
-	return count;
-}
-
-/*
- *
- * Public enumeration + PreferredPlugin override (Windows).
- *
- */
-
-int
-target_plugin_enumerate(struct target_plugin_desc *out, int max)
-{
-	if (out == NULL || max <= 0) {
-		return 0;
-	}
-
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = enumerate_registry(entries, MAX_PLUGIN_ENTRIES);
-	if (n > max) {
-		n = max;
-	}
-
-	for (int i = 0; i < n; i++) {
-		struct target_plugin_desc *d = &out[i];
-		memset(d, 0, sizeof(*d));
-		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
-		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
-		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
-		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
-		wide_to_utf8(entries[i].binary_path, d->binary_path, (int)sizeof(d->binary_path));
-		d->probe_order = entries[i].probe_order;
-	}
-
-	return n;
-}
-
-bool
-target_plugin_get_preferred(char *out, size_t cap)
-{
-	if (out == NULL || cap == 0) {
-		return false;
-	}
-	out[0] = '\0';
-
-	wchar_t wbuf[64];
-	DWORD wbuf_bytes = sizeof(wbuf);
-	LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
-	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
-	if (rc != ERROR_SUCCESS) {
-		return false;
-	}
-	wide_to_utf8(wbuf, out, (int)cap);
-	return out[0] != '\0';
-}
-
-xrt_result_t
-target_plugin_set_preferred(const char *id)
-{
-	if (id == NULL || id[0] == '\0') {
-		return target_plugin_clear_preferred();
-	}
-
-	wchar_t wid[64];
-	if (MultiByteToWideChar(CP_UTF8, 0, id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
-		return XRT_ERROR_IPC_FAILURE;
-	}
-
-	// 64-bit view: the runtime reader runs as a 64-bit process (no
-	// redirection), so we must write where it reads. Create the root key
-	// if a clean machine never installed a DisplayProcessor.
-	HKEY root;
-	LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0, NULL, 0,
-	                             KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &root, NULL);
-	if (rc != ERROR_SUCCESS) {
-		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
-	}
-
-	DWORD bytes = (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t));
-	rc = RegSetValueExW(root, L"PreferredPlugin", 0, REG_SZ, (const BYTE *)wid, bytes);
-	RegCloseKey(root);
-	if (rc != ERROR_SUCCESS) {
-		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
-	}
-	return XRT_SUCCESS;
-}
-
-xrt_result_t
-target_plugin_clear_preferred(void)
-{
-	HKEY root;
-	LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0,
-	                           KEY_SET_VALUE | KEY_WOW64_64KEY, &root);
-	if (rc == ERROR_FILE_NOT_FOUND) {
-		return XRT_SUCCESS; // no root key → nothing to clear
-	}
-	if (rc != ERROR_SUCCESS) {
-		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
-	}
-
-	rc = RegDeleteValueW(root, L"PreferredPlugin");
-	RegCloseKey(root);
-	if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
-		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
-	}
-	return XRT_SUCCESS;
 }
 
 #elif defined(XRT_OS_ANDROID)
@@ -1077,12 +908,6 @@ target_plugin_clear_preferred(void)
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
-
-/*
- * Same upper bound as the other platforms — admits a vendor plug-in plus
- * the sim_display fallback with plenty of headroom.
- */
-#define MAX_PLUGIN_ENTRIES 16
 
 /*
  * Host-iface callback: hand the plug-in the runtime's Android `JavaVM *`
@@ -1406,125 +1231,6 @@ plugin_host_get_android_class_host_context(void)
 	return g_class_host_ctx;
 }
 
-/*
- * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.2.
- *
- * Android v1 uses **convention-driven** discovery rather than the JSON
- * manifest scheme that POSIX (macOS / Linux) and the registry scheme
- * that Windows use. Reason: Android's package installer extracts only
- * `.so` files from an APK's `jniLibs/<abi>/` into the on-disk
- * `lib/<abi>/`. Any `.json` shipped in `jniLibs/` stays trapped inside
- * `base.apk` and would require AAssetManager + a JNIEnv to read — JNI
- * plumbing the loader has no access to at xrCreateInstance time. The
- * iface returned by `xrtPluginNegotiate` already carries id /
- * display_name / vendor; the only load-bearing manifest field is
- * ProbeOrder, which we encode in the filename.
- *
- * Filename convention: `libdxrp<NNN>_<id>.so` where `<NNN>` is the
- * three-digit zero-padded ProbeOrder and `<id>` matches the
- * iface->id the plug-in returns at negotiate. Examples:
- *   libdxrp050_leia_cnsdk.so   (vendor)
- *   libdxrp200_sim_display.so  (fallback)
- *
- * Lexicographic sort on filename gives probe-order ascending for free,
- * same trick the POSIX `050-leia-sr.json` filename convention uses.
- *
- * Discovery root (priority order):
- *   1. $XRT_PLUGIN_SEARCH_PATH — dev override, single dir (no colon
- *      splitting — Android emulator iteration is the only use case)
- *   2. dirname(dladdr(&get_runtime_lib_dir)) — the runtime `.so`'s
- *      own lib dir, which is `/data/app/<runtime-pkg>-<hash>/lib/<abi>/`.
- *      Plug-ins shipped in the runtime APK's `jniLibs/<abi>/` land here.
- *
- * Multi-APK discovery (separate vendor-APKs each shipping plug-ins) is
- * a v2 problem requiring PackageManager queries via JNI — out of scope
- * for v1.
- */
-
-struct plugin_entry
-{
-	char binary_path[PATH_MAX];  /* absolute path to the .so */
-	char filename[NAME_MAX + 1]; /* basename, used for stable sort */
-	char id[64];                 /* parsed from filename: chars between `_` and `.so` */
-	uint32_t probe_order;        /* parsed from filename: 3 digits after `libdxrp` */
-};
-
-static int
-compare_by_filename(const void *a, const void *b)
-{
-	return strcmp(((const struct plugin_entry *)a)->filename,
-	              ((const struct plugin_entry *)b)->filename);
-}
-
-/*!
- * Parse `libdxrp<NNN>_<id>.so` into probe_order and id. Returns true
- * on a well-formed filename, false otherwise (caller skips it).
- */
-static bool
-parse_plugin_filename(const char *name, uint32_t *out_order, char *out_id, size_t id_size)
-{
-	const char *prefix = "libdxrp";
-	const size_t prefix_len = 7; /* strlen("libdxrp") */
-	size_t n = strlen(name);
-
-	/* Min plausible: "libdxrpNNN_X.so" = 7 + 3 + 1 + 1 + 3 = 15 chars. */
-	if (n < 15 || strncmp(name, prefix, prefix_len) != 0) {
-		return false;
-	}
-	if (strcmp(name + n - 3, ".so") != 0) {
-		return false;
-	}
-	if (!(name[prefix_len + 0] >= '0' && name[prefix_len + 0] <= '9' &&
-	      name[prefix_len + 1] >= '0' && name[prefix_len + 1] <= '9' &&
-	      name[prefix_len + 2] >= '0' && name[prefix_len + 2] <= '9')) {
-		return false;
-	}
-	if (name[prefix_len + 3] != '_') {
-		return false;
-	}
-
-	*out_order = (uint32_t)((name[prefix_len + 0] - '0') * 100 +
-	                        (name[prefix_len + 1] - '0') * 10 +
-	                        (name[prefix_len + 2] - '0'));
-
-	size_t id_start = prefix_len + 4;
-	size_t id_len = n - 3 - id_start;
-	if (id_len == 0 || id_len >= id_size) {
-		return false;
-	}
-	memcpy(out_id, name + id_start, id_len);
-	out_id[id_len] = '\0';
-	return true;
-}
-
-static int
-enumerate_dir(const char *root, struct plugin_entry *entries, int start, int max)
-{
-	DIR *d = opendir(root);
-	if (d == NULL) {
-		return start;
-	}
-
-	int count = start;
-	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
-		if (count >= max) {
-			U_LOG_W("plugin loader: more than %d entries — truncating.", max);
-			break;
-		}
-		struct plugin_entry e;
-		memset(&e, 0, sizeof(e));
-		if (!parse_plugin_filename(de->d_name, &e.probe_order, e.id, sizeof(e.id))) {
-			continue;
-		}
-		snprintf(e.binary_path, sizeof(e.binary_path), "%s/%s", root, de->d_name);
-		snprintf(e.filename, sizeof(e.filename), "%s", de->d_name);
-		entries[count++] = e;
-	}
-	closedir(d);
-	return count;
-}
-
 /*!
  * Locate the runtime `.so`'s own lib dir via `dladdr` so we can
  * enumerate sibling plug-in `.so`s in the runtime APK's
@@ -1575,7 +1281,10 @@ get_runtime_lib_dir(char *out_dir, size_t out_size)
  * Skips:
  *   - the runtime DLL itself (already loaded by the OpenXR loader);
  *   - other plug-in candidates (`libdxrp*_*.so`) — those go through
- *     the normal discovery + probe flow.
+ *     the normal discovery + probe flow;
+ *   - conversion providers (`libdxrc*`, ADR-053): they live only in the
+ *     runtime APK's `:conversion` process, and the app-side runtime never
+ *     maps one (conversion-provider-discovery.md §3.6).
  *
  * Idempotent: dlopen of an already-loaded library returns the
  * existing handle without reloading.
@@ -1611,8 +1320,14 @@ preload_runtime_lib_dir(const char *lib_dir)
 		if (n < 4 || strcmp(name + n - 3, ".so") != 0) {
 			continue;
 		}
-		/* Skip plug-in candidates — they go through try_load_one. */
-		if (strncmp(name, "libdxrp", 7) == 0) {
+		/* Skip plug-in candidates — they go through the load path. */
+		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_DISPLAY, 7) == 0) {
+			continue;
+		}
+		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_CONVERSION, 7) == 0) {
+			continue;
+		}
+		if (strncmp(name, TARGET_PLUGIN_ANDROID_PREFIX_INPUT, 7) == 0) {
 			continue;
 		}
 		/* Skip the runtime DLL: already loaded, dlopen of it is
@@ -1676,74 +1391,303 @@ preload_runtime_lib_dir(const char *lib_dir)
 #undef MAX_PRELOAD_CANDIDATES
 }
 
-static const struct xrt_plugin_iface *
-try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
+/*!
+ * Android, once per process before the first discovery: bring the runtime
+ * APK's sibling vendor `.so` files into the namespace (so a plug-in's
+ * DT_NEEDED resolves) and remember the runtime package for the class-host
+ * Context (#1037). Same root the shared loader scans: `XRT_PLUGIN_SEARCH_PATH`
+ * if set, else the runtime library's own lib dir.
+ */
+static void
+dp_platform_prepare_discovery(void)
 {
-	*out_inst = NULL;
-
-	/* RTLD_LOCAL keeps the plug-in's symbols private; aux symbols
-	 * resolve via the runtime .so already in the namespace. */
-	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
-	if (handle == NULL) {
-		U_LOG_W("plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
-		return NULL;
+	static bool done = false;
+	if (done) {
+		return;
 	}
+	done = true;
 
-	dlerror();
-	xrt_plugin_negotiate_fn_t negotiate =
-	    (xrt_plugin_negotiate_fn_t)dlsym(handle, XRT_PLUGIN_ENTRYPOINT_NAME);
-	const char *err = dlerror();
-	if (negotiate == NULL || err != NULL) {
-		U_LOG_W("plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
-		        XRT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
-		dlclose(handle);
-		return NULL;
+	char root[PATH_MAX] = {0};
+	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
+	if (override != NULL && *override != '\0') {
+		snprintf(root, sizeof(root), "%s", override);
+	} else if (!get_runtime_lib_dir(root, sizeof(root))) {
+		U_LOG_W("plugin loader: dladdr could not locate runtime lib dir — no plug-ins to try.");
+		return;
 	}
+	struct stat st;
+	if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode)) {
+		U_LOG_I("plugin loader: discovery root '%s' absent — no plug-ins to try.", root);
+		return;
+	}
+	preload_runtime_lib_dir(root);
+	remember_runtime_package_from_lib_dir(root);
+}
 
-	struct xrt_plugin_host_iface host = {0};
-	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
-	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+#else /* !XRT_OS_WINDOWS && !XRT_OS_ANDROID — macOS / Linux */
+
+#include <limits.h>
+#include <stdio.h>
+#include <sys/stat.h>
+
+//! Nothing to do before discovery on desktop POSIX.
+static void
+dp_platform_prepare_discovery(void)
+{
+}
+
+#endif /* platform islands */
+
+
+/*
+ *
+ * Load + negotiate + ABI-check + probe (every platform).
+ *
+ */
+
+/*!
+ * The host iface every display processor receives at negotiate. Filled per
+ * call; a DP is not allowed to retain it past negotiate (unlike input
+ * providers), so a local is fine.
+ */
+/*!
+ * The one options contract's read slot (N3c): a plug-in's per-component
+ * settings through the shared store — `DXR_DP_<ID>_<KEY>` in this process's
+ * environment, the per-user overlay, the row's `Settings\*` / manifest
+ * `settings`. Never the plug-in's own getenv. Lives in the runtime for the
+ * process lifetime, so a plug-in may copy the pointer at negotiate.
+ */
+static bool
+dp_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_size)
+{
+	return target_component_get_setting(&g_dp_class, id, key, buf, buf_size, NULL);
+}
+
+static void
+dp_fill_host_iface(struct xrt_plugin_host_iface *host)
+{
+	memset(host, 0, sizeof(*host));
+	host->struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
+	host->host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
+	// ADR-047 Amendment 8: a plug-in may ask for the per-monitor claim sweep.
+	host->request_display_rescan = target_display_hotplug_plugin_request;
+	// ADR-054 decision 7 (N3c): the plug-in's settings come through here.
+	host->get_setting = dp_host_get_setting;
 #if defined(XRT_OS_ANDROID)
 	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
 	// (their own statically-linked aux_android copy is never populated).
-	host.get_android_vm = plugin_host_get_android_vm;
+	host->get_android_vm = plugin_host_get_android_vm;
 	// Activity when in-process; Service Context when out-of-process (CNSDK only
 	// needs an android.content.Context to bind the on-device tracking service).
-	host.get_android_activity = plugin_host_get_android_activity;
+	host->get_android_activity = plugin_host_get_android_activity;
 	// #1037: a Context whose classloader is the runtime APK's, so an
 	// in-process vendor plug-in can resolve vendor Java glue the app does
 	// not ship. Class loading only — see xrt_plugin.h.
-	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
-	host.android_package_is_visible = plugin_host_android_package_is_visible;
+	host->get_android_class_host_context = plugin_host_get_android_class_host_context;
+	host->android_package_is_visible = plugin_host_android_package_is_visible;
 #endif
+}
+
+const struct target_component_class *
+target_plugin_component_class(void)
+{
+	return &g_dp_class;
+}
+
+int
+target_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max)
+{
+	if (id == NULL || id[0] == '\0' || out == NULL || max <= 0) {
+		return 0;
+	}
+	// The manifest's schema first (POSIX), then whatever the binary declares.
+	int n = target_component_manifest_settings_schema(&g_dp_class, id, out, max);
+
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return n;
+	}
+	const int count = target_component_enumerate(&g_dp_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// Negotiate only (no probe, no instance): a disabled or declining
+		// plug-in still declares its settings — that is how one finds the
+		// key to enable it. Quiet: this is a lister, not the discovery scan.
+		void *module = NULL;
+		void *fn = NULL;
+		if (target_component_load_binary_ex(&g_dp_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module, &fn,
+		                                    NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_plugin_host_iface host;
+		dp_fill_host_iface(&host);
+		struct xrt_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret =
+		    ((xrt_plugin_negotiate_fn_t)fn)(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
+		if (target_component_abi_gate(&g_dp_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		        TARGET_COMPONENT_ABI_OK &&
+		    xrt_plugin_iface_has_describe_settings(iface)) {
+			const struct xrt_component_setting_desc *descs = NULL;
+			const uint32_t nd = iface->describe_settings(&descs);
+			n = target_component_merge_setting_descs(out, n, max, descs, nd);
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return n;
+}
+
+/*!
+ * ADR-054 N4b: copy the provenance verdict the shared load path left on the
+ * entry into the plug-in's ADR-045 status record, for `displayxr-cli info` /
+ * `selftest --json` and the dashboard.
+ */
+static void
+status_record_provenance(const char *id, const struct target_component_entry *e)
+{
+	status_lock();
+	int i = status_find_or_add_locked(id != NULL ? id : "?");
+	if (i >= 0) {
+		struct target_plugin_status *s = &g_status[i];
+		s->provenance = e->provenance;
+		snprintf(s->signer, sizeof(s->signer), "%s", e->signer);
+		snprintf(s->provenance_reason, sizeof(s->provenance_reason), "%s", e->provenance_reason);
+	}
+	status_unlock();
+}
+
+/*!
+ * Load + negotiate + ABI-check + probe one registered plug-in. Returns the
+ * iface (writing the instance to *out_inst and the negotiated ABI version to
+ * *out_version) on success, NULL (and unloads the binary) on any failure. No
+ * "active plug-in" logging — callers add their own role-specific line, so
+ * this can serve both the single-winner discovery and the load-all display
+ * probe (#69). Successful loads intentionally leak the module for the
+ * process lifetime so the iface's function pointers remain callable.
+ *
+ * The shared load path does the exists check, the #952 guard, the #328 pin,
+ * the #434 preload and the entry-point lookup; the ADR-020 gate classifies
+ * negotiate. What is this class's: the ADR-045 status record per attempt
+ * (one WARN per process for a binary that keeps failing the same way — the
+ * service re-probes on world events), the #461 skew check, the host iface,
+ * platform-state capture before probe, and probe itself.
+ */
+static const struct xrt_plugin_iface *
+load_and_probe_one(struct target_component_entry *e,
+                   struct xrt_plugin_instance **out_inst,
+                   uint32_t *out_version)
+{
+	*out_inst = NULL;
+	if (out_version != NULL) {
+		*out_version = 0;
+	}
+
+	// Per-attempt reject context, consumed by plugin_note_reject. Reset here
+	// so an attempt from the display-claim collection (which never consumes
+	// it) cannot leak a stale reason / "declined" mark into discovery.
+	g_last_reject_reason[0] = '\0';
+	g_last_reject_declined = false;
+
+	const bool first_attempt = status_begin(e->id, e->display_name, e->version, e->probe_order);
+
+#ifdef XRT_OS_WINDOWS
+	// #461: warn if the registry-declared version doesn't match the DLL on
+	// disk (an installer skipped a locked file). Diagnostic only — the ABI
+	// negotiation below remains the actual compatibility gate.
+	if (first_attempt) {
+		check_registry_dll_version_skew(e);
+	}
+#endif
+
+	void *module = NULL;
+	void *fn = NULL;
+	uint32_t os_error = 0;
+	char why[160] = {0};
+	const enum target_component_load_result lr =
+	    target_component_load_binary_ex(&g_dp_class, e, first_attempt ? 0u : TARGET_COMPONENT_LOAD_FLAG_QUIET,
+	                                    &module, &fn, &os_error, why, sizeof(why));
+	// ADR-054 N4b: whatever happened next, the provenance verdict the load
+	// path computed is a fact about the registration worth showing.
+	status_record_provenance(e->id, e);
+	if (lr != TARGET_COMPONENT_LOAD_OK) {
+		enum target_plugin_load_result result = TARGET_PLUGIN_RESULT_LOAD_FAILED;
+		const char *recorded = NULL;
+		switch (lr) {
+		case TARGET_COMPONENT_LOAD_BINARY_MISSING:
+			// ADR-045: an orphan registration (Binary deleted, key left
+			// behind) is a fact to skip, not an error to repeat.
+			result = TARGET_PLUGIN_RESULT_BINARY_MISSING;
+			break;
+		case TARGET_COMPONENT_LOAD_DEPENDENCY_MISSING:
+			// The binary exists, so a library IT imports is missing —
+			// typically the vendor platform the plug-in should resolve
+			// lazily (ADR-045 rule 1).
+			result = TARGET_PLUGIN_RESULT_DEPENDENCY_MISSING;
+			break;
+		case TARGET_COMPONENT_LOAD_PATH_REFUSED:
+			result = TARGET_PLUGIN_RESULT_PATH_REFUSED;
+			recorded = "dev/build-tree path refused (#952)";
+			break;
+		case TARGET_COMPONENT_LOAD_NO_ENTRY_POINT: result = TARGET_PLUGIN_RESULT_NO_ENTRY_POINT; break;
+		case TARGET_COMPONENT_LOAD_UNTRUSTED:
+			// ADR-054 N4b, enforcing: the reason names the allowlist row.
+			result = TARGET_PLUGIN_RESULT_UNTRUSTED;
+			recorded = why;
+			break;
+		case TARGET_COMPONENT_LOAD_FAILED:
+		default: result = TARGET_PLUGIN_RESULT_LOAD_FAILED; break;
+		}
+		const bool changed = status_finish(e->id, result, os_error, recorded);
+		if (changed && !first_attempt) {
+			// The shared path logged this retry at INFO; a CHANGED outcome
+			// on a retry is still news (ADR-045 re-probe rule).
+			U_LOG_W("plugin loader:   %s: load outcome changed to %s%s%s", e->id,
+			        target_plugin_load_result_str(result), why[0] != '\0' ? " — " : "", why);
+		}
+		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason), "%s", why);
+		return NULL;
+	}
+	xrt_plugin_negotiate_fn_t negotiate = (xrt_plugin_negotiate_fn_t)fn;
+
+	struct xrt_plugin_host_iface host;
+	dp_fill_host_iface(&host);
 
 	struct xrt_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
 	xrt_result_t xret = negotiate(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
-	if (xret != XRT_SUCCESS || iface == NULL) {
-		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
-		        (void *)iface);
-		dlclose(handle);
+
+	/* ADR-020 rule 3, classified the same way for every class. The reason
+	 * text lands in g_last_reject_reason for the vendor_dp self-test (#1212),
+	 * so a rejected vendor plug-in reads as an ABI mismatch rather than a
+	 * bare failure. */
+	switch (target_component_abi_gate(&g_dp_class, e->id, xret, iface, plugin_version, g_last_reject_reason,
+	                                  sizeof(g_last_reject_reason))) {
+	case TARGET_COMPONENT_ABI_DECLINED:
+		/* A plug-in that says "not my platform" at negotiate is behaving
+		 * correctly on a box without that panel — the same shape as a
+		 * declined probe, and recorded the same way. */
+		g_last_reject_declined = true;
+		status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, NULL);
+		target_component_unload(module);
 		return NULL;
+	case TARGET_COMPONENT_ABI_MISMATCH:
+		status_finish(e->id, TARGET_PLUGIN_RESULT_ABI_MISMATCH, 0, g_last_reject_reason);
+		target_component_unload(module);
+		return NULL;
+	case TARGET_COMPONENT_ABI_NEGOTIATE_FAILED:
+		status_finish(e->id, TARGET_PLUGIN_RESULT_NEGOTIATE_FAILED, 0, NULL);
+		target_component_unload(module);
+		return NULL;
+	case TARGET_COMPONENT_ABI_OK: break;
 	}
 
-	/* ADR-020 rule 3: reject a major-version mismatch before touching the
-	 * vtable. A plug-in built against a different ABI major lays its vtable
-	 * out at offsets the runtime doesn't agree on — calling through it is
-	 * exactly the corruption this guards against. Skip it (the caller falls
-	 * back to the next plug-in / sim_display); never dispatch. */
-	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
-		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
-		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
-		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		/* #1212: carry the reason to the self-test, so a rejected vendor
-		 * plug-in reads as an ABI mismatch rather than a bare failure. */
-		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
-		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
-		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		dlclose(handle);
-		return NULL;
-	}
+	// ADR-045: ask BEFORE probe(), so a plug-in about to decline can say why.
+	status_record_platform_state(e->id, iface);
 
 	if (iface->probe != NULL) {
 		xret = iface->probe(out_inst);
@@ -1755,26 +1699,148 @@ try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst
 			 * mark this so the vendor_dp self-test does not fail a
 			 * dev box that merely has a vendor plug-in registered. */
 			g_last_reject_declined = true;
-			dlclose(handle);
+			status_finish(e->id, TARGET_PLUGIN_RESULT_DECLINED, 0, NULL);
+			target_component_unload(module);
 			return NULL;
 		}
 		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
-			dlclose(handle);
+			bool changed = status_finish(e->id, TARGET_PLUGIN_RESULT_PROBE_FAILED, (uint32_t)xret, NULL);
+			PLUGIN_LOG_OUTCOME(changed, "plugin loader:   %s: probe returned %d — skipping.", e->id,
+			                   (int)xret);
+			target_component_unload(module);
 			return NULL;
 		}
+	}
+
+	if (out_version != NULL) {
+		*out_version = plugin_version;
+	}
+	status_finish(e->id, TARGET_PLUGIN_RESULT_CLAIMED, 0, NULL);
+
+	/* Module handle intentionally leaked: the iface's function pointers
+	 * remain reachable into the binary for the process's lifetime. */
+	return iface;
+}
+
+/*!
+ * Try one registered plug-in as the single active winner. Thin wrapper over
+ * @ref load_and_probe_one that adds the canonical "active plug-in:" log line
+ * (parsed by diagnostics) and the ACTIVE status. Returns the iface on
+ * success, NULL on any failure.
+ */
+static const struct xrt_plugin_iface *
+try_load_one(struct target_component_entry *e, struct xrt_plugin_instance **out_inst)
+{
+	uint32_t plugin_version = 0;
+	const struct xrt_plugin_iface *iface = load_and_probe_one(e, out_inst, &plugin_version);
+	if (iface == NULL) {
+		return NULL;
 	}
 
 	U_LOG_W(
 	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' version='%s' "
 	    "plugin_api=%u probe_order=%u path=%s",
-	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : "",
-	    iface->vendor ? iface->vendor : "", iface->version ? iface->version : "", plugin_version, e->probe_order,
-	    e->binary_path);
+	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
+	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
+	status_set_active(e->id);
 
-	/* dlopen handle intentionally leaked: the iface's function pointers
-	 * remain reachable into the .so for the process's lifetime. */
 	return iface;
+}
+
+
+/*
+ *
+ * Discovery (every platform).
+ *
+ */
+
+/*!
+ * Where a row's `enabled` came from (the input loader's vocabulary, so
+ * `dp list` and `input list` read the same): "user" when the shared per-user
+ * overlay applied, "machine" / "manifest" when the platform's own store
+ * disabled it, else "default".
+ */
+static const char *
+dp_enabled_source(const struct target_component_entry *e)
+{
+	if ((e->flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0) {
+		return "user";
+	}
+	if (!e->enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
+/*!
+ * A registered-but-disabled plug-in costs one WARN per process per id, not
+ * one per scan: `dp_enumerate` runs on every world event the service sees
+ * (hotplug rescans, compositor-create refreshes), and a `U_LOG_W` there
+ * would be the per-frame-log-bloat class of bug.
+ */
+static char g_disabled_logged[TARGET_COMPONENT_MAX_ENTRIES][64];
+static int g_disabled_logged_count = 0;
+
+static void
+dp_log_disabled_once(const struct target_component_entry *e)
+{
+	bool first = true;
+	for (int i = 0; i < g_disabled_logged_count; i++) {
+		if (strcmp(g_disabled_logged[i], e->id) == 0) {
+			first = false;
+			break;
+		}
+	}
+	if (first && g_disabled_logged_count < TARGET_COMPONENT_MAX_ENTRIES) {
+		snprintf(g_disabled_logged[g_disabled_logged_count], sizeof(g_disabled_logged[0]), "%s", e->id);
+		g_disabled_logged_count++;
+	}
+	PLUGIN_LOG_OUTCOME(first, "plugin loader:   %s disabled (Enabled=0, %s; ProbeOrder=%u) — never tried.", e->id,
+	                   dp_enabled_source(e), e->probe_order);
+}
+
+/*!
+ * Enumerate this class's registrations through the shared loader. Returns the
+ * count (0 = nothing registered, or no discovery root at all). Malformed rows
+ * come back flagged; the callers below skip them (a row the loader could never
+ * try is not a candidate) and say so once.
+ *
+ * `Enabled` (N3b, ADR-054 verb `enable|disable`; plugin-discovery.md §2 /
+ * §2.1 / §3.1) is honoured here for EVERY scan — the single-winner discovery,
+ * the display-claim collection, the hotplug rescan and `dp list` — through
+ * the shared per-user overlay (HKCU over HKLM, `Policy\Lock` aside; a no-op
+ * off Windows, where the manifest's `enabled` is the switch) and
+ * @ref dp_entry_usable. A disabled plug-in is logged once per process per id
+ * (WARN the first time, INFO after: the service re-enumerates on world
+ * events) and is never loaded, so a vendor DLL the user turned off never
+ * enters the process.
+ */
+static int
+dp_enumerate(struct target_component_entry *entries, bool loud)
+{
+	dp_platform_prepare_discovery();
+	const int n = target_component_enumerate(&g_dp_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_dp_class, entries, (size_t)n);
+	for (int i = 0; i < n; i++) {
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
+			PLUGIN_LOG_OUTCOME(loud, "plugin loader:   %s: %s — skipping.", entries[i].source,
+			                   entries[i].reason);
+		} else if (!entries[i].enabled) {
+			dp_log_disabled_once(&entries[i]);
+		}
+	}
+	return n;
+}
+
+//! A row every scan may try: well-formed AND enabled (N3b).
+static bool
+dp_entry_usable(const struct target_component_entry *e)
+{
+	return (e->flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && e->enabled;
 }
 
 static const struct xrt_plugin_iface *
@@ -1782,55 +1848,136 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 {
 	*out_inst = NULL;
 
-	char root[PATH_MAX] = {0};
-	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
-	if (override != NULL && *override != '\0') {
-		snprintf(root, sizeof(root), "%s", override);
-	} else if (!get_runtime_lib_dir(root, sizeof(root))) {
-		U_LOG_W("plugin loader: dladdr could not locate runtime lib dir — no plug-ins to try.");
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
 		return NULL;
 	}
-
-	struct stat st;
-	if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode)) {
-		U_LOG_I("plugin loader: discovery root '%s' absent — no plug-ins to try.", root);
-		return NULL;
-	}
-
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = enumerate_dir(root, entries, 0, MAX_PLUGIN_ENTRIES);
+	// First-call path (max == UINT32_MAX) is the loud one; the refresh path
+	// re-enumerates on every compositor create and keeps quiet (#342).
+	const bool first_call = max_probe_order == 0xFFFFFFFFu;
+	const int n = dp_enumerate(entries, first_call);
 	if (n == 0) {
-		U_LOG_I("plugin loader: '%s' searched, no libdxrp*.so files found.", root);
+		U_LOG_I("plugin loader: no registered plug-ins — no plug-ins to try.");
+		free(entries);
 		return NULL;
 	}
 
-	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
-
-	/* Bring sibling vendor `.so` files into the current namespace's
-	 * loaded-soinfo table before any plug-in dlopen so DT_NEEDED can
-	 * resolve them. See preload_runtime_lib_dir's docstring. */
-	preload_runtime_lib_dir(root);
-
-	/* #1037: the class-host Context handed to plug-ins is created for this
-	 * package — see plugin_host_get_android_class_host_context(). */
-	remember_runtime_package_from_lib_dir(root);
-
+	// DXR_PLUGIN_EXCLUSIVE (#1545): warn once if the pin matches nothing.
 	{
-		const char *ids[MAX_PLUGIN_ENTRIES];
+		const char *ids[TARGET_COMPONENT_MAX_ENTRIES];
 		for (int i = 0; i < n; i++) {
 			ids[i] = entries[i].id;
 		}
 		plugin_warn_exclusive_miss(ids, n);
 	}
 
-	U_LOG_I("plugin loader: %d registered plug-in(s) in %s; attempting in filename order.", n, root);
+	// N3b: the skipped-disabled summary describes the first-call pass; a
+	// refresh re-walks the same rows and must not double-count them.
+	if (first_call) {
+		g_skipped_disabled_count = 0;
+	}
+
+	// PreferredPlugin override (#378): try the user-pinned plug-in before
+	// the ProbeOrder sort. A stale or failed preference falls through to
+	// the normal order, so a bad value can never brick discovery.
+	char preferred[64];
+	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
+		for (int i = 0; i < n; i++) {
+			if (strcmp(entries[i].id, preferred) != 0) {
+				continue;
+			}
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && !entries[i].enabled) {
+				// N3b: `Enabled=0` is the stronger verb — a disabled
+				// preference falls through to ProbeOrder, said ONCE
+				// (the refresh path never reaches here: a set
+				// preference short-circuits target_plugin_refresh_active).
+				PLUGIN_LOG_OUTCOME(first_call,
+				                   "plugin loader: PreferredPlugin '%s' is disabled (Enabled=0, %s) — "
+				                   "falling through to ProbeOrder.",
+				                   preferred, dp_enabled_source(&entries[i]));
+				if (first_call) {
+					plugin_note_skipped_disabled(entries[i].id);
+					status_begin(entries[i].id, entries[i].display_name, entries[i].version,
+					             entries[i].probe_order);
+					(void)status_finish(entries[i].id, TARGET_PLUGIN_RESULT_DISABLED, 0,
+					                    entries[i].reason);
+				}
+				break;
+			}
+			if (!dp_entry_usable(&entries[i])) {
+				break;
+			}
+			// An exclusive pin outranks the user preference: the
+			// point is that nothing else is LOADED, and honoring a
+			// preference here would load exactly the DLL the lane
+			// asked to keep out of the process (#1545).
+			if (plugin_id_excluded(entries[i].id)) {
+				break;
+			}
+			// Refresh path: only honor the preference if it is also
+			// strictly-better; the sticky-preference guard in
+			// target_plugin_refresh_active normally prevents reaching
+			// here on a refresh at all.
+			if (entries[i].probe_order >= max_probe_order) {
+				break;
+			}
+			U_LOG_W("plugin loader: PreferredPlugin override — attempting id='%s' first.", preferred);
+			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
+			if (iface != NULL) {
+				g_active_probe_order = entries[i].probe_order;
+				snprintf(g_active_row_id, sizeof(g_active_row_id), "%s", entries[i].id);
+				free(entries);
+				return iface;
+			}
+			// #2436: the user pinned this plug-in, so anything else is a
+			// stand-in. Under DXR_DP_NO_FALLBACK a FAILED (not declined)
+			// preference stops discovery here. Not counted as a reject:
+			// the ProbeOrder loop below re-attempts the same row and
+			// counts it there if it still out-ranks the winner.
+			if (first_call && !g_last_reject_declined && plugin_no_fallback()) {
+				U_LOG_E(
+				    "plugin loader: preferred display plug-in '%s' failed to load (%s) and "
+				    "DXR_DP_NO_FALLBACK is set — refusing to fall back. No display processor is active "
+				    "in this process.",
+				    preferred,
+				    g_last_reject_reason[0] != '\0' ? g_last_reject_reason : "load or probe failed");
+				free(entries);
+				return NULL;
+			}
+			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
+			        preferred);
+			break;
+		}
+	}
+
+	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
-		// Refresh path (#342): only attempt strictly-better candidates.
-		// First-call path passes UINT32_MAX so no entry is skipped.
+		// Refresh path (#342) passes the active plug-in's ProbeOrder as
+		// max so we only re-attempt strictly-better candidates and never
+		// re-probe the already-active one. First-call path passes
+		// UINT32_MAX, so no entry is skipped.
 		if (entries[i].probe_order >= max_probe_order) {
 			continue;
 		}
-		/* #1545: skipped before dlopen, and not counted as a reject. */
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) == 0 && !entries[i].enabled) {
+			// N3b: entries are in ProbeOrder, so a disabled one met
+			// before the winner out-ranks it — the summary names it,
+			// and its ADR-045 record reads DISABLED rather than the
+			// NOT_ATTEMPTED a lister would otherwise infer. Logged by
+			// dp_enumerate (once per process); never a reject.
+			if (first_call) {
+				plugin_note_skipped_disabled(entries[i].id);
+				status_begin(entries[i].id, entries[i].display_name, entries[i].version,
+				             entries[i].probe_order);
+				(void)status_finish(entries[i].id, TARGET_PLUGIN_RESULT_DISABLED, 0, entries[i].reason);
+			}
+			continue;
+		}
+		if (!dp_entry_usable(&entries[i])) {
+			continue;
+		}
+		/* #1545: skipped BEFORE the load, and deliberately without
+		 * plugin_note_reject — an excluded plug-in is not a failure. */
 		if (plugin_id_excluded(entries[i].id)) {
 			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
 			continue;
@@ -1840,41 +1987,330 @@ discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe
 		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
 		if (iface != NULL) {
 			g_active_probe_order = entries[i].probe_order;
+			snprintf(g_active_row_id, sizeof(g_active_row_id), "%s", entries[i].id);
+			free(entries);
 			return iface;
 		}
 		/* #1212: attempted in ascending ProbeOrder and failed, so this is
 		 * by construction a better-ranked plug-in than whatever wins
 		 * below. The self-test's vendor_dp check keys off this. */
+		const int rejected_before = g_rejected_count;
 		plugin_note_reject(entries[i].id, entries[i].probe_order);
+		/* #2436: only on the first-call pass — a refresh never replaces
+		 * the active plug-in with a worse one, so it has nothing to stop. */
+		if (first_call && plugin_stop_after_failure(entries[i].id, rejected_before)) {
+			free(entries);
+			return NULL;
+		}
 	}
+	free(entries);
 
 	// A refresh (max_probe_order bounded by the current winner) legitimately
 	// attempts nothing when nothing better is registered — that is not a
 	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
-	if (max_probe_order == 0xFFFFFFFFu) {
+	if (first_call) {
 		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
 	}
 	return NULL;
 }
 
+#if !defined(XRT_OS_ANDROID)
+/* Android has one plug-in and no per-monitor claim sources (the resolve path
+ * below never collects there), so the two collectors would be unused code. */
+
+/*!
+ * Load EVERY registered plug-in and return them as display-claim sources for
+ * the per-monitor registry (#69 / ADR-015, multi-screen M0). Unlike
+ * @ref discover_active_plugin (which stops at the first winner), this consults
+ * all of them so the fallback (sim_display) and a vendor plug-in can both
+ * contribute claims. The already-active plug-in is reused — not loaded twice —
+ * and the remainder are loaded via @ref load_and_probe_one (modules leaked,
+ * consistent with the single-winner path). Plug-ins whose `probe()` declines
+ * contribute nothing. `DXR_PLUGIN_EXCLUSIVE` keeps every other plug-in out of
+ * the process exactly as it does for discovery. Returns the source count,
+ * sorted ascending by ProbeOrder (so a confidence tie resolves to the
+ * lower-ProbeOrder plug-in).
+ *
+ * Caller must hold @ref g_refresh_mutex and have already loaded the active
+ * plug-in (so `g_active_*` are set for the reuse path).
+ */
+static int
+collect_display_sources_platform(struct plugin_display_source *out, int max)
+{
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = dp_enumerate(entries, false);
+
+	const char *active_id = (g_active_iface != NULL && g_active_iface->id != NULL) ? g_active_iface->id : NULL;
+	bool active_seen = false;
+
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		if (!dp_entry_usable(&entries[i])) {
+			continue;
+		}
+		// #1545: THE load site this variable exists for. Claim
+		// collection consults every registered plug-in, so without this
+		// an exclusive lane would still load the vendor DLL (and its GL
+		// ICD) even though it never becomes the active DP.
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
+		// Reuse the already-loaded active plug-in rather than loading a
+		// second instance of it.
+		if (active_id != NULL && strcmp(entries[i].id, active_id) == 0) {
+			out[count].iface = g_active_iface;
+			out[count].inst = g_active_instance;
+			out[count].probe_order = g_active_probe_order;
+			count++;
+			active_seen = true;
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // declined / failed → contributes no claims
+		}
+		U_LOG_I("plugin loader: display-claim source id=%s (ProbeOrder=%u)", entries[i].id,
+		        entries[i].probe_order);
+		out[count].iface = iface;
+		out[count].inst = inst;
+		out[count].probe_order = entries[i].probe_order;
+		count++;
+	}
+	free(entries);
+
+	// An active plug-in that no registration names any more (removed after
+	// it loaded) is still the one devices come from: keep it as a source.
+	if (!active_seen && g_active_iface != NULL && count < max) {
+		out[count].iface = g_active_iface;
+		out[count].inst = g_active_instance;
+		out[count].probe_order = g_active_probe_order;
+		count++;
+	}
+	return count;
+}
+
+/*!
+ * Display hotplug (ADR-047 Amendment 8): add to @p out (holding @p count
+ * sources) every registered plug-in that is not a display-claim source yet — a
+ * vendor plug-in that declined at instance create because its panel was not
+ * attached, or one registered since. Sources already in the set are kept as
+ * they are and never re-probed or destroyed: a live segment DP may have been
+ * made from their instance. The set stays in ascending ProbeOrder (rule 3's
+ * hotplug carve-out reads "ranked before the active plug-in" off that order).
+ * `DXR_PLUGIN_EXCLUSIVE` is honoured exactly as in discovery.
+ *
+ * Caller holds @ref g_refresh_mutex. Returns the new count. Platform-neutral
+ * now; which platforms call it is decided in
+ * @ref target_plugin_rescan_claim_sources.
+ */
+static int
+rescan_display_sources_platform(struct plugin_display_source *out, int count, int max)
+{
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return count;
+	}
+	const int n = dp_enumerate(entries, false);
+
+	for (int i = 0; i < n && count < max; i++) {
+		if (!dp_entry_usable(&entries[i])) {
+			continue;
+		}
+		if (plugin_id_excluded(entries[i].id)) {
+			continue;
+		}
+		bool have = false;
+		for (int k = 0; k < count && !have; k++) {
+			const struct xrt_plugin_iface *sif = out[k].iface;
+			have = sif != NULL && sif->id != NULL && strcmp(sif->id, entries[i].id) == 0;
+		}
+		if (have) {
+			continue;
+		}
+
+		uint32_t ver = 0;
+		struct xrt_plugin_instance *inst = NULL;
+		const struct xrt_plugin_iface *iface = load_and_probe_one(&entries[i], &inst, &ver);
+		if (iface == NULL) {
+			continue; // still declines (no panel yet) / failed → no claims
+		}
+		U_LOG_W(
+		    "plugin loader: display hotplug — '%s' (ProbeOrder=%u) now loads as a display-claim source; it was "
+		    "not one before (declined, failed, or registered since)",
+		    entries[i].id, entries[i].probe_order);
+
+		// Insert in ascending ProbeOrder (after any equal one).
+		int at = count;
+		while (at > 0 && out[at - 1].probe_order > entries[i].probe_order) {
+			out[at] = out[at - 1];
+			at--;
+		}
+		out[at].iface = iface;
+		out[at].inst = inst;
+		out[at].probe_order = entries[i].probe_order;
+		count++;
+	}
+	free(entries);
+	return count;
+}
+
+#endif /* !XRT_OS_ANDROID — display-claim sources */
+
+
 /*
  *
- * Public enumeration + PreferredPlugin override (Android — minimal).
- *
- * Android discovery is convention-driven (filename ProbeOrder) and the
- * diagnostic CLI / Control Panel don't ship there in v1, so enumeration
- * and the writable override are stubs; the read honors the env override
- * so a dev/emulator can still pin a plug-in.
+ * Public enumeration (every platform).
  *
  */
 
 int
 target_plugin_enumerate(struct target_plugin_desc *out, int max)
 {
-	(void)out;
-	(void)max;
-	return 0;
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = dp_enumerate(entries, false);
+
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
+			continue; // a row the loader could never try is not a choice to list
+		}
+		// A DISABLED row IS listed (N3b): `dp list` must show what `dp
+		// disable` did, and `dp enable` must find it.
+		struct target_plugin_desc *d = &out[count++];
+		memset(d, 0, sizeof(*d));
+		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
+		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
+		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
+		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
+		snprintf(d->binary_path, sizeof(d->binary_path), "%s", entries[i].binary_path);
+		d->probe_order = entries[i].probe_order;
+		d->enabled = entries[i].enabled;
+		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", dp_enabled_source(&entries[i]));
+		// ADR-054 N4b: the load path classifies what it loads; a lister
+		// asks explicitly (thread-safe: the service's status snapshot reaches
+		// this from IPC threads; it re-hashes, but the signature check is
+		// cached per file identity + digest).
+		(void)target_component_check_provenance(&g_dp_class, &entries[i]);
+		d->provenance = entries[i].provenance;
+		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", entries[i].provenance_reason);
+		snprintf(d->signer, sizeof(d->signer), "%s", entries[i].signer);
+	}
+	free(entries);
+	return count;
 }
+
+
+/*
+ *
+ * The PreferredPlugin store — the one per-platform public surface left.
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+
+bool
+target_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	// N3b: HKCU first (per user, `dp use <id>` without admin), then the HKLM
+	// 64-bit view (`dp use --machine`). Only this value and the per-row
+	// `Enabled` are ever read from HKCU — the rows stay HKLM-only, so a
+	// per-user key can never inject a DLL (plugin-discovery.md §2.1).
+	wchar_t wbuf[64];
+	DWORD wbuf_bytes = sizeof(wbuf);
+	LSTATUS rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
+	                          RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
+		wbuf_bytes = sizeof(wbuf);
+		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, wbuf, &wbuf_bytes);
+	}
+	if (rc != ERROR_SUCCESS) {
+		return false;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
+		out[0] = '\0';
+	}
+	return out[0] != '\0';
+}
+
+xrt_result_t
+target_plugin_set_preferred(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return target_plugin_clear_preferred();
+	}
+
+	wchar_t wid[64];
+	if (MultiByteToWideChar(CP_UTF8, 0, id, -1, wid, (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+
+	// 64-bit view: the runtime reader runs as a 64-bit process (no
+	// redirection), so we must write where it reads. Create the root key
+	// if a clean machine never installed a DisplayProcessor.
+	HKEY root;
+	LSTATUS rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0, NULL, 0,
+	                             KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &root, NULL);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+
+	DWORD bytes = (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t));
+	rc = RegSetValueExW(root, L"PreferredPlugin", 0, REG_SZ, (const BYTE *)wid, bytes);
+	RegCloseKey(root);
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+target_plugin_clear_preferred(void)
+{
+	HKEY root;
+	LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\DisplayProcessors", 0,
+	                           KEY_SET_VALUE | KEY_WOW64_64KEY, &root);
+	if (rc == ERROR_FILE_NOT_FOUND) {
+		return XRT_SUCCESS; // no root key → nothing to clear
+	}
+	if (rc != ERROR_SUCCESS) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+
+	rc = RegDeleteValueW(root, L"PreferredPlugin");
+	RegCloseKey(root);
+	if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND) {
+		return rc == ERROR_ACCESS_DENIED ? XRT_ERROR_NOT_AUTHORIZED : XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+}
+
+#elif defined(XRT_OS_ANDROID)
+
+/*
+ * Android discovery is convention-driven (filename ProbeOrder) and the
+ * diagnostic CLI / Dashboard don't ship there in v1, so the writable override
+ * is a stub; the read honors the env override so a dev/emulator can still
+ * pin a plug-in.
+ */
 
 bool
 target_plugin_get_preferred(char *out, size_t cap)
@@ -1904,576 +2340,7 @@ target_plugin_clear_preferred(void)
 	return XRT_ERROR_NOT_IMPLEMENTED;
 }
 
-#else /* !XRT_OS_WINDOWS && !XRT_OS_ANDROID — macOS / Linux */
-
-#include "util/u_json.h"
-
-#include <dirent.h>
-#include <dlfcn.h>
-#include <limits.h>
-#include <stdio.h>
-#include <sys/stat.h>
-
-/*
- * Same upper bound as the Windows path — admits a vendor plug-in plus
- * the sim_display fallback with plenty of headroom.
- */
-#define MAX_PLUGIN_ENTRIES 16
-
-/*
- * Discovery contract: see docs/specs/runtime/plugin-discovery.md §3.
- *
- * Each plug-in publishes a JSON manifest with the filename convention
- * `<probe_order>-<id>.json` (three-digit zero-padded ProbeOrder prefix
- * gives lexicographic ordering — `050-leia-sr.json` runs before
- * `200-sim-display.json` without parsing the JSON to sort).
- *
- * Roots searched, in priority order:
- *   1. $XRT_PLUGIN_SEARCH_PATH — dev override, single colon-separated list
- *   2. macOS: ~/Library/Application Support/DisplayXR/DisplayProcessors/
- *      Linux: $XDG_DATA_HOME/DisplayXR/DisplayProcessors/
- *             (defaults to ~/.local/share/DisplayXR/DisplayProcessors/)
- *   3. macOS: /Library/Application Support/DisplayXR/DisplayProcessors/
- *      Linux: /usr/local/share/displayxr/DisplayProcessors/
- *             /usr/share/displayxr/DisplayProcessors/
- *
- * Per-user shadows system entries via lexicographic sort tie-break on
- * the absolute path (later inserts win — the loop inserts in priority
- * order, so per-user comes first and a duplicate `<id>` from a system
- * root is dropped at insert time).
- */
-
-struct plugin_entry
-{
-	char manifest_path[PATH_MAX]; /* absolute path to the JSON */
-	char manifest_file[PATH_MAX]; /* basename, used for stable sort */
-	char binary_path[PATH_MAX];   /* absolute path to the dylib/.so */
-	char id[64];                  /* manifest "plugin.id" */
-	char display_name[128];
-	char vendor[64];
-	char version[64];
-	uint32_t probe_order;
-};
-
-static int
-compare_by_filename(const void *a, const void *b)
-{
-	const struct plugin_entry *pa = (const struct plugin_entry *)a;
-	const struct plugin_entry *pb = (const struct plugin_entry *)b;
-	return strcmp(pa->manifest_file, pb->manifest_file);
-}
-
-static void
-copy_optional_str(const cJSON *root, const char *field, char *dst, size_t dst_size)
-{
-	if (dst_size == 0) {
-		return;
-	}
-	dst[0] = '\0';
-	const cJSON *node = u_json_get(root, field);
-	if (node == NULL) {
-		return;
-	}
-	(void)u_json_get_string_into_array(node, dst, dst_size);
-}
-
-static bool
-parse_manifest(const char *path, struct plugin_entry *e)
-{
-	FILE *f = fopen(path, "rb");
-	if (f == NULL) {
-		U_LOG_W("plugin loader: %s: fopen failed (errno=%d).", path, errno);
-		return false;
-	}
-	if (fseek(f, 0, SEEK_END) != 0) {
-		fclose(f);
-		return false;
-	}
-	long len = ftell(f);
-	if (len <= 0 || len > 64 * 1024) {
-		U_LOG_W("plugin loader: %s: implausible manifest size %ld.", path, len);
-		fclose(f);
-		return false;
-	}
-	if (fseek(f, 0, SEEK_SET) != 0) {
-		fclose(f);
-		return false;
-	}
-	char *buf = (char *)malloc((size_t)len + 1);
-	if (buf == NULL) {
-		fclose(f);
-		return false;
-	}
-	size_t got = fread(buf, 1, (size_t)len, f);
-	fclose(f);
-	if (got != (size_t)len) {
-		free(buf);
-		return false;
-	}
-	buf[len] = '\0';
-
-	cJSON *root = cJSON_Parse(buf);
-	free(buf);
-	if (root == NULL) {
-		U_LOG_W("plugin loader: %s: JSON parse failed.", path);
-		return false;
-	}
-
-	char fmt[16] = {0};
-	const cJSON *fmt_node = u_json_get(root, "file_format_version");
-	if (fmt_node != NULL) {
-		(void)u_json_get_string_into_array(fmt_node, fmt, sizeof(fmt));
-	}
-	if (strcmp(fmt, "1.0") != 0) {
-		U_LOG_W("plugin loader: %s: unsupported file_format_version='%s'.", path, fmt);
-		cJSON_Delete(root);
-		return false;
-	}
-
-	const cJSON *plugin = u_json_get(root, "plugin");
-	if (plugin == NULL) {
-		U_LOG_W("plugin loader: %s: missing 'plugin' object.", path);
-		cJSON_Delete(root);
-		return false;
-	}
-
-	copy_optional_str(plugin, "id", e->id, sizeof(e->id));
-	copy_optional_str(plugin, "display_name", e->display_name, sizeof(e->display_name));
-	copy_optional_str(plugin, "vendor", e->vendor, sizeof(e->vendor));
-	copy_optional_str(plugin, "version", e->version, sizeof(e->version));
-	copy_optional_str(plugin, "binary_path", e->binary_path, sizeof(e->binary_path));
-
-	int probe_order = 100;
-	const cJSON *po = u_json_get(plugin, "probe_order");
-	if (po != NULL) {
-		(void)u_json_get_int(po, &probe_order);
-	}
-	e->probe_order = (uint32_t)probe_order;
-
-	cJSON_Delete(root);
-
-	if (e->id[0] == '\0' || e->binary_path[0] == '\0') {
-		U_LOG_W("plugin loader: %s: required fields 'plugin.id' or 'plugin.binary_path' missing.", path);
-		return false;
-	}
-	return true;
-}
-
-static bool
-already_have_id(const struct plugin_entry *entries, int n, const char *id)
-{
-	for (int i = 0; i < n; i++) {
-		if (strcmp(entries[i].id, id) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static int
-enumerate_dir(const char *root, struct plugin_entry *entries, int start, int max)
-{
-	DIR *d = opendir(root);
-	if (d == NULL) {
-		return start;
-	}
-
-	int count = start;
-	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
-		if (count >= max) {
-			U_LOG_W("plugin loader: more than %d entries — truncating.", max);
-			break;
-		}
-		const char *name = de->d_name;
-		size_t n = strlen(name);
-		if (n < 6 || strcmp(name + n - 5, ".json") != 0) {
-			continue;
-		}
-		/* Input-provider manifests share the discovery roots but belong
-		 * to the second plug-in type (ADR-034) — the input loader owns
-		 * them (target_input_plugin_loader.c). Skipping here keeps the
-		 * DP path from load-attempting a DLL that exports
-		 * xrtInputPluginNegotiate instead of xrtPluginNegotiate. */
-		{
-			static const char ip_suffix[] = "-input-provider.json";
-			const size_t ip_len = sizeof(ip_suffix) - 1;
-			if (n >= ip_len && strcmp(name + n - ip_len, ip_suffix) == 0) {
-				continue;
-			}
-		}
-
-		struct plugin_entry e;
-		memset(&e, 0, sizeof(e));
-		snprintf(e.manifest_path, sizeof(e.manifest_path), "%s/%s", root, name);
-		snprintf(e.manifest_file, sizeof(e.manifest_file), "%s", name);
-
-		if (!parse_manifest(e.manifest_path, &e)) {
-			continue;
-		}
-		/* Per-user shadows system: roots are walked in priority order,
-		 * so the first occurrence of an `<id>` wins. */
-		if (already_have_id(entries, count, e.id)) {
-			U_LOG_I("plugin loader:   %s: shadowed by earlier manifest for id='%s'.", e.manifest_path,
-			        e.id);
-			continue;
-		}
-		entries[count++] = e;
-	}
-	closedir(d);
-	return count;
-}
-
-static void
-append_roots(char roots[][PATH_MAX], int max_roots, int *n_roots, const char *path)
-{
-	if (path == NULL || *path == '\0' || *n_roots >= max_roots) {
-		return;
-	}
-	struct stat st;
-	if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
-		return;
-	}
-	snprintf(roots[(*n_roots)++], PATH_MAX, "%s", path);
-}
-
-/*!
- * Assemble the platform's plug-in discovery roots into @p roots (each a
- * PATH_MAX buffer), in priority order, and return the count. Factored out
- * so both discover_active_plugin() and target_plugin_enumerate() search
- * exactly the same set — and shared (non-static) with the input-provider
- * loader, which scans the SAME roots for `*-input-provider.json`
- * manifests (ADR-034 / input-provider-discovery.md §3). See
- * docs/specs/runtime/plugin-discovery.md §3.
- */
-int
-target_plugin_build_discovery_roots(char roots[][PATH_MAX], int max_roots)
-{
-	int n_roots = 0;
-
-	const char *override = getenv("XRT_PLUGIN_SEARCH_PATH");
-	if (override != NULL && *override != '\0') {
-		/* Colon-separated list, like PATH. */
-		const char *p = override;
-		while (*p && n_roots < max_roots) {
-			const char *colon = strchr(p, ':');
-			size_t len = colon ? (size_t)(colon - p) : strlen(p);
-			if (len > 0 && len < PATH_MAX) {
-				char buf[PATH_MAX];
-				memcpy(buf, p, len);
-				buf[len] = '\0';
-				append_roots(roots, max_roots, &n_roots, buf);
-			}
-			if (!colon) {
-				break;
-			}
-			p = colon + 1;
-		}
-	}
-
-	const char *home = getenv("HOME");
-	char user_root[PATH_MAX];
-#ifdef __APPLE__
-	if (home != NULL && *home != '\0') {
-		snprintf(user_root, sizeof(user_root),
-		         "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
-		append_roots(roots, max_roots, &n_roots, user_root);
-	}
-	/* System-wide root for `.pkg`-style installs that run as root and
-	 * write to /Library/Application Support/ rather than ~. Per-user
-	 * entries above shadow system-wide entries via the already_have_id
-	 * dedup inside enumerate_dir. Issue #274. */
-	append_roots(roots, max_roots, &n_roots, "/Library/Application Support/DisplayXR/DisplayProcessors");
-#else
-	const char *xdg = getenv("XDG_DATA_HOME");
-	if (xdg != NULL && *xdg != '\0') {
-		snprintf(user_root, sizeof(user_root), "%s/DisplayXR/DisplayProcessors", xdg);
-		append_roots(roots, max_roots, &n_roots, user_root);
-	} else if (home != NULL && *home != '\0') {
-		snprintf(user_root, sizeof(user_root), "%s/.local/share/DisplayXR/DisplayProcessors", home);
-		append_roots(roots, max_roots, &n_roots, user_root);
-	}
-	/* Built-in default packaged plug-in dir — the Linux `.deb` drops the
-	 * sim-display .so + its `200-sim-display.json` manifest here, so an
-	 * installed box needs NO XRT_PLUGIN_SEARCH_PATH (#781). The env override
-	 * above is appended first, so a dev build still wins when it is set; when
-	 * it is unset this is the discovery root that makes an installed runtime
-	 * self-sufficient. This is the POSIX analogue of the Windows
-	 * DisplayProcessors registry root. */
-	append_roots(roots, max_roots, &n_roots, "/usr/lib/displayxr/plugins");
-	append_roots(roots, max_roots, &n_roots, "/usr/local/share/displayxr/DisplayProcessors");
-	append_roots(roots, max_roots, &n_roots, "/usr/share/displayxr/DisplayProcessors");
-#endif
-
-	return n_roots;
-}
-
-/*!
- * Per-user manifest dir — the writable root for the `preferred` override
- * file. Returns false if HOME (and XDG) are unset.
- */
-static bool
-user_manifest_dir(char *out, size_t cap)
-{
-	const char *home = getenv("HOME");
-#ifdef __APPLE__
-	if (home == NULL || *home == '\0') {
-		return false;
-	}
-	snprintf(out, cap, "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
-	return true;
-#else
-	const char *xdg = getenv("XDG_DATA_HOME");
-	if (xdg != NULL && *xdg != '\0') {
-		snprintf(out, cap, "%s/DisplayXR/DisplayProcessors", xdg);
-		return true;
-	}
-	if (home != NULL && *home != '\0') {
-		snprintf(out, cap, "%s/.local/share/DisplayXR/DisplayProcessors", home);
-		return true;
-	}
-	return false;
-#endif
-}
-
-static const struct xrt_plugin_iface *
-try_load_one(const struct plugin_entry *e, struct xrt_plugin_instance **out_inst)
-{
-	*out_inst = NULL;
-
-	/* RTLD_LOCAL keeps the plug-in's symbols private; aux symbols
-	 * resolve via the dependent runtime dylib that ld already linked
-	 * into our process. */
-	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
-	if (handle == NULL) {
-		U_LOG_W("plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
-		return NULL;
-	}
-
-	dlerror();
-	xrt_plugin_negotiate_fn_t negotiate =
-	    (xrt_plugin_negotiate_fn_t)dlsym(handle, XRT_PLUGIN_ENTRYPOINT_NAME);
-	const char *err = dlerror();
-	if (negotiate == NULL || err != NULL) {
-		U_LOG_W("plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
-		        XRT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
-		dlclose(handle);
-		return NULL;
-	}
-
-	struct xrt_plugin_host_iface host = {0};
-	host.struct_size = (uint32_t)sizeof(struct xrt_plugin_host_iface);
-	host.host_api_version = XRT_PLUGIN_API_VERSION_CURRENT;
-#if defined(XRT_OS_ANDROID)
-	// Android plug-ins need the host's JavaVM/activity for vendor-SDK init
-	// (their own statically-linked aux_android copy is never populated).
-	host.get_android_vm = plugin_host_get_android_vm;
-	// Activity when in-process; Service Context when out-of-process (CNSDK only
-	// needs an android.content.Context to bind the on-device tracking service).
-	host.get_android_activity = plugin_host_get_android_activity;
-	// #1037: a Context whose classloader is the runtime APK's, so an
-	// in-process vendor plug-in can resolve vendor Java glue the app does
-	// not ship. Class loading only — see xrt_plugin.h.
-	host.get_android_class_host_context = plugin_host_get_android_class_host_context;
-	host.android_package_is_visible = plugin_host_android_package_is_visible;
-#endif
-
-	struct xrt_plugin_iface *iface = NULL;
-	uint32_t plugin_version = 0;
-	xrt_result_t xret = negotiate(XRT_PLUGIN_API_VERSION_CURRENT, &host, &iface, &plugin_version);
-	if (xret != XRT_SUCCESS || iface == NULL) {
-		U_LOG_W("plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
-		        (void *)iface);
-		dlclose(handle);
-		return NULL;
-	}
-
-	/* ADR-020 rule 3: reject a major-version mismatch before touching the
-	 * vtable. A plug-in built against a different ABI major lays its vtable
-	 * out at offsets the runtime doesn't agree on — calling through it is
-	 * exactly the corruption this guards against. Skip it (the caller falls
-	 * back to the next plug-in / sim_display); never dispatch. */
-	if (plugin_version != XRT_PLUGIN_API_VERSION_CURRENT) {
-		U_LOG_E("plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
-		        "the plug-in must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
-		        e->id, plugin_version, (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		/* #1212: carry the reason to the self-test, so a rejected vendor
-		 * plug-in reads as an ABI mismatch rather than a bare failure. */
-		snprintf(g_last_reject_reason, sizeof(g_last_reject_reason),
-		         "ABI mismatch: plug-in reports v%u, runtime expects v%u (rebuild it)", plugin_version,
-		         (unsigned)XRT_PLUGIN_API_VERSION_CURRENT);
-		dlclose(handle);
-		return NULL;
-	}
-
-	if (iface->probe != NULL) {
-		xret = iface->probe(out_inst);
-		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
-			U_LOG_I("plugin loader:   %s: probe declined (no matching device).", e->id);
-			/* #1212: a plug-in that LOADED and then said "not my
-			 * hardware" is behaving correctly on a box without that
-			 * panel. Only a failed LOAD is a misconfiguration, so
-			 * mark this so the vendor_dp self-test does not fail a
-			 * dev box that merely has a vendor plug-in registered. */
-			g_last_reject_declined = true;
-			dlclose(handle);
-			return NULL;
-		}
-		if (xret != XRT_SUCCESS) {
-			U_LOG_W("plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
-			dlclose(handle);
-			return NULL;
-		}
-	}
-
-	U_LOG_W(
-	    "plugin loader: active plug-in: id=%s name='%s' vendor='%s' version='%s' "
-	    "plugin_api=%u probe_order=%u path=%s",
-	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
-	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
-
-	/* dlopen handle intentionally leaked: the iface's function pointers
-	 * remain reachable into the dylib for the process's lifetime. */
-	return iface;
-}
-
-static const struct xrt_plugin_iface *
-discover_active_plugin(struct xrt_plugin_instance **out_inst, uint32_t max_probe_order)
-{
-	*out_inst = NULL;
-
-	char roots[8][PATH_MAX];
-	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
-
-	if (n_roots == 0) {
-		U_LOG_I("plugin loader: no discovery roots present — no plug-ins to try.");
-		return NULL;
-	}
-
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = 0;
-	for (int r = 0; r < n_roots; r++) {
-		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
-	}
-	if (n == 0) {
-		U_LOG_I("plugin loader: %d root(s) searched, no JSON manifests found.", n_roots);
-		return NULL;
-	}
-
-	qsort(entries, (size_t)n, sizeof(entries[0]), compare_by_filename);
-
-	// DXR_PLUGIN_EXCLUSIVE (#1545): warn once if the pin matches nothing.
-	{
-		const char *ids[MAX_PLUGIN_ENTRIES];
-		for (int i = 0; i < n; i++) {
-			ids[i] = entries[i].id;
-		}
-		plugin_warn_exclusive_miss(ids, n);
-	}
-
-	// PreferredPlugin override (#378): try the user-pinned plug-in before
-	// the filename/ProbeOrder order. A stale or failed preference falls
-	// through to the normal order, so it can never brick discovery.
-	char preferred[64];
-	if (target_plugin_get_preferred(preferred, sizeof(preferred))) {
-		for (int i = 0; i < n; i++) {
-			if (strcmp(entries[i].id, preferred) != 0) {
-				continue;
-			}
-			// An exclusive pin outranks the user preference (#1545).
-			if (plugin_id_excluded(entries[i].id)) {
-				break;
-			}
-			if (entries[i].probe_order >= max_probe_order) {
-				break; // refresh path: not strictly-better
-			}
-			U_LOG_W("plugin loader: PreferredPlugin override — attempting id='%s' first.", preferred);
-			const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
-			if (iface != NULL) {
-				g_active_probe_order = entries[i].probe_order;
-				return iface;
-			}
-			U_LOG_W("plugin loader: preferred plug-in '%s' failed — falling back to ProbeOrder.",
-			        preferred);
-			break;
-		}
-	}
-
-	U_LOG_I("plugin loader: %d registered plug-in(s); attempting in filename order.", n);
-	for (int i = 0; i < n; i++) {
-		// Refresh path (#342): only attempt strictly-better candidates.
-		// First-call path passes UINT32_MAX so no entry is skipped.
-		if (entries[i].probe_order >= max_probe_order) {
-			continue;
-		}
-		/* #1545: skipped before dlopen, and not counted as a reject. */
-		if (plugin_id_excluded(entries[i].id)) {
-			U_LOG_I("plugin loader:   [%d/%d] %s skipped (DXR_PLUGIN_EXCLUSIVE).", i + 1, n, entries[i].id);
-			continue;
-		}
-		U_LOG_I("plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
-		        entries[i].probe_order, entries[i].binary_path);
-		const struct xrt_plugin_iface *iface = try_load_one(&entries[i], out_inst);
-		if (iface != NULL) {
-			g_active_probe_order = entries[i].probe_order;
-			return iface;
-		}
-		/* #1212: attempted in ascending ProbeOrder and failed, so this is
-		 * by construction a better-ranked plug-in than whatever wins
-		 * below. The self-test's vendor_dp check keys off this. */
-		plugin_note_reject(entries[i].id, entries[i].probe_order);
-	}
-
-	// A refresh (max_probe_order bounded by the current winner) legitimately
-	// attempts nothing when nothing better is registered — that is not a
-	// fallback, so do not shout (monkey-test F2: 48 false alarms per soak).
-	if (max_probe_order == 0xFFFFFFFFu) {
-		U_LOG_W("plugin loader: no registered plug-in claimed the system — falling back to static drivers.");
-	}
-	return NULL;
-}
-
-/*
- *
- * Public enumeration + PreferredPlugin override (POSIX: macOS / Linux).
- *
- */
-
-int
-target_plugin_enumerate(struct target_plugin_desc *out, int max)
-{
-	if (out == NULL || max <= 0) {
-		return 0;
-	}
-
-	char roots[8][PATH_MAX];
-	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
-	if (n_roots == 0) {
-		return 0;
-	}
-
-	struct plugin_entry entries[MAX_PLUGIN_ENTRIES];
-	int n = 0;
-	for (int r = 0; r < n_roots; r++) {
-		n = enumerate_dir(roots[r], entries, n, MAX_PLUGIN_ENTRIES);
-	}
-	if (n > max) {
-		n = max;
-	}
-
-	for (int i = 0; i < n; i++) {
-		struct target_plugin_desc *d = &out[i];
-		memset(d, 0, sizeof(*d));
-		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
-		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
-		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
-		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
-		snprintf(d->binary_path, sizeof(d->binary_path), "%s", entries[i].binary_path);
-		d->probe_order = entries[i].probe_order;
-	}
-
-	return n;
-}
+#else /* macOS / Linux: env override, else a `preferred` file in the per-user dir */
 
 bool
 target_plugin_get_preferred(char *out, size_t cap)
@@ -2491,7 +2358,7 @@ target_plugin_get_preferred(char *out, size_t cap)
 	}
 
 	char dir[PATH_MAX];
-	if (!user_manifest_dir(dir, sizeof(dir))) {
+	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return false;
 	}
 	char path[PATH_MAX];
@@ -2522,10 +2389,17 @@ target_plugin_set_preferred(const char *id)
 	}
 
 	char dir[PATH_MAX];
-	if (!user_manifest_dir(dir, sizeof(dir))) {
+	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	/* Best-effort: create the manifest dir if absent (single level). */
+	/* Best-effort mkdir -p (a fresh macOS account lacks .../DisplayXR itself). */
+	for (char *p = dir + 1; *p != '\0'; p++) {
+		if (*p == '/') {
+			*p = '\0';
+			(void)mkdir(dir, 0755);
+			*p = '/';
+		}
+	}
 	(void)mkdir(dir, 0755);
 
 	char path[PATH_MAX];
@@ -2543,7 +2417,7 @@ xrt_result_t
 target_plugin_clear_preferred(void)
 {
 	char dir[PATH_MAX];
-	if (!user_manifest_dir(dir, sizeof(dir))) {
+	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return XRT_SUCCESS; /* nowhere it could live → nothing to clear */
 	}
 	char path[PATH_MAX];
@@ -2554,7 +2428,8 @@ target_plugin_clear_preferred(void)
 	return XRT_SUCCESS;
 }
 
-#endif /* platform-specific loader */
+#endif /* PreferredPlugin store */
+
 
 
 /*
@@ -2581,8 +2456,13 @@ target_plugin_get_active(void)
 			U_LOG_W("plugin loader: os_mutex_init failed — refresh path will skip locking.");
 		}
 	}
+	// ADR-045 status records are read from diagnostics threads (service tray).
+	if (!g_status_mutex_initialized && os_mutex_init(&g_status_mutex) == 0) {
+		g_status_mutex_initialized = 1;
+	}
 
 	g_active_iface = discover_active_plugin(&g_active_instance, 0xFFFFFFFFu /* try all */);
+	plugin_report_fallback(g_active_iface);
 	return g_active_iface;
 }
 
@@ -2618,6 +2498,15 @@ target_plugin_refresh_active(void)
 		return g_active_iface;
 	}
 
+	// ADR-045 D3 — no live swap. Re-selection exists to get OFF the fallback
+	// (a vendor plug-in registered, or its platform came up, after this
+	// process selected the fallback). A non-fallback active plug-in is kept
+	// even when it reports NO_DISPLAY: diagnostics surface that state and its
+	// DP passes pixels through, and nothing is re-probed here.
+	if (g_active_iface != NULL && !target_plugin_iface_is_fallback(g_active_iface)) {
+		return g_active_iface;
+	}
+
 	if (g_refresh_mutex_initialized) {
 		os_mutex_lock(&g_refresh_mutex);
 	}
@@ -2638,6 +2527,7 @@ target_plugin_refresh_active(void)
 		// Invalidate the display-claim source cache so the next
 		// target_plugin_resolve_displays rebuilds it against the new winner.
 		g_display_source_count = -1;
+		g_display_sources_active_only = false;
 	}
 
 	const struct xrt_plugin_iface *result = g_active_iface;
@@ -2656,28 +2546,281 @@ target_plugin_refresh_active(void)
  */
 
 /*!
- * Stable-for-this-boot monitor id. FNV-1a-64 over the EDID identity fields
- * that survive a mode/refresh change — manufacturer, product, and screen
- * position (so two identical-model panels at different positions differ).
- * Excludes pixel dims/refresh/HMONITOR (transient). Known limitation:
- * repositioning a monitor changes its id within a boot — acceptable for
- * Phase 1; EDID device-instance-path keying is the Phase 2/3 hardening.
+ * Monitor id (also the `displayId` of `XR_DXR_display_info` v22). FNV-1a-64.
+ *
+ * Where the platform names the connector (desktop Linux: the DRM connector
+ * WITH its card prefix, e.g. "card1-HDMI-A-1", else the RandR output name) the
+ * id hashes the EDID identity
+ * — manufacturer, product, serial — plus that connector, and NOT the desktop
+ * position: the connector is unique per machine, so the id survives the user
+ * rearranging monitors and the service rebuilding its registry on the next
+ * client connect, and still separates two identical panels (different ports).
+ * It changes only when a different panel is plugged into that port, the
+ * panel moves to another port, or the kernel renumbers the card (a GPU added
+ * or removed, a different driver probe order across boots) (multi-screen M1).
+ *
+ * With no connector name (Windows today) the id stays what it has always
+ * been — manufacturer + product + screen position, position being the only
+ * thing that separates two identical panels there — so Windows ids are
+ * unchanged, and a rearrangement there does change them (documented in
+ * XR_DXR_display_info v22).
  */
 static uint64_t
-monitor_id_from_edid(uint16_t mfr, uint16_t product, int32_t left, int32_t top)
+monitor_id_from_edid(
+    uint16_t mfr, uint16_t product, uint32_t serial, int32_t left, int32_t top, const char *platform_key)
 {
 	uint64_t h = 1469598103934665603ULL; /* FNV-1a-64 offset basis */
 	const uint64_t prime = 1099511628211ULL;
+	const bool have_key = platform_key != NULL && platform_key[0] != '\0';
 	uint8_t bytes[12];
+	size_t n = 0;
 	memcpy(&bytes[0], &mfr, sizeof(mfr));
 	memcpy(&bytes[2], &product, sizeof(product));
-	memcpy(&bytes[4], &left, sizeof(left));
-	memcpy(&bytes[8], &top, sizeof(top));
-	for (size_t i = 0; i < sizeof(bytes); i++) {
+	if (have_key) {
+		memcpy(&bytes[4], &serial, sizeof(serial));
+		n = 8;
+	} else {
+		memcpy(&bytes[4], &left, sizeof(left));
+		memcpy(&bytes[8], &top, sizeof(top));
+		n = 12;
+	}
+	for (size_t i = 0; i < n; i++) {
 		h ^= (uint64_t)bytes[i];
 		h *= prime;
 	}
+	// The connector key exactly as the platform records it — on desktop
+	// Linux with its DRM card prefix ("card1-HDMI-A-1"), so two GPUs that both
+	// expose an "HDMI-A-1" still yield different ids.
+	for (const char *c = platform_key; have_key && *c != '\0'; c++) {
+		h ^= (uint64_t)(uint8_t)*c;
+		h *= prime;
+	}
 	return h;
+}
+
+/*!
+ * Runtime-private side table: the full @ref os_display_edid_monitor behind
+ * each descriptor the last @ref target_plugin_build_descriptors produced, keyed
+ * by monitor id. The descriptor is plug-in ABI and stays as it is; this is
+ * where the connector name, mm and device mode live for the runtime's own
+ * use (the back-compat claim below). Guarded by @ref g_refresh_mutex.
+ */
+static struct
+{
+	uint64_t monitor_id;
+	struct os_display_edid_monitor mon;
+	struct xrt_display_descriptor desc;
+	//! Stable screen key (target_screen_keys_build_ex), the per-screen preference's identity.
+	char key[TARGET_SCREEN_KEY_MAX];
+	//! The EDID-form key (pre-#2250); equals @ref key unless a vendor serial keys the monitor.
+	char legacy_key[TARGET_SCREEN_KEY_MAX];
+	//! The EDID-form key with the serial taken as 0: the key on Windows before enumeration read the serial.
+	char pre_serial_key[TARGET_SCREEN_KEY_MAX];
+	//! Sanitised vendor serial from a claim (target_screen_key_serial_pick), "" = none; kept across re-probes.
+	char vendor_serial[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+	//! OS device name the key was qualified with (Windows GDI name, else output / connector).
+	char device_name[64];
+	//! Every plug-in that claimed this monitor in the last resolve, in source order (dashboard).
+	struct target_plugin_screen_candidate cands[TARGET_PLUGIN_MAX_SOURCES];
+	uint32_t cand_count;
+	//! @ref cands is from a resolve over every loadable plug-in (not the POSIX active-only shortcut).
+	bool cands_valid;
+	//! When this monitor's EDID was last actually read (os_monotonic_get_ns), ADR-051 D6.
+	uint64_t edid_read_ns;
+	//! @ref mon's EDID identity is carried forward from an earlier read (target_plugin_edid_carry).
+	bool edid_carried;
+} g_monitor_side[XRT_DP_REGISTRY_MAX_ENTRIES];
+static uint32_t g_monitor_side_count = 0;
+
+/*!
+ * (Re)derive every side-table monitor's screen key and EDID-form key from its
+ * EDID identity, device name and remembered vendor serial (#2250). Caller
+ * holds @ref g_refresh_mutex.
+ */
+static void
+monitor_side_rebuild_keys(void)
+{
+	struct target_screen_key_input key_in[XRT_DP_REGISTRY_MAX_ENTRIES];
+	char keys[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	char legacy[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	char pre_serial[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	const uint32_t n = g_monitor_side_count;
+	for (uint32_t i = 0; i < n; i++) {
+		key_in[i].manufacturer_id = g_monitor_side[i].mon.manufacturer_id;
+		key_in[i].product_id = g_monitor_side[i].mon.product_id;
+		key_in[i].serial = g_monitor_side[i].mon.serial_number;
+		key_in[i].device_name = g_monitor_side[i].device_name;
+		key_in[i].vendor_serial = g_monitor_side[i].vendor_serial;
+	}
+	target_screen_keys_build_ex(key_in, n, keys, legacy);
+	target_screen_keys_build_pre_serial(key_in, n, pre_serial);
+	for (uint32_t i = 0; i < n; i++) {
+		(void)snprintf(g_monitor_side[i].pre_serial_key, sizeof(g_monitor_side[i].pre_serial_key), "%s",
+		               pre_serial[i]);
+		(void)snprintf(g_monitor_side[i].key, sizeof(g_monitor_side[i].key), "%s", keys[i]);
+		(void)snprintf(g_monitor_side[i].legacy_key, sizeof(g_monitor_side[i].legacy_key), "%s", legacy[i]);
+	}
+}
+
+/*!
+ * What the ACTIVE plug-in said about its panel (`get_display_info`), noted by
+ * @ref target_plugin_note_active_panel. Steers the active plug-in's
+ * back-compat claim off-Windows. Guarded by @ref g_refresh_mutex.
+ */
+static struct os_display_panel_hint g_active_panel_hint;
+static bool g_active_panel_valid = false;
+
+void
+target_plugin_note_active_panel(const struct xrt_plugin_display_info *pdi)
+{
+	if (pdi == NULL) {
+		return;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	g_active_panel_hint.screen_left = pdi->display_screen_left;
+	g_active_panel_hint.screen_top = pdi->display_screen_top;
+	g_active_panel_hint.pixel_width = pdi->display_pixel_width;
+	g_active_panel_hint.pixel_height = pdi->display_pixel_height;
+	g_active_panel_hint.width_m = pdi->display_width_m;
+	g_active_panel_hint.height_m = pdi->display_height_m;
+	g_active_panel_hint.origin_valid = (pdi->display_flags & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
+	g_active_panel_valid = pdi->display_pixel_width > 0 && pdi->display_pixel_height > 0;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+}
+
+/*!
+ * Log how each monitor was identified (desktop Linux: which RandR <-> DRM
+ * join rule fired), at INFO and only when the set changes, so a service that
+ * re-enumerates on every client connect logs it once. Silent when no record
+ * carries platform identity (Windows), whose enumerator has its own logs.
+ */
+static void
+log_monitor_join_once(const struct os_display_edid_list *list)
+{
+	static uint64_t s_last = 0;
+	uint64_t h = 1469598103934665603ULL;
+	bool any = false;
+	for (uint32_t i = 0; i < list->count; i++) {
+		const struct os_display_edid_monitor *m = &list->monitors[i];
+		any = any || m->join != OS_EDID_JOIN_NONE || m->output_name[0] != '\0';
+		const uint64_t parts[] = {m->manufacturer_id,
+		                          m->product_id,
+		                          m->serial_number,
+		                          (uint64_t)(uint32_t)m->screen_left,
+		                          (uint64_t)(uint32_t)m->screen_top,
+		                          m->pixel_width,
+		                          (uint64_t)m->join};
+		for (size_t k = 0; k < sizeof(parts) / sizeof(parts[0]); k++) {
+			h ^= parts[k];
+			h *= 1099511628211ULL;
+		}
+	}
+	h ^= list->count;
+	if (!any || h == s_last) {
+		return;
+	}
+	s_last = h;
+
+	for (uint32_t i = 0; i < list->count; i++) {
+		const struct os_display_edid_monitor *m = &list->monitors[i];
+		U_LOG_I(
+		    "plugin loader: monitor %u output='%s' connector='%s' join=%s mfr=0x%04x product=0x%04x "
+		    "serial=0x%08x %ux%u%s at (%d,%d)%s %ux%u mm",
+		    i, m->output_name, m->connector, os_display_edid_join_str(m->join), m->manufacturer_id,
+		    m->product_id, m->serial_number, m->pixel_width, m->pixel_height, m->is_primary ? " primary" : "",
+		    (int)m->screen_left, (int)m->screen_top, m->origin_unknown ? " (origin unknown)" : "",
+		    m->physical_width_mm, m->physical_height_mm);
+	}
+}
+
+/*!
+ * The OS device name of an enumerated monitor, for its screen key: the GDI
+ * name of the monitor at its origin on Windows (the EDID record carries no
+ * output name there), else its RandR output / macOS UUID, else its connector.
+ */
+static void
+monitor_device_name(const struct os_display_edid_monitor *m, char *out, size_t cap)
+{
+	out[0] = '\0';
+#ifdef XRT_OS_WINDOWS
+	struct os_display_desktop_info dm;
+	memset(&dm, 0, sizeof(dm));
+	if (os_display_desktop_info_at(m->screen_left, m->screen_top, &dm) && dm.left == m->screen_left &&
+	    dm.top == m->screen_top) {
+		(void)snprintf(out, cap, "%.*s", (int)(cap - 1), dm.device_name);
+		return;
+	}
+#endif
+	(void)snprintf(out, cap, "%s", m->output_name[0] != '\0' ? m->output_name : m->connector);
+}
+
+static bool
+edid_triple_zero(const struct os_display_edid_monitor *m)
+{
+	return m->manufacturer_id == 0 && m->product_id == 0 && m->serial_number == 0;
+}
+
+static bool
+same_name(const char *a, const char *b)
+{
+	return a[0] != '\0' && b[0] != '\0' && strcmp(a, b) == 0;
+}
+
+enum target_edid_carry
+target_plugin_edid_carry(const struct os_display_edid_monitor *prev,
+                         uint64_t prev_read_ns,
+                         struct os_display_edid_monitor *cur,
+                         uint64_t now_ns)
+{
+	if (prev == NULL || cur == NULL || !edid_triple_zero(cur) || edid_triple_zero(prev)) {
+		return TARGET_EDID_CARRY_NONE;
+	}
+	// The same output: the RandR output name (or macOS UUID) when both carry
+	// one, else the DRM connector. An unreadable EDID can also lose the
+	// DRM join, so the connector alone is not required.
+	const bool same_output =
+	    same_name(prev->output_name, cur->output_name) || same_name(prev->connector, cur->connector);
+	const bool same_rect = prev->screen_left == cur->screen_left && prev->screen_top == cur->screen_top &&
+	                       prev->pixel_width == cur->pixel_width && prev->pixel_height == cur->pixel_height &&
+	                       !cur->origin_unknown;
+	if (!same_output || !same_rect) {
+		return TARGET_EDID_CARRY_NONE;
+	}
+	if (now_ns < prev_read_ns || now_ns - prev_read_ns > TARGET_EDID_CARRY_WINDOW_NS) {
+		return TARGET_EDID_CARRY_EXPIRED;
+	}
+	cur->manufacturer_id = prev->manufacturer_id;
+	cur->product_id = prev->product_id;
+	cur->serial_number = prev->serial_number;
+	if (cur->connector[0] == '\0') {
+		(void)snprintf(cur->connector, sizeof(cur->connector), "%s", prev->connector);
+	}
+	if (cur->output_name[0] == '\0') {
+		(void)snprintf(cur->output_name, sizeof(cur->output_name), "%s", prev->output_name);
+	}
+	if (cur->display_name[0] == '\0') {
+		(void)snprintf(cur->display_name, sizeof(cur->display_name), "%s", prev->display_name);
+	}
+	if (cur->physical_width_mm == 0 || cur->physical_height_mm == 0) {
+		cur->physical_width_mm = prev->physical_width_mm;
+		cur->physical_height_mm = prev->physical_height_mm;
+	}
+	if (cur->native_width == 0 || cur->native_height == 0) {
+		cur->native_width = prev->native_width;
+		cur->native_height = prev->native_height;
+	}
+	if (cur->preferred_width == 0 || cur->preferred_height == 0) {
+		cur->preferred_width = prev->preferred_width;
+		cur->preferred_height = prev->preferred_height;
+	}
+	if (cur->join == OS_EDID_JOIN_NONE) {
+		cur->join = prev->join;
+	}
+	return TARGET_EDID_CARRY_KEPT;
 }
 
 uint32_t
@@ -2688,16 +2831,81 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 	if (list == NULL || out == NULL || max == 0) {
 		return 0;
 	}
+	log_monitor_join_once(list);
 	uint32_t n = list->count;
 	if (n > max) {
 		n = max;
 	}
+	if (n > OS_DISPLAY_EDID_MAX_MONITORS) {
+		n = OS_DISPLAY_EDID_MAX_MONITORS;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct os_display_edid_monitor mons[OS_DISPLAY_EDID_MAX_MONITORS];
+	uint64_t read_ns[OS_DISPLAY_EDID_MAX_MONITORS];
+	bool carried[OS_DISPLAY_EDID_MAX_MONITORS];
+	uint32_t carried_count = 0;
+
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	// ADR-051 D6: mid-reseat, the compositor can still list an output whose
+	// EDID reads back empty. Keep the identity the previous build read on the
+	// same output and rect, or the screen table publishes a removal plus an
+	// EDID-less "new" screen, then the reverse once the EDID is back.
+	bool prev_used[XRT_DP_REGISTRY_MAX_ENTRIES] = {false};
 	for (uint32_t i = 0; i < n; i++) {
-		const struct os_display_edid_monitor *m = &list->monitors[i];
+		mons[i] = list->monitors[i];
+		read_ns[i] = now_ns;
+		carried[i] = false;
+		if (!edid_triple_zero(&mons[i])) {
+			continue;
+		}
+		for (uint32_t j = 0; j < g_monitor_side_count; j++) {
+			if (prev_used[j]) {
+				continue;
+			}
+			const enum target_edid_carry r = target_plugin_edid_carry(
+			    &g_monitor_side[j].mon, g_monitor_side[j].edid_read_ns, &mons[i], now_ns);
+			if (r == TARGET_EDID_CARRY_NONE) {
+				continue;
+			}
+			prev_used[j] = true;
+			if (r == TARGET_EDID_CARRY_KEPT) {
+				read_ns[i] = g_monitor_side[j].edid_read_ns;
+				carried[i] = true;
+				carried_count++;
+				if (!g_monitor_side[j].edid_carried) {
+					U_LOG_W(
+					    "plugin loader: monitor '%s' at (%d,%d) %ux%u: EDID unreadable — "
+					    "keeping its identity mfr=0x%04x product=0x%04x serial=0x%08x "
+					    "(key '%s') for up to %llu s while it is re-read",
+					    mons[i].output_name[0] != '\0' ? mons[i].output_name : mons[i].connector,
+					    (int)mons[i].screen_left, (int)mons[i].screen_top, mons[i].pixel_width,
+					    mons[i].pixel_height, mons[i].manufacturer_id, mons[i].product_id,
+					    mons[i].serial_number, g_monitor_side[j].key,
+					    (unsigned long long)(TARGET_EDID_CARRY_WINDOW_NS /
+					                         (1000ull * 1000ull * 1000ull)));
+				}
+			} else if (g_monitor_side[j].edid_carried) {
+				U_LOG_W(
+				    "plugin loader: monitor '%s' at (%d,%d): EDID still unreadable after %llu s "
+				    "— treating it as a display without an EDID",
+				    mons[i].output_name[0] != '\0' ? mons[i].output_name : mons[i].connector,
+				    (int)mons[i].screen_left, (int)mons[i].screen_top,
+				    (unsigned long long)(TARGET_EDID_CARRY_WINDOW_NS / (1000ull * 1000ull * 1000ull)));
+			}
+			break;
+		}
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		const struct os_display_edid_monitor *m = &mons[i];
 		struct xrt_display_descriptor *d = &out[i];
 		memset(d, 0, sizeof(*d));
 		d->struct_size = (uint32_t)sizeof(*d);
-		d->monitor_id = monitor_id_from_edid(m->manufacturer_id, m->product_id, m->screen_left, m->screen_top);
+		d->monitor_id =
+		    monitor_id_from_edid(m->manufacturer_id, m->product_id, m->serial_number, m->screen_left,
+		                         m->screen_top, m->connector[0] != '\0' ? m->connector : m->output_name);
 		d->edid_manufacturer = m->manufacturer_id;
 		d->edid_product = m->product_id;
 		d->pixel_width = m->pixel_width;
@@ -2707,24 +2915,271 @@ target_plugin_build_descriptors(const struct os_display_edid_list *list,
 		d->screen_top = m->screen_top;
 		d->flags = m->is_primary ? 1u : 0u;
 	}
+
+	// #2250: what the last resolve learned of each monitor's vendor serial,
+	// by EDID-form key, so the key does not drop back to the EDID form
+	// between this enumeration and the next resolve (or while the claim that
+	// carried the serial is momentarily absent, e.g. present-not-ready).
+	struct
+	{
+		char legacy_key[TARGET_SCREEN_KEY_MAX];
+		char vendor_serial[TARGET_SCREEN_KEY_SERIAL_MAX + 1];
+	} prev_serial[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t prev_count = g_monitor_side_count;
+	for (uint32_t i = 0; i < prev_count; i++) {
+		(void)snprintf(prev_serial[i].legacy_key, sizeof(prev_serial[i].legacy_key), "%s",
+		               g_monitor_side[i].legacy_key);
+		(void)snprintf(prev_serial[i].vendor_serial, sizeof(prev_serial[i].vendor_serial), "%s",
+		               g_monitor_side[i].vendor_serial);
+	}
+
+	g_monitor_side_count = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		g_monitor_side[i].vendor_serial[0] = '\0';
+		g_monitor_side[i].monitor_id = out[i].monitor_id;
+		g_monitor_side[i].cand_count = 0;
+		g_monitor_side[i].cands_valid = false;
+		g_monitor_side[i].mon = mons[i];
+		g_monitor_side[i].desc = out[i];
+		g_monitor_side[i].edid_read_ns = read_ns[i];
+		g_monitor_side[i].edid_carried = carried[i];
+		monitor_device_name(&mons[i], g_monitor_side[i].device_name, sizeof(g_monitor_side[i].device_name));
+	}
+	// Display dashboard phase 7: the stable key a per-screen preference is
+	// stored under (the monitor id is per boot). First the EDID form, which
+	// finds each monitor's remembered vendor serial, then the real keys.
+	monitor_side_rebuild_keys();
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		for (uint32_t j = 0; j < prev_count; j++) {
+			if (prev_serial[j].vendor_serial[0] != '\0' &&
+			    strcmp(prev_serial[j].legacy_key, g_monitor_side[i].legacy_key) == 0) {
+				(void)snprintf(g_monitor_side[i].vendor_serial, sizeof(g_monitor_side[i].vendor_serial),
+				               "%s", prev_serial[j].vendor_serial);
+				break;
+			}
+		}
+	}
+	monitor_side_rebuild_keys();
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+
+	// A carried identity is provisional: ask for another enumeration so the
+	// real EDID is read once the kernel has it (the window bounds the series).
+	// Rate-limited, so a status read every second cannot keep re-arming the
+	// service worker's debounce and starve the re-run.
+	static uint64_t s_last_followup_ns = 0;
+	if (carried_count > 0 && now_ns - s_last_followup_ns >= 2ull * 1000ull * 1000ull * 1000ull) {
+		s_last_followup_ns = now_ns;
+		target_display_hotplug_request_followup("EDID unreadable — identity kept, re-reading");
+	}
 	return n;
 }
 
-/*!
- * Synthesize the back-compat claim for a loaded plug-in that has no
- * `probe_displays` but whose binary `probe()` succeeded: one
- * @ref XRT_DISPLAY_CLAIM_EDID claim on the primary monitor (or the first
- * descriptor if none is flagged primary). `supported_apis` is set to all
- * bits — the actual factory set is masked against the plug-in's non-NULL
- * factory pointers at fill time.
- */
-static uint32_t
-synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
-                         uint32_t n,
-                         struct xrt_display_claim *out,
-                         uint32_t max)
+bool
+target_plugin_get_monitor_key(uint64_t monitor_id, char *out_key, size_t key_cap, char *out_device, size_t device_cap)
 {
-	if (n == 0 || max == 0) {
+	bool found = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (out_key != NULL && key_cap > 0) {
+			(void)snprintf(out_key, key_cap, "%s", g_monitor_side[i].key);
+		}
+		if (out_device != NULL && device_cap > 0) {
+			(void)snprintf(out_device, device_cap, "%s", g_monitor_side[i].device_name);
+		}
+		found = true;
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
+}
+
+bool
+target_plugin_get_monitor_legacy_key(uint64_t monitor_id, char *out_key, size_t key_cap)
+{
+	bool differs = false;
+	if (out_key != NULL && key_cap > 0) {
+		out_key[0] = '\0';
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		differs = g_monitor_side[i].legacy_key[0] != '\0' &&
+		          strcmp(g_monitor_side[i].legacy_key, g_monitor_side[i].key) != 0;
+		if (differs && out_key != NULL && key_cap > 0) {
+			(void)snprintf(out_key, key_cap, "%s", g_monitor_side[i].legacy_key);
+		}
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return differs;
+}
+
+bool
+target_plugin_get_monitor_candidates(uint64_t monitor_id,
+                                     struct target_plugin_screen_candidate *out,
+                                     uint32_t max,
+                                     uint32_t *out_count)
+{
+	bool found = false;
+	if (out_count != NULL) {
+		*out_count = 0;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (g_monitor_side[i].cands_valid) {
+			uint32_t n = 0;
+			for (; out != NULL && n < g_monitor_side[i].cand_count && n < max; n++) {
+				out[n] = g_monitor_side[i].cands[n];
+			}
+			if (out_count != NULL) {
+				*out_count = n;
+			}
+			found = true;
+		}
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
+}
+
+bool
+target_plugin_get_monitor_record(uint64_t monitor_id,
+                                 struct xrt_display_descriptor *out_desc,
+                                 struct os_display_edid_monitor *out_mon)
+{
+	bool found = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id != monitor_id) {
+			continue;
+		}
+		if (out_desc != NULL) {
+			*out_desc = g_monitor_side[i].desc;
+		}
+		if (out_mon != NULL) {
+			*out_mon = g_monitor_side[i].mon;
+		}
+		found = true;
+		break;
+	}
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return found;
+}
+
+#ifndef XRT_OS_WINDOWS
+static const struct os_display_edid_monitor *
+monitor_side_find(uint64_t monitor_id)
+{
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		if (g_monitor_side[i].monitor_id == monitor_id) {
+			return &g_monitor_side[i].mon;
+		}
+	}
+	return NULL;
+}
+#endif
+
+/*!
+ * Off-Windows: which descriptor is the panel described by @p hint, by the
+ * same ADR-033 rules the desktop-rect resolver uses (origin, then connector
+ * mode, then pixel size; ties on physical size). Pure.
+ */
+#ifndef XRT_OS_WINDOWS
+static bool
+panel_monitor_index(const struct xrt_display_descriptor *descs,
+                    uint32_t n,
+                    const struct os_display_edid_monitor *const *monitors,
+                    const struct os_display_panel_hint *hint,
+                    uint32_t *out_pick)
+{
+	if (n > XRT_DP_REGISTRY_MAX_ENTRIES) {
+		n = XRT_DP_REGISTRY_MAX_ENTRIES;
+	}
+
+	struct os_display_desktop_info mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	memset(mons, 0, sizeof(mons));
+	bool origin_known[XRT_DP_REGISTRY_MAX_ENTRIES];
+	for (uint32_t i = 0; i < n; i++) {
+		struct os_display_desktop_info *m = &mons[i];
+		m->left = descs[i].screen_left;
+		m->top = descs[i].screen_top;
+		m->width = descs[i].pixel_width;
+		m->height = descs[i].pixel_height;
+		m->width_in_caller_dpi = m->width;
+		m->height_in_caller_dpi = m->height;
+		m->is_primary = (descs[i].flags & 1u) != 0;
+		origin_known[i] = true;
+		const struct os_display_edid_monitor *side = monitors != NULL ? monitors[i] : NULL;
+		if (side != NULL) {
+			m->physical_width_mm = side->physical_width_mm;
+			m->physical_height_mm = side->physical_height_mm;
+			m->native_width = side->native_width;
+			m->native_height = side->native_height;
+			(void)snprintf(m->device_name, sizeof(m->device_name), "%s",
+			               side->output_name[0] != '\0' ? side->output_name : side->connector);
+			origin_known[i] = !side->origin_unknown;
+		}
+	}
+
+	// Rule 1: the plug-in placed its panel. Trust a non-(0,0) origin (or a
+	// (0, 0) it vouched for, #2577) that falls inside a monitor whose own
+	// origin is a real desktop position.
+	if (hint->origin_valid || hint->screen_left != 0 || hint->screen_top != 0) {
+		for (uint32_t i = 0; i < n; i++) {
+			const struct os_display_desktop_info *m = &mons[i];
+			if (origin_known[i] && hint->screen_left >= m->left &&
+			    hint->screen_left < m->left + (int64_t)m->width && hint->screen_top >= m->top &&
+			    hint->screen_top < m->top + (int64_t)m->height) {
+				*out_pick = i;
+				return true;
+			}
+		}
+	}
+
+	// Rules 2/3: connector mode, then pixel size.
+	struct os_display_panel_match match = {0};
+	const int32_t idx = os_display_desktop_select_by_size(mons, n, hint, &match);
+	if (idx >= 0) {
+		*out_pick = (uint32_t)idx;
+		return true;
+	}
+	return false;
+}
+#endif
+
+uint32_t
+target_plugin_backcompat_claim_index(const struct xrt_display_descriptor *descs,
+                                     uint32_t n,
+                                     const struct os_display_edid_monitor *const *monitors,
+                                     const struct os_display_panel_hint *panel)
+{
+	if (descs == NULL || n == 0) {
 		return 0;
 	}
 	uint32_t pick = 0;
@@ -2734,9 +3189,76 @@ synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
 			break;
 		}
 	}
+#ifndef XRT_OS_WINDOWS
+	uint32_t at_panel = 0;
+	if (panel != NULL && panel->pixel_width > 0 && panel->pixel_height > 0 &&
+	    panel_monitor_index(descs, n, monitors, panel, &at_panel)) {
+		pick = at_panel;
+	}
+#else
+	(void)monitors;
+	(void)panel;
+#endif
+	return pick;
+}
+
+/*!
+ * Synthesize the back-compat claim for a loaded plug-in that has no
+ * `probe_displays` but whose binary `probe()` succeeded: one
+ * @ref XRT_DISPLAY_CLAIM_EDID claim on the monitor
+ * @ref target_plugin_backcompat_claim_index picks — the primary monitor, or,
+ * off-Windows for the ACTIVE plug-in once its panel is known, that panel's
+ * monitor. `supported_apis` is set to all bits — the actual factory set is
+ * masked against the plug-in's non-NULL factory pointers at fill time.
+ *
+ * Why the panel and not the primary: a 3D panel is a SECOND monitor on
+ * essentially every real deployment, so "the primary" lands the vendor's
+ * claim on the laptop screen — and the active plug-in wins every monitor it
+ * claims (#1521), so the registry would route the laptop screen to the vendor
+ * DP and the panel to the fallback. Caller holds @ref g_refresh_mutex.
+ */
+static uint32_t
+synth_primary_edid_claim(const struct xrt_display_descriptor *descs,
+                         uint32_t n,
+                         struct xrt_display_claim *out,
+                         uint32_t max,
+                         const struct xrt_plugin_iface *iface)
+{
+	if (n == 0 || max == 0) {
+		return 0;
+	}
+	if (n > XRT_DP_REGISTRY_MAX_ENTRIES) {
+		n = XRT_DP_REGISTRY_MAX_ENTRIES;
+	}
+	const bool is_active = iface != NULL && iface == g_active_iface;
+	const uint32_t primary = target_plugin_backcompat_claim_index(descs, n, NULL, NULL);
+	uint32_t pick = primary;
+#ifndef XRT_OS_WINDOWS
+	// A plug-in that ships `probe_displays` never reaches here, so its own
+	// claims always win; only the ACTIVE plug-in's panel is known.
+	if (is_active && g_active_panel_valid) {
+		const struct os_display_edid_monitor *side[XRT_DP_REGISTRY_MAX_ENTRIES];
+		for (uint32_t i = 0; i < n; i++) {
+			side[i] = monitor_side_find(descs[i].monitor_id);
+		}
+		pick = target_plugin_backcompat_claim_index(descs, n, side, &g_active_panel_hint);
+	}
+#else
+	(void)is_active;
+#endif
+	if (pick != primary) {
+		U_LOG_I(
+		    "plugin loader: '%s' has no probe_displays — back-compat claim placed on its panel "
+		    "(monitor 0x%016llx, %ux%u at (%d,%d)) instead of the primary monitor",
+		    iface->id != NULL ? iface->id : "?", (unsigned long long)descs[pick].monitor_id,
+		    descs[pick].pixel_width, descs[pick].pixel_height, (int)descs[pick].screen_left,
+		    (int)descs[pick].screen_top);
+	}
 	out[0].monitor_id = descs[pick].monitor_id;
 	out[0].confidence = (uint32_t)XRT_DISPLAY_CLAIM_EDID;
-	out[0].supported_apis = 0xFFFFFFFFu;
+	// Every API (masked against the real factories at fill time), but never a
+	// capability hint: a plug-in that cannot even enumerate monitors asserts nothing.
+	out[0].supported_apis = 0xFFFFFFFFu & ~XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE;
 	out[0].serial[0] = '\0';
 	return 1;
 }
@@ -2761,7 +3283,7 @@ query_source_claims(const struct plugin_display_source *src,
 	    iface->probe_displays != NULL) {
 		return iface->probe_displays(src->inst, descs, n, out, max);
 	}
-	return synth_primary_edid_claim(descs, n, out, max);
+	return synth_primary_edid_claim(descs, n, out, max, iface);
 }
 
 /*!
@@ -2881,26 +3403,123 @@ fill_registry_entry(struct xrt_dp_registry_entry *e,
 		e->dp_factory_metal = (void *)iface->create_dp_metal;
 	}
 #endif
+	e->claim_apis = claim->supported_apis;
 	e->owning_iface = (const void *)iface;
 	e->owning_instance = src->inst;
 }
 
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+/*!
+ * POSIX: does the active plug-in, on its own, already decide every monitor?
+ * The active plug-in wins every monitor it claims, at any confidence (#1521),
+ * and only three things outrank it: a different PreferredPlugin, a
+ * `DXR_SCREEN_PLUGIN` pin naming a different plug-in for that monitor, and a
+ * per-screen preference naming one (display dashboard phase 7). When it
+ * claims every descriptor and neither applies, loading and probing every other
+ * installed plug-in cannot change a single registry entry. It would only
+ * dlopen them, run their vendor probes (Leia's reaches the SR service and the
+ * shared panel), and keep their instances. Typical cases:
+ * `XRT_PREFERRED_PLUGIN_ID=sim-display`, or sim-display active because no
+ * vendor plug-in is installed.
+ *
+ * The pin check matters: `XRT_PREFERRED_PLUGIN_ID=sim-display
+ * DXR_SCREEN_PLUGIN=HDMI-1=leia-sr` (the documented sim-session-with-a-woven-
+ * DS1 recipe) needs leia-sr loaded as a claim source, or the pin finds no
+ * leia-sr claim and is ignored. The decision itself is the pure
+ * target_screen_active_decides_every_monitor() (unit-tested). Caller holds
+ * @ref g_refresh_mutex (the monitor side table).
+ */
+static bool
+active_plugin_decides_every_monitor(const struct xrt_display_descriptor *descs, uint32_t n)
+{
+	if (g_active_iface == NULL || g_active_iface->id == NULL || descs == NULL || n == 0) {
+		return false;
+	}
+	char preferred[64] = {0};
+	const bool have_preferred = target_plugin_get_preferred(preferred, sizeof(preferred));
+
+	struct target_screen_pins pins;
+	target_screen_pin_parse(getenv("DXR_SCREEN_PLUGIN"), &pins, NULL);
+
+	const struct plugin_display_source active = {
+	    .iface = g_active_iface,
+	    .inst = g_active_instance,
+	    .probe_order = g_active_probe_order,
+	};
+	struct xrt_display_claim claims[XRT_DP_REGISTRY_MAX_ENTRIES];
+	const uint32_t cn = query_source_claims(&active, descs, n, claims, XRT_DP_REGISTRY_MAX_ENTRIES);
+
+	struct target_screen_monitor mons[XRT_DP_REGISTRY_MAX_ENTRIES];
+	char screen_pref[XRT_DP_REGISTRY_MAX_ENTRIES][64];
+	const uint32_t mn = n < XRT_DP_REGISTRY_MAX_ENTRIES ? n : XRT_DP_REGISTRY_MAX_ENTRIES;
+	for (uint32_t d = 0; d < mn; d++) {
+		mons[d].monitor_id = descs[d].monitor_id;
+		mons[d].output_name = "";
+		mons[d].connector = "";
+		mons[d].active_claims = false;
+		for (uint32_t c = 0; c < cn && !mons[d].active_claims; c++) {
+			mons[d].active_claims = claims[c].monitor_id == descs[d].monitor_id;
+		}
+		mons[d].screen_pref = NULL;
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == descs[d].monitor_id) {
+				mons[d].output_name = g_monitor_side[i].mon.output_name;
+				mons[d].connector = g_monitor_side[i].mon.connector;
+				if (u_setting_get_preferred_plugin_for_screen(g_monitor_side[i].key, screen_pref[d],
+				                                              sizeof(screen_pref[d]), NULL) != NULL) {
+					mons[d].screen_pref = screen_pref[d];
+				}
+				break;
+			}
+		}
+	}
+	return target_screen_active_decides_every_monitor(g_active_iface->id, have_preferred ? preferred : NULL, &pins,
+	                                                  mons, mn);
+}
+#endif
+
 /*!
  * Build the cached display-claim source set if not already collected. Caller
  * holds @ref g_refresh_mutex and has loaded the active plug-in.
+ *
+ * POSIX only loads the other plug-ins when they could matter: if the active
+ * plug-in decides every monitor in @p descs on its own
+ * (@ref active_plugin_decides_every_monitor) the set is just the active
+ * plug-in, and that answer is re-checked on the next resolve.
  */
 static void
-ensure_display_sources(void)
+ensure_display_sources(const struct xrt_display_descriptor *descs, uint32_t n)
 {
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	if (g_display_source_count >= 0 && !g_display_sources_active_only) {
+		return;
+	}
+	if (active_plugin_decides_every_monitor(descs, n)) {
+		g_display_sources[0].iface = g_active_iface;
+		g_display_sources[0].inst = g_active_instance;
+		g_display_sources[0].probe_order = g_active_probe_order;
+		g_display_source_count = 1;
+		g_display_sources_active_only = true;
+		return;
+	}
+	g_display_sources_active_only = false;
+#else
+	(void)descs;
+	(void)n;
 	if (g_display_source_count >= 0) {
 		return;
 	}
+#endif
 	g_display_source_count = 0;
-#ifdef XRT_OS_WINDOWS
+#if !defined(XRT_OS_ANDROID)
+	// Windows (registry) and macOS/Linux (manifests): every registered
+	// plug-in is a claim source, so the fallback and a vendor plug-in both
+	// contribute. macOS has no EDID enumerator yet, so resolution is a no-op
+	// there before this is ever reached.
 	g_display_source_count = collect_display_sources_platform(g_display_sources, TARGET_PLUGIN_MAX_SOURCES);
 #else
-	// Off-Windows the EDID enumerator yields no monitors, so resolution is
-	// a no-op regardless; the single active plug-in suffices as the lone
+	// Android: one plug-in ships inside the runtime APK (ADR-038) and the
+	// EDID enumerator yields no monitors; the active plug-in is the lone
 	// source for any caller that supplies its own descriptors.
 	if (g_active_iface != NULL) {
 		g_display_sources[0].iface = g_active_iface;
@@ -2909,6 +3528,188 @@ ensure_display_sources(void)
 		g_display_source_count = 1;
 	}
 #endif
+}
+
+//! Case-insensitive plug-in id compare (a per-screen preference is written by hand or a UI).
+static bool
+screen_ids_equal(const char *a, const char *b)
+{
+	for (; *a != '\0' && *b != '\0'; a++, b++) {
+		char ca = *a, cb = *b;
+		if (ca >= 'A' && ca <= 'Z') {
+			ca = (char)(ca - 'A' + 'a');
+		}
+		if (cb >= 'A' && cb <= 'Z') {
+			cb = (char)(cb - 'A' + 'a');
+		}
+		if (ca != cb) {
+			return false;
+		}
+	}
+	return *a == *b;
+}
+
+#if !defined(XRT_OS_ANDROID)
+/*!
+ * `Enabled` for a plug-in that is ALREADY a display-claim source (N3b + N3d,
+ * #2049 / #2051). @ref dp_entry_usable keeps a disabled plug-in from ever
+ * loading, but the source set is collected once per process and a live
+ * `dp disable <id>` lands after that: the loaded plug-in must stop
+ * contributing claims, so every screen it drove re-resolves to the next
+ * candidate (the service recreates a secondary's segment DP; the session's
+ * primary DP stays until the next session, plugin-discovery.md §4.2a).
+ * Nothing is unloaded or destroyed — a live segment DP may still be made from
+ * the instance — and a source with no registration row at all is kept (the
+ * "removed after it loaded" rule of @ref collect_display_sources_platform).
+ * Re-read on every resolve (the policy overlay is what changed); each edge is
+ * logged once. Caller holds @ref g_refresh_mutex.
+ */
+static uint32_t g_withdrawn_mask = 0; // by source index; the set is stable per process
+
+static uint32_t
+dp_sources_apply_enabled(bool *withdrawn, uint32_t src_count)
+{
+	for (uint32_t s = 0; s < src_count; s++) {
+		withdrawn[s] = false;
+	}
+	struct target_component_entry *entries = dp_entries_alloc();
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = dp_enumerate(entries, false);
+	uint32_t mask = 0;
+	uint32_t count = 0;
+	for (uint32_t s = 0; s < src_count && s < 32; s++) {
+		const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+		if (sif == NULL || sif->id == NULL) {
+			continue;
+		}
+		for (int i = 0; i < n; i++) {
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 ||
+			    strcmp(entries[i].id, sif->id) != 0) {
+				continue;
+			}
+			const bool was = (g_withdrawn_mask & (1u << s)) != 0;
+			if (!entries[i].enabled) {
+				withdrawn[s] = true;
+				mask |= 1u << s;
+				count++;
+				if (!was) {
+					U_LOG_W(
+					    "plugin loader: '%s' withdrawn from the display claims (Enabled=0, %s): "
+					    "its "
+					    "screens re-resolve now, the session's primary DP at the next session.",
+					    sif->id, dp_enabled_source(&entries[i]));
+				}
+			} else if (was) {
+				U_LOG_W("plugin loader: '%s' re-admitted to the display claims (Enabled=1).", sif->id);
+			}
+			break;
+		}
+	}
+	g_withdrawn_mask = mask;
+	free(entries);
+	return count;
+}
+#endif /* !XRT_OS_ANDROID */
+
+//! Monitors the last resolve found "present, not ready" (WARN only on entry). Guarded by g_refresh_mutex.
+static uint64_t g_not_ready_prev[XRT_DP_REGISTRY_MAX_ENTRIES];
+static uint32_t g_not_ready_prev_count = 0;
+
+//! #2250: this process may rewrite the per-user store to re-key a legacy screen key (service, CLI).
+static bool g_screen_key_rekey_allowed = false;
+
+void
+target_plugin_set_screen_key_rekey(bool allowed)
+{
+	g_screen_key_rekey_allowed = allowed;
+}
+
+struct screen_pref_probe
+{
+	char *buf;
+	size_t cap;
+	enum u_setting_source source;
+};
+
+static bool
+screen_pref_has(const char *key, void *userdata)
+{
+	struct screen_pref_probe *p = (struct screen_pref_probe *)userdata;
+	return u_setting_get_preferred_plugin_for_screen(key, p->buf, p->cap, &p->source) != NULL;
+}
+
+/*!
+ * The per-screen preference for a monitor, by its current key, else by its
+ * EDID-form @p legacy_key (#2250: a preference stored before the key moved to
+ * the vendor serial keeps applying), else by @p pre_serial_key (one stored
+ * while Windows enumeration did not read the EDID serial). An older-key match
+ * from the per-user store is re-keyed in
+ * the store (one WARN; the next probe matches the current key directly) — but
+ * only in a process that opted in (@ref target_plugin_set_screen_key_rekey:
+ * the service and the CLI; an app never rewrites the user's settings file).
+ * Anywhere else, and for an env / machine match (no write access from here),
+ * the legacy match applies and is WARNed once per process with the command
+ * that re-stores it. Caller holds
+ * @ref g_refresh_mutex (it also guards the WARN latch).
+ */
+static bool
+screen_pref_lookup(const char *key,
+                   const char *legacy_key,
+                   const char *pre_serial_key,
+                   char *buf,
+                   size_t cap,
+                   enum u_setting_source *out_source)
+{
+	struct screen_pref_probe probe = {buf, cap, U_SETTING_SOURCE_DEFAULT};
+	enum target_screen_key_match m = target_screen_key_pref_match(key, legacy_key, screen_pref_has, &probe);
+	if (m == TARGET_SCREEN_KEY_MATCH_NONE) {
+		m = target_screen_key_pref_match(key, pre_serial_key, screen_pref_has, &probe);
+		legacy_key = pre_serial_key;
+	}
+	*out_source = probe.source;
+	if (m == TARGET_SCREEN_KEY_MATCH_NONE) {
+		buf[0] = '\0';
+		*out_source = U_SETTING_SOURCE_DEFAULT;
+		return false;
+	}
+	if (m == TARGET_SCREEN_KEY_MATCH_CURRENT) {
+		return true;
+	}
+	if (probe.source == U_SETTING_SOURCE_USER && g_screen_key_rekey_allowed &&
+	    u_setting_user_set_preferred_plugin_for_screen(key, buf) &&
+	    u_setting_user_set_preferred_plugin_for_screen(legacy_key, NULL)) {
+		U_LOG_W(
+		    "plugin loader: per-screen preference '%s' -> '%s' re-keyed to '%s' (per-user store): the screen "
+		    "is now keyed by its serial",
+		    legacy_key, buf, key);
+		return true;
+	}
+	static char s_warned[XRT_DP_REGISTRY_MAX_ENTRIES][TARGET_SCREEN_KEY_MAX];
+	static uint32_t s_warned_count = 0;
+	for (uint32_t i = 0; i < s_warned_count; i++) {
+		if (strcmp(s_warned[i], legacy_key) == 0) {
+			return true;
+		}
+	}
+	if (s_warned_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
+		(void)snprintf(s_warned[s_warned_count++], TARGET_SCREEN_KEY_MAX, "%s", legacy_key);
+	}
+	const char *hint =
+	    " — the service or 'displayxr-cli dp use <id> --screen <key>' re-stores it under the new key";
+	if (probe.source == U_SETTING_SOURCE_MACHINE) {
+		hint = " — re-store it with 'displayxr-cli dp use <id> --screen <key> --machine' (admin)";
+	} else if (probe.source == U_SETTING_SOURCE_ENV) {
+		hint = " — update " U_SETTING_PER_SCREEN_ENV;
+	} else if (g_screen_key_rekey_allowed) {
+		hint = " — re-keying the per-user store failed";
+	}
+	U_LOG_W(
+	    "plugin loader: per-screen preference '%s' -> '%s' (%s) matched by the screen's older key; its "
+	    "key is now '%s'%s",
+	    legacy_key, buf, u_setting_source_str(probe.source), key, hint);
+	return true;
 }
 
 void
@@ -2932,20 +3733,83 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 		os_mutex_lock(&g_refresh_mutex);
 	}
 
-	ensure_display_sources();
-
 	uint32_t dn = descriptor_count;
 	if (dn > XRT_DP_REGISTRY_MAX_ENTRIES) {
 		dn = XRT_DP_REGISTRY_MAX_ENTRIES;
 	}
 
+	ensure_display_sources(descriptors, dn);
+
+	// N3b live: a source the policy disabled since it loaded contributes
+	// nothing below. POSIX's active-only shortcut set then holds no claim
+	// source at all, so ask every other plug-in once (the full set stays
+	// cached from here on — ensure_display_sources returns early on it).
+	bool src_withdrawn[TARGET_PLUGIN_MAX_SOURCES] = {false};
+#if !defined(XRT_OS_ANDROID)
+	if (dp_sources_apply_enabled(src_withdrawn, g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0) >
+	        0 &&
+	    g_display_sources_active_only) {
+		g_display_sources_active_only = false;
+		g_display_source_count = collect_display_sources_platform(g_display_sources, TARGET_PLUGIN_MAX_SOURCES);
+		(void)dp_sources_apply_enabled(src_withdrawn,
+		                               g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0);
+	}
+#endif
+
 	// Query every source once for the full descriptor set.
 	static struct xrt_display_claim src_claims[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t src_claim_count[TARGET_PLUGIN_MAX_SOURCES] = {0};
-	for (int s = 0; s < g_display_source_count; s++) {
-		src_claim_count[s] =
-		    query_source_claims(&g_display_sources[s], descriptors, dn, src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
+	// The same claims flattened for target_screen_collect_candidates.
+	static uint64_t src_mon[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
+	static uint32_t src_conf[TARGET_PLUGIN_MAX_SOURCES][XRT_DP_REGISTRY_MAX_ENTRIES];
+	struct target_screen_source_claims src_view[TARGET_PLUGIN_MAX_SOURCES];
+	const uint32_t src_count = g_display_source_count > 0 ? (uint32_t)g_display_source_count : 0;
+	for (uint32_t s = 0; s < src_count; s++) {
+		src_claim_count[s] = src_withdrawn[s] ? 0u
+		                                      : query_source_claims(&g_display_sources[s], descriptors, dn,
+		                                                            src_claims[s], XRT_DP_REGISTRY_MAX_ENTRIES);
+		for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+			src_mon[s][c] = src_claims[s][c].monitor_id;
+			src_conf[s][c] = (uint32_t)src_claims[s][c].confidence;
+		}
+		const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+		src_view[s].plugin_id = (sif != NULL && sif->id != NULL) ? sif->id : "";
+		src_view[s].is_active = g_active_iface != NULL && sif == g_active_iface;
+		src_view[s].monitor_ids = src_mon[s];
+		src_view[s].confidences = src_conf[s];
+		src_view[s].count = src_claim_count[s];
 	}
+
+	// #2250: a monitor with no EDID serial is keyed by a claim's vendor
+	// serial, which names the panel whatever cable it is on (its EDID product
+	// code can differ per input). Picked from every claim, not the winner:
+	// the key decides the per-screen preference, which decides the winner.
+	// No qualifying claim this time keeps the remembered serial.
+	for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+		uint32_t conf[TARGET_PLUGIN_MAX_SOURCES];
+		char ser_buf[TARGET_PLUGIN_MAX_SOURCES][sizeof(src_claims[0][0].serial)];
+		const char *ser[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t k = 0;
+		for (uint32_t s = 0; s < src_count && k < TARGET_PLUGIN_MAX_SOURCES; s++) {
+			for (uint32_t c = 0; c < src_claim_count[s]; c++) {
+				if (src_claims[s][c].monitor_id != g_monitor_side[i].monitor_id) {
+					continue;
+				}
+				conf[k] = (uint32_t)src_claims[s][c].confidence;
+				(void)snprintf(ser_buf[k], sizeof(ser_buf[k]), "%.*s", (int)sizeof(ser_buf[k]) - 1,
+				               src_claims[s][c].serial);
+				ser[k] = ser_buf[k];
+				k++;
+				break;
+			}
+		}
+		const int sp = target_screen_key_serial_pick(conf, ser, k);
+		if (sp >= 0) {
+			(void)target_screen_key_sanitize_serial(ser[sp], g_monitor_side[i].vendor_serial,
+			                                        sizeof(g_monitor_side[i].vendor_serial));
+		}
+	}
+	monitor_side_rebuild_keys();
 
 	// #791: an explicit PreferredPlugin override (`displayxr-cli dp use <id>`,
 	// or XRT_PREFERRED_PLUGIN_ID off-Windows) must force the WEAVING DP too, not
@@ -2962,122 +3826,350 @@ target_plugin_resolve_displays(const struct xrt_display_descriptor *descriptors,
 	char preferred_id[64] = {0};
 	bool have_preferred = target_plugin_get_preferred(preferred_id, sizeof(preferred_id));
 
-	// Resolve per monitor: highest confidence wins; ties → lower ProbeOrder.
-	// Sources are already in ascending ProbeOrder, so a strict `>` keeps the
-	// first (lowest-order) source at any given confidence.
+	/*
+	 * Multi-screen M4 (#793 phase 3): DXR_SCREEN_PLUGIN pins ONE monitor to a
+	 * plug-in, outranking the global rules below for that monitor only. Read
+	 * per resolve (it is a test/bring-up knob, and resolve is rare).
+	 */
+	struct target_screen_pins pins;
+	uint32_t pins_malformed = 0;
+	target_screen_pin_parse(getenv("DXR_SCREEN_PLUGIN"), &pins, &pins_malformed);
+	bool pin_used[TARGET_SCREEN_PIN_MAX] = {false};
+	if (pins_malformed > 0) {
+		U_LOG_W(
+		    "plugin loader: DXR_SCREEN_PLUGIN has %u malformed entr%s (expected "
+		    "<output|connector|monitor-id-hex>=<plugin-id>[,...]) — ignored",
+		    pins_malformed, pins_malformed == 1 ? "y" : "ies");
+	}
+
+	// Monitors claimed "present, not ready" in this resolve (log edges).
+	uint64_t nr_now[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t nr_count = 0;
+
+	/*
+	 * The winner per monitor (target_screen_pick, unit-tested): a per-screen
+	 * pin, then PreferredPlugin (#791), then the active plug-in (#1521), then
+	 * highest confidence with ties to the lower ProbeOrder (sources are in
+	 * ascending ProbeOrder).
+	 */
 	for (uint32_t d = 0; d < dn; d++) {
 		const struct xrt_display_descriptor *desc = &descriptors[d];
 		const struct plugin_display_source *best_src = NULL;
 		const struct xrt_display_claim *best_claim = NULL;
 
-		// Preferred-plugin override (#791): if the pinned source claims this
-		// monitor, it wins regardless of confidence / ProbeOrder.
-		if (have_preferred) {
-			for (int s = 0; s < g_display_source_count && best_claim == NULL; s++) {
-				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
-				const char *sid = (sif != NULL && sif->id != NULL) ? sif->id : NULL;
-				if (sid == NULL || strcmp(sid, preferred_id) != 0) {
-					continue;
-				}
-				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-					if (src_claims[s][c].monitor_id == desc->monitor_id) {
-						best_src = &g_display_sources[s];
-						best_claim = &src_claims[s][c];
-						break;
-					}
-				}
+		// Every source's claim on this monitor, in source order.
+		struct target_screen_candidate cands[TARGET_PLUGIN_MAX_SOURCES];
+		const struct plugin_display_source *cand_src[TARGET_PLUGIN_MAX_SOURCES];
+		const struct xrt_display_claim *cand_claim[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t cand_s[TARGET_PLUGIN_MAX_SOURCES];
+		uint32_t cand_c[TARGET_PLUGIN_MAX_SOURCES];
+		const uint32_t nc = target_screen_collect_candidates(src_view, src_count, desc->monitor_id, cands,
+		                                                     cand_s, cand_c, TARGET_PLUGIN_MAX_SOURCES);
+		for (uint32_t i = 0; i < nc; i++) {
+			cand_src[i] = &g_display_sources[cand_s[i]];
+			cand_claim[i] = &src_claims[cand_s[i]][cand_c[i]];
+		}
+
+		// The dashboard's per-screen selector lists exactly these: the
+		// plug-ins that can drive this monitor. Complete only when every
+		// loadable plug-in was asked (not the POSIX active-only shortcut).
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id != desc->monitor_id) {
+				continue;
 			}
-			if (best_claim != NULL) {
-				U_LOG_W("plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
-				        "(forced over EDID confidence)",
-				        (unsigned long long)desc->monitor_id, preferred_id);
+			for (uint32_t k = 0; k < nc; k++) {
+				(void)snprintf(g_monitor_side[i].cands[k].plugin_id,
+				               sizeof(g_monitor_side[i].cands[k].plugin_id), "%s", cands[k].plugin_id);
+				g_monitor_side[i].cands[k].confidence = cands[k].confidence;
+			}
+			g_monitor_side[i].cand_count = nc;
+			g_monitor_side[i].cands_valid = !g_display_sources_active_only;
+			break;
+		}
+
+		// This monitor's names, for the pin match (the side table is
+		// guarded by g_refresh_mutex, which this function holds).
+		const char *out_name = "";
+		const char *conn_name = "";
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				out_name = g_monitor_side[i].mon.output_name;
+				conn_name = g_monitor_side[i].mon.connector;
+				break;
+			}
+		}
+		// Display dashboard phase 7: the per-screen preference, by the
+		// monitor's stable key (env > per-user file > machine).
+		const char *screen_key = "";
+		const char *legacy_key = "";
+		const char *pre_serial_key = "";
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				screen_key = g_monitor_side[i].key;
+				legacy_key = g_monitor_side[i].legacy_key;
+				pre_serial_key = g_monitor_side[i].pre_serial_key;
+				break;
+			}
+		}
+		char screen_pref[64] = {0};
+		enum u_setting_source pref_source = U_SETTING_SOURCE_DEFAULT;
+		const bool have_screen_pref =
+		    screen_pref_lookup(screen_key, legacy_key, pre_serial_key, screen_pref, sizeof(screen_pref), &pref_source);
+
+		const int pin_idx = target_screen_pin_find(&pins, desc->monitor_id, out_name, conn_name);
+		const char *pin_plugin = pin_idx >= 0 ? pins.pin[pin_idx].plugin_id : NULL;
+		if (pin_idx >= 0) {
+			pin_used[pin_idx] = true;
+		}
+
+		enum target_screen_pick_reason reason = TARGET_SCREEN_PICK_NONE;
+		bool pin_unclaimed = false;
+		bool pref_unclaimed = false;
+		const int pick = target_screen_pick_ex(cands, nc, pin_plugin, have_screen_pref ? screen_pref : NULL,
+		                                       have_preferred ? preferred_id : NULL, &reason, &pin_unclaimed,
+		                                       &pref_unclaimed);
+		if (pref_unclaimed) {
+			// The named plug-in is not loaded, or it has no claim on this monitor.
+			bool loaded = false;
+			for (int s = 0; s < g_display_source_count && !loaded; s++) {
+				const struct xrt_plugin_iface *sif = g_display_sources[s].iface;
+				loaded = sif != NULL && sif->id != NULL && screen_ids_equal(sif->id, screen_pref);
+			}
+			U_LOG_W("plugin loader: per-screen preference '%s' -> '%s' ignored: %s", screen_key,
+			        screen_pref,
+			        loaded ? "that plug-in has no claim on this screen"
+			               : "that plug-in is not loaded (not registered, or it failed to load)");
+		}
+		if (pin_unclaimed) {
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN pins monitor 0x%016llx ('%s'/'%s') to '%s', which has no "
+			    "claim on it — the pin is ignored for this monitor",
+			    (unsigned long long)desc->monitor_id, out_name, conn_name, pin_plugin);
+		}
+		if (pick >= 0) {
+			best_src = cand_src[pick];
+			best_claim = cand_claim[pick];
+		}
+
+		// What confidence alone would pick, for the override logs.
+		int conf_pick = -1;
+		for (uint32_t i = 0; i < nc; i++) {
+			if (conf_pick < 0 || cands[i].confidence > cands[conf_pick].confidence) {
+				conf_pick = (int)i;
 			}
 		}
 
-		// #1521: the ACTIVE plug-in wins any monitor it claims. ProbeOrder
-		// forcing (`scripts\run_cts.ps1 -Plugin <id>`, `register_dev_plugin.bat`)
-		// steers only discover_active_plugin, and the scalar `dp_factory_*` follow
-		// that active plug-in — so without this the registry could name a DIFFERENT
-		// vendor and the registry-routed APIs (in-process GL, the D3D11 service
-		// compositor; both via comp_dp_factory_for_window) would weave with a
-		// different DP than the scalar-routed ones (in-process D3D11/D3D12/VK/Metal).
-		// That is exactly the sim-forced-active-but-Leia-wins-on-EDID-confidence
-		// case. On a normal box this is a no-op: the active plug-in IS the lowest-
-		// ProbeOrder vendor, which is also the confidence winner on the monitors it
-		// claims. A vendor does not claim monitors that are not its own, so those
-		// still fall through to confidence below — sim's FALLBACK backstop and the
-		// Phase 3b multi-vendor intent are preserved. PreferredPlugin (#791) is
-		// resolved first and still outranks this.
-		if (best_claim == NULL) {
-			// What confidence alone would pick: highest confidence wins; ties →
-			// lower ProbeOrder. Sources are already in ascending ProbeOrder, so a
-			// strict `>` keeps the first (lowest-order) source at any confidence.
-			const struct plugin_display_source *conf_src = NULL;
-			const struct xrt_display_claim *conf_claim = NULL;
-			for (int s = 0; s < g_display_source_count; s++) {
-				for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-					const struct xrt_display_claim *cl = &src_claims[s][c];
-					if (cl->monitor_id != desc->monitor_id) {
-						continue;
-					}
-					if (conf_claim == NULL || cl->confidence > conf_claim->confidence) {
-						conf_claim = cl;
-						conf_src = &g_display_sources[s];
-					}
+		if (reason == TARGET_SCREEN_PICK_SCREEN_PREF) {
+			// Once per resolve (rare: instance create, re-probe), and it is the
+			// one line that explains a screen woven by a non-default plug-in.
+			bool over_active = false;
+			for (uint32_t i = 0; i < nc && !cands[pick].is_active; i++) {
+				over_active |= cands[i].is_active;
+			}
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx (screen '%s') -> '%s' by a per-screen preference (%s; "
+			    "confidence=%u)%s",
+			    (unsigned long long)desc->monitor_id, screen_key, cands[pick].plugin_id,
+			    u_setting_source_str(pref_source), cands[pick].confidence,
+			    over_active ? " — the active plug-in's claim on it yields to the explicit preference" : "");
+		} else if (reason == TARGET_SCREEN_PICK_PIN) {
+			U_LOG_I(
+			    "plugin loader: monitor 0x%016llx ('%s'/'%s') → '%s' by DXR_SCREEN_PLUGIN (confidence=%u; "
+			    "outranks PreferredPlugin and the active plug-in for this monitor)",
+			    (unsigned long long)desc->monitor_id, out_name, conn_name, cands[pick].plugin_id,
+			    cands[pick].confidence);
+		} else if (reason == TARGET_SCREEN_PICK_PREFERRED) {
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → PreferredPlugin override '%s' "
+			    "(forced over EDID confidence)",
+			    (unsigned long long)desc->monitor_id, preferred_id);
+		} else if (reason == TARGET_SCREEN_PICK_BETTER_RANKED) {
+			const char *active_name = "?";
+			for (uint32_t i = 0; i < nc; i++) {
+				if (cands[i].is_active) {
+					active_name = cands[i].plugin_id;
 				}
 			}
-
-			// The active plug-in's own claim for this monitor, if it has one.
-			const struct plugin_display_source *act_src = NULL;
-			const struct xrt_display_claim *act_claim = NULL;
-			if (g_active_iface != NULL) {
-				for (int s = 0; s < g_display_source_count && act_claim == NULL; s++) {
-					if (g_display_sources[s].iface != g_active_iface) {
-						continue;
-					}
-					for (uint32_t c = 0; c < src_claim_count[s]; c++) {
-						if (src_claims[s][c].monitor_id == desc->monitor_id) {
-							act_src = &g_display_sources[s];
-							act_claim = &src_claims[s][c];
-							break;
-						}
-					}
-				}
-			}
-
-			if (act_claim != NULL) {
-				best_src = act_src;
-				best_claim = act_claim;
-				// One-off per monitor, and only when the override actually
-				// changes the outcome.
-				if (conf_claim != NULL && conf_claim != act_claim) {
-					const struct xrt_plugin_iface *aif = act_src->iface;
-					const struct xrt_plugin_iface *cif = conf_src->iface;
-					const char *aid = (aif != NULL && aif->id != NULL) ? aif->id : "?";
-					const char *cid = (cif != NULL && cif->id != NULL) ? cif->id : "?";
-					U_LOG_W(
-					    "plugin loader: monitor 0x%016llx → ACTIVE plug-in '%s' "
-					    "(confidence=%u, ProbeOrder=%u) forced over '%s' (confidence=%u) — "
-					    "the weaving DP follows the active plug-in so registry-routed APIs "
-					    "(GL, service D3D11) match the scalar-routed ones (#1521)",
-					    (unsigned long long)desc->monitor_id, aid, (unsigned)act_claim->confidence,
-					    act_src->probe_order, cid, (unsigned)conf_claim->confidence);
-				}
-			} else {
-				best_src = conf_src;
-				best_claim = conf_claim;
-			}
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → '%s' (confidence=%u, ProbeOrder=%u, ranked before "
+			    "the active plug-in) — the active plug-in '%s' claims it only as a fallback: a panel "
+			    "that came up after instance create (display hotplug, ADR-047 Amendment 8)",
+			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
+			    cand_src[pick]->probe_order, active_name);
+		} else if (reason == TARGET_SCREEN_PICK_ACTIVE && conf_pick >= 0 && conf_pick != pick) {
+			// One-off per monitor, and only when the override changes the outcome.
+			U_LOG_W(
+			    "plugin loader: monitor 0x%016llx → ACTIVE plug-in '%s' "
+			    "(confidence=%u, ProbeOrder=%u) forced over '%s' (confidence=%u) — "
+			    "the weaving DP follows the active plug-in so registry-routed APIs "
+			    "(GL, service D3D11) match the scalar-routed ones (#1521)",
+			    (unsigned long long)desc->monitor_id, cands[pick].plugin_id, cands[pick].confidence,
+			    cand_src[pick]->probe_order, cands[conf_pick].plugin_id, cands[conf_pick].confidence);
 		}
 		if (best_claim == NULL) {
 			continue; // no plug-in claimed this monitor
 		}
 		struct xrt_dp_registry_entry *e = &out_registry->entries[out_registry->entry_count++];
 		fill_registry_entry(e, desc, best_src, best_claim);
+		for (uint32_t i = 0; i < g_monitor_side_count; i++) {
+			if (g_monitor_side[i].monitor_id == desc->monitor_id) {
+				e->platform_id = g_monitor_side[i].mon.platform_id;
+				break;
+			}
+		}
+		// Display hotplug (ADR-047 Amendment 8): "present, not ready" — the
+		// plug-in owns the panel, but no display processor may touch it yet:
+		// no factory, so every compositor shows the screen flat 2D.
+		// DXR_TEST_SCREEN_NOT_READY=<output|connector|id-hex> forces it (test).
+		{
+			struct target_screen_pins nr;
+			char spec[96];
+			const char *t = getenv("DXR_TEST_SCREEN_NOT_READY");
+			(void)snprintf(spec, sizeof(spec), "%s=x", t != NULL ? t : "");
+			const bool forced_nr = t != NULL && t[0] != '\0' &&
+			                       target_screen_pin_parse(spec, &nr, NULL) == 1 &&
+			                       target_screen_pin_find(&nr, desc->monitor_id, out_name, conn_name) == 0;
+			if (best_claim->confidence == (uint32_t)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY || forced_nr) {
+				e->not_ready = true;
+				e->dp_factory_vk = NULL;
+				e->dp_factory_gl = NULL;
+				e->dp_factory_d3d11 = NULL;
+				e->dp_factory_d3d12 = NULL;
+				e->dp_factory_metal = NULL;
+				// WARN when a monitor enters the state; repeats (follow-up sweeps) at INFO.
+				bool was_nr = false;
+				for (uint32_t k = 0; k < g_not_ready_prev_count && !was_nr; k++) {
+					was_nr = g_not_ready_prev[k] == desc->monitor_id;
+				}
+				if (nr_count < XRT_DP_REGISTRY_MAX_ENTRIES) {
+					nr_now[nr_count++] = desc->monitor_id;
+				}
+				if (was_nr) {
+					U_LOG_I(
+					    "plugin loader: monitor 0x%016llx → '%s' still PRESENT, NOT READY (flat "
+					    "2D)",
+					    (unsigned long long)desc->monitor_id, e->plugin_id);
+				} else {
+					U_LOG_W(
+					    "plugin loader: monitor 0x%016llx → '%s' PRESENT, NOT READY%s — no display "
+					    "processor, the screen shows flat 2D until the plug-in claims it for real",
+					    (unsigned long long)desc->monitor_id, e->plugin_id,
+					    forced_nr ? " (DXR_TEST_SCREEN_NOT_READY)" : "");
+				}
+			}
+		}
+		if (have_screen_pref) {
+			(void)snprintf(e->preferred_plugin, sizeof(e->preferred_plugin), "%s", screen_pref);
+			e->preferred_source = (uint32_t)pref_source;
+		}
+		if (reason == TARGET_SCREEN_PICK_SCREEN_PREF) {
+			e->forced = true;
+			e->forced_source = (uint32_t)pref_source;
+		}
 		U_LOG_I("plugin loader: monitor 0x%016llx → plug-in '%s' (confidence=%u)",
 		        (unsigned long long)e->monitor_id, e->plugin_id, e->confidence);
+		if (reason == TARGET_SCREEN_PICK_PIN && e->dp_factory_vk == NULL && e->dp_factory_gl == NULL &&
+		    e->dp_factory_d3d11 == NULL && e->dp_factory_d3d12 == NULL && e->dp_factory_metal == NULL) {
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN pinned monitor 0x%016llx to '%s', but it offers no "
+			    "display-processor factory for it — that screen will not be woven",
+			    (unsigned long long)e->monitor_id, e->plugin_id);
+		}
+	}
+
+	for (uint32_t i = 0; i < nr_count; i++) {
+		g_not_ready_prev[i] = nr_now[i];
+	}
+	g_not_ready_prev_count = nr_count;
+
+	for (uint32_t i = 0; i < pins.count; i++) {
+		if (!pin_used[i]) {
+			U_LOG_W(
+			    "plugin loader: DXR_SCREEN_PLUGIN entry '%s=%s' names no known monitor (match an output "
+			    "or connector name, e.g. HDMI-1 / HDMI-A-1, or a monitor id in hex)",
+			    pins.pin[i].match, pins.pin[i].plugin_id);
+		}
 	}
 
 	if (g_refresh_mutex_initialized) {
 		os_mutex_unlock(&g_refresh_mutex);
 	}
+}
+
+void
+target_plugin_release_claim_sources(void)
+{
+#if !defined(XRT_OS_WINDOWS) && !defined(XRT_OS_ANDROID)
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	for (int s = 0; s < g_display_source_count; s++) {
+		struct plugin_display_source *src = &g_display_sources[s];
+		// The active plug-in's instance belongs to discovery and outlives
+		// any one xrt_instance; only the claim-only instances are ours.
+		// destroy() pairs with the probe() that made the instance, even when
+		// probe() handed back NULL (a plug-in with process-global state).
+		if (src->iface == NULL || src->iface == g_active_iface) {
+			continue;
+		}
+		if (src->iface->destroy != NULL) {
+			U_LOG_I("plugin loader: releasing display-claim source id=%s",
+			        src->iface->id != NULL ? src->iface->id : "?");
+			src->iface->destroy(src->inst);
+		}
+		src->inst = NULL;
+	}
+	// The next resolve re-collects (and re-probes) from scratch. The dlopen
+	// handles stay loaded, as everywhere else in this loader: a re-collection
+	// just takes another reference.
+	g_display_source_count = -1;
+	g_display_sources_active_only = false;
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+#endif
+}
+
+uint32_t
+target_plugin_rescan_claim_sources(void)
+{
+#if !defined(XRT_OS_ANDROID)
+	(void)target_plugin_get_active();
+	if (g_refresh_mutex_initialized) {
+		os_mutex_lock(&g_refresh_mutex);
+	}
+	uint32_t added = 0;
+	if (g_display_source_count >= 0) {
+		// A user-pinned active plug-in (PreferredPlugin == active) wins every
+		// monitor it claims (rule 2), and the shortcut set means it claimed
+		// them all: loading the others could change nothing, and #1874 keeps
+		// them (and the vendor service they reach) out of the process. Any
+		// other set loads the rest now — a better-ranked plug-in may have
+		// found a hotplugged panel (rule 3's carve-out).
+		char preferred[64] = {0};
+		const bool pinned_active = target_plugin_get_preferred(preferred, sizeof(preferred)) &&
+		                           g_active_iface != NULL && g_active_iface->id != NULL &&
+		                           strcmp(preferred, g_active_iface->id) == 0;
+		if (!(g_display_sources_active_only && pinned_active)) {
+			const int before = g_display_source_count;
+			g_display_source_count = rescan_display_sources_platform(
+			    g_display_sources, g_display_source_count, TARGET_PLUGIN_MAX_SOURCES);
+			added = (uint32_t)(g_display_source_count - before);
+			// Every loadable plug-in has now been asked: the set is the full one.
+			g_display_sources_active_only = false;
+		}
+	}
+	// g_display_source_count < 0: never collected; the next resolve collects
+	// (and so probes) every plug-in from scratch.
+	if (g_refresh_mutex_initialized) {
+		os_mutex_unlock(&g_refresh_mutex);
+	}
+	return added;
+#else
+	// Android: one plug-in, no claim-only sources. (Windows rescans like
+	// POSIX since #2305: rescan_display_sources_platform walks the same
+	// registry entries discovery does, so a vendor plug-in that declined at
+	// instance create — no panel then — is asked again on a hotplug.)
+	return 0;
+#endif
 }

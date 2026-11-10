@@ -155,6 +155,100 @@ bool
 comp_ipc_client_compositor_get_window_metrics(struct xrt_compositor *xc, struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3) — same gating contract as
+ * comp_ipc_client_compositor_get_window_metrics (only valid when @p xc is an
+ * ipc_client_compositor).
+ *
+ * - `segments_enable`: ask the service to weave this session's window per
+ *   screen when it spans monitors (the service owns the screen registry;
+ *   @p pinned_display_id is the session's XrSessionDisplayBindingDXR pin, 0 =
+ *   none). Sent once, at session create.
+ * - `get_segment_metrics`: the segment table the service's last weave of this
+ *   window took, eyes predicted now (count 0 = one view set). False on an
+ *   empty table or a failed call.
+ * - `set_view_routing`: where each segment's views are in the next frame's
+ *   projection layer (count 0 = unrouted). Best-effort.
+ */
+struct xrt_segment_metrics;
+struct xrt_segment_view_routing;
+
+void
+comp_ipc_client_compositor_segments_enable(struct xrt_compositor *xc, uint64_t pinned_display_id);
+
+bool
+comp_ipc_client_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
+void
+comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
+ * XR_DXR_display_info v25 over IPC: tell the service whether this client's
+ * locates are fixed-viewer (XrViewLocateFixedViewerDXR) — framed for the
+ * nominal viewer, asking the service-hosted viewer tracking for nothing. The
+ * service applies it to every view / eye / segment query from this client
+ * until the next call. Sent on change only. The system-compositor variant
+ * serves sessions without a compositor (same contract as the
+ * get_predicted_eye_positions pair). False on a failed call.
+ */
+struct xrt_system_compositor;
+
+bool
+comp_ipc_client_compositor_set_fixed_viewer(struct xrt_compositor *xc, bool fixed);
+
+bool
+comp_ipc_client_system_compositor_set_fixed_viewer(struct xrt_system_compositor *xsysc, bool fixed);
+
+/*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): hand the service this
+ * frame's runtime-drawn cursor request (call it right before the commit it
+ * belongs to). The service answers with the outcome of the PREVIOUS request
+ * (#1952; its draw happens at or after that commit), which this writes into
+ * @p req's report.
+ *
+ * Same gating contract as comp_ipc_client_compositor_get_window_metrics. The
+ * app's own sprite swapchain does not cross yet: such a request is refused
+ * here (SPRITE_UNUSABLE) without IPC traffic.
+ *
+ * @return true when @p req's report was written (an answer exists); false
+ *         before the service has answered anything, or on IPC failure.
+ */
+struct u_cursor_draw_request;
+
+bool
+comp_ipc_client_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): hand the
+ * D3D11 service this frame's measured-disparity request (for the commit that
+ * follows) and keep the newest measurement it returns. Same gating contract as
+ * comp_ipc_client_compositor_set_cursor_draw_request.
+ *
+ * @return false on IPC failure (the placement then has no content).
+ */
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+
+bool
+comp_ipc_client_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                      const struct u_cursor_measure_request *req);
+
+/*!
+ * The newest measurement comp_ipc_client_compositor_set_cursor_measure_request
+ * received. @return @p out->valid.
+ */
+bool
+comp_ipc_client_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
+/*!
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the per-screen segment table
+ * of this present-owner's last weave, every screen's eyes included (count 0 =
+ * woven by one display processor). Zeroed on any failure; the result is
+ * XRT_ERROR_IPC_FAILURE only for a dead connection.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
+/*!
  * Phase 2 workspace_sync_fence bridges. Same gating contract as
  * comp_ipc_client_compositor_get_window_metrics — only valid when @p xc is
  * an ipc_client_compositor. Used by the D3D11 client compositor to import
@@ -238,6 +332,11 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  *   must be physically FLAT; the service publishes union(rects) minus
  *   union(flat_rects) as the per-region hardware wish. Advisory and hardware-only
  *   — 0 is byte-for-byte pre-v8.
+ *   @p mono_in_2d (spec v13): while the session's hardware state is 2D, the
+ *   desktop-Linux engine presents one view (stereo: the left) flat instead of weaving.
+ *   @p out_segment_count (optional, spec v19 cheap split signal): how many
+ *   screens the service wove this submit on — 0 for a window on one screen, so
+ *   the caller fetches the per-screen table (weave_get_segments) only past 0.
  * @c weave_set_screen_flat_regions latches the STICKY screen-space flat regions
  *   (spec v8, absolute physical screen px, held until the next call).
  * @c weave_get_output / @c weave_get_fence fetch the persistent server-allocated
@@ -245,6 +344,8 @@ comp_ipc_client_compositor_get_transparent_output_fence(struct xrt_compositor *x
  */
 xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
+
+struct xrt_weave_woven_origin; // xrt/xrt_weave_dmabuf.h
 
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
@@ -264,11 +365,17 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        bool mono_in_2d,
+                                        bool overlay_unchanged,
+                                        float overlay_filter_strength,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes);
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_segment_count,
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
@@ -286,6 +393,27 @@ xrt_result_t
 comp_ipc_client_compositor_weave_get_fence(struct xrt_compositor *xc,
                                            bool *out_have_fence,
                                            xrt_graphics_sync_handle_t *out_handle);
+
+/*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): stage the weave-rect cursor
+ * request of the NEXT weave_submit on this connection. Sent only by a submit
+ * that chained XrCursorDepthWeaveRequestDXR (zero cost otherwise).
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v8: hand over the texture carrier of a new sprite
+ * generation (the handle is copied, not consumed). Sent on a sprite change only.
+ */
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info);
+
+//! XR_DXR_cursor_depth v8: what the last weave_submit's cursor request drew.
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
 
 /*!
  * Workspace controller bridges (XR_DXR_spatial_workspace).
@@ -386,6 +514,22 @@ comp_ipc_client_compositor_workspace_set_focused_client(struct xrt_compositor *x
 xrt_result_t
 comp_ipc_client_compositor_workspace_set_reserved_keys(struct xrt_compositor *xc,
                                                        const struct ipc_workspace_reserved_keys *table);
+
+/*!
+ * spec_version 25 (ADR-052): the workspace's screens, and a window placement
+ * in any screen's display space.
+ */
+xrt_result_t
+comp_ipc_client_compositor_workspace_enumerate_screens(struct xrt_compositor *xc,
+                                                       struct ipc_workspace_screen_list *out_list);
+xrt_result_t
+comp_ipc_client_compositor_workspace_set_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          const struct ipc_workspace_window_placement *placement);
+xrt_result_t
+comp_ipc_client_compositor_workspace_get_window_placement(struct xrt_compositor *xc,
+                                                          uint32_t client_id,
+                                                          struct ipc_workspace_window_placement *out_placement);
 
 xrt_result_t
 comp_ipc_client_compositor_workspace_get_focused_client(struct xrt_compositor *xc, uint32_t *out_client_id);

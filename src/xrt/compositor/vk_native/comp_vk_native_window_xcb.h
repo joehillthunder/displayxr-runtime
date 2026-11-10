@@ -86,6 +86,7 @@ struct comp_vk_native_wayland_handle
 };
 
 struct comp_vk_native_window_xcb;
+struct xrt_system_devices;
 
 /*!
  * Wrap an app-provided Xlib window (XR_DXR_xlib_window_binding) into the XCB
@@ -173,6 +174,14 @@ comp_vk_native_window_xcb_query_refresh_hz(const struct comp_vk_native_xcb_handl
  *                               wired in Phase 1 (desktop WSI usually exposes
  *                               only OPAQUE compositeAlpha). Accepted for API
  *                               parity with the macOS/Windows helpers.
+ * @param adopt_own_window_auto  Default for adopt-own-window mode (#2322): create
+ *                               the window as an input-transparent CHILD of this
+ *                               process's own largest viewable top-level instead
+ *                               of a new top-level, when there is one. The caller
+ *                               passes true for a hosted app whose VkInstance has
+ *                               no VK_KHR_xcb_surface (a hosted Windows app under
+ *                               a translation layer). DXR_XCB_ADOPT_OWN_WINDOW=1
+ *                               forces the mode, =0 disables it.
  * @param out_win                Receives the created window handle.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -183,7 +192,22 @@ comp_vk_native_window_xcb_create(uint32_t width,
                                  int32_t screen_left,
                                  int32_t screen_top,
                                  bool transparent_background,
+                                 bool adopt_own_window_auto,
                                  struct comp_vk_native_window_xcb **out_win);
+
+/*!
+ * Route keyboard and mouse input from the self-owned window into the qwerty
+ * driver (#1727) — the Linux counterpart of comp_d3d11_window_set_system_devices.
+ *
+ * Input is decoded and dispatched from @ref comp_vk_native_window_xcb_pump, so
+ * it arrives at the cadence the compositor pumps the window (every frame).
+ * A no-op when the runtime is built without the qwerty driver.
+ *
+ * @param xsysd System devices whose qwerty devices receive the input; NULL
+ *              detaches (and releases anything held).
+ */
+void
+comp_vk_native_window_xcb_set_system_devices(struct comp_vk_native_window_xcb *win, struct xrt_system_devices *xsysd);
 
 /*!
  * Fill in the surface handle (connection + window) for VkSurfaceKHR creation.

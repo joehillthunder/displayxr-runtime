@@ -7,6 +7,7 @@
  */
 
 #include "service_orchestrator.h"
+#include "service_spawn.h"
 #include "service_tray_win.h"
 #include "service_workspace_registry.h"
 
@@ -63,6 +64,20 @@ DEBUG_GET_ONCE_LOG_OPTION(orchestrator_log, "DISPLAYXR_ORCHESTRATOR_LOG", U_LOGG
 #define WM_ORCHESTRATOR_SPAWN_WORKSPACE    (WM_APP + 100)
 #define WM_ORCHESTRATOR_INSTALL_HOOK   (WM_APP + 101)
 #define WM_ORCHESTRATOR_UNINSTALL_HOOK (WM_APP + 102)
+// Display dashboard phase 8: system_reload_service_config, marshalled onto the
+// tray thread so every config mutation (tray menu, reload RPC) runs there.
+#define WM_ORCHESTRATOR_RELOAD_CONFIG (WM_APP + 103)
+// Display dashboard phase 8: system_workspace_hotkey_suspend (wParam 1 / 0).
+#define WM_ORCHESTRATOR_HOTKEY_SUSPEND (WM_APP + 104)
+
+//! SetTimer id on the tray HWND for the suspend safety timeout. Only this id is
+//! intercepted by our subclass; every other WM_TIMER reaches the tray proc.
+#define HOTKEY_SUSPEND_TIMER_ID 0xD8A1
+#define HOTKEY_SUSPEND_TIMEOUT_MS 60000
+
+//! wParam of WM_ORCHESTRATOR_SPAWN_WORKSPACE: who asked (for the log line).
+#define SPAWN_REASON_HOTKEY 0
+#define SPAWN_REASON_LAUNCH_REQUEST 1
 
 
 /*
@@ -89,6 +104,19 @@ static HHOOK s_kbd_hook = NULL;
 static bool s_workspace_available = false;
 static struct workspace_controller_entry s_workspace_active = {0};
 
+// Display dashboard phase 8: the active controller's launch settings with
+// every default applied (mode + hotkey), recomputed from s_cfg whenever it or
+// the active controller changes. The hook proc reads only the two words
+// below, which the tray thread (the hook's own thread) writes — no lock.
+static struct service_launch_resolved s_launch = {0};
+static volatile uint32_t s_hook_vk = 0;   //!< 0 = no hotkey
+static volatile uint32_t s_hook_mods = 0; //!< SERVICE_HOTKEY_MOD_* bits
+
+// Display dashboard phase 8: the hook is out of the input pipeline on request
+// (a hotkey-capture box must see the current combo). Tray thread only. Never
+// persisted; ended by an explicit resume or the 60 s safety timeout.
+static bool s_hotkey_suspended = false;
+
 
 /*
  *
@@ -101,37 +129,41 @@ static struct workspace_controller_entry s_workspace_active = {0};
 // file), but the watchdog and spawn_workspace need to call them per #344.
 static bool install_workspace_hotkey(void);
 static void uninstall_workspace_hotkey(void);
+static void
+apply_workspace_mode(enum service_child_mode mode);
 
-//! Build the path to a sibling executable next to displayxr-service.exe.
-static bool
-sibling_exe_path(const char *exe_name, char *buf, size_t buf_size)
+//! Recompute s_launch (and the hook's combo) for the active controller.
+static void
+refresh_launch_settings(void)
 {
-	char self_path[MAX_PATH];
-	DWORD len = GetModuleFileNameA(NULL, self_path, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		return false;
-	}
+	service_config_resolve_launch(&s_cfg, s_workspace_available ? s_workspace_active.id : "", true, &s_launch);
+	s_hook_mods = s_launch.has_hotkey ? s_launch.hotkey.mods : 0;
+	s_hook_vk = s_launch.has_hotkey ? s_launch.hotkey.vk : 0;
 
-	// Strip filename to get directory
-	char *last_sep = strrchr(self_path, '\\');
-	if (!last_sep) {
-		last_sep = strrchr(self_path, '/');
-	}
-	if (!last_sep) {
-		return false;
-	}
-	*(last_sep + 1) = '\0';
+	// Advisory, for the controller: the combo that summons it, so it can
+	// bind the same chord to dismiss itself. Inherited by the spawned child.
+	SetEnvironmentVariableA("DISPLAYXR_WORKSPACE_HOTKEY", s_launch.has_hotkey ? s_launch.hotkey_text : NULL);
+}
 
-	snprintf(buf, buf_size, "%s%s", self_path, exe_name);
-	return true;
+//! The active controller's effective lifecycle mode.
+static enum service_child_mode
+active_mode(void)
+{
+	return s_launch.mode;
+}
+
+//! Human-readable combo for log lines.
+static const char *
+hotkey_label(void)
+{
+	return s_launch.has_hotkey ? s_launch.hotkey_text : "(no hotkey)";
 }
 
 //! Existence check that excludes directories.
 static bool
 sibling_file_exists(const char *path)
 {
-	DWORD attrs = GetFileAttributesA(path);
-	return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+	return service_spawn_file_exists(path);
 }
 
 //! Returns true if @p s contains a path separator (\ or /) — used to
@@ -190,22 +222,17 @@ detect_workspace_controller(const struct service_config *cfg)
 		return;
 	}
 
-	// 3. Preferred-id match.
-	int picked = 0;
-	if (cfg->workspace_binary[0] != '\0') {
-		bool found = false;
-		for (int i = 0; i < n; i++) {
-			if (_stricmp(entries[i].id, cfg->workspace_binary) == 0) {
-				picked = i;
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			OW("Preferred workspace controller id '%s' not registered; "
-			   "falling back to '%s'",
-			   cfg->workspace_binary, entries[0].id);
-		}
+	// 3. Preferred-id match, else the first entry — the shared selection
+	//    rule (service_config_pick_controller), so `displayxr-cli workspace
+	//    list` names the same active controller this spawns.
+	int picked = service_config_pick_controller(cfg, entries, n);
+	if (picked < 0) {
+		picked = 0;
+	}
+	if (cfg->workspace_binary[0] != '\0' && _stricmp(entries[picked].id, cfg->workspace_binary) != 0) {
+		OW("Preferred workspace controller id '%s' not registered; "
+		   "falling back to '%s'",
+		   cfg->workspace_binary, entries[picked].id);
 	}
 
 	// 4. Commit selection.
@@ -217,92 +244,19 @@ detect_workspace_controller(const struct service_config *cfg)
 	   s_workspace_active.binary);
 }
 
-//! Launch a child process and return its PROCESS_INFORMATION.
-//! If log_path is non-NULL, child's stdout and stderr are redirected to it.
-static bool
-launch_child_with_log(const char *exe_path, const char *args,
-                      const char *log_path, PROCESS_INFORMATION *pi)
-{
-	char cmd[1024];
-	if (args && args[0]) {
-		snprintf(cmd, sizeof(cmd), "\"%s\" %s", exe_path, args);
-	} else {
-		snprintf(cmd, sizeof(cmd), "\"%s\"", exe_path);
-	}
-
-	STARTUPINFOA si;
-	ZeroMemory(&si, sizeof(si));
-	si.cb = sizeof(si);
-	ZeroMemory(pi, sizeof(*pi));
-
-	HANDLE log_h = INVALID_HANDLE_VALUE;
-	BOOL inherit = FALSE;
-	if (log_path && log_path[0]) {
-		SECURITY_ATTRIBUTES sa;
-		ZeroMemory(&sa, sizeof(sa));
-		sa.nLength = sizeof(sa);
-		sa.bInheritHandle = TRUE;
-		log_h = CreateFileA(log_path,
-		                    FILE_APPEND_DATA | SYNCHRONIZE,
-		                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-		                    &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-		if (log_h != INVALID_HANDLE_VALUE) {
-			si.dwFlags = STARTF_USESTDHANDLES;
-			si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-			si.hStdOutput = log_h;
-			si.hStdError = log_h;
-			inherit = TRUE;
-		} else {
-			OW("Failed to open log file %s (error %lu)", log_path,
-			   (unsigned long)GetLastError());
-		}
-	}
-
-	BOOL ok = CreateProcessA(NULL, cmd, NULL, NULL, inherit, CREATE_NO_WINDOW, NULL, NULL, &si, pi);
-	if (log_h != INVALID_HANDLE_VALUE) {
-		CloseHandle(log_h); // our copy; child keeps its own
-	}
-	if (!ok) {
-		OW("Failed to launch: %s (error %lu)", cmd, (unsigned long)GetLastError());
-		return false;
-	}
-
-	// Close the thread handle immediately — we only need the process handle
-	CloseHandle(pi->hThread);
-	pi->hThread = NULL;
-
-	return true;
-}
-
+//! Launch a child process (no console window); the spawn mechanics are shared
+//! with the conversion-host supervisor (service_spawn.c).
 static bool
 launch_child(const char *exe_path, const char *args, PROCESS_INFORMATION *pi)
 {
-	return launch_child_with_log(exe_path, args, NULL, pi);
-}
-
-//! Build %LOCALAPPDATA%\DisplayXR\<basename>.log.
-static bool
-appdata_log_path(const char *basename, char *buf, size_t buf_size)
-{
-	char appdata[MAX_PATH];
-	DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", appdata, MAX_PATH);
-	if (len == 0 || len >= MAX_PATH) {
-		return false;
-	}
-	snprintf(buf, buf_size, "%s\\DisplayXR\\%s.log", appdata, basename);
-	return true;
+	return service_spawn_child(exe_path, args, NULL, 0, pi);
 }
 
 //! Terminate a child process if running.
 static void
 terminate_child(PROCESS_INFORMATION *pi, bool *running_flag)
 {
-	if (pi->hProcess) {
-		TerminateProcess(pi->hProcess, 0);
-		WaitForSingleObject(pi->hProcess, 3000);
-		CloseHandle(pi->hProcess);
-		pi->hProcess = NULL;
-	}
+	service_spawn_terminate(pi, 0, 3000);
 	if (running_flag) {
 		*running_flag = false;
 	}
@@ -347,16 +301,18 @@ workspace_watch_thread_body(LPVOID param)
 
 	// #344: in Auto mode the hook is uninstalled while the controller is
 	// running (see spawn_workspace). Re-install it now so the next
-	// Ctrl+Space re-spawns the workspace. install_workspace_hotkey is
-	// a PostMessage to the tray thread — safe from this watchdog thread.
-	if (s_cfg.workspace == SERVICE_CHILD_AUTO && s_workspace_available) {
+	// launch-hotkey press re-spawns the workspace (none configured → no hook).
+	// install_workspace_hotkey is a PostMessage to the tray thread — safe
+	// from this watchdog thread.
+	if (active_mode() == SERVICE_CHILD_AUTO && s_workspace_available && s_launch.has_hotkey &&
+	    !s_hotkey_registered && !s_hotkey_suspended) {
 		if (install_workspace_hotkey()) {
 			s_hotkey_registered = true;
 		}
 	}
 
 	// In Enable mode, restart the workspace controller
-	if (s_cfg.workspace == SERVICE_CHILD_ENABLE && s_workspace_available) {
+	if (active_mode() == SERVICE_CHILD_ENABLE && s_workspace_available) {
 		if (launch_child(s_workspace_active.binary, "--service-managed", &s_workspace_pi)) {
 			s_workspace_running = true;
 			OW("Restarted workspace controller (Enable mode)");
@@ -395,12 +351,12 @@ spawn_workspace(void)
 		AllowSetForegroundWindow(s_workspace_pi.dwProcessId);
 	}
 
-	// #344: in Auto mode, the controller now owns Ctrl+Space via its own
-	// RegisterHotKey. Pull our LL keyboard hook out of the input pipeline
+	// #344: in Auto mode, the controller now owns its toggle chord via its
+	// own RegisterHotKey. Pull our LL keyboard hook out of the input pipeline
 	// for the duration — no chance of throttling other chords, and the
 	// shell's hotkey works without going through CallNextHookEx. The
 	// watchdog re-installs the hook when the controller exits.
-	if (s_cfg.workspace == SERVICE_CHILD_AUTO && s_hotkey_registered) {
+	if (active_mode() == SERVICE_CHILD_AUTO && s_hotkey_registered) {
 		uninstall_workspace_hotkey();
 		s_hotkey_registered = false;
 	}
@@ -418,9 +374,10 @@ spawn_workspace(void)
  * Hotkey handling — low-level keyboard hook (WH_KEYBOARD_LL).
  *
  * RegisterHotKey turned out unreliable on systems where Windows IME or
- * third-party launchers already claim Ctrl+Space (error 1408 on every
- * plausible combo). A low-level keyboard hook runs before global-hotkey
- * dispatch, so our chord always wins.
+ * third-party launchers already claim the combo (error 1408 on every
+ * plausible combo; first seen with the old Ctrl+Space default). A
+ * low-level keyboard hook runs before global-hotkey dispatch, so our chord
+ * always wins — which is also why the default must not be a combo apps use.
  *
  * The hook proc runs on the thread that installed it (the tray thread,
  * which has a GetMessage pump). From there we PostMessage a custom
@@ -430,7 +387,8 @@ spawn_workspace(void)
  *
  * #344: the hook is *uninstalled* while the controller is running (see
  * spawn_workspace + workspace_watch_thread_func). The shell owns
- * Ctrl+Space via its own RegisterHotKey while it's up; we only need the
+ * its toggle chord (the same combo by default, Ctrl+Shift+Space) via its own
+ * RegisterHotKey while it's up; we only need the
  * LL hook to handle the "no controller running → spawn one" case. This
  * keeps the runtime entirely out of the keyboard pipeline whenever the
  * workspace is alive — no chance of throttling/disabling other chords
@@ -455,14 +413,31 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 	if (wParam != WM_KEYDOWN && wParam != WM_SYSKEYDOWN) goto pass;
 
 	KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lParam;
-	if (kbd->vkCode != VK_SPACE) goto pass;
+	const uint32_t want_vk = s_hook_vk;
+	if (want_vk == 0 || kbd->vkCode != want_vk)
+		goto pass;
 
-	// Ctrl-only — anything else (Ctrl+Shift+Space, Win+Space IME switch, …)
-	// passes through. GetAsyncKeyState is a register read; sub-microsecond.
-	if (!(GetAsyncKeyState(VK_CONTROL) & 0x8000)) goto pass;
-	if (  GetAsyncKeyState(VK_SHIFT)   & 0x8000)  goto pass;
-	if (  GetAsyncKeyState(VK_MENU)    & 0x8000)  goto pass;
-	if ( (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000) goto pass;
+	// Display dashboard phase 8: the configured combo (service.json,
+	// SERVICE_HOTKEY_DEFAULT = Ctrl+Shift+Space when absent) must match
+	// EXACTLY — every required modifier down, every other modifier up — so
+	// with the default, plain Ctrl+Space (an app's binding: editor completion,
+	// "maximize area", the IME switch) and Win+Space pass through untouched,
+	// and a user who stored Ctrl+Space does not swallow Ctrl+Shift+Space.
+	// GetAsyncKeyState is a register read; sub-microsecond.
+	{
+		const uint32_t want = s_hook_mods;
+		uint32_t down = 0;
+		if (GetAsyncKeyState(VK_CONTROL) & 0x8000)
+			down |= SERVICE_HOTKEY_MOD_CTRL;
+		if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+			down |= SERVICE_HOTKEY_MOD_SHIFT;
+		if (GetAsyncKeyState(VK_MENU) & 0x8000)
+			down |= SERVICE_HOTKEY_MOD_ALT;
+		if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)
+			down |= SERVICE_HOTKEY_MOD_WIN;
+		if (down != want)
+			goto pass;
+	}
 
 	// Controller already up? In the normal AUTO path the hook is
 	// uninstalled while running (see spawn_workspace), so this check is
@@ -485,20 +460,85 @@ orchestrator_kbd_hook_proc(int nCode, WPARAM wParam, LPARAM lParam)
 	// reads PROCESS_INFORMATION etc.; never call it from the hook stack.
 	{
 		HWND hwnd = (HWND)service_tray_get_hwnd();
-		if (hwnd) PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, 0, 0);
+		if (hwnd)
+			PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, SPAWN_REASON_HOTKEY, 0);
 	}
-	return 1; // swallow — don't let other handlers see Ctrl+Space
+	return 1; // swallow — don't let other handlers see the launch combo
 
 pass:
 	return CallNextHookEx(s_kbd_hook, nCode, wParam, lParam);
+}
+
+//! Tray thread: take the hook out until resumed or the safety timeout fires.
+static void
+suspend_hotkey_on_tray_thread(HWND hwnd)
+{
+	s_hotkey_suspended = true;
+	SetTimer(hwnd, HOTKEY_SUSPEND_TIMER_ID, HOTKEY_SUSPEND_TIMEOUT_MS, NULL); // re-arms if already set
+	if (s_hotkey_registered) {
+		uninstall_workspace_hotkey();
+		s_hotkey_registered = false;
+	}
+	OW("Workspace launch hotkey %s SUSPENDED (hook out; resumes on request or in %d s)", hotkey_label(),
+	   HOTKEY_SUSPEND_TIMEOUT_MS / 1000);
+}
+
+//! Tray thread: end a suspension and re-install the hook from the current config.
+static void
+resume_hotkey_on_tray_thread(HWND hwnd, const char *reason)
+{
+	KillTimer(hwnd, HOTKEY_SUSPEND_TIMER_ID);
+	if (!s_hotkey_suspended) {
+		return;
+	}
+	s_hotkey_suspended = false;
+	OW("Workspace launch hotkey %s RESUMED (%s)", hotkey_label(), reason);
+	if (active_mode() == SERVICE_CHILD_AUTO) {
+		apply_workspace_mode(SERVICE_CHILD_AUTO); // installs iff hotkey set + controller not running
+	}
+}
+
+//! Tray thread: re-read service.json and apply it (system_reload_service_config).
+static void
+reload_config_on_tray_thread(void)
+{
+	struct service_config cfg;
+	service_config_load(&cfg);
+	// The tray keeps its own copy for its menu writes; refresh it first so a
+	// later menu click saves on top of what the CLI wrote, not over it.
+	service_tray_set_config(&cfg);
+	service_orchestrator_apply_config(&cfg);
+	OW("service.json reloaded: active controller '%s' mode=%s hotkey=%s",
+	   s_workspace_available ? s_workspace_active.id : "(none)", service_config_launch_mode_str(active_mode()),
+	   hotkey_label());
 }
 
 static LRESULT CALLBACK
 orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	if (msg == WM_ORCHESTRATOR_SPAWN_WORKSPACE) {
-		OW("Ctrl+Space pressed — launching workspace controller");
+		if (wParam == SPAWN_REASON_LAUNCH_REQUEST) {
+			OW("Launch requested over IPC — launching workspace controller");
+		} else {
+			OW("%s pressed — launching workspace controller", hotkey_label());
+		}
 		spawn_workspace();
+		return 0;
+	}
+	if (msg == WM_ORCHESTRATOR_RELOAD_CONFIG) {
+		reload_config_on_tray_thread();
+		return 0;
+	}
+	if (msg == WM_ORCHESTRATOR_HOTKEY_SUSPEND) {
+		if (wParam != 0) {
+			suspend_hotkey_on_tray_thread(hwnd);
+		} else {
+			resume_hotkey_on_tray_thread(hwnd, "explicit");
+		}
+		return 0;
+	}
+	if (msg == WM_TIMER && wParam == HOTKEY_SUSPEND_TIMER_ID) {
+		resume_hotkey_on_tray_thread(hwnd, "timeout");
 		return 0;
 	}
 	if (msg == WM_ORCHESTRATOR_INSTALL_HOOK) {
@@ -510,7 +550,7 @@ orchestrator_wnd_proc_hook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 				OW("SetWindowsHookEx(WH_KEYBOARD_LL) failed: error %lu",
 				   (unsigned long)GetLastError());
 			} else {
-				OW("Installed Ctrl+Space keyboard hook (Auto mode)");
+				OW("Installed %s keyboard hook (Auto mode)", hotkey_label());
 			}
 		}
 		return 0;
@@ -613,17 +653,26 @@ apply_workspace_mode(enum service_child_mode mode)
 		break;
 
 	case SERVICE_CHILD_AUTO:
-		// Install low-level keyboard hook so Ctrl+Space summons the workspace
+		// Install low-level keyboard hook so the launch combo summons the workspace
 		// controller. #344: the hook is only active when the controller is
 		// NOT running — spawn_workspace uninstalls it on a successful launch
-		// (the shell's own RegisterHotKey owns Ctrl+Space while up), and the
+		// (the shell's own RegisterHotKey owns its toggle chord while up), and the
 		// watchdog re-installs it on controller exit. This keeps the runtime
 		// out of the keyboard pipeline whenever the workspace is alive, so
 		// even an LL-hook timeout couldn't throttle other chords.
 		//
 		// Actual install happens on the tray thread via PostMessage; log only
-		// on failure here.
-		if (!s_hotkey_registered) {
+		// on failure here. Phase 8: `--no-hotkey` → no hook at all (the
+		// controller is then launched only by `workspace launch` / the tray).
+		if (!s_launch.has_hotkey) {
+			if (s_hotkey_registered) {
+				uninstall_workspace_hotkey();
+				s_hotkey_registered = false;
+			}
+			OW("Workspace controller has no launch hotkey (service.json); hook not installed");
+		} else if (s_hotkey_suspended) {
+			// system_workspace_hotkey_suspend: the resume installs it.
+		} else if (!s_hotkey_registered && !s_workspace_running) {
 			if (install_workspace_hotkey()) {
 				s_hotkey_registered = true;
 			} else {
@@ -658,8 +707,9 @@ service_orchestrator_init(const struct service_config *cfg)
 	// short-circuits when no controller is installed, leaving the runtime as a
 	// standalone OpenXR + WebXR platform with no spatial-desktop features.
 	detect_workspace_controller(cfg);
+	refresh_launch_settings();
 
-	apply_workspace_mode(cfg->workspace);
+	apply_workspace_mode(active_mode());
 
 	return true;
 }
@@ -675,18 +725,80 @@ service_orchestrator_refresh_workspace_controller(void)
 {
 	bool was_available = s_workspace_available;
 	detect_workspace_controller(&s_cfg);
+	refresh_launch_settings();
 
 	// If availability just flipped (controller installed / uninstalled
 	// while the service was running), re-apply the current workspace
 	// mode so:
 	//   - mode=ENABLE → spawns the controller now that we know it exists
-	//   - mode=AUTO   → installs the Ctrl+Space hotkey
+	//   - mode=AUTO   → installs the launch-hotkey hook
 	//   - mode=DISABLE → terminates any stray controller (no-op if none)
 	// apply_workspace_mode itself early-returns when !s_workspace_available,
 	// so the false→true and true→false transitions are both safe.
 	if (was_available != s_workspace_available) {
-		apply_workspace_mode(s_cfg.workspace);
+		apply_workspace_mode(active_mode());
 	}
+}
+
+bool
+service_orchestrator_request_config_reload(void)
+{
+	HWND hwnd = (HWND)service_tray_get_hwnd();
+	if (hwnd == NULL) {
+		return false;
+	}
+	return PostMessageW(hwnd, WM_ORCHESTRATOR_RELOAD_CONFIG, 0, 0) != 0;
+}
+
+uint32_t
+service_orchestrator_request_launch(const char *controller_id)
+{
+	if (!s_workspace_available) {
+		return SERVICE_LAUNCH_NO_CONTROLLER;
+	}
+	if (controller_id == NULL || _stricmp(controller_id, s_workspace_active.id) != 0) {
+		return SERVICE_LAUNCH_NOT_ACTIVE;
+	}
+	if (active_mode() == SERVICE_CHILD_DISABLE) {
+		return SERVICE_LAUNCH_DISABLED;
+	}
+	if (s_workspace_running) {
+		return SERVICE_LAUNCH_ALREADY_RUNNING;
+	}
+	// Same singleton probe as the hotkey path: a controller started outside
+	// the orchestrator (direct CLI launch) counts as running.
+	HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\DisplayXR.Shell.Singleton");
+	if (existing != NULL) {
+		CloseHandle(existing);
+		return SERVICE_LAUNCH_ALREADY_RUNNING;
+	}
+	HWND hwnd = (HWND)service_tray_get_hwnd();
+	if (hwnd == NULL || !PostMessageW(hwnd, WM_ORCHESTRATOR_SPAWN_WORKSPACE, SPAWN_REASON_LAUNCH_REQUEST, 0)) {
+		return SERVICE_LAUNCH_UNSUPPORTED;
+	}
+	return SERVICE_LAUNCH_STARTED;
+}
+
+bool
+service_orchestrator_request_hotkey_suspend(bool suspend)
+{
+	HWND hwnd = (HWND)service_tray_get_hwnd();
+	if (hwnd == NULL) {
+		return false;
+	}
+	return PostMessageW(hwnd, WM_ORCHESTRATOR_HOTKEY_SUSPEND, suspend ? 1 : 0, 0) != 0;
+}
+
+const char *
+service_orchestrator_get_launch_hotkey(void)
+{
+	return s_launch.has_hotkey ? s_launch.hotkey_text : "";
+}
+
+enum service_child_mode
+service_orchestrator_get_workspace_mode(void)
+{
+	return active_mode();
 }
 
 const char *
@@ -763,11 +875,41 @@ service_orchestrator_get_workspace_supports_file_dialog(void)
 void
 service_orchestrator_apply_config(const struct service_config *cfg)
 {
-	enum service_child_mode old_workspace = s_cfg.workspace;
+	// The ONE apply path: the tray's menu writes and the
+	// system_reload_service_config RPC both land here, on the tray thread.
+	const enum service_child_mode old_mode = active_mode();
+	const struct service_launch_resolved old_launch = s_launch;
+	const bool selection_changed = strcmp(s_cfg.workspace_binary, cfg->workspace_binary) != 0;
 	s_cfg = *cfg;
 
-	if (cfg->workspace != old_workspace) {
-		apply_workspace_mode(cfg->workspace);
+	if (selection_changed) {
+		// A different preferred controller: re-pick. A controller that is
+		// already running keeps running; the new pick applies to the next
+		// spawn.
+		detect_workspace_controller(&s_cfg);
+	}
+	refresh_launch_settings();
+
+	const bool hotkey_changed = old_launch.has_hotkey != s_launch.has_hotkey ||
+	                            old_launch.hotkey.mods != s_launch.hotkey.mods ||
+	                            old_launch.hotkey.vk != s_launch.hotkey.vk;
+
+	if (active_mode() != old_mode) {
+		apply_workspace_mode(active_mode());
+	} else if (hotkey_changed && active_mode() == SERVICE_CHILD_AUTO && s_workspace_available) {
+		// Same mode, new combo: re-install the hook so the change is
+		// observable in the log; a running controller is left alone (the
+		// hook stays out while it runs, #344, and the watchdog re-arms it
+		// with the new combo when it exits).
+		if (s_hotkey_registered) {
+			uninstall_workspace_hotkey();
+			s_hotkey_registered = false;
+		}
+		apply_workspace_mode(SERVICE_CHILD_AUTO);
+	}
+	if (hotkey_changed) {
+		OW("Workspace launch hotkey: %s -> %s", old_launch.has_hotkey ? old_launch.hotkey_text : "(no hotkey)",
+		   hotkey_label());
 	}
 }
 
@@ -819,18 +961,25 @@ workspace_watch_thread_func(LPVOID param)
 	return (DWORD)(uintptr_t)u_crash_guard_run("workspace_watch_thread_func", workspace_watch_thread_body_adapter, (void *)param);
 }
 
-#elif defined(XRT_OS_MACOS)
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
 
 /*
  *
- * macOS orchestrator — auto-spawn + crash-respawn the workspace controller.
+ * macOS / desktop-Linux orchestrator — auto-spawn + crash-respawn the
+ * workspace controller.
+ *
+ * Linux reuses the macOS posix_spawn + waitpid-watcher model unchanged and adds
+ * the launch hotkey (service_hotkey_linux.c: GNOME Shell extension keybinding,
+ * X11 root grab fallback), the DISPLAYXR_WORKSPACE_HOTKEY advisory and a reaper
+ * for fire-and-forget action children. Every Linux-only piece below sits in an
+ * XRT_OS_LINUX_DESKTOP block, so the macOS build is unchanged.
  *
  * Pieces 1+2 of the macOS spatial-shell port (#61): discover a registered
  * workspace controller (cross-platform service_workspace_registry), posix_spawn
  * it with "--service-managed", and respawn it on crash via a waitpid watcher
  * thread. None of this touches the main thread, so it is safe w.r.t. the
  * kqueue/AppKit main-thread-ownership hazard (only the deferred Piece 3 global
- * Ctrl+Space hotkey would re-enter that).
+ * launch hotkey would re-enter that).
  *
  */
 
@@ -847,6 +996,12 @@ workspace_watch_thread_func(LPVOID param)
 #include <errno.h>
 
 extern char **environ;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "service_hotkey_linux.h"
+#include <stdio.h>
+#include "server/ipc_server_input_queue.h" // ipc_server_input_queue_push_controller_key
+#endif
 
 
 /*
@@ -865,6 +1020,16 @@ static pthread_t s_watch_thread;
 static bool s_watch_started = false;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cv = PTHREAD_COND_INITIALIZER;
+//! Display dashboard phase 8: the active controller's launch settings, resolved
+//! from s_cfg (per-controller entry over the top-level `workspace`).
+static struct service_launch_resolved s_launch = {0};
+
+//! Recompute s_launch for the active controller.
+static void
+refresh_launch_settings(void)
+{
+	service_config_resolve_launch(&s_cfg, s_workspace_available ? s_workspace_active.id : "", true, &s_launch);
+}
 
 
 /*
@@ -925,9 +1090,15 @@ detect_workspace_controller(const struct service_config *cfg)
 	struct workspace_controller_entry entries[WORKSPACE_REGISTRY_MAX_ENTRIES];
 	int n = service_workspace_registry_enumerate(entries, WORKSPACE_REGISTRY_MAX_ENTRIES);
 	if (n <= 0) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		OW("No workspace controllers registered "
+		   "($XDG_DATA_HOME/DisplayXR/WorkspaceControllers, /usr/local/share/displayxr/WorkspaceControllers, "
+		   "/usr/share/displayxr/WorkspaceControllers empty); running in standalone-platform mode");
+#else
 		OW("No workspace controllers registered "
 		   "(~/Library/Application Support/DisplayXR/WorkspaceControllers empty); "
 		   "running in standalone-platform mode");
+#endif
 		return;
 	}
 
@@ -975,7 +1146,18 @@ build_child_envp(void)
 		}
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Advisory, for the controller (Windows parity): the combo that summons
+	// it, unset when there is none. Replaces any inherited value.
+	static char hotkey_var[sizeof("DISPLAYXR_WORKSPACE_HOTKEY=") + SERVICE_HOTKEY_MAX];
+	const bool have_hotkey = s_launch.has_hotkey && s_launch.hotkey_text[0] != '\0';
+	if (have_hotkey) {
+		snprintf(hotkey_var, sizeof(hotkey_var), "DISPLAYXR_WORKSPACE_HOTKEY=%s", s_launch.hotkey_text);
+	}
+	int extra = (have_session ? 0 : 1) + (have_hotkey ? 1 : 0);
+#else
 	int extra = have_session ? 0 : 1;
+#endif
 	char **envp = (char **)malloc(sizeof(char *) * (size_t)(count + extra + 1));
 	if (envp == NULL) {
 		return NULL;
@@ -983,11 +1165,21 @@ build_child_envp(void)
 
 	int i = 0;
 	for (char **e = environ; *e != NULL; e++) {
+#ifdef XRT_OS_LINUX_DESKTOP
+		if (strncmp(*e, "DISPLAYXR_WORKSPACE_HOTKEY=", 27) == 0) {
+			continue;
+		}
+#endif
 		envp[i++] = *e;
 	}
 	if (!have_session) {
 		envp[i++] = (char *)session_var;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (have_hotkey) {
+		envp[i++] = hotkey_var;
+	}
+#endif
 	envp[i] = NULL;
 	return envp;
 }
@@ -1063,18 +1255,17 @@ watch_thread_func(void *param)
 		}
 
 		// Crash-respawn ONLY in ENABLE (always-on). In AUTO the controller is
-		// summoned on demand (Ctrl+Space / status item) and a close or crash
+		// summoned on demand (launch hotkey / status item) and a close or crash
 		// returns to the off state — the next summon relaunches it. DISABLE never
 		// respawns.
-		if (s_workspace_available && s_cfg.workspace == SERVICE_CHILD_ENABLE) {
+		if (s_workspace_available && s_launch.mode == SERVICE_CHILD_ENABLE) {
 			OW("Workspace controller exited — respawning (ENABLE mode)");
 			// Brief settle so a controller that crashes on launch can't spin a
 			// tight fork loop.
 			pthread_mutex_unlock(&s_lock);
 			os_nanosleep(1000 * 1000 * 1000); // 1 s
 			pthread_mutex_lock(&s_lock);
-			if (!s_shutting_down && s_workspace_available &&
-			    s_cfg.workspace == SERVICE_CHILD_ENABLE) {
+			if (!s_shutting_down && s_workspace_available && s_launch.mode == SERVICE_CHILD_ENABLE) {
 				(void)do_spawn_locked();
 			}
 		} else {
@@ -1156,7 +1347,7 @@ apply_workspace_mode(enum service_child_mode mode)
 
 	case SERVICE_CHILD_AUTO:
 		// On-demand (Windows parity): do NOT spawn at init. The controller is
-		// summoned via Ctrl+Space / the menu-bar status item, and a close or
+		// summoned via the launch hotkey / the menu-bar status item, and a close or
 		// crash returns to the off state. This keeps the service running with the
 		// shell off — menu bar visible — until the user summons it.
 		break;
@@ -1166,6 +1357,104 @@ apply_workspace_mode(enum service_child_mode mode)
 		break;
 	}
 }
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Push the active controller's launch combo to the hotkey backend: armed only
+ * while a controller is registered, its mode is not disabled and it has a
+ * hotkey (Windows parity: no controller, no grab). Unlike Windows (#344) the
+ * grab stays armed while the controller runs: a Wayland client cannot grab a
+ * chord, so a press while the controller runs is forwarded to it as a
+ * controller key (forward_hotkey_to_controller; registration spec, Linux).
+ */
+static void
+rearm_hotkey(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool armed = s_workspace_available && s_launch.mode != SERVICE_CHILD_DISABLE && s_launch.has_hotkey;
+	char combo[SERVICE_HOTKEY_MAX];
+	snprintf(combo, sizeof(combo), "%s", armed ? s_launch.hotkey_text : "");
+	pthread_mutex_unlock(&s_lock);
+	service_hotkey_linux_arm(combo);
+}
+
+/*!
+ * The controller-key modifier bits of ipc_server_input_queue_push_controller_key
+ * (bit0 Shift, bit1 Ctrl, bit2 Alt) from SERVICE_HOTKEY_MOD_* bits. That
+ * encoding has no Win/Super bit: a Win+ combo forwards without it.
+ */
+uint32_t
+service_orchestrator_controller_key_mods(uint32_t hotkey_mods)
+{
+	uint32_t m = 0;
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_SHIFT) {
+		m |= 1u << 0;
+	}
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_CTRL) {
+		m |= 1u << 1;
+	}
+	if (hotkey_mods & SERVICE_HOTKEY_MOD_ALT) {
+		m |= 1u << 2;
+	}
+	return m;
+}
+
+/*!
+ * A press of the launch combo while the controller runs: hand it to the
+ * controller as a key (its dismiss / toggle chord — a Wayland client cannot
+ * grab the chord itself).
+ *
+ * The press reaches the controller as an ordinary KEY event on its input
+ * queue (ipc_server_input_queue_push_controller_key: thread-safe, Windows VK
+ * codes), exactly as the chord would on Windows.
+ */
+static void
+forward_hotkey_to_controller(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool has = s_launch.has_hotkey;
+	const struct service_hotkey hk = s_launch.hotkey;
+	pthread_mutex_unlock(&s_lock);
+	if (!has || hk.vk == 0) {
+		return;
+	}
+	ipc_server_input_queue_push_controller_key(hk.vk, service_orchestrator_controller_key_mods(hk.mods));
+}
+
+//! Hotkey worker thread: a press of the launch combo.
+static void
+hotkey_activated(void)
+{
+	pthread_mutex_lock(&s_lock);
+	const bool available = s_workspace_available;
+	const enum service_child_mode mode = s_launch.mode;
+	const bool running = s_workspace_running;
+	pthread_mutex_unlock(&s_lock);
+
+	if (!available || mode == SERVICE_CHILD_DISABLE) {
+		return;
+	}
+	if (running) {
+		// The controller owns its dismiss: forward the chord to it.
+		OL(U_LOGGING_INFO, "Launch hotkey: workspace controller already running");
+		forward_hotkey_to_controller();
+		return;
+	}
+	spawn_workspace();
+}
+
+//! Reap one fire-and-forget child (dispatch_controller_action) so it never
+//! lingers as a zombie. The controller itself is reaped by the watcher only.
+static void *
+reap_child_thread(void *p)
+{
+	pid_t pid = (pid_t)(intptr_t)p;
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+	}
+	return NULL;
+}
+#endif
 
 
 /*
@@ -1178,7 +1467,7 @@ void
 service_orchestrator_summon_workspace(void)
 {
 	// Idempotent: spawn_workspace() no-ops when a controller is already running
-	// or none is registered. This is the on-demand AUTO trigger (Ctrl+Space /
+	// or none is registered. This is the on-demand AUTO trigger (launch hotkey /
 	// menu-bar status item) — in AUTO the controller is not spawned at init.
 	spawn_workspace();
 }
@@ -1195,8 +1484,13 @@ service_orchestrator_init(const struct service_config *cfg)
 	// controller is registered, leaving the runtime a standalone OpenXR + WebXR
 	// platform with no spatial-desktop features.
 	detect_workspace_controller(cfg);
+	refresh_launch_settings();
 
-	apply_workspace_mode(cfg->workspace);
+	apply_workspace_mode(s_launch.mode);
+#ifdef XRT_OS_LINUX_DESKTOP
+	service_hotkey_linux_start(hotkey_activated);
+	rearm_hotkey();
+#endif
 	return true;
 }
 
@@ -1204,18 +1498,40 @@ void
 service_orchestrator_apply_config(const struct service_config *cfg)
 {
 	pthread_mutex_lock(&s_lock);
-	enum service_child_mode old_workspace = s_cfg.workspace;
+	enum service_child_mode old_mode = s_launch.mode;
+	const bool selection_changed = strcmp(s_cfg.workspace_binary, cfg->workspace_binary) != 0;
 	s_cfg = *cfg;
 	pthread_mutex_unlock(&s_lock);
 
-	if (cfg->workspace != old_workspace) {
-		apply_workspace_mode(cfg->workspace);
+	if (selection_changed) {
+		detect_workspace_controller(&s_cfg);
 	}
+	pthread_mutex_lock(&s_lock);
+	refresh_launch_settings();
+	enum service_child_mode new_mode = s_launch.mode;
+	pthread_mutex_unlock(&s_lock);
+
+	// macOS: the global toggle hotkey is the fixed default combo
+	// (Control+Shift+Space, plus the Control+Option+Space fallback) registered
+	// in ipc_server_macos_appkit.m; it does not follow service.json yet. The
+	// hotkey setting is stored and reported, and applies once it does.
+	if (new_mode != old_mode) {
+		apply_workspace_mode(new_mode);
+	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Linux: a changed combo / mode / selection re-arms the grab. Never
+	// restarts a running controller.
+	rearm_hotkey();
+#endif
 }
 
 void
 service_orchestrator_shutdown(void)
 {
+#ifdef XRT_OS_LINUX_DESKTOP
+	// First, so no press spawns a controller during teardown.
+	service_hotkey_linux_stop();
+#endif
 	pthread_mutex_lock(&s_lock);
 	s_shutting_down = true;
 	bool join = s_watch_started;
@@ -1247,6 +1563,7 @@ service_orchestrator_refresh_workspace_controller(void)
 {
 	bool was_available = s_workspace_available;
 	detect_workspace_controller(&s_cfg);
+	refresh_launch_settings();
 
 	// If availability just flipped (controller installed / uninstalled while the
 	// service was running), re-apply the current workspace mode so a newly
@@ -1254,8 +1571,11 @@ service_orchestrator_refresh_workspace_controller(void)
 	// apply_workspace_mode early-returns when !s_workspace_available, so both
 	// transitions are safe.
 	if (was_available != s_workspace_available) {
-		apply_workspace_mode(s_cfg.workspace);
+		apply_workspace_mode(s_launch.mode);
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	rearm_hotkey();
+#endif
 }
 
 const char *
@@ -1298,6 +1618,12 @@ service_orchestrator_dispatch_controller_action(const char *action_name)
 
 	// Fire-and-forget — the controller is responsible for singleton forwarding.
 	// Detach so the child never becomes a zombie (we never waitpid it here).
+#ifdef XRT_OS_LINUX_DESKTOP
+	pthread_t reaper;
+	if (pthread_create(&reaper, NULL, reap_child_thread, (void *)(intptr_t)pid) == 0) {
+		pthread_detach(reaper);
+	}
+#endif
 	OW("Dispatched controller action: %s --workspace-action %s", s_workspace_active.binary,
 	   action_name);
 }
@@ -1315,9 +1641,68 @@ service_orchestrator_get_workspace_supports_file_dialog(void)
 	       (s_workspace_active.capabilities & WORKSPACE_CAPABILITY_FILE_DIALOG) != 0;
 }
 
-#else // !XRT_OS_WINDOWS && !XRT_OS_MACOS
+bool
+service_orchestrator_request_config_reload(void)
+{
+	// No tray thread to marshal onto: apply_config takes s_lock itself.
+	struct service_config cfg;
+	service_config_load(&cfg);
+	service_orchestrator_apply_config(&cfg);
+	return true;
+}
 
-// Stubs for other platforms (Linux, Android)
+uint32_t
+service_orchestrator_request_launch(const char *controller_id)
+{
+	pthread_mutex_lock(&s_lock);
+	uint32_t result = SERVICE_LAUNCH_STARTED;
+	if (!s_workspace_available) {
+		result = SERVICE_LAUNCH_NO_CONTROLLER;
+	} else if (controller_id == NULL || strcmp(controller_id, s_workspace_active.id) != 0) {
+		result = SERVICE_LAUNCH_NOT_ACTIVE;
+	} else if (s_launch.mode == SERVICE_CHILD_DISABLE) {
+		result = SERVICE_LAUNCH_DISABLED;
+	} else if (s_workspace_running) {
+		result = SERVICE_LAUNCH_ALREADY_RUNNING;
+	}
+	pthread_mutex_unlock(&s_lock);
+
+	if (result == SERVICE_LAUNCH_STARTED) {
+		spawn_workspace(); // the same path the status item / summon takes
+	}
+	return result;
+}
+
+bool
+service_orchestrator_request_hotkey_suspend(bool suspend)
+{
+#ifdef XRT_OS_LINUX_DESKTOP
+	// The grab (extension keybinding or X11 root grab) comes out / goes back;
+	// 60 s safety timeout as on Windows.
+	service_hotkey_linux_suspend(suspend);
+	return true;
+#else
+	// No service-owned global hotkey hook on macOS: nothing to take out.
+	(void)suspend;
+	return true;
+#endif
+}
+
+const char *
+service_orchestrator_get_launch_hotkey(void)
+{
+	return s_launch.has_hotkey ? s_launch.hotkey_text : "";
+}
+
+enum service_child_mode
+service_orchestrator_get_workspace_mode(void)
+{
+	return s_launch.mode;
+}
+
+#else // !XRT_OS_WINDOWS && !XRT_OS_MACOS && !XRT_OS_LINUX_DESKTOP
+
+// Stubs for other platforms (Android)
 
 bool
 service_orchestrator_init(const struct service_config *cfg)
@@ -1376,6 +1761,38 @@ bool
 service_orchestrator_get_workspace_supports_file_dialog(void)
 {
 	return false;
+}
+
+bool
+service_orchestrator_request_config_reload(void)
+{
+	return false;
+}
+
+uint32_t
+service_orchestrator_request_launch(const char *controller_id)
+{
+	(void)controller_id;
+	return SERVICE_LAUNCH_UNSUPPORTED;
+}
+
+bool
+service_orchestrator_request_hotkey_suspend(bool suspend)
+{
+	(void)suspend;
+	return false;
+}
+
+const char *
+service_orchestrator_get_launch_hotkey(void)
+{
+	return "";
+}
+
+enum service_child_mode
+service_orchestrator_get_workspace_mode(void)
+{
+	return SERVICE_CHILD_AUTO;
 }
 
 #endif // XRT_OS_WINDOWS

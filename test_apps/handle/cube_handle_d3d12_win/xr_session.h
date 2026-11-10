@@ -12,6 +12,7 @@
 #define XR_USE_GRAPHICS_API_D3D12
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 #include <openxr/XR_DXR_local_3d_zone.h>
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
@@ -25,6 +26,12 @@ extern int32_t g_displayScreenTop;
 // more consumers adopt it.
 extern bool g_hasViewRigExt;
 
+// XR_DXR_cursor_depth (ADR-046) available + enabled on the instance, and the
+// spec version the runtime advertises (v5 = the runtime can draw the cursor).
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0. App-local, like the view-rig flag.
+extern bool g_hasCursorDepthExt;
+extern uint32_t g_cursorDepthSpecVersion;
+
 // #439 Phase 3 — XR_DXR_local_3d_zone harness (header v3 carries the Local2D
 // composition-layer + view-size-changed types). App-local for the same reason
 // as the view-rig flag: the shared XrSessionManager doesn't carry this
@@ -36,6 +43,8 @@ struct ZoneMaskHarness {
     PFN_xrSetLocal3DZoneFromRectsDXR pfnSetRects = nullptr;
     PFN_xrSubmitLocal3DZoneDXR pfnSubmit = nullptr;
     PFN_xrDestroyLocal3DZoneMaskDXR pfnDestroy = nullptr;
+    // #2342: Tier-3 (DXR_LOCAL2D_MASK=3) — optional; NULL leaves Tier-2 only.
+    PFN_xrAcquireLocal3DZoneRenderTargetDXR pfnAcquire = nullptr;
     XrLocal3DZoneMaskDXR mask = XR_NULL_HANDLE;
 };
 extern ZoneMaskHarness g_zone;

@@ -36,8 +36,17 @@
 #include "oxr_chain.h"
 #include "oxr_xret.h"
 #include "oxr_view_config_rule.h"
+#include "oxr_segment_views.h"
 
 #include <openxr/XR_DXR_win32_window_binding.h>
+
+// Multi-screen M3 over IPC (ADR-047 Amendment 3): the routing hand-off to the
+// D3D11 service. Declared here rather than via ipc_client.h (st_oxr does not
+// pull the ipc_client include path); the runtime links ipc_client.
+struct xrt_compositor;
+struct xrt_segment_view_routing;
+void
+comp_ipc_client_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -1895,6 +1904,323 @@ submit_quad_layer(struct oxr_session *sess,
 	return XR_SUCCESS;
 }
 
+#if defined(OXR_HAVE_DXR_cursor_depth) && defined(OXR_HAVE_KHR_composition_layer_depth)
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): this frame's locate asked for
+ * the depth-layer source, and this projection layer carries depth - record
+ * what the patch read will need to be turned back into a point, and hand the
+ * compositor its one-frame request.
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test), so a
+ * session that never chained XrCursorDepthSourceDXR never gets here.
+ */
+static void
+cursor_depth_record_layer(struct oxr_session *sess, const XrCompositionLayerProjection *proj)
+{
+	sess->cursor_depth_source.armed = false; // first depth layer of the frame only
+
+	uint32_t n = sess->cursor_depth_source.active_view_count;
+	if (n > proj->viewCount) {
+		n = proj->viewCount;
+	}
+	if (n < 2) {
+		return; // 2D: nothing to read, the placement is inactive anyway
+	}
+
+	struct u_cursor_depth_patch_request req = {0};
+	req.requested = true;
+	req.tag = ++sess->cursor_depth_source.next_tag;
+	req.u = sess->cursor_depth_source.u;
+	req.v = sess->cursor_depth_source.v;
+	req.radius_u = sess->cursor_depth_source.radius_u;
+	req.radius_v = sess->cursor_depth_source.radius_v;
+	req.view_index[0] = 0;
+	req.view_index[1] = n - 1;
+	if (!u_cursor_depth_patch_should_sample(&req)) {
+		return;
+	}
+
+	const uint32_t slot = (uint32_t)(req.tag % ARRAY_SIZE(sess->cursor_depth_source.frames));
+	sess->cursor_depth_source.frames[slot].tag = req.tag;
+	sess->cursor_depth_source.frames[slot].space = proj->space;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const XrCompositionLayerProjectionView *pv = &proj->views[req.view_index[i]];
+		const XrCompositionLayerDepthInfoKHR *d = OXR_GET_INPUT_FROM_CHAIN(
+		    pv, XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR, XrCompositionLayerDepthInfoKHR);
+		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+		sess->cursor_depth_source.frames[slot].view[i].pose = *(const struct xrt_pose *)&pv->pose;
+		sess->cursor_depth_source.frames[slot].view[i].fov = *(const struct xrt_fov *)&pv->fov;
+		sess->cursor_depth_source.frames[slot].depth[i] =
+		    (struct u_cursor_depth_layer_depth){d->minDepth, d->maxDepth, d->nearZ, d->farZ};
+		// Reversed Z flips which end is nearest. Mixed conventions across the
+		// two views would be odd; the first view's decides.
+		if (i == 0) {
+			req.nearest_is_max = d->nearZ > d->farZ;
+		}
+	}
+
+	if (!oxr_session_cursor_depth_hand_request(sess, &req) && !sess->cursor_depth_source.warned_no_reader) {
+		sess->cursor_depth_source.warned_no_reader = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: this compositor cannot read submitted depth yet - the depth-layer "
+		    "source reports no content (cursor on the display plane) (one-time warning)");
+	}
+}
+#endif
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): this frame's locate asked for
+ * the measured-disparity source with the pointer over the canvas - hand the
+ * compositor its one-frame request. It measures between the two outermost
+ * views of the frame's first projection layer, in that layer's sub-image
+ * pixels; the state tracker converts with the LOCATED views (ratios only, so
+ * no pose or space bookkeeping is needed here).
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test).
+ */
+static void
+cursor_measure_submit(struct oxr_session *sess, bool zones_frame)
+{
+	sess->cursor_measure.armed = false;
+	if (zones_frame) {
+		// The zone layers' sub-images are not the canvas the hint's UV is in.
+		if (!sess->cursor_measure.warned_no_reader) {
+			sess->cursor_measure.warned_no_reader = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: measured disparity is not supported in display-zones frames yet - "
+			    "reporting no content (one-time warning)");
+		}
+		return;
+	}
+	const uint32_t n = sess->cursor_measure.active_view_count;
+	if (n < 2) {
+		return; // 2D: nothing to match, the placement is inactive anyway
+	}
+	struct u_cursor_measure_request req = {0};
+	req.requested = true;
+	req.tag = ++sess->cursor_measure.next_tag;
+	req.u = sess->cursor_measure.u;
+	req.v = sess->cursor_measure.v;
+	req.height = sess->cursor_measure.height;
+	req.view_index[0] = 0;
+	req.view_index[1] = n - 1;
+	if (!u_cursor_measure_should_sample(&req)) {
+		return;
+	}
+	if (!oxr_session_cursor_measure_hand_request(sess, &req) && !sess->cursor_measure.warned_no_reader) {
+		sess->cursor_measure.warned_no_reader = true;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: this compositor cannot measure disparity yet - the measured source "
+		    "reports no content (cursor on the display plane) (one-time warning)");
+	}
+}
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): this frame's locate said
+ * the runtime will draw the cursor. Map the placement into each view of the
+ * frame's first projection layer - with the poses and fovs the app submitted,
+ * in the layer's own space, which must be the locate space - and hand the
+ * compositor its one-frame draw request.
+ *
+ * Display zones (#1949): one cursor per frame, in the zone whose locate
+ * carried the hint (the zone under the pointer). In a zones frame the views
+ * are THAT zone's layer's, so the map is zone-normalised; the request carries
+ * the zone rect as submitted and the compositor places it the way it places
+ * the zone's own layer.
+ *
+ * Only ever called on an ARMED frame (the caller's single bool test), so a
+ * session that never chained XrCursorDepthDrawInfoDXR never gets here.
+ */
+static void
+cursor_draw_submit(struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo, bool zones_frame)
+{
+	sess->cursor_draw.armed = false;
+
+	const XrCompositionLayerProjection *proj = NULL;
+	struct xrt_rect zone_rect = {{0, 0}, {0, 0}};
+	bool zone_missing = false;
+	if (zones_frame || sess->cursor_draw.zone_valid) {
+		// The hinted zone's layer (a zone locate without a zones frame, or
+		// a zones frame whose hint was not zone-scoped, has none).
+		zone_missing = true;
+#ifdef OXR_HAVE_DXR_display_zones
+		for (uint32_t i = 0; zones_frame && sess->cursor_draw.zone_valid && i < frameEndInfo->layerCount; i++) {
+			if (frameEndInfo->layers[i]->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+				continue;
+			}
+			const XrCompositionLayerProjection *p =
+			    (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
+			const XrDisplayZoneDXR *zone =
+			    OXR_GET_INPUT_FROM_CHAIN(p, XR_TYPE_DISPLAY_ZONE_DXR, XrDisplayZoneDXR);
+			if (zone != NULL && zone->zoneId == sess->cursor_draw.zone_id) {
+				proj = p;
+				// The submitted rect is authoritative (ADR-027): it is
+				// where the compositor places this zone's tiles.
+				zone_rect.offset.w = zone->rect.offset.x;
+				zone_rect.offset.h = zone->rect.offset.y;
+				zone_rect.extent.w = zone->rect.extent.width;
+				zone_rect.extent.h = zone->rect.extent.height;
+				zone_missing = false;
+				break;
+			}
+		}
+#endif
+	} else {
+		for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+			if (frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+				proj = (const XrCompositionLayerProjection *)frameEndInfo->layers[i];
+				break;
+			}
+		}
+	}
+	if (zone_missing) {
+		sess->cursor_draw.cannot_draw = true;
+		if (!sess->cursor_draw.warned_zone) {
+			sess->cursor_draw.warned_zone = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but %s - not drawn, reporting "
+			    "willDraw = false (one-time warning)",
+			    !zones_frame ? "the hint rode a zone-scoped locate and the frame has no display zones"
+			    : !sess->cursor_draw.zone_valid
+			        ? "the frame has display zones and the hint did not ride a zone-scoped locate"
+			        : "the frame has no 3D zone with the hinted locate's zoneId");
+		}
+		return;
+	}
+	if (proj == NULL) {
+		sess->cursor_draw.cannot_draw = true;
+		if (!sess->cursor_draw.warned_no_layer) {
+			sess->cursor_draw.warned_no_layer = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: runtime-drawn cursor requested, but the frame has no projection "
+			    "layer "
+			    "to draw it with - not drawn, reporting willDraw = false (one-time warning)");
+		}
+		return;
+	}
+	// The views the cursor is projected with are the layer's, in the layer's
+	// space; the placement is in the locate space. They must be one XrSpace
+	// (same rule as the depth-layer source): converting between two app
+	// spaces is not worth a per-frame space locate for a cursor.
+	sess->cursor_draw.cannot_draw = proj->space != sess->cursor_draw.space;
+	if (sess->cursor_draw.cannot_draw) {
+		if (!sess->cursor_draw.warned_space) {
+			sess->cursor_draw.warned_space = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the projection layer's space is not the locate space - the "
+			    "runtime-drawn cursor needs them to be the same XrSpace; reporting willDraw = false "
+			    "(one-time warning)");
+		}
+		return;
+	}
+
+	// Build the request even when the locate reported false: whether THIS
+	// frame could have drawn is what clears (or keeps) draw_failed, and so
+	// what the next locate reports. Every way out below that draws nothing
+	// sets it - the willDraw contract.
+	sess->cursor_draw.draw_failed = true;
+
+	struct u_cursor_draw_request req = {0};
+	req.requested = true;
+	// Only the views the arming locate reported active: a layer submitted for
+	// the worst-case mode carries views that are not tiles in this one, and
+	// their poses must not decide drawability.
+	// Multi-screen M3: a split frame draws with the view set of the segment
+	// the locate placed the cursor in - views [first, first + count) of the
+	// layer - segment-normalised, at that segment's rect of each tile.
+	const uint32_t first_view = sess->cursor_draw.segment_valid ? sess->cursor_draw.segment_first_view : 0;
+	const uint32_t layer_views = proj->viewCount < XRT_MAX_VIEWS ? proj->viewCount : XRT_MAX_VIEWS;
+	req.view_count = layer_views > first_view ? layer_views - first_view : 0;
+	if (sess->cursor_draw.view_count >= 2 && req.view_count > sess->cursor_draw.view_count) {
+		req.view_count = sess->cursor_draw.view_count;
+	}
+	struct u_cursor_depth_view submitted[XRT_MAX_VIEWS];
+	for (uint32_t i = 0; i < req.view_count; i++) {
+		// XrPosef/XrFovf are layout-identical to xrt_pose/xrt_fov.
+		submitted[i].pose = *(const struct xrt_pose *)&proj->views[first_view + i].pose;
+		submitted[i].fov = *(const struct xrt_fov *)&proj->views[first_view + i].fov;
+	}
+	if (sess->cursor_draw.segment_valid) {
+		req.segment_valid = true;
+		req.segment_rect = sess->cursor_draw.segment_rect;
+		req.segment_canvas = sess->cursor_draw.segment_canvas;
+	}
+	// The same predicate the locate reported with, on the submitted views.
+	if (!u_cursor_draw_placement_drawable(submitted, req.view_count, &sess->cursor_draw.position,
+	                                      &sess->cursor_draw.orientation, sess->cursor_draw.unit, req.view)) {
+		if (!sess->cursor_draw.warned_undrawable) {
+			sess->cursor_draw.warned_undrawable = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: the cursor placement maps to no pixels in the submitted views - not "
+			    "drawn, the next locate reports willDraw = false (one-time warning)");
+		}
+		return; // draw nothing rather than a partial cursor
+	}
+
+	struct oxr_swapchain *sc = sess->cursor_draw.image;
+	if (sc != NULL) {
+		if (!sc->released.yes || sc->released.index < 0 ||
+		    sc->released.index >= (int)sc->swapchain->image_count) {
+			if (!sess->cursor_draw.warned_image) {
+				sess->cursor_draw.warned_image = true;
+				U_LOG_W(
+				    "XR_DXR_cursor_depth: the cursor sprite swapchain has no released image yet - "
+				    "not drawn (one-time warning)");
+			}
+			return;
+		}
+		req.image = sc->swapchain;
+		req.image_index = (uint32_t)sc->released.index;
+	}
+	req.hot_u = sess->cursor_draw.hot_u;
+	req.hot_v = sess->cursor_draw.hot_v;
+	req.size_m = sess->cursor_draw.size_m;
+	req.disparity = sess->cursor_draw.disparity;
+	if (zones_frame) {
+		req.zone_valid = true;
+		req.zone_id = sess->cursor_draw.zone_id;
+		req.zone_rect = zone_rect;
+	}
+	if (!u_cursor_draw_should_draw(&req)) {
+		return;
+	}
+	sess->cursor_draw.draw_failed = false;
+	// #1952: the compositor answers through req.report during the commit
+	// (folded in by cursor_draw_fold_report). A locate that reported false
+	// - after an earlier refusal - gets a REPORT-ONLY request: every check
+	// runs, nothing is drawn (the app is showing its OS cursor), and a
+	// frame that would draw clears the latch without willDraw oscillating.
+	req.report_only = !sess->cursor_draw.will_draw;
+	u_cursor_draw_report_begin(&sess->cursor_draw.report);
+	req.report = &sess->cursor_draw.report;
+	sess->cursor_draw.report_pending = oxr_session_cursor_draw_hand_request(sess, &req);
+}
+
+/*!
+ * #1952: after the commit, fold the compositor's answer into the willDraw
+ * latch - a refusal makes the next locate report willDraw = false, a commit
+ * that drew (or would have) restores it. One WARN per distinct reason.
+ *
+ * Only ever called with a request handed this frame (the caller's single
+ * bool test), so a session that never asked pays nothing.
+ */
+static void
+cursor_draw_fold_report(struct oxr_session *sess)
+{
+	sess->cursor_draw.report_pending = false;
+	if (u_cursor_draw_latch_record(&sess->cursor_draw.refusal_latch, &sess->cursor_draw.report)) {
+		const enum u_cursor_draw_refusal reason = sess->cursor_draw.report.answered
+		                                              ? sess->cursor_draw.report.reason
+		                                              : U_CURSOR_DRAW_REFUSAL_NOT_REACHED;
+		U_LOG_W(
+		    "XR_DXR_cursor_depth: the compositor did not draw the cursor (%s) - the next locate reports "
+		    "willDraw = false until a frame draws again (one-time warning for this reason)",
+		    u_cursor_draw_refusal_name(reason));
+	}
+}
+#endif
+
 static XrResult
 submit_projection_layer(struct oxr_session *sess,
                         struct xrt_compositor *xc,
@@ -1979,6 +2305,13 @@ submit_projection_layer(struct oxr_session *sess,
 #ifdef OXR_HAVE_KHR_composition_layer_depth
 		fill_in_depth_test(sess, (XrCompositionLayerBaseHeader *)proj, &data);
 		data.type = XRT_LAYER_PROJECTION_DEPTH;
+#ifdef OXR_HAVE_DXR_cursor_depth
+		// ADR-046 Phase 3a. ZERO COST UNLESS REQUESTED: one bool test, true
+		// only on a frame whose locate chained XrCursorDepthSourceDXR.
+		if (sess->cursor_depth_source.armed) {
+			cursor_depth_record_layer(sess, proj);
+		}
+#endif
 		xrt_result_t xret = xrt_comp_layer_projection_depth( //
 		    xc,                                              // compositor
 		    head,                                            // xdev
@@ -2317,6 +2650,13 @@ submit_equirect1_layer(struct oxr_session *sess,
 static void
 do_synchronize_state_change(struct oxr_logger *log, struct oxr_session *sess)
 {
+	// #2467: decided and changed under sessions_mutex, as in the poll; this
+	// unlocked check only keeps the lock off the steady-state frame path.
+	if (sess->has_ended_once && !(sess->is_appcontainer && sess->state == XR_SESSION_STATE_SYNCHRONIZED)) {
+		return;
+	}
+	os_mutex_lock(&sess->sys->inst->sessions_mutex);
+
 	// First frame: transition from READY to SYNCHRONIZED
 	if (!sess->has_ended_once && sess->state < XR_SESSION_STATE_VISIBLE) {
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_SYNCHRONIZED, 0);
@@ -2332,6 +2672,8 @@ do_synchronize_state_change(struct oxr_logger *log, struct oxr_session *sess)
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_VISIBLE, 0);
 		oxr_session_change_state(log, sess, XR_SESSION_STATE_FOCUSED, 0);
 	}
+
+	os_mutex_unlock(&sess->sys->inst->sessions_mutex);
 }
 
 static XrResult
@@ -2538,8 +2880,14 @@ oxr_session_set_content_bounds(struct oxr_session *sess, float u0, float v0, flo
 		return;
 	}
 #endif
-	// GL, Metal and the IPC path run no policy (oxr_session.c's
-	// get_rear_budget returns false for them), so there is nothing to aim.
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_content_bounds(&sess->xcn->base, u0, v0, u1, v1, now_ns);
+		return;
+	}
+#endif
+	// GL and the IPC path run no policy (oxr_session.c's get_rear_budget
+	// returns false for them), so there is nothing to aim.
 }
 
 //! Parse, validate and forward the optional XrContentBoundsDXR on this frame.
@@ -2663,7 +3011,13 @@ oxr_session_set_content_mask(struct oxr_session *sess,
 		return;
 	}
 #endif
-	// GL, Metal and the IPC path run no policy, so there is nothing to aim.
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+	if (sess->is_metal_native_compositor) {
+		comp_metal_compositor_set_content_mask(&sess->xcn->base, cells, w, h, stride, margin, now_ns);
+		return;
+	}
+#endif
+	// GL and the IPC path run no policy, so there is nothing to aim.
 }
 
 //! Parse, validate, COPY and forward the optional XrContentMaskDXR on this frame.
@@ -2860,6 +3214,16 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		return oxr_error(log, XR_ERROR_LAYER_INVALID, "(frameEndInfo->layers == NULL)");
 	}
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): this frame's texture target, before the layers it frames.
+	{
+		XrResult tt_ret = oxr_texture_target_frame_end(log, sess, frameEndInfo);
+		if (tt_ret != XR_SUCCESS) {
+			return tt_ret;
+		}
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_display_zones
 	// XR_DXR_display_zones (ADR-027): zones-frame detection + gating. Only
 	// runs with the extension enabled — zero-zone bit-identity is
@@ -2980,6 +3344,15 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 	// Do state change if needed.
 	do_synchronize_state_change(log, sess);
 
+#ifdef OXR_HAVE_DXR_display_info
+	// Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h):
+	// every view of the projection layer names the same swapchain image ->
+	// after a short hysteresis the compositor holds the panel 2D, flat, no
+	// weave. Decided BEFORE this frame's layers reach the compositor, so the
+	// edge frame itself is presented in the new state.
+	oxr_session_mono_auto_2d_frame(log, sess, frameEndInfo, (uint64_t)os_monotonic_get_ns());
+#endif
+
 	struct xrt_pose inv_offset = {0};
 	math_pose_invert(&xdev->tracking_origin->initial_offset, &inv_offset);
 
@@ -3068,6 +3441,61 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 	}
 
+#ifdef XRT_HAVE_VK_NATIVE_COMPOSITOR
+	// Multi-screen M3: which views of this frame belong to which window
+	// segment — what the app's last xrLocateViews handed out. The compositor
+	// routes each segment's tiles to that segment's display processor.
+	if (sess->is_vk_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_vk_native_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
+#if defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M3 on Windows: same hand-off to the in-process D3D11 compositor.
+	if (sess->is_d3d11_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_d3d11_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
+#if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XRT_OS_MACOS)
+	// Multi-screen M3 on macOS: same hand-off to the in-process Metal compositor.
+	if (sess->is_metal_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_metal_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
+	// Multi-screen M3 over IPC (ADR-047 Amendment 3): the same hand-off to the
+	// D3D11 service, change-only — the service keeps the last routing, so a
+	// window that stays split costs no extra round trip per frame. Sent ahead
+	// of this frame's layer_commit on the same connection, so it applies to it.
+	if (sess->seg_ipc && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		if (oxr_segment_views_route_differs(&sess->seg_route_sent, &route)) {
+			comp_ipc_client_compositor_set_view_routing(&sess->xcn->base, &route);
+			sess->seg_route_sent = route;
+		}
+	}
+#if defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M3 on Windows: same hand-off to the in-process D3D12 compositor.
+	if (sess->is_d3d12_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_d3d12_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
+#if defined(XRT_HAVE_GL_NATIVE_COMPOSITOR) && defined(XRT_OS_WINDOWS)
+	// Multi-screen M3 on Windows: same hand-off to the in-process OpenGL compositor.
+	if (sess->is_gl_native_compositor && sess->xcn != NULL) {
+		struct xrt_segment_view_routing route;
+		oxr_session_take_segment_view_routing(sess, &route);
+		comp_gl_compositor_set_view_routing(&sess->xcn->base, &route);
+	}
+#endif
+
 	xrt_result_t xret;
 	xret = xrt_comp_layer_begin(xc, &data);
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_begin);
@@ -3128,8 +3556,57 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 		}
 	}
 
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// ADR-046 Amendment 2 B. ZERO COST UNLESS REQUESTED: one bool test, true
+	// only on a frame whose locate chained XrCursorDepthDrawInfoDXR with the
+	// placement active. Handed to the compositor before the commit that
+	// draws it.
+	if (sess->cursor_draw.armed) {
+		bool cursor_zones_frame = false;
+#ifdef OXR_HAVE_DXR_display_zones
+		cursor_zones_frame = zones_frame;
+#endif
+		cursor_draw_submit(sess, frameEndInfo, cursor_zones_frame);
+	}
+	// ADR-046 Amendment 3. ZERO COST UNLESS REQUESTED: one bool test, true
+	// only on a frame whose locate chained the measured-disparity source with
+	// the pointer over the canvas. One request per frame: at most one
+	// measurement per submitted frame.
+	if (sess->cursor_measure.armed) {
+		bool measure_zones_frame = false;
+#ifdef OXR_HAVE_DXR_display_zones
+		measure_zones_frame = zones_frame;
+#endif
+		cursor_measure_submit(sess, measure_zones_frame);
+	}
+#endif
+
 	xret = xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// #1952: one bool test - true only on a frame that handed the
+	// compositor a cursor request. Folded before the error check, so a
+	// failed commit counts as the refusal it is.
+	if (sess->cursor_draw.report_pending) {
+		cursor_draw_fold_report(sess);
+	}
+#endif
 	OXR_CHECK_XRET(log, sess, xret, xrt_comp_layer_commit);
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// ADR-046 Phase 3a: a request covers one frame. Still armed here means no
+	// projection layer carried depth (or XR_KHR_composition_layer_depth is
+	// not available), so nothing was read.
+	if (sess->cursor_depth_source.armed) {
+		sess->cursor_depth_source.armed = false;
+		if (!sess->cursor_depth_source.warned_no_layer) {
+			sess->cursor_depth_source.warned_no_layer = true;
+			U_LOG_W(
+			    "XR_DXR_cursor_depth: depth-layer source requested, but no projection layer carries "
+			    "XrCompositionLayerDepthInfoKHR - reporting no content (one-time warning)");
+		}
+	}
+#endif
 
 #if defined(OXR_HAVE_DXR_local_3d_zone) || defined(OXR_HAVE_EXT_view_configuration_views_change)
 	// #439 Phase 3 Q4 — view-size renegotiation poll. The just-committed
@@ -3279,9 +3756,9 @@ oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const Xr
 			// backlog-free, so flipping the switch back on cannot
 			// produce a burst.
 			struct oxr_views_change_stats vc_stats = {0};
-			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views, sess->sys->view_count,
-			                            view_w, view_h, os_monotonic_get_ns(), want_ext_views_change,
-			                            &vc_stats) &&
+			if (oxr_views_change_update(&sess->sys->views_change, sess->sys->views,
+			                            sess->sys->view_config_max_count, view_w, view_h,
+			                            os_monotonic_get_ns(), want_ext_views_change, &vc_stats) &&
 			    debug_get_bool_option_views_change_event()) {
 				oxr_event_push_XrEventDataViewConfigurationViewsChangedEXT(
 				    // #1486: the type the SESSION began (the system advertises two).

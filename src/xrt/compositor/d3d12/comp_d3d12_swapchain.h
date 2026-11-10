@@ -65,6 +65,15 @@ void *
 comp_d3d12_swapchain_get_resource(struct xrt_swapchain *xsc, uint32_t index);
 
 /*!
+ * #2362: the app's published release-fence value recorded when image @p index
+ * was last released (0 = none).
+ *
+ * @ingroup comp_d3d12
+ */
+uint64_t
+comp_d3d12_swapchain_get_release_value(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
  * The DXGI format a view over @p resource must use.
  *
  * Swapchain images are created TYPELESS (#1503), which is not a legal view
@@ -118,6 +127,14 @@ comp_d3d12_swapchain_compose_format(void *resource);
  */
 bool
 comp_d3d12_swapchain_resource_is_srgb(void *resource);
+
+/*!
+ * XR_DXR_swapchain_color_encoding: must a composing frame sample this image
+ * through an 8-bit shadow? True for an image declared display-encoded whose
+ * format has no `_SRGB` sibling (10/16-bit), which no view can decode.
+ */
+bool
+comp_d3d12_swapchain_resource_needs_compose_shadow(void *resource);
 
 #ifdef __cplusplus
 }

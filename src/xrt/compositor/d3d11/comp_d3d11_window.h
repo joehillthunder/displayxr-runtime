@@ -389,6 +389,15 @@ void *
 comp_d3d11_window_get_last_pointer_down_target(struct comp_d3d11_window *window);
 
 /*!
+ * Return the HWND the most recent real button-UP was forwarded to (NULL if
+ * none yet), with that UP's button (1/2/3) and message time (GetTickCount
+ * base). The service uses it to tell whether a synthetic DOWN it posted for
+ * one-click-drag was paired by a real UP or is still owed one.
+ */
+void *
+comp_d3d11_window_get_last_pointer_up(struct comp_d3d11_window *window, uint32_t *out_button, uint32_t *out_time_ms);
+
+/*!
  * Mark workspace mode as active/inactive on the window. While active, ESC on the
  * compositor window is swallowed instead of posting WM_CLOSE — an empty workspace
  * (no focused app) would otherwise take the service down with its own window.
@@ -484,6 +493,20 @@ comp_d3d11_window_consume_workspace_public_events(struct comp_d3d11_window *wind
  */
 void
 comp_d3d11_window_set_workspace_pointer_capture(struct comp_d3d11_window *window, bool enabled, uint32_t button);
+
+/*!
+ * ADR-052: comp_d3d11_window_set_workspace_pointer_capture with the Win32
+ * grab made optional. With @p grab false and @p enabled true the window
+ * reports MOTION and applies the capture's forwarding rules, but does not
+ * `SetCapture` — for the presenter windows the press did NOT go down on (a
+ * window on another thread cannot take the capture; only the owner grabs).
+ * A disable always posts the release (guarded on the window thread).
+ */
+void
+comp_d3d11_window_set_workspace_pointer_capture_ex(struct comp_d3d11_window *window,
+                                                   bool enabled,
+                                                   uint32_t button,
+                                                   bool grab);
 
 /*!
  * Phase 2.K: read the current pointer-capture flag. Used by the service

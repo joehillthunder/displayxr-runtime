@@ -229,3 +229,210 @@ regression is observable rather than felt.
    `DXR_VK_QUEUE_MODE=layer` on NVIDIA).
 6. Flip default: tier auto-selection ON — VK repaint default-on everywhere,
    matching D3D11/D3D12.
+
+## 7. Android: per-queue scope and delivery (#1905)
+
+**Status: PROTOTYPE, device-validated** (branch `feat/android-queue-lock-layer`,
+PR #1915). Companion: PR #1910, which auto-enables mid-frame fill when this
+layer is live.
+
+**Scope: per-queue, decided by measurement.** The first hypothesis was that
+on Adreno 740 the app's queue (family 0 idx 0) and the runtime's repaint queue
+(idx 1), though distinct `VkQueue`s, collide *across* queues on their shared
+kernel GSL context (`Adreno-GSL ctx N: next client ts … must be greater`,
+then -3 on the next idx-0 submit), which would have needed one mutex per
+`VkDevice`. The device experiment says otherwise. Lume phone, Adreno 740,
+60 Hz, layer loaded through the `gpu_debug` settings path, force-repaint probe
+(`debug.dxr.weave_repaint_force=1`, which reproduces the -3 at ~0.5/s without
+the layer), 30 s runs:
+
+| scope | GSL warnings | submit -3 | weave refresh (CNSDK GetFace) | fills | app fps |
+|---|---|---|---|---|---|
+| per-queue | 0 | 0 | 41.5 Hz | not recorded | = baseline |
+| per-device | 0 | 0 | 22.5 Hz | 10/s | — |
+
+Per-queue locks already clear the race, so the colliding calls are on the
+**same** queue, which is exactly §2's contract. Per-device adds a cost:
+the app's submits wait behind the fill's blocking present, and fills collapse.
+So **per-queue is the default on every platform** (`QL_DEFAULT_PER_DEVICE=0`).
+`setprop debug.dxr.ql_scope device` (read at `vkCreateDevice`) keeps the
+per-device A/B. Tier selection (§3.5) is unchanged. Adreno gives the runtime
+idx 1, so the repaint stays on tier 1 with its own queue, and the layer only
+serializes. With the layer live and #1910's mid-frame fill on, there were
+also 0 GSL warnings, 0 `Failed to render layers` and 0 CNSDK -3.
+
+**Android loader contract** (checked against AOSP `frameworks/native`
+`vulkan/libvulkan/layers_extensions.cpp` + `api.cpp`, main branch):
+- There is no JSON manifest and no `vkNegotiateLoaderLayerInterfaceVersion`.
+  The loader scans each directory, or `apk!/lib/<abi>` zip path, on its layer
+  search path for `libVkLayer*.so`.
+- It `dlsym`s `vkEnumerateInstanceLayerProperties` and
+  `vkEnumerateInstanceExtensionProperties`. Both are required: without them
+  the library is rejected.
+- The device-side `vkEnumerateDeviceLayerProperties` and
+  `vkEnumerateDeviceExtensionProperties` are nominally optional. However, a
+  layer whose device properties do not `memcmp`-equal its instance properties
+  is marked non-global, and the loader leaves it out of every **device** chain
+  (`IsLayerGlobal`). For this layer they are therefore mandatory.
+- GIPA/GDPA resolve as `<layerName>GetInstanceProcAddr` first, then fall back
+  to `vkGetInstanceProcAddr`.
+- An unknown layer name fails `vkCreateInstance` with
+  `VK_ERROR_LAYER_NOT_PRESENT`, which is what the §3.3 retry already handles.
+- `gpu_debug_layers` names become implicit layers. An explicit request for the
+  same layer name is de-duplicated (`OverrideLayerNames`).
+- The NDK ships no `vk_layer.h`. The layer defines Android's
+  `vk_layer_interface.h` chain structs locally.
+
+**Delivery.**
+- *Experiment:* the `.so` ships in the runtime APK
+  (`lib/arm64-v8a/libVkLayer_DXR_queue_lock.so`). A userdebug device loads it
+  into an app with `enable_gpu_debug_layers=1`, `gpu_debug_app=<app>`,
+  `gpu_debug_layers=VK_LAYER_DXR_queue_lock` and
+  `gpu_debug_layer_app=org.freedesktop.monado.openxr_runtime.out_of_process`.
+  This path is debug-only: `GraphicsEnvironment.debugLayerEnabled()` requires
+  a debuggable build or app, or the inject-layers metadata.
+- *Product (#1919):* the `.so` ships inside the DisplayXR client AAR
+  (`jni/arm64-v8a/`, built by a standalone layer-only CMake project in
+  `displayxr_client/src/main/cpp`; CI asserts it is byte-identical to the
+  runtime APK's copy) so it lands in the **app's own** library path. App-side
+  contract and verification: `docs/getting-started/android-build-guide.md`
+  § *The queue-lock layer ships in the client AAR*. **Verified (AOSP main):**
+  `GraphicsEnvironment.setupGpuLayers()` appends the app's library search
+  paths to the layer path "in all cases", outside the debug gate. In
+  `DiscoverLayers()`, the loader searches `getLayerPaths()` unconditionally;
+  only `/data/local/debug/vulkan` is gated on `isDebuggable()`. So a
+  non-debuggable app can load a layer bundled in its own APK, and the runtime's
+  existing injection names it.
+- *Uncompressed libs — verified in AOSP (#1919), android11/13/14-release and
+  main:* `LoadedApk.makePaths()` puts both `nativeLibraryDir` and
+  `<apk>!/lib/<abi>` on the class loader's library search path, which
+  `ApplicationLoaders` hands to `GraphicsEnvironment.setLayerPaths()`;
+  `DiscoverLayersInPathList()` walks `!/` zip paths, keeping entries that are
+  stored and page-aligned (AGP's uncompressed packaging), and opens them via
+  the app namespace. *Not verified:* the OEM builds our devices run. Fallback:
+  `extractNativeLibs=true` / `useLegacyPackaging true`.
+
+**Hazards to measure before productizing.**
+- With the per-device A/B scope only: a DP-internal `vkQueueWaitIdle`, or a
+  blocking present, stalls the **other** queue's submits as well as its own
+  (§5.2, widened); this is what the 22.5 Hz row above measured.
+  `vkQueueWaitIdle` held under the device lock can also **deadlock** in one
+  case: the waited queue has a pending timeline-semaphore wait whose signal the
+  other queue has not been submitted yet (wait-before-signal). Binary
+  semaphores cannot do this. Per-queue scope (the default) has neither hazard.
+- The layer covers every `VkDevice` in the app process, including ones the app
+  creates for itself.
+- **`vkDeviceWaitIdle` gap: closed.** The spec externally synchronizes host
+  access to *every* queue of the device for the duration of the call, and on
+  Adreno a concurrent `vkQueueSubmit` on another thread races it on the shared
+  GSL context (the -3 class above). The runtime calls it on the weave/repaint
+  thread during target recreate (`comp_vk_native_target.cpp`, rotation /
+  `OUT_OF_DATE`) while the app keeps submitting. (It also called it on the
+  `debug.dxr.weave_postwait_queue=0` path, until #2095 / ADR-055 deleted that
+  switch together with the post-weave drain it widened — the in-process weave is
+  now ordered by `set_weave_sync` semaphores, not host drains.) The layer now intercepts it on every platform: it takes
+  every registered queue's mutex in ascending registry-slot order (per-device
+  scope: the one device mutex), calls down, and releases in reverse. That order
+  cannot invert against the other entry points, which each hold exactly one
+  queue mutex and acquire nothing while holding it. The registry lock is held
+  only to snapshot the set, never while waiting on a queue mutex. Registration
+  stays complete: both `vkGetDeviceQueue` and `vkGetDeviceQueue2` are
+  intercepted, and a queue first seen at a submit is registered lazily.
+  What remains:
+  - A queue registered *after* the snapshot (a `vkGetDeviceQueue` racing the
+    wait-idle) or beyond `QL_MAX_QUEUES` (16) is not locked.
+  - The app's submits now wait out the whole device drain instead of racing
+    it. That is the spec's contract, but a recreate costs the app a stall.
+  - A deadlock is possible if a queue has a pending timeline-semaphore wait
+    whose signal only a *later* submit from another thread provides
+    (wait-before-signal). That submit is blocked behind the wait-idle's locks.
+    Without the layer this case is a spec violation that happens to race
+    through, so the runtime should still prefer per-queue
+    `vkQueueWaitIdle`/fences over `vkDeviceWaitIdle` on a shared device.
+
+### 7.1 Non-blocking `xrEndFrame` hand-off and its fallback (#1905 ask 2, #1939, #1962)
+
+**What it is.** With the queue-lock layer live, an in-process Android frame
+whose weave reads nothing the app owns (no window-space layers, Local2D, zones
+or zero-copy) is posted to the weave thread and `xrEndFrame` returns once the
+frame is *committed* — the app's images are already blitted into the runtime
+atlas. The next `layer_commit` drains the outstanding serve before it rewrites
+anything that serve reads (the depth-1 bound). The serve runs on the
+runtime-owned queue. Knob: `DXR_ASYNC_HANDOFF` / `debug.dxr.async_handoff`
+(`1` forced on with no fallback, `0` off, else auto) — census row in
+`control-panel-performance-settings.md`.
+
+**Why it needs a fallback.** On one Adreno GSL context the two queues share a
+priority, so a run-ahead app's next frames sit in front of the serve: the
+commit drain waits about a frame. Before #1959 removed the per-frame sRGB copy,
+that made non-blocking *slower* than blocking on the model viewer (#1939: 22.5
+→ 13.4 fps), so #1939 added a stall-adaptive fallback.
+
+**Why the #1939 scorer was wrong (#1962, measured on v2.37.1).** It scored the
+drain *wait*, not harm: a window of 16 non-blocking frames with most drains
+over half a panel period tripped it. Two defects:
+- It scored the first 16 frames of a launch, when warm-up drains run 19–43 ms,
+  so it tripped on every model-viewer launch (and on earthview, where the
+  trip happens not to show).
+- It re-probed with ONE frame every 5 s against P/2 straight after a blocking
+  stretch. That probe cannot pass: no recovery in ~25 runs.
+
+With the fallback bypassed (`=1`), the model viewer drains 8–16 ms on almost
+every frame and still runs **55–59 fps on the phone** (blocking: 31) and
+**38–39 fps on the NP02J** (blocking: 22–30, GPU pinned at 680 MHz). On a
+vsync-paced app the drain replaces time the app would spend blocked anyway.
+Blocking also parks the GPU clock (348 vs 680 MHz on the phone): app CPU → app
+GPU → weave run serially, so busy-% never reaches the governor's step-up
+threshold (#1917).
+
+**The harm-scored fallback (#1962).** The sample is the app's frame interval
+(admit to admit), attributed to the mode the previous frame was posted in. P is
+one panel period.
+- **Warm-up:** nothing is scored for the first 60 frames **and** 1 s of a
+  session. The warm-up restarts after any swapchain creation, any change to
+  the effective layout, target size or 2D/3D state, any frame that cannot go
+  non-blocking, an abandoned serve, or a gap of more than 250 ms.
+- **Settle:** the first 2 samples after any mode switch are discarded.
+- **Trip** (checked per 32-sample window): the drain exceeded a **full** P on
+  more than half the frames, **and** the mean app interval is worse than 2P,
+  **and**, if an earlier fallback measured a blocking reference, worse than
+  1.1× that reference. The last condition is hysteresis: async already proved
+  it beats blocking there.
+- **Blocking:** each full 32-sample blocking window refreshes the blocking
+  reference interval.
+- **Probe:** 1 s after a trip, then every 5 s after a failed probe, run a
+  **window** of non-blocking frames (2 settle + 32 samples). It recovers if
+  its mean app interval is no worse than 1.05× the blocking reference, or if
+  the window would not trip on its own.
+
+Each trip, recovery and failed probe logs one WARN line with its numbers
+(window size, drain-over-P count, mean drain, app interval, blocking
+reference). The first four of each kind are WARN; later ones are INFO, and the
+trace row counts them all. The `#1905 trace` row shows the state:
+`handoff{mode=auto|fallback|probe|async|blocking … trips= recovered= probe_fails=}`.
+The #1939 case (13 fps, ~42 ms drains) still trips (checked offline: the
+scorer driven by synthetic intervals).
+
+**Measured (#1964, dev APK vs released v2.37.1, auto, 2×30 s per row).**
+
+| device | app | v2.37.1 fps | #1964 fps | GPU clk (MHz) |
+|---|---|---|---|---|
+| phone `D123171101B0` | model viewer | 30.3 / 35.5 | **57.4 / 59.0** | 348–401 → 680 |
+| phone | earthview | 59.4 / 59.4 | 59.8 / 59.8 | 220 → 220 |
+| phone | mediaplayer | 59.9 / 59.9 | 59.8 / 59.8 | 125 → 125 |
+| NP02J `327343950099` | model viewer | 29.5 / 23.6 | **39.2 / 39.1** | 475–550 → 680 |
+| NP02J | earthview | 47.1 / 58.8 | 59.8 / 56.2 | 220–295 |
+| NP02J | mediaplayer | 59.9 / 59.9 | 59.9 / 59.9 | 220 → 220 |
+
+v2.37.1 tripped to blocking at launch in all 12 runs. #1964 did not trip in
+11. The one exception was the NP02J model viewer, run 2: it tripped 7 s after
+launch (25/32 drains over P, 38.3 ms interval), and 1.9 s later the first
+probe window recovered (25.7 ms non-blocking vs 27.8 ms blocking). The
+`debug.dxr.async_handoff=0` control still blocks (phone model viewer 30.0 fps
+at 348 MHz).
+
+**What it does not do.** It does not deepen the hand-off. A depth-D ring would
+need a lock split first: the served weave holds `c->mutex` for its whole
+duration and `layer_commit` takes it right after the drain, so with D > 1 the
+wait would just move to `c->mutex`. It would also need a D-slot atlas ring and
+per-slot snapshots (#1962 comment). The data says depth 1 is not the limiter.

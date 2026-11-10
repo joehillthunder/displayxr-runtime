@@ -280,6 +280,12 @@ Phase 2.1) and bare `git describe` walks only *annotated* tags. Without it every
 APK from v2.14.5 to v2.16.14 named itself `v2.14.5-<n>-g<sha>` while being built
 from a v2.16.x commit.
 
+The runtime `.so` inside the APK reports the same release: its `runtimeName` tag
+is the same describe as `versionName` (minus `-dirty`), and its
+`xrGetInstanceProperties` `runtimeVersion` is that describe's `X.Y.Z`
+(`cmake/DisplayXRVersion.cmake`; before #1790 it said `1.6.0` in every APK).
+build-android.yml's "Inspect APK" step checks the `.so` for that string.
+
 **`versionCode`** is positional arithmetic over
 `git describe --tags --long`, *not* string concatenation:
 
@@ -430,6 +436,90 @@ adb logcat -d | grep "Hybrid mode:"
 adb shell ps -A -o PID,NAME | grep :dxr   # satellites, one per IPC client
 ```
 
+### The queue-lock layer ships in the client AAR (#1919)
+
+The DisplayXR client AAR (`DisplayXR-Client-<ver>.aar`, attached to every
+runtime `v*` release — the library Android apps already depend on for the
+runtime wake/broker visibility) also carries
+`jni/arm64-v8a/libVkLayer_DXR_queue_lock.so`, the per-queue Vulkan layer from
+#1905.
+
+**Why it has to ride in the app.** On Adreno, unsynchronised `vkQueue*` calls
+from the app and the runtime corrupt the GSL context timestamp; the layer
+serialises them. Only a layer sits in the app's dispatch chain, and Android's
+Vulkan loader only looks for layers on the **app's own** library search path
+(plus the debug-only paths below). A copy inside the runtime APK is invisible
+to a shipped app. When the layer is live, the vk_native compositor's marker
+handshake (`vkGetQueueLockMarkerDXR`) auto-enables mid-frame fills (#1910), so
+the weave refreshes at panel rate instead of app rate. When it is absent,
+everything still works, just at app rate. The AAR copy is built from the same
+commit, NDK and flags as the runtime APK's, and CI asserts the two are
+byte-identical.
+
+**What an app must do: depend on the AAR, nothing else.** The runtime's
+`xrCreateVulkanInstanceKHR` (`XR_KHR_vulkan_enable2`) appends
+`VK_LAYER_DXR_queue_lock` to the app's layer list itself, and retries without
+it if the loader cannot find it.
+
+- Do **not** enable the layer yourself, ship a manifest or JSON for it, or
+  rename the `.so`. The loader discovers it by the `libVkLayer*.so` file name.
+- An app on `XR_KHR_vulkan_enable` (v1) creates its own `VkInstance`, so the
+  runtime cannot inject the layer. That app must add `VK_LAYER_DXR_queue_lock`
+  to `ppEnabledLayerNames` itself, or move to enable2.
+- The layer is `arm64-v8a` only, like the runtime. Other ABIs simply do not get
+  it.
+- Letting your build strip it, as it strips any other native lib, is fine.
+
+**Uncompressed native libs (`extractNativeLibs=false`, AGP's default
+`useLegacyPackaging false`).** AOSP supports this: verified in `android11-release`,
+`android13-release`, `android14-release` and `main`. `LoadedApk.makePaths()` adds
+both `nativeLibraryDir` and `<base.apk>!/lib/<abi>` to the class loader's
+library search path. `GraphicsEnvironment.setupGpuLayers()` appends that whole
+search path to the layer path "in all cases" (outside the debug gate). The
+loader's `DiscoverLayersInPathList()` walks `apk!/` zip paths and accepts
+entries that are **stored and page-aligned**, which is how AGP packages
+uncompressed libs. It then opens them through the app's linker namespace. What
+is *not* verified is the exact OEM builds our devices run. If a device does not
+find the layer with uncompressed libs, the fallback is to extract them:
+
+```gradle
+android { packagingOptions { jniLibs { useLegacyPackaging true } } }
+// equivalently: <application android:extractNativeLibs="true"> in the manifest
+```
+
+(The DisplayXR demos already set `useLegacyPackaging true`.)
+
+**Verify.**
+
+```bash
+unzip -l app-release.apk | grep VkLayer
+#   lib/arm64-v8a/libVkLayer_DXR_queue_lock.so
+adb logcat -d | grep -E "DXR-queue-lock|#1905: mid-frame fill"
+#   DXR-queue-lock: VK_LAYER_DXR_queue_lock: device 0x... registered, lock scope per-queue
+#   #1905: mid-frame fill ON — auto: VK_LAYER_DXR_queue_lock is live on this device ...
+```
+
+If you see `#902: VK_LAYER_DXR_queue_lock not found by the Vulkan loader —
+retrying without` followed by `mid-frame fill OFF — auto: ... absent`, the
+layer did not reach the app's lib path. Check the APK listing first, then
+`extractNativeLibs`. `setprop debug.dxr.midframe_fill 0|1` forces the policy
+either way for A/B testing.
+
+**Apps without the AAR (userdebug only).** The runtime APK also carries the
+layer, so a debug setup can load it into any app from there:
+
+```bash
+adb shell settings put global enable_gpu_debug_layers 1
+adb shell settings put global gpu_debug_app <app.package>
+adb shell settings put global gpu_debug_layers VK_LAYER_DXR_queue_lock
+adb shell settings put global gpu_debug_layer_app org.freedesktop.monado.openxr_runtime.out_of_process
+# undo: for k in enable_gpu_debug_layers gpu_debug_app gpu_debug_layers gpu_debug_layer_app; do adb shell settings delete global $k; done
+```
+
+This path is debug-gated (`GraphicsEnvironment.debugLayerEnabled()` requires a
+debuggable build or app). It is a test path, not a delivery path. Background:
+`docs/roadmap/vk-late-weave-queue-serialization.md` §7.
+
 ## Step 4: Build the test app APK
 
 ```bash
@@ -570,6 +660,29 @@ is the single source of truth: it generates the `MonadoServiceSlotN` classes. Ad
 `AndroidManifest.xml` — `:src:xrt:ipc:checkSatelliteSlotManifest` fails the build if you forget.
 Each extra live satellite costs ~30–60 MB and one GPU context.
 
+### Workspace overlay mode (one shared surface, #1006)
+
+The opt-in alternative to satellites: a verified workspace controller composites every IPC
+client that joins after it into its own fullscreen surface, through one display processor
+(ADR-036 D4; contract in `docs/specs/runtime/workspace-controller-registration.md`). The test
+controller is `test_apps/workspace/workspace_controller_android`; it must be signed with the
+**same key as the runtime** (build both on one box), or set
+`debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER 1`.
+
+```bash
+./gradlew :test_apps:workspace_controller_android:assembleDebug
+adb shell setprop debug.dxr.force_ipc 'com.displayxr.cube_handle_vk_android*'
+adb shell am start -n com.displayxr.workspace_controller_android/android.app.NativeActivity
+adb shell am start -n com.displayxr.cube_handle_vk_android/.MainActivity      # joins the overlay
+adb shell am start -n com.displayxr.workspace_controller_android/android.app.NativeActivity  # back in front
+adb logcat | grep -E '#1006|dxr-workspace|dxr-slot-broker|shared (surface|display processor)'
+adb shell setprop debug.dxr.test_controller.mode 0   # controller asks for 2D (1 = 3D)
+adb shell setprop debug.dxr.test_controller.active 0 # end the overlay; per-window resumes
+```
+
+A Leia device needs the Leia variant built as **release** (the released plug-in is built with
+`NDEBUG`; a debug runtime logs `vk_bundle ABI mismatch` and refuses its DP, so nothing weaves).
+
 ## Troubleshooting
 
 **Before chasing a runtime bug, check the platform underneath it.**
@@ -648,6 +761,12 @@ adb logcat | grep -E "SURFACE_FMT|set_transparent_background|alpha-gate"
 A healthy overlay session logs `canDrawOverOtherApps (overlay mode) = true`,
 `connect: overlay mode — creating service overlay`, `transparent=1 overlay=1`,
 and `Leia CNSDK DP: alpha-gate pipeline ready`.
+
+### Low frame rate with an idle-looking GPU: the clock never ramps (#1917)
+
+ADPF hint sessions are **unsupported** on the Lume phone and the NP02J (Android 13, Adreno 740): `dumpsys performance_hint` reports `HAL Support: false`, so every app logs `ADPF: createSession failed` (the line now carries `APerformanceHint_getPreferredUpdateRateNanos` — `-1` confirms the HAL, `>0` would mean our arguments). Without hints the msm-adreno-tz governor parks the GPU near **220 MHz** (floor 124.8, max 680) at ~50% busy; pinning 680 MHz gave the model viewer +60% fps, while `cmd power set-fixed-performance-mode-enabled` changed nothing.
+Experiment knob, default **off** until measured: `adb shell setprop debug.dxr.sustained_perf 1` makes `MonadoView` request `Window.setSustainedPerformanceMode(true)` on the host Activity (one WARN line reports supported / applied / Activity class; service-owned overlays skip it).
+**App rule:** keep **≥2 frames in flight**. A strictly serialised submit → `vkWaitForFences` → submit loop never looks busy to the governor and runs the GPU at about a third of its max clock. The full rule (one submit per frame, no per-frame drains or command-buffer allocation), the shared `dxr::VkFrameRing` helper and the lint check: [INV-4.10](../guides/displayxr-app-rules.md) in the app-authoring rules.
 
 ### Device not found by ADB
 

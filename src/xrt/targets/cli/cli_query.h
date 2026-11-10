@@ -8,8 +8,9 @@
  * text + JSON serializers over it. `info` and `selftest` are thin wrappers:
  * they run the query and pick a serializer; the boilerplate that creates an
  * instance, runs vendor plug-in discovery with no compositor, and reads the
- * vendor-neutral display info lives here once. The Control Panel (issue
- * #378) and the session-free MCP tools consume the same `--json` shape.
+ * vendor-neutral display info lives here once. The DisplayXR Dashboard
+ * (successor of the #378 Control Panel) and the session-free MCP tools
+ * consume the same `--json` shape.
  *
  * @author David Fattal
  */
@@ -19,15 +20,26 @@
 #include "cli_dims_check.h"
 
 #include "xrt/xrt_plugin.h"
+#include "target_plugin_loader.h" // ADR-045 per-plug-in status
 #include "os/os_display_desktop.h"
 #include "os/os_display_scale.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_zones.h"
+#include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_screen.h"
+#include "xrt/xrt_display_status.h" // ADR-053 conversion provider rows
 
 #include <stdint.h>
 #include <stdbool.h>
 
 typedef struct cJSON cJSON;
+
+/*!
+ * Top-level `"schema"` of the CLI's published `--json` shapes (`info`,
+ * `displays`, `displays --claims`; ADR-051, display dashboard phase 0). Keys
+ * are only ever added; bump this only on an incompatible change.
+ */
+#define CLI_JSON_SCHEMA 1
 
 struct xrt_instance;
 struct xrt_instance_info;
@@ -109,6 +121,36 @@ enum cli_selftest_result
 	 * navigating provider.
 	 */
 	CLI_SELFTEST_BAD_RIG = 10,
+	/*!
+	 * The plug-in's 2D→3D conversion module (XR_DXR_lift, ADR-042) answered
+	 * a MALFORMED caps struct (unknown mode bits, a state out of range, a
+	 * READY module with no streams, an NVIEW module with < 2 views). ABSENCE
+	 * NEVER FAILS: no module (modes 0) — the state of every plug-in without
+	 * one, and of sim_display — passes.
+	 */
+	CLI_SELFTEST_BAD_LIFT_CAPS = 11,
+
+	/*!
+	 * The active plug-in fills the stereo camera slots (ADR-043) and one of
+	 * its cameras is described out of contract: zero / odd eye extent, an
+	 * unknown native format, a non-positive frame rate, or CALIBRATED with no
+	 * (or a degenerate) calibration. ABSENCE NEVER FAILS: no slots or zero
+	 * cameras is the state of almost every box.
+	 */
+	CLI_SELFTEST_BAD_STEREO_CAMERA = 12,
+
+	/*!
+	 * A registered conversion provider (ADR-053) described a MALFORMED
+	 * capability: unknown task, lanes 0 / unknown lane bit, min_views >
+	 * max_views or > 8, VIEWS_* without EXPLICIT_VIEWPOINTS, an unknown
+	 * licence class, a duplicate / zero cap_id, a failing describe_cap, or a
+	 * get_state answer out of range (spec §7.2). ABSENCE NEVER FAILS: no
+	 * provider registered, a provider that declines its probe, or one the
+	 * loader rejects (ABI, missing binary) all pass — they are reported, not
+	 * failed. The check enumerates, negotiates, probes and describes; it never
+	 * warms (no model load).
+	 */
+	CLI_SELFTEST_BAD_CONVERSION = 13,
 };
 
 //! Hardware adapters reported by the GPU-topology probe (#918).
@@ -150,10 +192,15 @@ struct cli_gpu_adapter
  * instance is destroyed before @ref cli_query_run returns, so the result
  * stays valid with no dangling iface pointers and no live runtime objects.
  */
+//! = XRT_SYSTEM_MAX_DEVICES, without pulling xrt_system.h into every CLI TU (N7 device list).
+#define CLI_INPUT_MAX_DEVICES 32
+
 struct cli_query_result
 {
 	/* Runtime. */
 	char runtime_description[256];
+	//! "X.Y.Z" -- xrGetInstanceProperties' runtimeVersion (#1790).
+	char version[32];
 	char git_tag[128];
 	uint32_t plugin_abi_version; //!< XRT_PLUGIN_API_VERSION_CURRENT.
 
@@ -186,6 +233,22 @@ struct cli_query_result
 	 * i.e. the runtime fell back. Absence of such a candidate is fine. */
 	bool vendor_dp_ok;
 	char vendor_dp_note[256];
+	/* N3b: better-ranked plug-ins discovery skipped because they are
+	 * DISABLED (`Enabled` = 0 / `"enabled": false`), incl. a disabled
+	 * PreferredPlugin. Never a failure — the user asked — but the
+	 * `display_processor` block says so (`skipped_disabled`). */
+	int skipped_disabled_count;
+	char skipped_disabled[8][64];
+	//! Registration id of the winning row ("" when none) — `plugin_id` is
+	//! iface->id, which two rows of one DLL share.
+	char active_row_id[64];
+
+	/* ADR-045 — every registered plug-in with its load outcome and the
+	 * platform state + hint it reports (UNKNOWN for a plug-in that predates
+	 * the get_platform_state slot). Sorted by ProbeOrder. Valid once the
+	 * instance was created; count 0 otherwise. */
+	int plugin_state_count;
+	struct target_plugin_status plugin_states[16];
 
 	/* Head/display device description (valid iff head_ok). */
 	char head_str[256];
@@ -266,7 +329,39 @@ struct cli_query_result
 	bool zone_caps_probed;
 	bool zone_caps_malformed;
 	char zone_probe_note[128];
+
+	/* Stereo camera slots (ADR-043, `stereo_camera_caps`). Absence never
+	 * fails; only an out-of-contract camera description does. */
+	uint32_t stereo_camera_count;
+	bool stereo_camera_malformed;
+	char stereo_camera_note[200];
 	struct xrt_dp_local_zone_caps zone_caps;
+
+	/* ADR-042 lift-caps probe (Windows-only: WARP D3D11 device + the plug-in's
+	 * lift-only DP factory, else its ordinary one with a NULL window, then
+	 * lift_get_caps). Same outcome contract as the zone probe: modes 0 / no
+	 * slots / no factory pass; only a malformed answer fails. */
+	bool lift_caps_probed;
+	bool lift_caps_malformed;
+	char lift_probe_note[160];
+	struct xrt_dp_lift_caps lift_caps;
+
+	/* ADR-053 `conversion_providers` check (#2006): enumerate -> negotiate ->
+	 * probe -> describe (target_conv_status), NO model load. Absence never
+	 * fails; only a malformed descriptor does (CLI_SELFTEST_BAD_CONVERSION).
+	 * `conv_count` is the provider rows (registered providers + the static
+	 * dp-lift row when the active plug-in has the lift-only factory). */
+	bool conv_evaluated;
+	uint32_t conv_count;
+	uint32_t conv_registered;
+	uint32_t conv_negotiated;
+	uint32_t conv_malformed_rows;
+	uint32_t conv_bad_descriptors;
+	uint32_t conv_task_count;
+	bool conv_dp_lift_declared;
+	char conv_kill_switch[16]; //!< #2029: "DXR_CONV" / "DXR_LIFT" when that switch emptied the pass
+	char conv_note[256];
+	struct xrt_status_conv_provider conv_providers[XRT_STATUS_MAX_CONV_PROVIDERS];
 
 	/* Input-provider checks (ADR-034 / #823). Absence never fails: with
 	 * no provider registered — or the ForceQwerty override set, or the
@@ -281,16 +376,59 @@ struct cli_query_result
 	 * state of any box whose tracker is unplugged, and it is a PASS: the
 	 * arbiter hands the hand roles to qwerty, which is exactly right. */
 	int input_provider_count;    //!< registered providers (enumerated, unloaded)
+	int input_enabled_count;     //!< ...of which Enabled (ADR-054 N4: Enabled=0 must fall back)
+	int input_scan_declined;     //!< loader scan: providers that declined cleanly
+	int input_scan_failed;       //!< loader scan: providers that could not be dispatched (load / ABI)
+	int input_scan_untrusted;    //!< loader scan: providers the provenance gate refused (ADR-054 N4b)
 	bool input_force_qwerty;     //!< ForceQwerty override set
+
+	/* ADR-054 N7 (#2143): the EmulatedControllers gate as read by the loader
+	 * (value + where it came from: user | machine | file | default), and the
+	 * system's device list as data so a conformance cell can assert the
+	 * qwerty pair's presence / absence from a field, not log text. */
+	int input_emulated_controllers; //!< 1 = the qwerty pair is published (default), 0 = withheld
+	char input_emulated_source[12];
+	int input_device_count;
+	char input_device_str[CLI_INPUT_MAX_DEVICES][64];
+	int input_device_type[CLI_INPUT_MAX_DEVICES]; //!< enum xrt_device_type
+
 	bool input_provider_active;  //!< a provider claimed the system
 	bool input_provider_present; //!< …and its hardware is there right now
 	bool input_evaluated;        //!< checks ran (provider present, no override)
 	bool input_left_ok;
 	bool input_right_ok;
 	char input_provider_id[64];
+	/* N3b: the resident providers' REGISTRATION ids in priority order
+	 * (index 0 = the one the loader ranked first — the PreferredPlugin row
+	 * when one is set). `input_provider_id` above is iface->id, which two
+	 * rows of one DLL share; this is what tells them apart. */
+	int input_ranked_count;
+	char input_ranked[16][64];
 	char input_left_str[256];
 	char input_right_str[256];
-	char input_note[160];
+	char input_note[256];
+	/* Ultraleap's implicit OpenXR layer (XR_APILAYER_ULTRALEAP_hand_tracking)
+	 * is registered + enabled while an `ultraleap` input provider is
+	 * registered: the layer resets the Leap to Head-mounted mode in every
+	 * OpenXR app. A WARNING only, never a selftest failure. */
+	bool input_ultraleap_layer_warn;
+	char input_ultraleap_layer_note[1024];
+
+	/* ADR-054 N6 Part 2: the viewer-tracking class — the scan tally, the
+	 * resident rows in rank order, and the primary screen's viewer source as
+	 * the trunk would arbitrate it (evaluated headlessly: nothing started). */
+	bool tracking_evaluated;     //!< the arbitration ran (display info known)
+	int tracking_registered;     //!< usable rows
+	int tracking_enabled;        //!< ... of which enabled
+	int tracking_scan_declined;  //!< enabled, dispatched, no usable source
+	int tracking_scan_failed;    //!< load / ABI failures
+	int tracking_scan_untrusted; //!< refused by the provenance gate
+	int tracking_ranked_count;
+	char tracking_ranked[16][64];
+	char tracking_viewer_source[96]; //!< "dp" / "provider:<id>" / "nominal"
+	char tracking_viewer_reason[128];
+	char tracking_viewer_policy[16];  //!< the DP's viewer policy: OWN / EXTERNAL_OK / FIXED
+	uint32_t tracking_composed_modes; //!< what XR_DXR_display_info would advertise (composed)
 
 	/* Rig (navigation) role checks (ADR-034 Amendment 4 / #1380). ABSENCE
 	 * NEVER FAILS: with no `XRT_DEVICE_TYPE_NAVIGATION` device in the
@@ -312,12 +450,14 @@ struct cli_query_result
 	bool rig_nav_present;       //!< a NAVIGATION device is in xsysd->xdevs
 	bool rig_evaluated;         //!< checks ran (a navigation device exists)
 	bool rig_role_ok;           //!< xrt_system_roles::rig points at that device
-	bool rig_moves_ok;          //!< the head pose changed over the window and stayed finite
+	bool rig_moves_ok;          //!< head moved (or head and provider both at rest) and stayed finite
 	bool rig_recenter_expected; //!< >= 2 scripted recenters fired during the window
 	bool rig_recenter_ok;       //!< …and the head returned to one identical pose each time
 	uint32_t rig_recenter_seen; //!< recenter timestamp advances observed
 	uint32_t rig_repeat_max;    //!< largest exact-repeat count among the sampled head poses
 	float rig_travel_m;         //!< furthest the head got from its first sample
+	float rig_nav_travel_m;     //!< furthest the navigation device's own pose got from its first sample
+	bool rig_at_rest;           //!< head AND provider both still: no navigation input, composition not exercised
 	char rig_nav_str[256];
 	char rig_note[224];
 
@@ -337,7 +477,7 @@ struct cli_query_result
 	 * reads the scalar dp_factory (== the active plug-in, `plugin_id` above),
 	 * while the D3D11 service / shell path AND in-process GL read the
 	 * per-monitor DP registry's PRIMARY entry (`comp_dp_factory_for_window`
-	 * with COMP_DP_PRIMARY_MONITOR → entries[0]). On a single display they MUST
+	 * with COMP_DP_PRIMARY_MONITOR → xrt_dp_registry_primary_entry). On a single display they MUST
 	 * agree — the loader enforces it for any monitor the active plug-in claims
 	 * (#1521) — and a mismatch means standalone apps, GL apps and the shell
 	 * weave with different DPs — e.g. Leia in-process but sim_display in the
@@ -353,6 +493,14 @@ struct cli_query_result
 	char dp_sel_inproc_id[64];     //!< in-process path plug-in id (mirrors plugin_id).
 	char dp_sel_service_id[64];    //!< service path plug-in id (registry primary; == in-proc on empty registry).
 	char dp_sel_service_conf[24];  //!< service claim confidence label (FALLBACK/EDID/VERIFIED/scalar-fallback).
+
+	/* Multi-screen M1 — the per-screen list `xrEnumerateDisplaysDXR` reports,
+	 * built from the same registry + display info the runtime uses
+	 * (target_screens_build), so M1 is verifiable without a window.
+	 * screens_probed — the list was built (the active plug-in described its
+	 * panel; an empty registry still yields the synthesized default). */
+	bool screens_probed;
+	struct xrt_screen_list screens;
 
 	/* #918 GPU topology — does this box pay a cross-adapter present to get
 	 * the woven frame onto the panel? Windows-only: `gpu_probed` stays false
@@ -390,6 +538,27 @@ struct cli_query_result
 	//! came from.
 	char gpu_weave_env[64];
 	char gpu_weave_source[16]; //!< "env" / "user" / "machine" / "default".
+	/*!
+	 * #2317 step 2: DXR_HUB as THIS process resolves it (the settings chain;
+	 * a managed name). The in-process D3D11 leg weaves through the D3D11 hub by
+	 * default on a cross-adapter box; `DXR_HUB=0` is the kill switch and `=1`
+	 * also engages it on one adapter. An "env" source says nothing about another
+	 * process, "user" / "machine" describe every app; either way a hint — the
+	 * session's own `hub placement:` log line is the truth.
+	 */
+	bool gpu_hub_env_set;
+	char gpu_hub_env[64];
+	char gpu_hub_source[16]; //!< "env" / "user" / "machine" / "default".
+	/*!
+	 * #2375: DXR_SPLIT_D3D12_HYBRID_REROUTE as THIS process resolves it (the
+	 * settings chain; a managed name). An in-process D3D12 session on a
+	 * cross-adapter box weaves through the D3D11 hub by default; `=0` is the
+	 * kill switch back to the tier's own-legs split. A hint, like the DXR_HUB
+	 * fields: the session's `hub placement:` log line is the truth.
+	 */
+	bool gpu_d3d12_reroute_env_set;
+	char gpu_d3d12_reroute_env[64];
+	char gpu_d3d12_reroute_source[16]; //!< "env" / "user" / "machine" / "default".
 	/*!
 	 * #918 Phase 2b — the SERVICE split, as far as a headless tool can honestly
 	 * answer it: this process is not the service, holds no IPC connection, and
@@ -435,8 +604,10 @@ struct cli_query_result
 
 	/*!
 	 * #1234 / #902 — is `VK_LAYER_DXR_queue_lock` reachable by the Vulkan
-	 * loader? INFORMATIONAL ONLY, and Windows-only (`vk_layer_probed` stays
-	 * false elsewhere).
+	 * loader? INFORMATIONAL ONLY. Probed on Windows (the ExplicitLayers
+	 * registry key) and desktop Linux (the loader's explicit_layer.d search
+	 * path, #2036); `vk_layer_probed` stays false elsewhere. On Linux
+	 * "registered" means a manifest was found and `enabled` is always true.
 	 *
 	 * The layer is what lets the #868 late-weave repaint share the app's
 	 * VkQueue on a GPU whose graphics family exposes a single queue. Without
@@ -476,6 +647,21 @@ struct cli_query_result
 	char vk_layer_manifest[512];
 	char vk_layer_library[512];
 	char vk_layer_note[256];
+
+	/*!
+	 * #886 — the IMPLICIT twin of the manifest above (desktop Linux only):
+	 * the same layer for vulkan_enable1 apps, loaded only when the app's
+	 * environment has DXR_VK_QUEUE_LOCK=1. INFORMATIONAL ONLY, like the
+	 * explicit probe. `gated` is the safety property: an implicit manifest
+	 * without that enable_environment would load the layer into every Vulkan
+	 * process on the box.
+	 */
+	bool vk_ilayer_probed;
+	bool vk_ilayer_gated;
+	bool vk_ilayer_library_ok;
+	char vk_ilayer_manifest[512];
+	char vk_ilayer_library[512];
+	char vk_ilayer_note[256];
 };
 
 /*!
@@ -524,6 +710,35 @@ cli_query_info_to_cjson(const struct cli_query_result *r);
 
 cJSON *
 cli_query_selftest_to_cjson(const struct cli_query_result *r);
+
+/*!
+ * The XR_DXR_lift (ADR-042) caps contract: true when @p caps is malformed
+ * (unknown mode bits, a state out of range, a READY module with no streams,
+ * an NVIEW module with < 2 views, unknown depth semantics).
+ */
+bool
+cli_query_lift_caps_malformed(const struct xrt_dp_lift_caps *caps);
+
+/*!
+ * Record live lift caps in @p r (probed = true, the malformed verdict, a note
+ * naming @p source) and, when malformed and nothing failed before, set
+ * CLI_SELFTEST_BAD_LIFT_CAPS. The CLI calls it with the running service's
+ * caps (a DIAG `lift_get_properties`) -- the headless pass itself never
+ * instantiates a lift module (the WARP probe was retired, ADR-053 §7.1).
+ */
+void
+cli_query_set_lift_caps(struct cli_query_result *r, const struct xrt_dp_lift_caps *caps, const char *source);
+
+struct target_conv_status;
+
+/*!
+ * ADR-053 (#2006): record a conversion pass (target_conv_status) in @p r --
+ * the `conversion_providers` check's counts, rows and note -- and, when it
+ * found a malformed descriptor and nothing failed before, set
+ * CLI_SELFTEST_BAD_CONVERSION (exit 13). Absence never fails.
+ */
+void
+cli_query_apply_conversion(struct cli_query_result *r, const struct target_conv_status *st);
 
 void
 cli_query_print_info_text(const struct cli_query_result *r);

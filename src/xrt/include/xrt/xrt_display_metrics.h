@@ -86,6 +86,75 @@ struct xrt_weave_atlas_layout
 };
 
 /*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): most rects one weave cursor
+ * request carries (XR_WEAVE_SUBMIT_MAX_RECTS_DXR).
+ */
+#define XRT_WEAVE_CURSOR_MAX_RECTS 32
+
+/*!
+ * One rect's depth under the pointer (XrCursorDepthWeaveRectDXR). POD: it
+ * rides the IPC wire as is.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_rect
+{
+	uint32_t rect_index;  //!< into the submit's rects
+	uint32_t has_content; //!< 0 = nothing 3D under the pointer
+	float disparity_px;   //!< device px between the outermost views, < 0 = in front
+	float sample_u;       //!< diagnostic: where the page sampled it (rect-normalised)
+	float sample_v;
+	uint32_t flags; //!< reserved, 0
+};
+
+/*!
+ * The weave-rect cursor request of the NEXT weave submit
+ * (XrCursorDepthWeaveRequestDXR, the sprite without its texture handle -
+ * that rides weave_cursor_sprite_texture). POD for the IPC wire.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_request
+{
+	uint32_t sprite_kind; //!< XrCursorDepthWeaveSpriteKindDXR value
+	uint32_t rect_count;  //!< 0..XRT_WEAVE_CURSOR_MAX_RECTS
+	uint64_t sprite_generation;
+	uint64_t os_cursor; //!< OS_CURSOR: the HCURSOR
+	float size_m;       //!< <= 0: image px x panel pitch
+	uint32_t reserved;
+	struct xrt_weave_cursor_rect rects[XRT_WEAVE_CURSOR_MAX_RECTS];
+};
+
+/*!
+ * The texture carrier's description (XrCursorDepthWeaveSpriteDXR with kind
+ * TEXTURE); the shared handle travels beside it. Sent only on a sprite change.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_sprite_texture
+{
+	uint64_t generation;
+	uint32_t width, height; //!< px, <= 256 x 256
+	float hot_x, hot_y;     //!< hotspot, px from the top-left
+	float size_m;           //!< <= 0: image px x panel pitch
+	uint32_t is_dxgi;       //!< Windows: legacy global DXGI handle (else NT)
+};
+
+/*!
+ * What the runtime drew for the last weave submit's cursor request
+ * (XrCursorDepthWeaveStateDXR).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_weave_cursor_state
+{
+	uint32_t drawn_rect_mask; //!< bit i = drawn into the submit's rects[i]
+	uint32_t reserved;
+	uint64_t sprite_generation; //!< the sprite the runtime holds, 0 = none
+	int32_t bounds_x, bounds_y, bounds_w, bounds_h; //!< window px the sprite covers; 0 if none
+};
+
+/*!
  * Window metrics for adaptive FOV calculation and eye position adjustment.
  *
  * Contains display and window geometry needed to compute window-adaptive
@@ -120,6 +189,105 @@ struct xrt_window_metrics
 	struct xrt_quat window_orientation;
 
 	bool valid; //!< True if all metrics are valid
+};
+
+/*!
+ * Max window segments that get their own views (multi-screen M3, ADR-047 D3).
+ *
+ * A `PRIMARY_MULTIVIEW_DXR` session advertises `device max views x
+ * min(XRT_MAX_SEGMENTS, DP-backed screens)` views (capped at XRT_MAX_VIEWS) on a
+ * system that can segment windows, so a window spanning up to this many screens
+ * can carry one view set per screen; elsewhere the pre-M3 device max. The plan's eventual cap
+ * is 4; 2 covers every two-monitor layout and keeps the 8-view sim quad mode
+ * inside XRT_MAX_VIEWS. A window covering more screens keeps one view set for
+ * the whole window (the M2 crop path).
+ *
+ * @ingroup xrt_iface
+ */
+#define XRT_MAX_SEGMENTS 2
+
+/*!
+ * One window segment — the part of a window's canvas on one screen — as the
+ * view math needs it (multi-screen M3). Produced by an in-process compositor
+ * that segments its window (Vulkan native on desktop Linux, D3D11 on Windows).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_metric
+{
+	uint64_t screen_id; //!< The screen (registry monitor id; `XrDisplayDXR::displayId`)
+
+	struct xrt_rect window_rect; //!< The segment in WINDOW pixels (client area, top-left origin)
+	struct xrt_rect screen_rect; //!< The segment in its SCREEN's pixels (relative to the screen's desktop origin)
+
+	int32_t screen_desktop_left; //!< The screen's desktop rect (the space window positions are read in)
+	int32_t screen_desktop_top;
+	uint32_t screen_desktop_width;
+	uint32_t screen_desktop_height;
+	float screen_width_m; //!< The screen's physical size, metres (0 = unknown)
+	float screen_height_m;
+	float nominal_viewer_x_m; //!< The screen's nominal viewer, screen-centre relative, metres
+	float nominal_viewer_y_m;
+	float nominal_viewer_z_m;
+
+	bool is_primary;         //!< On the screen the session's own DP weaves
+	bool has_dp;             //!< A display processor exists for the screen right now
+	bool tolerates_resample; //!< That DP's output survives a resample (`XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`)
+	bool woven;              //!< The compositor weaves it in 3D (else a flat 2D copy)
+
+	//! The screen DP's predicted eyes, in THAT screen's display space (filled per query).
+	struct xrt_eye_positions eyes;
+	bool have_eyes; //!< @ref eyes is valid (the DP reported them)
+};
+
+/*!
+ * The segment table of a window, for per-segment views (multi-screen M3).
+ *
+ * @ref count is 0 when the window is not segmented (on the primary screen only,
+ * no window yet, segmentation off, an IPC/service session): the caller then
+ * keeps the single view set. When non-zero, the compositor weaves the window
+ * per screen and every segment is listed, left to right.
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_metrics
+{
+	uint32_t count;
+	struct xrt_segment_metric seg[XRT_MAX_SEGMENTS];
+
+	struct xrt_rect canvas;     //!< The canvas the table was cut from, window px
+	int32_t window_screen_left; //!< The window's client-area origin, desktop coordinates
+	int32_t window_screen_top;
+	uint32_t window_pixel_width;
+	uint32_t window_pixel_height;
+
+	//! Bumped whenever the table's geometry changes (a move, a resize, a screen change).
+	uint64_t generation;
+
+	//! The window plane's distance in front of the screens, metres (+z toward
+	//! the viewer). 0 for an OS window (it IS on the screen plane); a workspace
+	//! tile's pose z (ADR-052 D2) — every segment's canvas sits at this depth.
+	float window_depth_m;
+};
+
+/*!
+ * Where each segment's views go, handed from the state tracker to the
+ * compositor with the frame they were located for (multi-screen M3).
+ *
+ * Views `[first_view[i], first_view[i] + view_count[i])` of the projection
+ * layer belong to segment @ref rect[i] (window px). @ref count 0 = the frame
+ * carries one view set for the whole window (nothing to route).
+ *
+ * @ingroup xrt_iface
+ */
+struct xrt_segment_view_routing
+{
+	uint32_t count;
+	uint64_t screen_id[XRT_MAX_SEGMENTS];
+	struct xrt_rect rect[XRT_MAX_SEGMENTS];
+	uint32_t first_view[XRT_MAX_SEGMENTS];
+	uint32_t view_count[XRT_MAX_SEGMENTS];
+	struct xrt_rect canvas; //!< The canvas the rects are relative to, window px
 };
 
 #ifdef __cplusplus

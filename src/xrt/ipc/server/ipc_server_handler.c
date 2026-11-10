@@ -17,9 +17,17 @@
 #include "util/u_trace_marker.h"
 #include "util/u_canvas.h" // XR_DXR_display_zones P5: zone-scoped locate rebase
 #include "util/u_snap_grid.h" // XR_DXR_weave v11: bulk grid snap (#1723)
+#include "util/u_weave_rect_parts.h" // ADR-047 Amendment 4 addendum: per-screen element views
+#include "util/u_cursor_depth.h"      // XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4)
 
 #include "server/ipc_server.h"
 #include "server/ipc_server_peer_creds.h"
+#include "server/ipc_server_stereo_camera.h" // in-process camera consumers share the CAMERA_CONSUMER quota
+#include "util/u_exe_basename.h"
+#include "server/ipc_server_interface.h"
+#include "shared/ipc_lift_caps.h"
+#include "server/ipc_server_conv.h"
+#include "util/u_client_class.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_results.h"
@@ -52,7 +60,8 @@
 // XRT_FEATURE_COMP_MULTI_WEAVE_LINUX — #1699). Header-only, safe everywhere.
 #include "multi/comp_multi_interface.h"
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                              \
+    defined(COMP_MULTI_SHARED_SURFACE)
 // Out-of-process non-D3D11 service path (Android #510, macOS #48): the per-client
 // compositor is a multi_compositor; the server pulls its live present-target
 // extent for the client's Kooima and runs the server-side Kooima for the
@@ -62,23 +71,29 @@
 #include "xrt/xrt_display_metrics.h" // struct xrt_eye_positions (DP-tracked eyes; Leia M2)
 #endif
 
-#if defined(XRT_OS_MACOS)
-// macOS service input forwarding (#48): drain the generic queue fed by the
-// AppKit pump's NSEvent capture (ipc_server_macos_appkit.m).
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+// XR_DXR_lift §6 on the macOS / desktop-Linux weave engines (lift_weave_rects).
+#include "multi/comp_multi_weave_lift.h"
+#endif
+
+#if defined(COMP_MULTI_SHARED_SURFACE)
+// Shared-surface service input forwarding (macOS #48, desktop Linux #710): drain
+// the generic per-target queues fed by the service window's input capture
+// (ipc_server_macos_appkit.m / ipc_server_linux_input.c).
 #include "ipc_server_input_queue.h"
-// macOS workspace chrome (#48): the generic comp_multi chrome registry the
-// per-session render path composites from (the cross-platform analogue of the
-// D3D11 monolith's per-slot chrome storage).
+// Workspace chrome / pose / cursor / overlays (#48): the generic comp_multi
+// workspace registry the shared surface composites from (the cross-platform
+// analogue of the D3D11 monolith's per-slot storage).
 #include "multi/comp_multi_workspace.h"
 // Forward decl: the canonical-id → per-session compositor resolver is defined
 // lower in this file (alongside the chrome RPC handlers) but is also used by
 // the earlier get_window_pose handler.
 static struct xrt_compositor *
-macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
+multi_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
-    defined(COMP_MULTI_HAVE_WEAVE)
+    defined(COMP_MULTI_HAVE_WEAVE) || defined(COMP_MULTI_SHARED_SURFACE)
 // Shared Kooima rig math (#396 W7): same displayxr-common core as the
 // in-process oxr_session.c path and every app/engine consumer. Both server-side
 // Kooima paths (D3D11 service on Windows, null+comp_multi on Android/macOS and
@@ -89,6 +104,55 @@ macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id);
 #ifdef XRT_BUILD_DRIVER_QWERTY
 #include "qwerty_interface.h"
 #endif
+
+#include "xrt/xrt_system.h"
+#include "xrt/xrt_viewer_tracking.h" // ADR-054 N6 Part 2: the service hosts the viewer-tracking provider
+
+
+/*
+ *
+ * Viewer tracking (ADR-054 N6 Part 2, service hosting).
+ *
+ * The service's own native system arbitrates the viewer per screen exactly
+ * as an in-process runtime does (target_viewer_tracking.c) and hosts the one
+ * chosen provider for every IPC client: every place below that hands an IPC
+ * client eyes for its VIEWS (locate, the raw rig channel, the tracking state,
+ * the per-screen segment table) asks it here. A screen whose display tracks
+ * — or whose policy is not EXTERNAL_OK — answers false and the DP's eyes
+ * stand. The weave keeps the DP's eyes always (ADR-033).
+ *
+ */
+
+/*!
+ * Splice the provider's eyes for @p screen_id (XRT_VIEWER_SCREEN_PRIMARY or a
+ * monitor id) at @p target_ns over @p inout when the service's arbitration
+ * routed that screen to a provider. False = untouched.
+ */
+XRT_MAYBE_UNUSED static bool
+ipc_viewer_override_eyes(volatile struct ipc_client_state *ics,
+                         uint64_t screen_id,
+                         int64_t target_ns,
+                         struct xrt_eye_positions *inout,
+                         bool have_dp)
+{
+	struct ipc_server *s = ics != NULL ? ics->server : NULL;
+	// XR_DXR_display_info v25: a fixed-viewer client asks for no viewer —
+	// the provider is never started (or kept alive) on its behalf.
+	if (ics != NULL && ics->fixed_viewer) {
+		return false;
+	}
+	struct xrt_viewer_tracking *vt = (s != NULL && s->xsysd != NULL) ? s->xsysd->viewer_tracking : NULL;
+	const bool spliced = xrt_viewer_tracking_override_eyes(vt, screen_id, target_ns, inout, have_dp);
+	static bool logged = false;
+	if (spliced && !logged) {
+		logged = true;
+		IPC_WARN(s,
+		         "viewer tracking (ADR-054 N6): IPC client views from the service-hosted provider "
+		         "(screen 0x%016llx, tracking=%d)",
+		         (unsigned long long)screen_id, (int)inout->is_tracking);
+	}
+	return spliced;
+}
 
 
 /*
@@ -141,6 +205,32 @@ ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn
 	s_class_verify_provider = fn;
 }
 
+#ifdef XRT_OS_ANDROID
+static ipc_server_android_controller_verify_fn s_android_controller_verify = NULL;
+static ipc_server_android_overlay_fn s_android_overlay_hook = NULL;
+
+void
+ipc_server_set_android_controller_verify_provider(ipc_server_android_controller_verify_fn fn)
+{
+	s_android_controller_verify = fn;
+}
+
+void
+ipc_server_set_android_overlay_hook(ipc_server_android_overlay_fn fn)
+{
+	s_android_overlay_hook = fn;
+}
+
+void
+ipc_server_android_notify_overlay(bool active, long controller_uid)
+{
+	U_LOG_W("[#1006] workspace overlay %s (controller uid %ld)", active ? "ON" : "OFF", controller_uid);
+	if (s_android_overlay_hook != NULL) {
+		s_android_overlay_hook(active, controller_uid);
+	}
+}
+#endif
+
 const char *
 ipc_server_client_class_str(uint32_t client_class)
 {
@@ -151,6 +241,7 @@ ipc_server_client_class_str(uint32_t client_class)
 	case XRT_CLIENT_CLASS_RELAY: return "RELAY";
 	case XRT_CLIENT_CLASS_PROVIDER_HOST: return "PROVIDER_HOST";
 	case XRT_CLIENT_CLASS_DIAG: return "DIAG";
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER: return "CAMERA_CONSUMER";
 	default: return "?";
 	}
 }
@@ -164,6 +255,7 @@ ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class)
 	case XRT_CLIENT_CLASS_PRESENT_OWNER: return 2;
 	case XRT_CLIENT_CLASS_DIAG: return 4;
 	case XRT_CLIENT_CLASS_PROVIDER_HOST: return 2;
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER: return 4;
 	case XRT_CLIENT_CLASS_APP:
 	default:
 		// APP gets the rest of the admitted cap minus the reserved controller slot.
@@ -190,14 +282,29 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 	case XRT_CLIENT_CLASS_APP: return XRT_CLIENT_CLASS_APP;
 	case XRT_CLIENT_CLASS_RELAY:
 	case XRT_CLIENT_CLASS_PRESENT_OWNER:
+	case XRT_CLIENT_CLASS_CAMERA_CONSUMER:
 		// Verified by use: a RELAY may never create a compositor (session_create
-		// refuses), only a PRESENT_OWNER may call the weave_* handlers.
+		// refuses), only a PRESENT_OWNER may call the weave_* handlers, and a
+		// CAMERA_CONSUMER may never create a session at all (ADR-043 R3) — the
+		// class buys camera calls and nothing else, so there is nothing to spoof.
 		return declared;
 	case XRT_CLIENT_CLASS_CONTROLLER: {
 		unsigned long orch = get_orchestrator_workspace_pid();
 		if (orch != 0 && (unsigned long)pid == orch) {
 			return declared; // spawned by our orchestrator
 		}
+#ifdef XRT_OS_ANDROID
+		// #1006: an Android controller is a package, identified by the peer UID
+		// (manifest meta-data + the runtime's signing certificate).
+		{
+			long uid = ipc_server_derive_peer_uid(ics->imc.ipc_handle);
+			if (uid >= 0 && s_android_controller_verify != NULL && s_android_controller_verify(uid)) {
+				IPC_WARN(s, "[CLASS] pid %ld uid %ld: verified Android workspace controller (#1006).", pid,
+				         uid);
+				return declared;
+			}
+		}
+#endif
 		if (s_class_verify_provider != NULL && s_class_verify_provider(pid, peer_exe_path, declared)) {
 			return declared; // a registered controller binary
 		}
@@ -208,7 +315,12 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 			         pid, peer_exe_path);
 			return declared;
 		}
+#ifdef XRT_OS_ANDROID
+		why = "not a verified Android workspace controller (needs the com.displayxr.workspace_controller "
+		      "meta-data and the runtime's signing certificate)";
+#else
 		why = "not orchestrator-spawned and not a registered controller binary";
+#endif
 		break;
 	}
 	case XRT_CLIENT_CLASS_DIAG:
@@ -232,6 +344,37 @@ verify_client_class(volatile struct ipc_client_state *ics, uint32_t declared, co
 	return XRT_CLIENT_CLASS_APP;
 }
 
+// PRESENT_OWNER quota counts OWNERS, not connections: one browser is several
+// processes of one executable (its GPU process weaves, the browser process binds
+// the window), and all of them are the one owner competing for the panel. A
+// connection from the same executable as an already-admitted PRESENT_OWNER is a
+// SIBLING and takes no new slot; otherwise the quota is compared against the
+// number of DISTINCT owner executables. A peer whose image path the OS will not
+// reveal ("") is never a sibling and counts as its own owner (fails closed). The
+// browser's video-capture utility declares CAMERA_CONSUMER (ADR-043 R3) and is
+// not in this count at all — the rule itself is the pure
+// u_client_class_present_owner_count() so it can be tested host-side. Caller
+// holds global_state.lock; the exe lookups run at admission only.
+static uint32_t
+count_present_owners_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, const char *ics_exe)
+{
+	static char exes[IPC_MAX_CLIENTS][512]; // under global_state.lock
+	struct u_client_class_peer peers[IPC_MAX_CLIENTS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		volatile struct ipc_client_state *o = &s->threads[i].ics;
+		if (o == ics || o->server_thread_index < 0 || !o->class_verified) {
+			continue;
+		}
+		exes[n][0] = '\0';
+		ipc_server_peer_exe_path(o->peer_pid, exes[n], sizeof(exes[n]));
+		peers[n].client_class = o->client_state.client_class;
+		peers[n].exe = exes[n];
+		n++;
+	}
+	return u_client_class_present_owner_count(peers, n, ics_exe);
+}
+
 // Count connected clients of a class, EXCLUDING ics. Caller holds global_state.lock.
 static uint32_t
 count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, uint32_t client_class)
@@ -249,8 +392,17 @@ count_class_locked(struct ipc_server *s, volatile struct ipc_client_state *ics, 
 	return n;
 }
 
+uint32_t
+ipc_server_client_class_count(struct ipc_server *s, uint32_t client_class)
+{
+	os_mutex_lock(&s->global_state.lock);
+	uint32_t n = count_class_locked(s, NULL, client_class);
+	os_mutex_unlock(&s->global_state.lock);
+	return n;
+}
+
 // The effective workspace-controller pid for input/command authorization. The
-// orchestrator only knows a pid for a controller it SPAWNED (Windows Ctrl+Space
+// orchestrator only knows a pid for a controller it SPAWNED (Windows launch-hotkey
 // trampoline). A manually-launched controller — the macOS shell (#61), and any
 // dev/CLI-launched shell — instead registers itself via xrActivateWorkspaceEXT,
 // which sets s->workspace_controller_pid. Prefer that activate-registered pid and
@@ -383,6 +535,39 @@ ipc_server_request_workspace_summon(void)
 	return true;
 }
 
+// Display dashboard phase 8: the service's launch-settings hooks (see the
+// system_reload_service_config / system_workspace_launch handlers).
+static ipc_server_service_config_reload_fn s_service_config_reload_provider = NULL;
+static ipc_server_workspace_launch_fn s_workspace_launch_provider = NULL;
+// ADR-054 N3d (#2051): the service's live re-select hook.
+static ipc_server_component_reselect_fn s_component_reselect_provider = NULL;
+
+void
+ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn)
+{
+	s_service_config_reload_provider = fn;
+}
+
+void
+ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn)
+{
+	s_component_reselect_provider = fn;
+}
+
+void
+ipc_server_set_workspace_launch_provider(ipc_server_workspace_launch_fn fn)
+{
+	s_workspace_launch_provider = fn;
+}
+
+static ipc_server_workspace_hotkey_suspend_fn s_workspace_hotkey_suspend_provider = NULL;
+
+void
+ipc_server_set_workspace_hotkey_suspend_provider(ipc_server_workspace_hotkey_suspend_fn fn)
+{
+	s_workspace_hotkey_suspend_provider = fn;
+}
+
 
 /*
  *
@@ -422,7 +607,7 @@ validate_device_id(volatile struct ipc_client_state *ics, int64_t device_id, str
 #define IPC_CHECK_SWAPCHAIN_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SWAPCHAINS) { IPC_ERROR((ICS)->server, "swapchain id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #define IPC_CHECK_SEMAPHORE_ID(ICS, ID) do { if ((ID) >= IPC_MAX_CLIENT_SEMAPHORES) { IPC_ERROR((ICS)->server, "semaphore id %u out of range", (ID)); return XRT_ERROR_IPC_FAILURE; } } while (0)
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) ||                  \
-    defined(COMP_MULTI_HAVE_WEAVE)
+    defined(COMP_MULTI_HAVE_WEAVE) || defined(COMP_MULTI_SHARED_SURFACE)
 /*!
  * Fill surplus view slots [from, view_count) with valid poses.
  *
@@ -460,6 +645,32 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 }
 #endif // D3D11 service || Android || macOS || comp_multi weave (Linux) — fill_surplus_view_poses
 
+/*!
+ * XR_DXR_view_rig spec 4 (#2189): record in the rig reply the canvas this
+ * locate's eyes were rebased by and the physical display plane, so the client
+ * maps rig-scoped hand joints into the same frame as these views.
+ */
+XRT_MAYBE_UNUSED static void
+fill_rig_canvas(struct ipc_info_locate_views_rig *r,
+                float width_m,
+                float height_m,
+                struct xrt_vec3 center,
+                struct xrt_quat orientation,
+                bool has_orientation,
+                const struct xrt_vec3 *nominal,
+                const struct xrt_pose *phys_plane)
+{
+	r->canvas.valid = width_m > 0.0f && height_m > 0.0f ? 1u : 0u;
+	r->canvas.width_m = width_m;
+	r->canvas.height_m = height_m;
+	r->canvas.center = center;
+	r->canvas.orientation = orientation;
+	r->canvas.has_orientation = has_orientation ? 1u : 0u;
+	r->canvas.nominal_y_m = nominal->y;
+	r->canvas.nominal_z_m = nominal->z;
+	r->canvas.plane = *phys_plane;
+}
+
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 /*!
  * Try to get SR-aware view poses for IPC clients.
@@ -473,6 +684,25 @@ fill_surplus_view_poses(struct xrt_device *xdev,
 // that forcing substituted for). `rig_reply` (optional) receives the raw
 // input set (XrViewDisplayRawDXR payload) + the world-space rig eyes. Both
 // NULL on the legacy device_get_view_poses path — zero behavior change.
+/*!
+ * XR_DXR_display_info v25: the nominal viewer's eye pair for a fixed-viewer
+ * client — straight in front of the display centre at @p nominal_z_m, one IPD
+ * apart, untracked. Same rule as the in-process locate (oxr_session.c: the
+ * nominal y never leaks into the eye, only into the parallax pivot).
+ */
+XRT_MAYBE_UNUSED static void
+ipc_fixed_viewer_eyes(const struct xrt_vec3 *eye_relation, float nominal_z_m, struct xrt_eye_positions *out)
+{
+	const float ipd = (eye_relation != NULL && eye_relation->x > 0.0f) ? eye_relation->x : 0.063f;
+	const float z = nominal_z_m > 0.0f ? nominal_z_m : 0.6f;
+	memset(out, 0, sizeof(*out));
+	out->count = 2;
+	out->valid = true;
+	out->is_tracking = false;
+	out->eyes[0] = (struct xrt_eye_position){-ipd * 0.5f, 0.0f, z};
+	out->eyes[1] = (struct xrt_eye_position){ipd * 0.5f, 0.0f, z};
+}
+
 static bool
 ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
                           struct xrt_compositor *xc,
@@ -524,10 +754,41 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		return false;
 	}
 
+	// ADR-052 D2 — per-screen views of a workspace tile: a window wholly (or,
+	// for this one-view-set locate, mostly) on another presenter's screen is
+	// framed from THAT screen's eyes, geometry and nominal viewer, not the
+	// primary's. False for everything else (a non-workspace client, a tile on
+	// the primary, a one-presenter workspace): the path below is unchanged.
+	// Headless relays own no window and are never tiles.
+	struct xrt_window_metrics ws_wm = {0};
+	struct xrt_eye_positions ws_eyes = {0};
+	struct xrt_vec3 ws_nominal = {0};
+	const bool ws_framed = xc != NULL && comp_d3d11_service_get_client_workspace_view_frame(s->xsysc, xc, &ws_wm,
+	                                                                                        &ws_eyes, &ws_nominal);
+
 	// Get eye positions from SR weaver (currently 2 eyes; array for future N-view)
 	struct xrt_vec3 raw_eyes[XRT_MAX_VIEWS] = {0};
 	uint32_t eye_count = (view_count < 2) ? view_count : 2; // DP currently reports max 2
-	{
+	// XR_DXR_display_info v25: a fixed-viewer client is framed for the nominal
+	// viewer of the screen it is framed against — never the DP's tracked eyes
+	// (its weave keeps those) and never a provider's.
+	const bool fixed_viewer = ics->fixed_viewer;
+	struct xrt_eye_positions fixed_eyes = {0};
+	if (fixed_viewer) {
+		ipc_fixed_viewer_eyes(fallback_eye_relation,
+		                      ws_framed ? ws_nominal.z : s->xsysc->info.nominal_viewer_z_m, &fixed_eyes);
+		for (uint32_t i = 0; i < eye_count; i++) {
+			raw_eyes[i] =
+			    (struct xrt_vec3){fixed_eyes.eyes[i].x, fixed_eyes.eyes[i].y, fixed_eyes.eyes[i].z};
+		}
+	} else if (ws_framed) {
+		// That screen's eyes, in its own display space (the window metrics
+		// below are in the same space). A one-eye answer is used for both.
+		for (uint32_t i = 0; i < eye_count; i++) {
+			const uint32_t k = (i < ws_eyes.count) ? i : 0;
+			raw_eyes[i] = (struct xrt_vec3){ws_eyes.eyes[k].x, ws_eyes.eyes[k].y, ws_eyes.eyes[k].z};
+		}
+	} else {
 		struct xrt_vec3 left_eye, right_eye;
 		// Ask THIS client's DP (#625). Each client gets its own DP at
 		// session-create, so a client that never renders a frame — the
@@ -537,13 +798,32 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		// fell through to device-default view poses (rig_applied=0): a
 		// static, symmetric frustum with the rig and zone rect ignored.
 		// xc == NULL (headless relay) keeps the previous behaviour.
-		if (!comp_d3d11_service_get_predicted_eye_positions_for_client(s->xsysc, xc, &left_eye, &right_eye)) {
+		// N6 Part 1 (#2144): at the locate's display time, not "latest".
+		const bool have_dp_pair = comp_d3d11_service_get_predicted_eye_positions_for_client_at(
+		    s->xsysc, xc, at_timestamp_ns, &left_eye, &right_eye);
+		// ADR-054 N6 Part 2: the primary screen's viewer source — the
+		// service-hosted provider when the arbitration chose one (the DP
+		// does not track, policy EXTERNAL_OK), else the DP's pair unchanged.
+		struct xrt_eye_positions pair = {0};
+		if (have_dp_pair) {
+			pair.count = 2;
+			pair.valid = true;
+			pair.eyes[0] = (struct xrt_eye_position){left_eye.x, left_eye.y, left_eye.z};
+			pair.eyes[1] = (struct xrt_eye_position){right_eye.x, right_eye.y, right_eye.z};
+		}
+		const bool spliced =
+		    ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &pair, have_dp_pair);
+		if (!have_dp_pair && !spliced) {
 			static bool logged_no_eye_pos = false;
 			if (!logged_no_eye_pos) {
 				logged_no_eye_pos = true;
 				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_predicted_eye_positions FAILED, skipping");
 			}
 			return false;
+		}
+		if (spliced) {
+			left_eye = (struct xrt_vec3){pair.eyes[0].x, pair.eyes[0].y, pair.eyes[0].z};
+			right_eye = (struct xrt_vec3){pair.eyes[1].x, pair.eyes[1].y, pair.eyes[1].z};
 		}
 		raw_eyes[0] = left_eye;
 		if (eye_count > 1) raw_eyes[1] = right_eye;
@@ -559,8 +839,22 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// Timestamp + tracking lock come from the same full DP eye query.
 	if (rig_reply != NULL) {
 		struct xrt_eye_positions full_eyes = {0};
-		if (comp_d3d11_service_get_predicted_eye_positions_full_for_client(s->xsysc, xc, &full_eyes) &&
-		    full_eyes.valid) {
+		if (fixed_viewer) {
+			full_eyes = fixed_eyes; // XR_DXR_display_info v25: the nominal pair
+		} else if (ws_framed) {
+			full_eyes = ws_eyes; // the framing screen's set (ADR-052 D2)
+		}
+		bool have_full = fixed_viewer || ws_framed ||
+		                 comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		                     s->xsysc, xc, at_timestamp_ns, &full_eyes);
+		// ADR-054 N6 Part 2: the raw channel reports the eyes the views
+		// follow — the provider's on a screen routed to it (primary only
+		// here; a workspace tile framed on another screen keeps its DP's).
+		if (!ws_framed && ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &full_eyes,
+		                                           have_full && full_eyes.valid)) {
+			have_full = true;
+		}
+		if (have_full && full_eyes.valid) {
 			uint32_t raw_n = full_eyes.count;
 			if (raw_n > XRT_MAX_VIEWS) {
 				raw_n = XRT_MAX_VIEWS;
@@ -595,12 +889,22 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	struct xrt_quat win_orient = {0, 0, 0, 1};
 	bool win_has_orientation = false;
 	bool headless_client = (xc == NULL);
+	// ADR-047 Amendment 4, addendum: a zone-scoped locate of an element that
+	// lies wholly on a NON-primary screen of a window woven per screen is framed
+	// against that screen — its eyes, its nominal viewer, its geometry.
+	bool zone_reframed = false;
+	struct xrt_segment_metric zone_screen = {0};
 	{
 		struct xrt_window_metrics wm = {0};
 		bool have_wm = false;
+		bool wm_from_app_window = false;
 
 		// Per-client metrics: virtual window size + center offset from pose
-		if (xc != NULL) {
+		if (ws_framed) {
+			// ADR-052 D2: the tile as seen from the screen it is on.
+			wm = ws_wm;
+			have_wm = wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		} else if (xc != NULL) {
 			have_wm = comp_d3d11_service_get_client_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
 		}
@@ -616,6 +920,7 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (!have_wm && !headless_client && rig_reply != NULL && xc != NULL) {
 			have_wm = comp_d3d11_service_get_client_app_window_metrics(s->xsysc, xc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+			wm_from_app_window = have_wm;
 			static bool hwnd_wm_logged = false;
 			if (!hwnd_wm_logged && have_wm) {
 				hwnd_wm_logged = true;
@@ -630,6 +935,54 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 		if (!have_wm && !headless_client) {
 			have_wm = comp_d3d11_service_get_window_metrics(s->xsysc, &wm) &&
 			          wm.valid && wm.window_width_m > 0.0f && wm.window_height_m > 0.0f;
+		}
+
+		// ADR-047 Amendment 4, addendum (displayxr-browser-pvt#272): a
+		// present-owner's bound window can be woven per screen; its locates
+		// were still framed from the primary screen (the session DP's eyes, the
+		// window relative to the primary's display). An element that lies
+		// WHOLLY on another screen now gets that screen's eyes and is framed
+		// against that screen's display: swap in the whole window relative to
+		// it, and the zone rebase below places the element on it exactly as it
+		// places one on the primary. A straddling element, an element on the
+		// primary, and every window on one screen keep the framing above, byte
+		// for byte (no per-screen table exists for a window on one screen: the
+		// lookup answers false before anything else is touched). Per-part views
+		// for a straddling element need a second view set per element
+		// (displayxr-browser-pvt#272).
+		if (have_wm && wm_from_app_window && rig != NULL && rig->zone_valid != 0 && rig->zone_w_px > 0 &&
+		    rig->zone_h_px > 0) {
+			struct xrt_rect zone_rect;
+			zone_rect.offset.w = rig->zone_x_px; // xrt_offset names its fields w/h
+			zone_rect.offset.h = rig->zone_y_px;
+			zone_rect.extent.w = rig->zone_w_px;
+			zone_rect.extent.h = rig->zone_h_px;
+			struct xrt_segment_metrics wseg;
+			uint32_t k = 0;
+			struct xrt_window_metrics swm;
+			// That screen's DP must have eyes for it (a segment with no DP is
+			// flat 2D anyway): otherwise the element keeps the primary's views.
+			if (comp_d3d11_service_get_zone_weave_screen(s->xsysc, xc, &zone_rect, wm.window_pixel_width,
+			                                             wm.window_pixel_height, &wseg, &k) &&
+			    wseg.seg[k].have_eyes && wseg.seg[k].eyes.valid && wseg.seg[k].eyes.count > 0 &&
+			    u_weave_segment_window_metrics(&wseg, k, &swm)) {
+				wm = swm;
+				zone_reframed = true;
+				zone_screen = wseg.seg[k];
+				// Change-only (never per frame): which screen elements were
+				// last re-framed onto. Not logged back: a page with elements on
+				// both screens would flip it every locate.
+				static uint64_t s_zone_screen_logged = 0;
+				if (zone_screen.screen_id != s_zone_screen_logged) {
+					s_zone_screen_logged = zone_screen.screen_id;
+					IPC_WARN(
+					    s,
+					    "multi-screen: element (%d,%d %dx%d) wholly on screen 0x%016llx - views "
+					    "from that screen's eyes and geometry (ADR-047 Amendment 4 addendum)",
+					    rig->zone_x_px, rig->zone_y_px, rig->zone_w_px, rig->zone_h_px,
+					    (unsigned long long)zone_screen.screen_id);
+				}
+			}
 		}
 
 		// XR_DXR_display_zones P5 — zone-scoped locate over IPC: rebase
@@ -669,11 +1022,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 			eye_offset_x = wm.window_center_offset_x_m;
 			eye_offset_y = wm.window_center_offset_y_m;
 			eye_offset_z = wm.window_center_offset_z_m;
-			win_orient = wm.window_orientation;
-			win_has_orientation = (fabsf(win_orient.x) > 0.0001f ||
-			                      fabsf(win_orient.y) > 0.0001f ||
-			                      fabsf(win_orient.z) > 0.0001f ||
-			                      fabsf(win_orient.w - 1.0f) > 0.0001f);
+			// A never-filled (zero) quaternion is the identity.
+			win_has_orientation = u_canvas_window_orientation(&wm, &win_orient);
 			// XR_DXR_view_rig raw channel: the effective canvas on the
 			// panel — wm already describes the canvas sub-rect when one
 			// is set (u_canvas_apply_to_metrics), the client area
@@ -694,6 +1044,34 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 				IPC_WARN(s, "ipc_try_get_sr_view_poses: get_display_dimensions FAILED, skipping SR poses");
 			}
 			return false;
+		}
+	}
+
+	// ADR-047 Amendment 4, addendum: the re-framed element's eyes are its
+	// screen's (that screen's display space, the frame wm now describes), both
+	// for the render pair and the raw channel.
+	if (zone_reframed) {
+		// ADR-054 N6 Part 2: that screen's viewer source — the provider,
+		// mapped into its display space, when the arbitration routed it there.
+		(void)ipc_viewer_override_eyes(ics, zone_screen.screen_id, at_timestamp_ns, &zone_screen.eyes, true);
+		if (fixed_viewer) {
+			// XR_DXR_display_info v25: that screen's nominal viewer.
+			ipc_fixed_viewer_eyes(fallback_eye_relation, zone_screen.nominal_viewer_z_m, &zone_screen.eyes);
+		}
+		const struct xrt_eye_positions *ze = &zone_screen.eyes;
+		const uint32_t zn = ze->count < XRT_MAX_VIEWS ? ze->count : XRT_MAX_VIEWS;
+		for (uint32_t i = 0; i < eye_count; i++) {
+			const uint32_t src = i < zn ? i : zn - 1;
+			raw_eyes[i] = (struct xrt_vec3){ze->eyes[src].x, ze->eyes[src].y, ze->eyes[src].z};
+		}
+		if (rig_reply != NULL) {
+			for (uint32_t i = 0; i < zn; i++) {
+				rig_reply->raw.eyes[i] = (struct xrt_vec3){ze->eyes[i].x, ze->eyes[i].y, ze->eyes[i].z};
+			}
+			rig_reply->raw.eye_count = zn;
+			rig_reply->raw.sample_time_ns = ze->timestamp_ns;
+			rig_reply->raw.is_tracking = ze->is_tracking ? 1u : 0u;
+			rig_reply->raw.valid = 1;
 		}
 	}
 
@@ -969,6 +1347,9 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// is latched. Values arrive pre-clamped.
 	const bool rig_display = rig != NULL && rig->rig_type == IPC_VIEW_RIG_DISPLAY;
 	const bool rig_camera = rig != NULL && rig->rig_type == IPC_VIEW_RIG_CAMERA;
+	// #2189: the PHYSICAL display plane (before a rig pose replaces it) — what
+	// rig-scoped hand joints are undone by on the client.
+	const struct xrt_pose phys_plane = {display_ori, display_pos};
 	if (rig_display || rig_camera) {
 		// The wire pose is in the head device's TRACKING-ORIGIN space - the
 		// frame this math (and the qwerty pose above) runs in. The client
@@ -1012,12 +1393,27 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 	// defaulted the converter to 0.5 while the toggle used 0.6 — the old WebXR
 	// toggle shift, the sole reason this path diverged from oxr_session.c.)
 	struct xrt_vec3 nominal_viewer = {0.0f, s->xsysc->info.nominal_viewer_y_m, s->xsysc->info.nominal_viewer_z_m};
+	if (ws_framed && ws_nominal.z > 0.0f) {
+		// ADR-052 D2: the framing screen's own nominal viewer (its display space).
+		nominal_viewer = (struct xrt_vec3){0.0f, ws_nominal.y, ws_nominal.z};
+	}
+	if (zone_reframed && zone_screen.nominal_viewer_z_m > 0.0f) {
+		// The element's own screen's nominal viewer (its display space). Never
+		// together with ws_framed: an element is re-framed only on app-window
+		// metrics, which a workspace-framed tile never resolves to.
+		nominal_viewer.y = zone_screen.nominal_viewer_y_m;
+		nominal_viewer.z = zone_screen.nominal_viewer_z_m;
+	}
 	const struct xrt_vec3 *rig_nominal = (rig_display || rig_camera) ? &nominal_viewer : NULL;
 
 	if (rig_reply != NULL) {
 		rig_reply->raw.display_pose = display_pose;
 		rig_reply->rig_applied =
 		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
+		// #2189: the canvas the eyes above were rebased by.
+		fill_rig_canvas(rig_reply, screen_width_m, screen_height_m,
+		                (struct xrt_vec3){eye_offset_x, eye_offset_y, eye_offset_z}, win_orient,
+		                win_has_orientation, &nominal_viewer, &phys_plane);
 	}
 
 	if (rig_camera) {
@@ -1148,7 +1544,8 @@ ipc_try_get_sr_view_poses(volatile struct ipc_client_state *ics,
 }
 #endif // XRT_HAVE_D3D11_SERVICE_COMPOSITOR
 
-#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                              \
+    defined(COMP_MULTI_SHARED_SURFACE)
 /*!
  * Server-side Kooima for the out-of-process null+comp_multi path (Android #510,
  * macOS #48, desktop Linux with the weave engine #1699).
@@ -1347,8 +1744,8 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	}
 #endif
 
-#ifdef XRT_OS_MACOS
-	// Shared spatial surface (#59) PER-WINDOW Kooima. Each client composites into a
+#ifdef COMP_MULTI_SHARED_SURFACE
+	// Shared spatial surface (#59; macOS, and desktop Linux #710) PER-WINDOW Kooima. Each client composites into a
 	// TILED window, not the full display, so the Kooima screen must be the WINDOW's
 	// physical size — otherwise the client renders for the wide display aspect and a
 	// tall window squishes the blit. Use the controller-placed window pose: its
@@ -1386,6 +1783,54 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 			win_orient = wpose.orientation;
 			win_has_orientation = (fabsf(win_orient.x) > 0.0001f || fabsf(win_orient.y) > 0.0001f ||
 			                       fabsf(win_orient.z) > 0.0001f || fabsf(win_orient.w - 1.0f) > 0.0001f);
+		}
+	}
+#endif // COMP_MULTI_SHARED_SURFACE
+
+#ifdef XRT_OS_MACOS
+	// PER-WINDOW Kooima for a macOS weave present-owner (the DisplayXR Browser)
+	// — the macOS counterpart of the desktop-Linux #1699 block above. The
+	// window is the geometry the caller bound (xrWeaveBindWindow2DXR /
+	// xrWeaveSetWindowGeometryDXR: global CoreGraphics BACKING px, y down),
+	// re-based by the weave front end to the SAME panel and origin it feeds the
+	// DP phase slot. screen = the window's metres, render eyes rebased to the
+	// window centre, so the off-axis frustum looks THROUGH the window instead
+	// of spanning the panel. multi_compositor_get_window_metrics() cannot do
+	// this re-base on macOS (it has no panel origin for a global CG rect), so
+	// without it the window's offset from the panel centre was dropped and
+	// every off-centre window rendered as if centred. A controller-placed
+	// window (#59 above) keeps its pose; no bound geometry → display-scoped.
+	if (!placed_window) {
+		int32_t wx = 0, wy = 0;
+		uint32_t ww = 0, wh = 0, pw = 0, ph = 0;
+		// Square-pixel pitch from the panel's physical size, as the Linux arm
+		// and the display-zones rebase below use it.
+		float pitch = 0.0f;
+		if (s->xsysc->info.display_pixel_width > 0 && s->xsysc->info.display_width_m > 0.0f) {
+			pitch = s->xsysc->info.display_width_m / (float)s->xsysc->info.display_pixel_width;
+		}
+		if (pitch > 0.0f && comp_multi_weave_macos_window_on_panel(mc, &wx, &wy, &ww, &wh, &pw, &ph)) {
+			screen_width_m = (float)ww * pitch;
+			screen_height_m = (float)wh * pitch;
+			// +x right in both frames; y negated because screen pixels are
+			// y-down and eye coordinates are y-up.
+			win_eye_offset_x = ((float)wx + (float)ww * 0.5f - (float)pw * 0.5f) * pitch;
+			win_eye_offset_y = -(((float)wy + (float)wh * 0.5f - (float)ph * 0.5f) * pitch);
+			win_eye_offset_z = 0.0f;
+			// Lifecycle only (a window moved or resized), never per frame.
+			static int32_t logged_x = INT32_MIN, logged_y = INT32_MIN;
+			static uint32_t logged_w = 0, logged_h = 0;
+			if (wx != logged_x || wy != logged_y || ww != logged_w || wh != logged_h) {
+				logged_x = wx;
+				logged_y = wy;
+				logged_w = ww;
+				logged_h = wh;
+				IPC_WARN(s,
+				         "oop Kooima: per-window rect=(%d,%d %ux%u)px on panel %ux%u canvas=%.4fx%.4fm "
+				         "offset=(%.4f,%.4f)m (macOS weave)",
+				         wx, wy, ww, wh, pw, ph, (double)screen_width_m, (double)screen_height_m,
+				         (double)win_eye_offset_x, (double)win_eye_offset_y);
+			}
 		}
 	}
 #endif
@@ -1520,7 +1965,11 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	bool is_tracking = false;
 	int64_t sample_time_ns = 0;
 	struct xrt_eye_positions eyes = {0};
-	bool have_dp_eyes = multi_compositor_get_predicted_eye_positions(mc, &eyes) && eyes.valid && eyes.count > 0;
+	// N6 Part 1 (#2144): the eyes at the locate's display time, not "latest".
+	// XR_DXR_display_info v25: a fixed-viewer client's views are the nominal
+	// layout below even on a display that tracks (its weave keeps the DP's).
+	bool have_dp_eyes = !ics->fixed_viewer && multi_compositor_get_eye_positions_at(mc, at_timestamp_ns, &eyes) &&
+	                    eyes.valid && eyes.count > 0;
 	if (have_dp_eyes) {
 		head_eye_count = (eyes.count < XRT_MAX_VIEWS) ? eyes.count : XRT_MAX_VIEWS;
 		for (uint32_t i = 0; i < head_eye_count; i++) {
@@ -1557,6 +2006,30 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 				head_eyes[i] =
 				    (struct xrt_vec3){nx + ((i & 1u) ? ipd * 0.5f : -ipd * 0.5f), ny, nz};
 			}
+		}
+	}
+
+	// ADR-054 N6 Part 2: the primary screen's viewer source. When the
+	// service's arbitration routed it to a viewer-tracking provider (the DP
+	// does not track, policy EXTERNAL_OK), the provider's pair replaces the
+	// head set above — the DP's or the nominal layout, whose N-view shape is
+	// kept and translated onto the pair (xrt_viewer_tracking_splice). A
+	// tracking DP's eyes are never replaced (the call answers false).
+	{
+		struct xrt_eye_positions cur = {0};
+		cur.count = head_eye_count;
+		cur.valid = head_eye_count > 0;
+		for (uint32_t i = 0; i < head_eye_count && i < XRT_MAX_VIEWS; i++) {
+			cur.eyes[i] = (struct xrt_eye_position){head_eyes[i].x, head_eyes[i].y, head_eyes[i].z};
+		}
+		if (ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, at_timestamp_ns, &cur, cur.valid)) {
+			head_eye_count = cur.count < XRT_MAX_VIEWS ? cur.count : XRT_MAX_VIEWS;
+			for (uint32_t i = 0; i < head_eye_count; i++) {
+				head_eyes[i] = (struct xrt_vec3){cur.eyes[i].x, cur.eyes[i].y, cur.eyes[i].z};
+			}
+			is_tracking = cur.is_tracking;
+			sample_time_ns = cur.timestamp_ns;
+			have_dp_eyes = true;
 		}
 	}
 
@@ -1598,7 +2071,7 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		}
 	}
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// #59 Task 10: rotate the (window-centre-relative) render eyes into the
 	// window's LOCAL frame by the inverse window orientation — the eyes above are
 	// already centre-relative (win_eye_offset subtracted), so this is exactly the
@@ -1640,20 +2113,27 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 	// keeps the identity head (a workspace tile). On Android the head pose is
 	// the nominal eye the per-client LOCAL is seeded from, so a LOCAL locate
 	// is byte-identical to the pre-#1370 result.
-	struct xrt_vec3 display_pos = {0, 0, 0};
-	struct xrt_quat display_ori = XRT_QUAT_IDENTITY;
-	if (rig_any) {
-		display_pos = rig->pose.position;
-		display_ori = rig->pose.orientation;
-	} else if (!placed_window && head != NULL) {
+	// #2189: the PHYSICAL plane is resolved whether or not a rig replaces it
+	// (rig-scoped hand joints are undone by it); the display pose is then the
+	// rig's, else that plane — exactly as before.
+	struct xrt_vec3 phys_pos = {0, 0, 0};
+	struct xrt_quat phys_ori = XRT_QUAT_IDENTITY;
+	if (!placed_window && head != NULL) {
 		struct xrt_space_relation head_rel = XRT_SPACE_RELATION_ZERO;
 		xrt_device_get_tracked_pose(head, XRT_INPUT_GENERIC_HEAD_POSE, at_timestamp_ns, &head_rel);
 		const enum xrt_space_relation_flags head_valid = (enum xrt_space_relation_flags)(
 		    XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
 		if ((head_rel.relation_flags & head_valid) == head_valid) {
-			display_pos = head_rel.pose.position;
-			display_ori = head_rel.pose.orientation;
+			phys_pos = head_rel.pose.position;
+			phys_ori = head_rel.pose.orientation;
 		}
+	}
+	const struct xrt_pose phys_plane = {phys_ori, phys_pos};
+	struct xrt_vec3 display_pos = phys_pos;
+	struct xrt_quat display_ori = phys_ori;
+	if (rig_any) {
+		display_pos = rig->pose.position;
+		display_ori = rig->pose.orientation;
 	}
 
 	dxr_screen scr = {screen_width_m, screen_height_m};
@@ -1760,6 +2240,20 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		rig_reply->raw.size_w_m = canvas_w_m;
 		rig_reply->raw.size_h_m = canvas_h_m;
 		rig_reply->raw.valid = 1;
+		// #2189: the canvas the render eyes were rebased by — the zone and window
+		// centre offsets, and (shared-surface builds) the window orientation.
+		{
+#ifdef COMP_MULTI_SHARED_SURFACE
+			const bool canvas_rotated = win_has_orientation;
+#else
+			const bool canvas_rotated = false;
+#endif
+			fill_rig_canvas(rig_reply, screen_width_m, screen_height_m,
+			                (struct xrt_vec3){zone_eye_offset_x + win_eye_offset_x,
+			                                  zone_eye_offset_y + win_eye_offset_y,
+			                                  zone_eye_offset_z + win_eye_offset_z},
+			                win_orient, canvas_rotated, &nominal_viewer, &phys_plane);
+		}
 		rig_reply->rig_applied =
 		    rig_camera ? IPC_VIEW_RIG_CAMERA : (rig_display ? IPC_VIEW_RIG_DISPLAY : IPC_VIEW_RIG_NONE);
 	}
@@ -1785,15 +2279,15 @@ ipc_try_get_oop_view_poses(volatile struct ipc_client_state *ics,
 		float fov_aspect = (v != 0.0f) ? (h / v) : 0.0f;
 		IPC_WARN(s,
 		         "oop Kooima: views=%u screen=%.3fx%.3fm winOffset=(%.4f,%.4f)m FOV H=%.1f° V=%.1f° "
-		         "fovAspect=%.3f tracking=%d rig=%d zone=%d",
+		         "fovAspect=%.3f dp_eyes=%d tracking=%d rig=%d zone=%d",
 		         view_count, (double)screen_width_m, (double)screen_height_m, (double)win_eye_offset_x,
 		         (double)win_eye_offset_y, (double)h, (double)v,
-		         (double)fov_aspect, (int)is_tracking, (int)rig_display, (int)zone_applied);
+		         (double)fov_aspect, (int)have_dp_eyes, (int)is_tracking, (int)rig_display, (int)zone_applied);
 	}
 
 	return true;
 }
-#endif // XRT_OS_ANDROID || XRT_OS_MACOS || COMP_MULTI_HAVE_WEAVE
+#endif // XRT_OS_ANDROID || XRT_OS_MACOS || COMP_MULTI_HAVE_WEAVE || COMP_MULTI_SHARED_SURFACE
 
 
 static xrt_result_t
@@ -2081,6 +2575,8 @@ ipc_handle_instance_declare_peer(volatile struct ipc_client_state *ics,
 		ics->peer_declared = true;
 		ics->peer_pid = declared;
 		ics->client_state.pid = (int)declared;
+		// ADR-034 Am.5: the declared peer is the app whose per-app pin applies.
+		ipc_server_client_resolve_input_identity(ics, declared);
 		// The only site that actually changes behaviour: ipc_send_handles's
 		// open_target_process_dup_handle now duplicates into the declared peer
 		// instead of the pipe opener.
@@ -2128,11 +2624,21 @@ ipc_handle_instance_describe_client(volatile struct ipc_client_state *ics,
 	if (!ics->class_verified) {
 		char exe[512];
 		ipc_server_peer_exe_path(ics->peer_pid, exe, sizeof(exe));
+		// Input focus by application (ipc_app_group.h): keep the peer's
+		// executable and parent for the sibling test on flush.
+		snprintf((char *)ics->peer_exe_path, sizeof(ics->peer_exe_path), "%s", exe);
+		ics->peer_parent_pid = ipc_server_peer_parent_pid(ics->peer_pid);
 		uint32_t verified = verify_client_class(ics, client_desc->info.declared_client_class, exe);
 
 		struct ipc_server *s = ics->server;
 		os_mutex_lock(&s->global_state.lock);
-		uint32_t in_use = count_class_locked(s, ics, verified);
+		uint32_t in_use = verified == XRT_CLIENT_CLASS_PRESENT_OWNER ? count_present_owners_locked(s, ics, exe)
+		                                                           : count_class_locked(s, ics, verified);
+		if (verified == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+			// The service's in-process camera consumers (input providers on the
+			// shared-camera host slot) take from the same quota.
+			in_use += ipc_server_stereo_camera_internal_consumer_count();
+		}
 		uint32_t quota = ipc_server_client_class_quota(s, verified);
 		bool refused = quota != 0 && in_use >= quota;
 		if (!refused) {
@@ -2204,6 +2710,26 @@ ipc_handle_system_compositor_get_info(volatile struct ipc_client_state *ics,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Multi-screen M1 (`XR_DXR_display_info` v22): the service's screen list, so an
+ * IPC client's `xrEnumerateDisplaysDXR` returns exactly what an in-process app
+ * would. A separate message on purpose — `xrt_system_compositor_info` crosses
+ * the wire by value and is not grown for this.
+ */
+xrt_result_t
+ipc_handle_system_enumerate_displays(volatile struct ipc_client_state *ics, struct xrt_screen_list *out_list)
+{
+	IPC_TRACE_MARKER();
+
+	xrt_result_t xret = xrt_instance_enumerate_displays(ics->server->xinst, out_list);
+	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
+		// An instance that cannot enumerate has no screens to report.
+		memset(out_list, 0, sizeof(*out_list));
+		return XRT_SUCCESS;
+	}
+	return xret;
+}
+
 xrt_result_t
 ipc_handle_session_create(volatile struct ipc_client_state *ics,
                           const struct xrt_session_info *xsi,
@@ -2250,6 +2776,15 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 			         ics->peer_pid);
 			return XRT_ERROR_NOT_AUTHORIZED;
 		}
+		if (cls == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+			// ADR-043 R3: a camera consumer has no session by contract — that is
+			// what keeps it out of the panel quota.
+			IPC_WARN(ics->server,
+			         "session_create: denied — CAMERA_CONSUMER client pid %ld may only use the stereo "
+			         "camera entry points (ADR-043 R3).",
+			         ics->peer_pid);
+			return XRT_ERROR_NOT_AUTHORIZED;
+		}
 		if ((xsi->is_workspace_controller && cls != XRT_CLIENT_CLASS_CONTROLLER) ||
 		    (xsi->is_bridge_relay && cls != XRT_CLIENT_CLASS_RELAY)) {
 			IPC_WARN(ics->server,
@@ -2269,9 +2804,11 @@ ipc_handle_session_create(volatile struct ipc_client_state *ics,
 
 	ics->client_state.session_overlay = xsi->is_overlay;
 	ics->client_state.z_order = xsi->z_order;
+	ics->app_share_opt_out = xsi->app_share_not_shareable; // ADR-061 spec §5
 
 	ics->xs = xs;
 	ics->xc = xcn != NULL ? &xcn->base : NULL;
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061: a new shareable session?
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	// #1018: hand the compositor this client's OS-derived pid so the
@@ -2332,7 +2869,9 @@ ipc_handle_session_begin(volatile struct ipc_client_state *ics)
 	    .meta_body_tracking_calibration_enabled = ics->client_state.info.meta_body_tracking_calibration_enabled,
 	};
 
-	return xrt_comp_begin_session(ics->xc, &begin_session_info);
+	xrt_result_t xret = xrt_comp_begin_session(ics->xc, &begin_session_info);
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061
+	return xret;
 }
 
 xrt_result_t
@@ -2350,7 +2889,9 @@ ipc_handle_session_end(volatile struct ipc_client_state *ics)
 		return XRT_ERROR_IPC_COMPOSITOR_NOT_CREATED;
 	}
 
-	return xrt_comp_end_session(ics->xc);
+	xrt_result_t xret = xrt_comp_end_session(ics->xc);
+	ipc_server_stereo_camera_apps_changed(ics->server->stereo_camera); // ADR-061
+	return xret;
 }
 
 xrt_result_t
@@ -2972,8 +3513,47 @@ ipc_handle_compositor_get_window_metrics(volatile struct ipc_client_state *ics,
 	return XRT_SUCCESS;
 }
 
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*!
+ * ADR-047 Amendment 7: this client's session-level "is anyone tracked" — its
+ * own DP's answer @p own ORed with every other DP presenting for it
+ * (comp_d3d11_service_get_other_screens_tracking), through @p state's
+ * hand-over debounce (util/u_tracking_any.h). With no other DP presenting the
+ * answer is @p own, exactly as before. Called on the client's own IPC thread.
+ */
+static bool
+session_tracking_or(volatile struct ipc_client_state *ics, struct u_tracking_any *state, bool own)
+{
+	uint32_t others = 0;
+	bool others_tracked = false;
+	if (ics->server != NULL && ics->server->xsysc != NULL) {
+		others_tracked = comp_d3d11_service_get_other_screens_tracking(
+		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &others, NULL);
+	}
+	return u_tracking_any_update(state, os_monotonic_get_ns(), own, others_tracked, others, U_TRACKING_ANY_HOLD_NS);
+}
+#endif
+
+xrt_result_t
+ipc_handle_compositor_set_fixed_viewer(volatile struct ipc_client_state *ics, bool fixed)
+{
+	IPC_TRACE_MARKER();
+
+	// XR_DXR_display_info v25 (XrViewLocateFixedViewerDXR): the client sends
+	// this on change, before the locate it applies to; every view, eye and
+	// segment query it makes from then on is framed for the nominal viewer
+	// and posts no viewer-tracking demand (ipc_viewer_override_eyes).
+	if (ics->fixed_viewer != fixed) {
+		ics->fixed_viewer = fixed;
+		IPC_INFO(ics->server, "client %u: fixed-viewer locates %s (XR_DXR_display_info v25)",
+		         ics->client_state.id, fixed ? "on" : "off");
+	}
+	return XRT_SUCCESS;
+}
+
 xrt_result_t
 ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_state *ics,
+                                                  int64_t target_ns,
                                                   struct xrt_eye_positions *out_eye_positions)
 {
 	IPC_TRACE_MARKER();
@@ -2991,17 +3571,225 @@ ipc_handle_compositor_get_predicted_eye_positions(volatile struct ipc_client_sta
 		// Scope to THIS client's DP (#625) — same reason as the locate path:
 		// a client that never renders still owns a live DP, and the xc-less
 		// query would report isTracking=false for it (or another app's state)
-		// even while its own located views are tracked.
-		(void)comp_d3d11_service_get_predicted_eye_positions_full_for_client(
-		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, &eyes);
+		// even while its own located views are tracked. N6 Part 1 (#2144):
+		// at the client's target time (its frame's displayTime).
+		const bool have_dp = comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(
+		    ics->server->xsysc, (struct xrt_compositor *)ics->xc, target_ns, &eyes);
+		// ADR-054 N6 Part 2: on a screen routed to the service-hosted
+		// provider, the live tracking state is the provider's (its lock, its
+		// staleness) — the eyes the views follow, not a display that does
+		// not track.
+		(void)ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, target_ns, &eyes, have_dp && eyes.valid);
+
+		// ADR-047 Amendment 7: the session is tracked when ANY DP presenting
+		// for it sees a viewer — its own (above), or a segment DP / workspace
+		// presenter / present-owner weave segment on another screen. Only
+		// the boolean changes; the eyes stay this client's own screen's.
+		// The client passes this answer straight through (oxr_session.c).
+		eyes.is_tracking = session_tracking_or(ics, &((struct ipc_client_state *)ics)->tracking_any_locate,
+		                                       u_tracking_dp_viewer_present(&eyes));
+	}
+#elif defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+	// macOS / desktop-Linux null+comp_multi service: THIS client's DP — its per-session DP,
+	// else its weave engine's (vk or Metal backend), the same eye source
+	// ipc_try_get_oop_view_poses uses for its views. Without this branch a
+	// macOS IPC session's XrViewEyeTrackingStateDXR.isTracking was constant
+	// FALSE (and the tracking-state edge event never fired) even while its
+	// located views and the weave itself tracked the head.
+	if (ics->xc != NULL) {
+		// N6 Part 1 (#2144): at the client's target time.
+		const bool have_dp = multi_compositor_get_eye_positions_at(multi_compositor(ics->xc), target_ns, &eyes);
+		// ADR-054 N6 Part 2: the service-hosted provider's state when it serves the screen.
+		(void)ipc_viewer_override_eyes(ics, XRT_VIEWER_SCREEN_PRIMARY, target_ns, &eyes, have_dp && eyes.valid);
 	}
 #else
 	(void)ics;
+	(void)target_ns;
 #endif
 
 	// eyes.valid == false signals "no DP / no data" to the client.
 	*out_eye_positions = eyes;
 
+	return XRT_SUCCESS;
+}
+
+/*
+ * Multi-screen M6/M3 over IPC (ADR-047 Amendment 3): per-screen weaving of a
+ * direct client's window, and per-segment views for its xrLocateViews. The
+ * service owns the screen registry (its own instance), so the client sends
+ * only its session's display pin; the table and the routing then cross the
+ * wire by value. Off the D3D11 service compositor these are inert: enable is
+ * a no-op, the table is empty (one view set), the routing is dropped.
+ */
+static_assert(sizeof(struct ipc_compositor_get_segment_metrics_reply) <= IPC_BUF_SIZE,
+              "compositor_get_segment_metrics reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_compositor_set_view_routing_msg) <= IPC_BUF_SIZE,
+              "compositor_set_view_routing message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_segments_enable(volatile struct ipc_client_state *ics, uint64_t pinned_display_id)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list == NULL) {
+			return XRT_ERROR_ALLOCATION;
+		}
+		if (xrt_instance_enumerate_displays(ics->server->xinst, list) != XRT_SUCCESS) {
+			memset(list, 0, sizeof(*list)); // no screens: the manager stays disabled
+		}
+		comp_d3d11_service_set_client_segment_screens(ics->server->xsysc, (struct xrt_compositor *)ics->xc,
+		                                              list, pinned_display_id);
+		free(list);
+	}
+#else
+	(void)ics;
+	(void)pinned_display_id;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_compositor_get_segment_metrics(volatile struct ipc_client_state *ics,
+                                          struct xrt_segment_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
+		(void)comp_d3d11_service_get_client_segment_metrics(ics->server->xsysc,
+		                                                    (struct xrt_compositor *)ics->xc, out_metrics);
+		// ADR-054 N6 Part 2, per screen: the client computes each segment's
+		// views from this table, so the service splices the provider's eyes
+		// (mapped into each routed screen's display space) here. The message
+		// carries no target time: "now" — the ring extrapolates a bounded
+		// distance, the same horizon the DP's own "latest" answer has.
+		const int64_t now_ns = (int64_t)os_monotonic_get_ns();
+		for (uint32_t i = 0; i < out_metrics->count && i < XRT_MAX_SEGMENTS; i++) {
+			if (ipc_viewer_override_eyes(ics, out_metrics->seg[i].screen_id, now_ns,
+			                             &out_metrics->seg[i].eyes, out_metrics->seg[i].have_eyes)) {
+				out_metrics->seg[i].have_eyes = true;
+			}
+		}
+	}
+#else
+	(void)ics;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+/*
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): the present-owner's per-screen
+ * segment table of its last weave, with every screen's eyes. Inert (an empty
+ * table) off the D3D11 service compositor and for a client that never enabled
+ * segments.
+ */
+static_assert(sizeof(struct ipc_weave_get_segments_reply) <= IPC_BUF_SIZE,
+              "weave_get_segments reply exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_weave_get_segments(volatile struct ipc_client_state *ics, struct xrt_segment_metrics *out_metrics)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_metrics, 0, sizeof(*out_metrics));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		(void)comp_d3d11_service_weave_get_segments((struct xrt_compositor *)ics->xc, out_metrics);
+	}
+#else
+	(void)ics;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_compositor_set_view_routing(volatile struct ipc_client_state *ics,
+                                       const struct xrt_segment_view_routing *routing)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL) {
+		comp_d3d11_service_set_client_view_routing(ics->server->xsysc, (struct xrt_compositor *)ics->xc,
+		                                           routing);
+	}
+#else
+	(void)ics;
+	(void)routing;
+#endif
+
+	return XRT_SUCCESS;
+}
+
+/*
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4). The D3D11 service stores
+ * the request for the commit that follows and answers with the outcome of the
+ * previous one. Every other service answers "refused" (it has no drawer), so
+ * the client's willDraw stays honest and the app keeps its OS cursor.
+ * Per-frame while armed: never log here.
+ */
+static_assert(sizeof(struct ipc_compositor_set_cursor_draw_request_msg) <= IPC_BUF_SIZE,
+              "compositor_set_cursor_draw_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_set_cursor_draw_request(volatile struct ipc_client_state *ics,
+                                              const struct ipc_cursor_draw_request *request,
+                                              struct ipc_cursor_draw_outcome *out_outcome)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_outcome, 0, sizeof(*out_outcome));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		comp_d3d11_service_set_cursor_draw_request((struct xrt_compositor *)ics->xc, request, out_outcome);
+		return XRT_SUCCESS;
+	}
+#endif
+	(void)ics;
+	(void)request;
+	out_outcome->answered = 1;
+	out_outcome->drew = 0;
+	out_outcome->reason = (uint32_t)U_CURSOR_DRAW_REFUSAL_NO_COMPOSE_PASS;
+	return XRT_SUCCESS;
+}
+
+/*
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6). The D3D11
+ * service measures at the commit that follows and answers with its newest
+ * finished measurement. Every other service answers "no result" (valid = 0):
+ * the client then has no content and the cursor sits on the screen plane.
+ * Per-frame while armed: never log here.
+ */
+static_assert(sizeof(struct ipc_compositor_set_cursor_measure_request_msg) <= IPC_BUF_SIZE,
+              "compositor_set_cursor_measure_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_compositor_set_cursor_measure_request(volatile struct ipc_client_state *ics,
+                                                 const struct ipc_cursor_measure_request *request,
+                                                 struct ipc_cursor_measure_result *out_measurement)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_measurement, 0, sizeof(*out_measurement));
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (ics->server != NULL && ics->server->xsysc != NULL && ics->xc != NULL &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		comp_d3d11_service_set_cursor_measure_request((struct xrt_compositor *)ics->xc, request, out_measurement);
+		return XRT_SUCCESS;
+	}
+#endif
+	(void)ics;
+	(void)request;
 	return XRT_SUCCESS;
 }
 
@@ -3908,8 +4696,257 @@ ipc_handle_system_get_display_status(volatile struct ipc_client_state *_ics, str
 		st.tracking_valid = true;
 		st.is_tracking = eyes.is_tracking;
 	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-047 Amendment 7: the system is tracking when any presenting DP is —
+	// the panel DP above, or any secondary workspace presenter / segment DP
+	// on another screen. A status read, not a decision: undebounced.
+	if (s->xsysc != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		uint32_t others = 0;
+		if (comp_d3d11_service_get_other_screens_tracking(s->xsysc, NULL, &others, NULL)) {
+			st.is_tracking = true;
+		}
+		if (others > 0) {
+			st.tracking_valid = true;
+		}
+	}
+#endif
 
 	*out_status = st;
+	return XRT_SUCCESS;
+}
+
+/*
+ * ADR-051 D3 (display dashboard phase 2): the service's display status
+ * snapshot, session-free, for DIAG clients only (`displayxr-cli status`, the
+ * Dashboard through it, the MCP surface through the CLI). Read-only. The
+ * snapshot crosses in fixed-size pieces — the head with one screen row per
+ * `system_get_status_snapshot(screen_index)`, one client row per
+ * `system_get_client_segments(client_id)` — each carrying the generation it
+ * belongs to, so a reader that sees two generations refetches.
+ */
+static xrt_result_t
+require_status_diag(volatile struct ipc_client_state *ics, const char *what)
+{
+	if (ics->client_state.client_class != XRT_CLIENT_CLASS_DIAG) {
+		IPC_WARN(ics->server, "%s: denied — caller pid %ld is class %s (display status: DIAG only).", what,
+		         (long)ics->client_state.pid, ipc_server_client_class_str(ics->client_state.client_class));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+static_assert(sizeof(struct ipc_system_get_status_snapshot_msg) <= IPC_BUF_SIZE,
+              "system_get_status_snapshot message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_system_get_client_segments_msg) <= IPC_BUF_SIZE,
+              "system_get_client_segments message exceeds IPC_BUF_SIZE");
+// ADR-053 (#2006): each conversion row crosses in its own reply, which stays
+// under the 1 KB DIAG limit -- that is why the rows are fetched by index.
+static_assert(sizeof(struct ipc_system_get_conv_provider_row_reply) <= IPC_BUF_SIZE,
+              "system_get_conv_provider_row reply exceeds the 1 KB DIAG limit");
+static_assert(sizeof(struct ipc_system_get_conv_task_row_reply) <= IPC_BUF_SIZE,
+              "system_get_conv_task_row reply exceeds the 1 KB DIAG limit");
+
+xrt_result_t
+ipc_handle_system_get_conv_provider_row(volatile struct ipc_client_state *ics,
+                                        uint32_t index,
+                                        struct xrt_status_conv_provider *out_row,
+                                        struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_conv_provider_row");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_conv_provider(ics->server, index, out_row, out_generation);
+}
+
+xrt_result_t
+ipc_handle_system_get_conv_task_row(volatile struct ipc_client_state *ics,
+                                    uint32_t index,
+                                    struct xrt_status_conv_task *out_row,
+                                    struct xrt_status_generation *out_generation)
+{
+	memset(out_row, 0, sizeof(*out_row));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_conv_task_row");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_conv_task(ics->server, index, out_row, out_generation);
+}
+
+xrt_result_t
+ipc_handle_system_get_status_generation(volatile struct ipc_client_state *ics,
+                                        struct xrt_status_generation *out_generation)
+{
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_status_generation");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_generation(ics->server, out_generation);
+}
+
+xrt_result_t
+ipc_handle_system_get_status_snapshot(volatile struct ipc_client_state *ics,
+                                      uint32_t screen_index,
+                                      struct xrt_status_head *out_head,
+                                      struct xrt_status_screen *out_screen)
+{
+	memset(out_head, 0, sizeof(*out_head));
+	memset(out_screen, 0, sizeof(*out_screen));
+	xrt_result_t xret = require_status_diag(ics, "system_get_status_snapshot");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return ipc_server_status_get_snapshot_piece(ics->server, screen_index, out_head, out_screen);
+}
+
+xrt_result_t
+ipc_handle_system_get_client_segments(volatile struct ipc_client_state *ics,
+                                      uint32_t client_id,
+                                      struct xrt_status_client *out_client,
+                                      struct xrt_segment_metrics *out_metrics,
+                                      struct xrt_status_generation *out_generation)
+{
+	memset(out_client, 0, sizeof(*out_client));
+	memset(out_metrics, 0, sizeof(*out_metrics));
+	memset(out_generation, 0, sizeof(*out_generation));
+	xrt_result_t xret = require_status_diag(ics, "system_get_client_segments");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	// Any client's table, read-only — compositor_get_segment_metrics stays
+	// own-session.
+	return ipc_server_status_get_client(ics->server, client_id, out_client, out_metrics, out_generation);
+}
+
+/*
+ * Display dashboard phase 7: `displayxr-cli dp use|reset --screen` (and the
+ * dashboard through it) wrote a per-screen display-processor preference; ask
+ * the re-probe worker to re-resolve now instead of at the next world event.
+ * Session-free, DIAG only, and it does nothing but flag the debounced request
+ * (the worker re-reads the preference stores before it resolves).
+ */
+xrt_result_t
+ipc_handle_system_request_display_reprobe(volatile struct ipc_client_state *ics)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_request_display_reprobe");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+#ifndef XRT_OS_ANDROID
+	ipc_server_request_display_reprobe("per-screen DP preference changed");
+#endif
+	return XRT_SUCCESS;
+}
+
+/*
+ * ADR-054 N3d (#2051): `displayxr-cli dp|input|conv use|reset|enable|disable`
+ * just wrote a class's Enabled / Preferred policy — re-select now rather than
+ * at the next service start. Session-free, DIAG only. The service's watch
+ * thread also catches edits made without the CLI; this is the no-wait path.
+ */
+xrt_result_t
+ipc_handle_system_request_component_reselect(volatile struct ipc_client_state *ics, uint32_t component_class)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_request_component_reselect");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_component_reselect_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	xret = s_component_reselect_provider(component_class);
+	IPC_INFO(ics->server, "system_request_component_reselect: class %u requested by pid %ld (%d).",
+	         (unsigned)component_class, (long)ics->client_state.pid, (int)xret);
+	return xret;
+}
+
+/*
+ * Display dashboard phase 8: `displayxr-cli workspace set` (and the dashboard
+ * through it) rewrote the workspace controllers' launch settings in
+ * service.json; re-read and apply them now (new hotkey hook, mode) instead of
+ * at the next service start. Session-free, DIAG only. A service without an
+ * orchestrator (Android, sdl_test) has no provider: XRT_ERROR_NOT_IMPLEMENTED,
+ * which the CLI reports as "applies on next service start".
+ */
+xrt_result_t
+ipc_handle_system_reload_service_config(volatile struct ipc_client_state *ics)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_reload_service_config");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_service_config_reload_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (!s_service_config_reload_provider()) {
+		IPC_WARN(ics->server, "system_reload_service_config: the service could not apply the reload.");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(ics->server, "system_reload_service_config: reload requested by pid %ld.",
+	         (long)ics->client_state.pid);
+	return XRT_SUCCESS;
+}
+
+/*
+ * Display dashboard phase 8: `displayxr-cli workspace launch <id>` — spawn the
+ * workspace controller now, through the same path as the launch hotkey.
+ * Session-free, DIAG only. The refusals (not the active controller, disabled,
+ * already running, none registered) come back in `out_status`, so the CLI can
+ * say which.
+ */
+xrt_result_t
+ipc_handle_system_workspace_launch(volatile struct ipc_client_state *ics,
+                                   const struct ipc_workspace_controller_id *controller,
+                                   uint32_t *out_status)
+{
+	*out_status = IPC_WORKSPACE_LAUNCH_UNSUPPORTED;
+	xrt_result_t xret = require_status_diag(ics, "system_workspace_launch");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_workspace_launch_provider == NULL) {
+		return XRT_SUCCESS;
+	}
+	char id[sizeof(controller->id) + 1];
+	memcpy(id, controller->id, sizeof(controller->id));
+	id[sizeof(controller->id)] = '\0'; // never trust the wire to terminate
+	*out_status = s_workspace_launch_provider(id);
+	IPC_WARN(ics->server, "system_workspace_launch('%s') by pid %ld: status %u.", id, (long)ics->client_state.pid,
+	         (unsigned)*out_status);
+	return XRT_SUCCESS;
+}
+
+/*
+ * Display dashboard phase 8: a hotkey-capture box (the dashboard, through
+ * `displayxr-cli workspace hotkey-suspend on|off`) must see the CURRENT combo
+ * instead of the service's hook swallowing it. true = take the hook out
+ * (config and a running controller untouched), false = put it back from the
+ * current config. Session-free, DIAG only. Deliberately NOT tied to the
+ * caller's connection (the caller is a one-shot CLI that exits at once):
+ * resumed only by an explicit false or by the service's 60 s safety timeout,
+ * which every true re-arms. The service logs the suspend / resume WARNs.
+ */
+xrt_result_t
+ipc_handle_system_workspace_hotkey_suspend(volatile struct ipc_client_state *ics, bool suspend)
+{
+	xrt_result_t xret = require_status_diag(ics, "system_workspace_hotkey_suspend");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (s_workspace_hotkey_suspend_provider == NULL) {
+		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+	if (!s_workspace_hotkey_suspend_provider(suspend)) {
+		IPC_WARN(ics->server, "system_workspace_hotkey_suspend(%s): the service could not apply it.",
+		         suspend ? "true" : "false");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(ics->server, "system_workspace_hotkey_suspend(%s) by pid %ld.", suspend ? "true" : "false",
+	         (long)ics->client_state.pid);
 	return XRT_SUCCESS;
 }
 
@@ -3971,6 +5008,21 @@ ipc_handle_system_get_client_window_metrics(volatile struct ipc_client_state *_i
 			         (double)wm.window_center_offset_x_m,
 			         (double)wm.window_center_offset_y_m,
 			         (double)wm.window_center_offset_z_m);
+		}
+	}
+#elif defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop-Linux null + comp_multi service (ADR-051 D3): the rect the
+	// service composites the client at in its shared surface, or a weave
+	// present-owner's published window geometry. The compositor pointer is
+	// only matched against the system's live client list, never dereferenced
+	// unless found there (multi_compositor_status_get_client).
+	struct ipc_server *s = _ics->server;
+	struct xrt_compositor *target_xc = NULL;
+	if (ipc_server_get_client_xc(s, client_id, &target_xc) == XRT_SUCCESS && s->xsysc != NULL &&
+	    target_xc != NULL) {
+		struct multi_compositor_status_client mcs;
+		if (multi_compositor_status_get_client(s->xsysc, target_xc, &mcs)) {
+			wm = mcs.window;
 		}
 	}
 #else
@@ -4051,6 +5103,32 @@ ipc_handle_system_toggle_io_device(volatile struct ipc_client_state *ics, uint32
 	return XRT_SUCCESS;
 }
 
+/*!
+ * ADR-052: rebuild the workspace's screen set from this server's screen
+ * registry (the instance's `enumerate_displays`). @p activation: a controller
+ * just (re)activated, so it starts un-opted-in to SCREENS_CHANGED.
+ */
+static void
+workspace_refresh_screens(struct ipc_server *s, bool activation)
+{
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s == NULL || s->xsysc == NULL || s->xinst == NULL || !comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list == NULL) {
+		return;
+	}
+	if (xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		comp_d3d11_service_workspace_update_screens(s->xsysc, list, activation);
+	}
+	free(list);
+#else
+	(void)s;
+	(void)activation;
+#endif
+}
+
 xrt_result_t
 ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 {
@@ -4081,6 +5159,9 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
 
+	// ADR-052: the workspace's screens as of this activation.
+	workspace_refresh_screens(s, true);
+
 	if (s->workspace_mode) {
 		IPC_INFO(s, "Workspace: already in workspace mode — ensuring window for relaunch");
 		// Re-ensure the workspace window even when already in workspace mode.
@@ -4089,6 +5170,16 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		if (s->xsysc != NULL) {
 #ifdef XRT_OS_WINDOWS
 			comp_d3d11_service_ensure_workspace_window(s->xsysc);
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+			// A service started in workspace mode lands here on the first
+			// activate: the shared surface must still learn a controller is up.
+			comp_multi_system_set_workspace_active(s->xsysc, true);
+#endif
+#ifdef XRT_OS_ANDROID
+			s->workspace_controller_pid = caller_pid;
+			s->workspace_controller_uid = ipc_server_derive_peer_uid(_ics->imc.ipc_handle);
+			ipc_server_android_notify_overlay(true, s->workspace_controller_uid);
 #endif
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			// Force-reset to 3D on EVERY activate, including this
@@ -4117,12 +5208,18 @@ ipc_handle_workspace_activate(volatile struct ipc_client_state *_ics)
 		comp_d3d11_service_ensure_workspace_window(s->xsysc);
 #endif
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 		// #61: keep the shared spatial surface rendering (empty backdrop + DXR
 		// splash + launcher band) while the controller is connected, even with no
-		// content app — wakes the render thread (the macOS analogue of eagerly
-		// creating the workspace window above).
+		// content app — wakes the render thread (the shared-surface analogue of
+		// eagerly creating the workspace window above). On Android this is the
+		// workspace OVERLAY MODE (#1006): the render thread switches every
+		// main-service client into the controller's surface through one DP.
 		comp_multi_system_set_workspace_active(s->xsysc, true);
+#endif
+#ifdef XRT_OS_ANDROID
+		s->workspace_controller_uid = ipc_server_derive_peer_uid(_ics->imc.ipc_handle);
+		ipc_server_android_notify_overlay(true, s->workspace_controller_uid);
 #endif
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
@@ -4166,11 +5263,20 @@ ipc_handle_workspace_deactivate(volatile struct ipc_client_state *_ics)
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 		comp_d3d11_service_deactivate_workspace(s->xsysc);
 #endif
-#ifdef XRT_OS_MACOS
-		// #61: let the shared-surface render thread idle again (no controller).
+#ifdef COMP_MULTI_SHARED_SURFACE
+		// #61: let the shared-surface render thread idle again (no controller),
+		// and drop the controller's cursor / overlays / focus.
 		comp_multi_system_set_workspace_active(s->xsysc, false);
+		comp_multi_workspace_reset_controller_state();
+		ipc_server_input_queue_set_input_grab(false);
+		ipc_server_input_queue_set_pointer_capture(false);
+		ipc_server_input_queue_clear_frame_tick();
 #endif
 	}
+#ifdef XRT_OS_ANDROID
+	s->workspace_controller_uid = -1;
+	ipc_server_android_notify_overlay(false, -1);
+#endif
 
 	return XRT_SUCCESS;
 }
@@ -4201,6 +5307,19 @@ ipc_handle_workspace_request_display_mode(volatile struct ipc_client_state *_ics
 		// No multi_comp (workspace not active / non-d3d11 backend) —
 		// caller falls back to legacy device-property path on the client.
 		return XRT_ERROR_NOT_IMPLEMENTED;
+	}
+#elif defined(COMP_MULTI_SHARED_SURFACE)
+	// #967 D-5: the shared display processor's hardware 2D/3D, from the mode's
+	// own hardware flag (the same mode table the clients enumerate).
+	{
+		struct xrt_device *head = s->xsysd != NULL ? s->xsysd->static_roles.head : NULL;
+		if (head == NULL || mode_index >= head->rendering_mode_count) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
+		if (!comp_multi_system_request_workspace_display_mode(
+		        s->xsysc, head->rendering_modes[mode_index].hardware_display_3d)) {
+			return XRT_ERROR_NOT_IMPLEMENTED;
+		}
 	}
 #else
 	(void)mode_index;
@@ -4277,7 +5396,7 @@ ipc_handle_workspace_set_input_grab(volatile struct ipc_client_state *_ics, bool
 	IPC_INFO(s, "Workspace: set_input_grab %s", grab ? "true" : "false");
 	comp_d3d11_service_set_input_grab(s->xsysc, grab);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// #61: the launcher band grabs all input. Flag the AppKit router so every
 	// event goes to the controller queue only (no content forwarding) until the
 	// band closes and the shell releases the grab.
@@ -4311,7 +5430,7 @@ ipc_handle_workspace_set_cursor_depth(volatile struct ipc_client_state *_ics,
 	// Per-frame; never log here (would flood the service log).
 	comp_d3d11_service_workspace_set_cursor_depth(s->xsysc, hit_z_m, over_window != 0, dim_factor);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	(void)dim_factor; // v1 cursor is flat; dim not yet applied.
 	comp_multi_workspace_set_cursor_depth(hit_z_m, over_window != 0);
@@ -4405,14 +5524,14 @@ ipc_handle_workspace_set_window_pose(volatile struct ipc_client_state *_ics,
 	bool ok = comp_d3d11_service_set_client_window_pose(s->xsysc, target_xc, pose, width_m, height_m);
 
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Tier-2 (#59): reposition + resize the client's runtime-owned NSWindow into a
 	// display sub-rect so multiple apps tile instead of stacking full-screen. The
 	// shell's grid/drag/resize layout primitives all funnel here through the same
 	// xrSetWorkspaceClientWindowPoseDXR path the Windows monolith uses.
 	IPC_INFO(s, "Workspace: set_window_pose client_id=%u pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f (macOS)",
 	         client_id, pose->position.x, pose->position.y, pose->position.z, width_m, height_m);
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4464,12 +5583,12 @@ ipc_handle_workspace_set_window_visibility(volatile struct ipc_client_state *_ic
 
 	bool ok = comp_d3d11_service_set_client_visibility(s->xsysc, target_xc, visible);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP: record the minimized/hidden state in the workspace registry. The
 	// per-session render path (render_per_session_clients_locked) reads it and
 	// renders a black desktop canvas + overlays for a hidden client instead of
 	// skipping it, so the taskbar stays visible while minimized (#61).
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4512,13 +5631,13 @@ ipc_handle_workspace_get_window_pose(volatile struct ipc_client_state *_ics,
 
 	bool ok = comp_d3d11_service_get_client_window_pose(s->xsysc, target_xc, out_pose, out_width_m, out_height_m);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP single-app model: the client fills the display, so its window
 	// IS the display. Return the display dims (consistent with where the chrome
 	// composite, session_render_chrome_overlay, places chrome) + an identity
 	// pose. This unblocks the shell's per-client chrome sizing (#61); true
 	// per-client window placement is Tier-2 (#59).
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4628,7 +5747,7 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 		if (s->xsysc != NULL) {
 			comp_d3d11_service_set_focused_slot(s->xsysc, -1);
 		}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 		// #59 Task 10: clear the focus tint (no client tinted).
 		comp_multi_workspace_set_focused_client(NULL);
 #else
@@ -4671,10 +5790,10 @@ ipc_handle_workspace_set_focused_client(volatile struct ipc_client_state *_ics, 
 	int mc_slot = comp_d3d11_service_workspace_find_slot_by_xc(s->xsysc, xc);
 	comp_d3d11_service_set_focused_slot(s->xsysc, mc_slot);
 	return XRT_SUCCESS;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// #59 Task 10: the compositor's focus-tint gate is the authority on macOS.
 	// The macOS shell passes canonical client ids (no 1000+slot form).
-	struct xrt_compositor *xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *xc = multi_workspace_find_client_xc(s, client_id);
 	if (xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -4809,10 +5928,11 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 
 	unsigned long expected_pid = effective_workspace_controller_pid(s);
 	unsigned long caller_pid = (unsigned long)_ics->client_state.pid;
-#ifndef XRT_OS_MACOS
+#ifndef COMP_MULTI_SHARED_SURFACE
 	// Single shared queue (Windows/Android): the activate-registered controller
 	// pid gates the drain so a content app can't steal the controller's input.
-	// macOS has per-client queues (#61), so it keys by caller below instead.
+	// The shared surface (macOS #61, desktop Linux) has per-client queues, so it
+	// keys by caller below instead.
 	if (expected_pid != 0 && caller_pid != expected_pid) {
 		return XRT_ERROR_NOT_AUTHORIZED;
 	}
@@ -4829,7 +5949,7 @@ ipc_handle_workspace_enumerate_input_events(volatile struct ipc_client_state *_i
 	}
 	bool ok = comp_d3d11_service_workspace_drain_input_events(s->xsysc, capacity, out_batch);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS null+comp_multi service (#48/#61): the AppKit router hit-tests each
 	// NSEvent and pushes it onto a per-target queue. Each client drains only its
 	// own: the workspace controller drains the controller queue (NULL key); a
@@ -4871,7 +5991,7 @@ ipc_handle_workspace_pointer_capture_set(volatile struct ipc_client_state *_ics,
 	}
 	bool ok = comp_d3d11_service_workspace_pointer_capture_set(s->xsysc, enabled, button);
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS has no OS-level pointer capture to toggle: the appkit pump already
 	// publishes POINTER_MOTION every cycle from a global CGEventGetLocation poll
 	// (carrying the pressed-button mask), so a gesture's motion flows whether or
@@ -4927,12 +6047,12 @@ ipc_handle_workspace_request_client_exit(volatile struct ipc_client_state *_ics,
 		return XRT_ERROR_IPC_FAILURE;
 	}
 	return comp_d3d11_service_workspace_request_exit_by_slot(s->xsysc, slot);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS OOP (#59): resolve the canonical client id to its per-session
 	// compositor and push an exit request — the chrome close (X) button / DELETE
 	// key path. The window-close global never fires in this route (the service
 	// pump doesn't track NSWindows), so this is the app-quit mechanism.
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5148,7 +6268,7 @@ ipc_handle_workspace_get_client_info(volatile struct ipc_client_state *_ics,
 			}
 		}
 	}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS shared surface: like the D3D11 path above, report session_visible
 	// from the WORKSPACE minimize state, not the xrSession lifecycle flag. A
 	// freshly-connected OOP client sits in a non-VISIBLE session state until the
@@ -5214,8 +6334,34 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 	memcpy(prefix, request->path_prefix, sizeof(prefix));
 	prefix[sizeof(prefix) - 1] = '\0';
 
-	bool ok = comp_d3d11_service_capture_frame(s->xsysc, prefix, request->flags,
-	                                           out_capture_result);
+	// #1810: flags == 0 means "runtime picks" — that is what the shell's MCP
+	// capture_frame sends (`req.flags = 0`), and comp_d3d11_service_capture_frame
+	// rejects a zero stage mask outright, so every shell capture came back
+	// {"ok":false} with nothing written and nothing logged. Default the STAGE
+	// bits only, keeping any modifier bit (RAW_ALPHA) the caller set.
+	uint32_t flags = request->flags;
+	if ((flags & (IPC_CAPTURE_FLAG_ATLAS | IPC_CAPTURE_FLAG_PROJECTION_ONLY)) == 0) {
+		flags |= IPC_CAPTURE_FLAG_ALL;
+	}
+
+	// #1810: an APP (allowed only outside workspace mode, above) captures its
+	// OWN per-client atlas, not whichever client rendered last. ics->xc is this
+	// thread's own compositor, and its teardown runs on this same thread, so it
+	// outlives the call. CONTROLLER/DIAG keep the historical source.
+	struct xrt_compositor *self_xc = NULL;
+	{
+		uint32_t cls = _ics->client_state.client_class;
+		bool privileged = cls == XRT_CLIENT_CLASS_CONTROLLER || cls == XRT_CLIENT_CLASS_DIAG;
+		if (!privileged) {
+			self_xc = (struct xrt_compositor *)_ics->xc;
+		}
+	}
+
+	bool ok = comp_d3d11_service_capture_frame_for_client(s->xsysc, self_xc, prefix, flags, out_capture_result);
+	if (!ok) {
+		IPC_WARN(s, "workspace_capture_frame: nothing written for pid %ld (prefix=%s flags=0x%x)",
+		         _ics->peer_pid, prefix, flags);
+	}
 	return ok ? XRT_SUCCESS : XRT_ERROR_IPC_FAILURE;
 #else
 	(void)s;
@@ -5230,13 +6376,13 @@ ipc_handle_workspace_capture_frame(volatile struct ipc_client_state *_ics,
 // dispatches to comp_d3d11_service. Layout has the same client_id→slot
 // resolution.
 
-#if defined(XRT_OS_MACOS)
+#if defined(COMP_MULTI_SHARED_SURFACE)
 // Resolve a canonical workspace client id to its per-session compositor
 // (== ics->xc == the multi_compositor the render path keys chrome by, #48). The
 // macOS service hands the controller canonical ids from EnumerateWorkspaceClients,
 // so no 1000+slot normalization is needed here (that is the D3D11-only form).
 static struct xrt_compositor *
-macos_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id)
+multi_workspace_find_client_xc(struct ipc_server *s, uint32_t client_id)
 {
 	struct xrt_compositor *xc = NULL;
 	os_mutex_lock(&s->global_state.lock);
@@ -5316,7 +6462,7 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 	IPC_INFO(s, "Workspace: register_chrome_swapchain client_id=%u swapchain_id=%u → slot=%d",
 	         client_id, swapchain_id, slot);
 	return comp_d3d11_service_workspace_register_chrome_swapchain_by_slot(s->xsysc, slot, client_id, swapchain_id, xsc);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Generic comp_multi path (#48): store the controller's chrome swapchain in
 	// the chrome registry, keyed by the *target* client's compositor; the
 	// per-session render path composites it (no D3D11 monolith / slots here).
@@ -5328,7 +6474,7 @@ ipc_handle_workspace_register_chrome_swapchain(volatile struct ipc_client_state 
 		IPC_WARN(s, "Workspace: register_chrome_swapchain - swapchain %u not bound", swapchain_id);
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		// Client may not be bound yet — controller retries.
 		IPC_WARN(s, "Workspace: register_chrome_swapchain - client %u not bound yet", client_id);
@@ -5361,7 +6507,7 @@ ipc_handle_workspace_unregister_chrome_swapchain(volatile struct ipc_client_stat
 	}
 	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u", swapchain_id);
 	return comp_d3d11_service_workspace_unregister_chrome_swapchain(s->xsysc, swapchain_id);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	IPC_INFO(s, "Workspace: unregister_chrome_swapchain swapchain_id=%u (macOS)", swapchain_id);
 	comp_multi_workspace_chrome_unregister_by_id(swapchain_id);
 	return XRT_SUCCESS;
@@ -5415,11 +6561,11 @@ ipc_handle_workspace_set_chrome_layout(volatile struct ipc_client_state *_ics,
 	}
 
 	return comp_d3d11_service_workspace_set_chrome_layout_by_slot(s->xsysc, slot, layout);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	if (layout == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		IPC_WARN(s, "Workspace: set_chrome_layout - client %u not found", client_id);
 		return XRT_ERROR_IPC_FAILURE;
@@ -5496,7 +6642,7 @@ ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
 	                                                info->hot_x, info->hot_y,
 	                                                info->size_meters,
 	                                                info->visible != 0);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	if (info == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
@@ -5514,11 +6660,17 @@ ipc_handle_workspace_set_cursor(volatile struct ipc_client_state *_ics,
 #endif
 }
 
-xrt_result_t
-ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
-                                  const struct ipc_workspace_overlay_info *info)
+/*!
+ * Shared body of workspace_set_overlay (screen 0 = the primary, pre-v26) and
+ * spec_version 26's workspace_set_overlay_on_screen (ADR-052 Amendment 2).
+ */
+static xrt_result_t
+workspace_set_overlay_common(volatile struct ipc_client_state *_ics,
+                             const struct ipc_workspace_overlay_info *info,
+                             uint64_t screen_id,
+                             const char *what)
 {
-	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_overlay");
+	xrt_result_t authz = require_workspace_controller(_ics, what);
 	if (authz != XRT_SUCCESS) {
 		return authz;
 	}
@@ -5535,14 +6687,16 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 		xsc = (struct xrt_swapchain *)_ics->xscs[info->swapchain_id];
 	}
 
-	return comp_d3d11_service_workspace_set_overlay(s->xsysc, info->overlay_id, xsc,
-	                                                 info->anchor_x, info->anchor_y,
-	                                                 info->pivot_x, info->pivot_y,
-	                                                 info->size_w_m, info->size_h_m,
-	                                                 info->visible != 0,
-	                                                 info->stereo_sbs != 0);
-#elif defined(XRT_OS_MACOS)
+	return comp_d3d11_service_workspace_set_overlay_on_screen(s->xsysc, info->overlay_id, xsc,
+	                                                           info->anchor_x, info->anchor_y,
+	                                                           info->pivot_x, info->pivot_y,
+	                                                           info->size_w_m, info->size_h_m,
+	                                                           info->visible != 0,
+	                                                           info->stereo_sbs != 0, screen_id);
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
+	// One presenter: every screen tag falls back to the primary (ADR-052 Amendment 2).
+	(void)screen_id;
 	if (info == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5557,8 +6711,24 @@ ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
 #else
 	(void)s;
 	(void)info;
+	(void)screen_id;
 	return XRT_ERROR_IPC_FAILURE;
 #endif
+}
+
+xrt_result_t
+ipc_handle_workspace_set_overlay(volatile struct ipc_client_state *_ics,
+                                  const struct ipc_workspace_overlay_info *info)
+{
+	return workspace_set_overlay_common(_ics, info, 0, "workspace_set_overlay");
+}
+
+xrt_result_t
+ipc_handle_workspace_set_overlay_on_screen(volatile struct ipc_client_state *_ics,
+                                            const struct ipc_workspace_overlay_info *info,
+                                            uint64_t screen_id)
+{
+	return workspace_set_overlay_common(_ics, info, screen_id, "workspace_set_overlay_on_screen");
 }
 
 xrt_result_t
@@ -5603,11 +6773,11 @@ ipc_handle_workspace_update_chrome_layer_pose(volatile struct ipc_client_state *
 	}
 
 	return comp_d3d11_service_workspace_update_chrome_layer_pose_by_slot(s->xsysc, slot, pose_in_client);
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	if (pose_in_client == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		// Per-frame call — quieter than set_chrome_layout (no warn).
 		return XRT_ERROR_IPC_FAILURE;
@@ -5743,7 +6913,7 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	return comp_d3d11_service_set_client_style_by_slot(s->xsysc, slot, style)
 	           ? XRT_SUCCESS
 	           : XRT_ERROR_IPC_FAILURE;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// macOS shared surface (#59 Task 10): store the controller's per-client style.
 	// The content compositing loop applies the focus tint to the focused client's
 	// edge — the macOS analogue of the D3D11 service per-slot style, which renders
@@ -5754,7 +6924,7 @@ ipc_handle_workspace_set_client_style(volatile struct ipc_client_state *_ics,
 	if (s == NULL || style == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
-	struct xrt_compositor *target_xc = macos_workspace_find_client_xc(s, client_id);
+	struct xrt_compositor *target_xc = multi_workspace_find_client_xc(s, client_id);
 	if (target_xc == NULL) {
 		return XRT_ERROR_IPC_FAILURE;
 	}
@@ -5814,6 +6984,25 @@ ipc_handle_workspace_acquire_wakeup_event(volatile struct ipc_client_state *_ics
 	out_handles[0] = src;
 	*out_handle_count = 1;
 	return XRT_SUCCESS;
+#elif defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_SHARED_SURFACE)
+	// POSIX form (#710): an eventfd made readable by every push onto the
+	// controller's input queue. The generated dispatch sends it without
+	// closing, so the server keeps its copy; the controller receives its own
+	// duplicate (SCM_RIGHTS), polls it for POLLIN and read()s to reset.
+	if (max_handle_count == 0 || out_handles == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (_ics->client_state.client_class != XRT_CLIENT_CLASS_CONTROLLER) {
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	int fd = ipc_server_input_queue_get_wakeup_fd();
+	if (fd < 0) {
+		IPC_WARN(s, "Workspace: wakeup eventfd creation failed");
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	out_handles[0] = fd;
+	*out_handle_count = 1;
+	return XRT_SUCCESS;
 #else
 	(void)s;
 	(void)max_handle_count;
@@ -5843,6 +7032,7 @@ ipc_handle_swapchain_create(volatile struct ipc_client_state *ics,
                             uint32_t *out_image_count,
                             uint64_t *out_size,
                             bool *out_use_dedicated_allocation,
+                            bool *out_is_d3d11_texture,
                             uint32_t max_handle_capacity,
                             xrt_graphics_buffer_handle_t *out_handles,
                             uint32_t *out_handle_count)
@@ -5887,11 +7077,13 @@ ipc_handle_swapchain_create(volatile struct ipc_client_state *ics,
 	for (size_t i = 1; i < xsc->image_count; i++) {
 		assert(xscn->images[0].size == xscn->images[i].size);
 		assert(xscn->images[0].use_dedicated_allocation == xscn->images[i].use_dedicated_allocation);
+		assert(xscn->images[0].is_d3d11_texture == xscn->images[i].is_d3d11_texture);
 	}
 
 	// Assuming all images allocated in the same swapchain have the same allocation requirements.
 	*out_size = xscn->images[0].size;
 	*out_use_dedicated_allocation = xscn->images[0].use_dedicated_allocation;
+	*out_is_d3d11_texture = xscn->images[0].is_d3d11_texture;
 	*out_id = index;
 	*out_image_count = xsc->image_count;
 
@@ -6247,6 +7439,21 @@ ipc_handle_weave_bind_window(volatile struct ipc_client_state *ics, uint64_t hwn
 	if (!comp_d3d11_service_weave_bind_window(ics->xc, hwnd)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
+	// ADR-060 R2: offer the screen list. Inert unless this client's weave DP
+	// turns out windowless; then the service cuts the window per screen itself
+	// (the vendor's own 2D-region logic is gone with the window). A bind is
+	// rare (once per window), so the enumeration is not a per-frame cost.
+	if (ics->server != NULL && ics->server->xsysc != NULL && hwnd != 0 &&
+	    comp_d3d11_service_is_d3d11_service(ics->server->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list != NULL) {
+			if (xrt_instance_enumerate_displays(ics->server->xinst, list) == XRT_SUCCESS) {
+				comp_d3d11_service_weave_offer_screens(ics->server->xsysc,
+				                                       (struct xrt_compositor *)ics->xc, list);
+			}
+			free(list);
+		}
+	}
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	if (!comp_multi_weave_bind_window(ics->xc, hwnd)) {
@@ -6272,7 +7479,11 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
                                      int32_t origin_y,
                                      uint32_t client_w,
                                      uint32_t client_h,
-                                     int32_t display_id)
+                                     int32_t display_id,
+                                     uint32_t logical_valid,
+                                     int32_t logical_x,
+                                     int32_t logical_y,
+                                     float logical_scale)
 {
 	IPC_TRACE_MARKER();
 
@@ -6285,13 +7496,39 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
 	}
 
-#if defined(COMP_MULTI_HAVE_WEAVE)
+#if defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// v12 (browser-pvt#180): the logical half is latched with the device half
+	// under one engine lock. The wire is not trusted: a non-positive or
+	// non-finite scale (the client validated it) is treated as "no logical".
+	struct xrt_weave_logical_origin logical = {0};
+	if (logical_valid != 0 && logical_scale > 0.0f && logical_scale <= 64.0f) {
+		logical.valid = true;
+		logical.x = logical_x;
+		logical.y = logical_y;
+		logical.scale = logical_scale;
+	}
+	if (!comp_multi_weave_set_window_geometry_logical(ics->xc, origin_x, origin_y, client_w, client_h, display_id,
+	                                                  &logical)) {
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
+#elif defined(COMP_MULTI_HAVE_WEAVE)
+	// macOS / Android: no logical coordinate space in the drag protocol there,
+	// so v12's logical origin is accepted and dropped.
+	(void)logical_valid;
+	(void)logical_x;
+	(void)logical_y;
+	(void)logical_scale;
 	// Engine refusal, not a dead pipe (browser#103).
 	if (!comp_multi_weave_set_window_geometry(ics->xc, origin_x, origin_y, client_w, client_h, display_id)) {
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
 #else
+	(void)logical_valid;
+	(void)logical_x;
+	(void)logical_y;
+	(void)logical_scale;
 	// Windows: the D3D11 service reads the client rect off the bound HWND, so an
 	// explicit publication is redundant rather than unsupported — accept and drop
 	// it, keeping the call portable for a caller that always sends it.
@@ -6308,8 +7545,9 @@ ipc_handle_weave_set_window_geometry(volatile struct ipc_client_state *ics,
  * XR_DXR_weave spec v8 (browser#88): latch the present-owner's STICKY
  * screen-space flat regions (xrWeaveSetScreenFlatRegionsDXR). Absolute physical
  * screen pixels, held until the next call; the service intersects them with the
- * bound window and subtracts them from every subsequent submit's hardware wish.
- * Applied immediately — if a wish is already published the service re-rasters and
+ * bound window and subtracts them from every subsequent submit's hardware wish
+ * (Windows), or paints them flat in every subsequent woven output (desktop Linux).
+ * Applied immediately on Windows — if a wish is already published the service re-rasters and
  * republishes before returning, so screen furniture goes flat without waiting for
  * the next frame.
  */
@@ -6346,9 +7584,23 @@ ipc_handle_weave_set_screen_flat_regions(volatile struct ipc_client_state *ics,
 		return XRT_ERROR_WEAVE_REFUSED;
 	}
 	return XRT_SUCCESS;
+#elif defined(COMP_MULTI_HAVE_WEAVE) && defined(XRT_OS_LINUX_DESKTOP)
+	// Desktop Linux: latched in the weave engine and painted flat from the next
+	// submit (no Linux DP has a per-region lens to wish to).
+	struct xrt_rect rects[IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX];
+	for (uint32_t i = 0; i < args->rect_count; i++) {
+		rects[i].offset.w = args->rects[i].x; // xrt_offset fields are named w/h
+		rects[i].offset.h = args->rects[i].y;
+		rects[i].extent.w = (int)args->rects[i].w;
+		rects[i].extent.h = (int)args->rects[i].h;
+	}
+	if (!comp_multi_weave_set_screen_flat_regions(ics->xc, args->rect_count, args->rect_count > 0 ? rects : NULL)) {
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
 #else
-	// No per-region hardware wish channel on this platform yet (macOS / Android /
-	// Linux). Accept and drop rather than fail, so a portable caller can always
+	// No per-region hardware wish channel on this platform yet (macOS /
+	// Android). Accept and drop rather than fail, so a portable caller can always
 	// publish its flat furniture — the same accept-and-ignore contract v7's
 	// window geometry has on Windows.
 	(void)args;
@@ -6392,12 +7644,21 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
                         uint32_t *out_height,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes,
+                        uint32_t *out_segment_count,
+                        uint32_t *out_lift_cursor_mask,
+                        struct ipc_weave_woven_origin *out_origin,
                         const xrt_graphics_buffer_handle_t *handles,
                         uint32_t handle_count)
 {
 	IPC_TRACE_MARKER();
 
 	*out_have_output = false;
+	// v12 §5e: no woven origin unless the D3D11 service reports one (ADR-060 R3).
+	memset(out_origin, 0, sizeof(*out_origin));
+	// XR_DXR_weave v19 cheap split signal: 0 = woven by one display processor
+	// (every platform but the D3D11 service, every window on one screen).
+	*out_segment_count = 0;
+	*out_lift_cursor_mask = 0;
 	xrt_result_t auth = require_present_owner(ics, "weave_submit");
 	if (auth != XRT_SUCCESS) {
 		weave_submit_release_handles(handles, handle_count);
@@ -6495,6 +7756,12 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	// v14: per submit — a submit without XrWeaveSubmitOverlayUnchangedDXR clears it.
+	comp_d3d11_service_weave_set_overlay_unchanged(ics->xc, args->overlay_unchanged != 0);
+	// v15: per submit — negative = not set by the app, the DP's own default applies.
+	comp_d3d11_service_weave_set_overlay_filter_strength(ics->xc, args->overlay_filter_strength);
+	// #2289: the client's exe basename tags its per-client capture trigger (the #2207 twin).
+	comp_d3d11_service_weave_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
 	bool ok = comp_d3d11_service_weave_submit(                  //
 	    ics->xc, in_handle, in_is_dxgi,                         //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
@@ -6518,7 +7785,33 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_width = w;
 	*out_height = h;
 	*out_fence_value = fv;
+	// ADR-047 Amendment 7: eyesTracking is "is anyone tracked" over every DP
+	// weaving this window (the session's weave DP + its per-screen segment
+	// DPs). The eyes stay the session weave DP's; per-screen eyes ride
+	// XrWeaveOutputRectPartsDXR as before. eyesValid false keeps eyesTracking false.
+	if (eyes.valid) {
+		eyes.is_tracking = session_tracking_or(ics, &((struct ipc_client_state *)ics)->tracking_any_weave,
+		                                       u_tracking_dp_viewer_present(&eyes));
+	}
 	*out_eyes = eyes;
+	// #1884 (ADR-047 Amendment 4, addendum): how many screens this very submit
+	// was woven on, so the client fetches the per-screen table
+	// (weave_get_segments) only when the window actually spans screens.
+	*out_segment_count = comp_d3d11_service_weave_segment_count(ics->xc);
+	// XR_DXR_cursor_depth v6: which lift rects of this submit got the cursor.
+	*out_lift_cursor_mask = comp_d3d11_service_weave_lift_cursor_mask(ics->xc);
+	// ADR-060 R3: the origin a windowless weave DP was phased for; field by
+	// field onto the wire POD. No logical space on Windows.
+	{
+		int32_t ox = 0, oy = 0;
+		uint64_t serial = 0;
+		if (comp_d3d11_service_weave_get_woven_origin(ics->xc, &ox, &oy, &serial)) {
+			out_origin->valid = 1u;
+			out_origin->x = ox;
+			out_origin->y = oy;
+			out_origin->serial = serial;
+		}
+	}
 	return XRT_SUCCESS;
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// handles[0] is the retained IOSurfaceRef (macOS) / acquired AHardwareBuffer
@@ -6553,7 +7846,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	// v8 (browser#88): the flat (physically-2D) regions of this submit. The
 	// macOS / Android weave engines accept and ignore them for now — there is no
 	// per-region hardware wish channel on those platforms yet, exactly as v7's
-	// Windows-only handle kinds are accepted and ignored here.
+	// Windows-only handle kinds are accepted and ignored here. The desktop-Linux
+	// engine paints them flat in the woven output instead.
 	if (args->flat_rect_count > IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX) {
 		xrt_graphics_buffer_handle_t reject = handles[0];
 		u_graphics_buffer_unref(&reject); // don't leak the retained IOSurfaceRef
@@ -6596,7 +7890,24 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
-	bool ok = comp_multi_weave_submit(                          //
+#ifdef XRT_OS_LINUX_DESKTOP
+	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
+	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
+	// v14/v15: per submit, read only when the DP composites the overlay.
+	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
+	// #2207: the client's exe basename tags its per-client capture trigger.
+	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
+#elif defined(XRT_OS_ANDROID)
+	// v14/v15: same per-submit hints for the Android weave (2D under the lens).
+	comp_multi_weave_android_set_overlay_hints(ics->xc, args->overlay_unchanged != 0,
+	                                           args->overlay_filter_strength);
+	// #2501: the client's package name (from its uid) tags its capture trigger.
+	comp_multi_weave_android_set_capture_uid(ics->xc, ics->peer_uid);
+#elif defined(XRT_OS_MACOS)
+	// #2470: the client's exe basename tags its per-client capture trigger (the #2207 twin).
+	comp_multi_weave_macos_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
+#endif
+	bool ok = comp_multi_weave_submit(                        //
 	    ics->xc, handles[0],                                    //
 	    args->rect_x, args->rect_y, args->rect_w, args->rect_h, //
 	    args->rect_count, args->rect_count > 0 ? rects : NULL,  //
@@ -6614,6 +7925,8 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// Stereo camera A2: this uid presents woven 3D (the front-camera gate).
+	ics->last_weave_ns = (int64_t)os_monotonic_get_ns();
 	return XRT_SUCCESS;
 #else
 	// No weave engine in this build (e.g. desktop Linux until #1699 R2). The
@@ -6624,6 +7937,105 @@ ipc_handle_weave_submit(volatile struct ipc_client_state *ics,
 	weave_submit_release_handles(handles, handle_count);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
+}
+
+/*
+ *
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the weave-rect cursor. The
+ * request is staged for the NEXT weave_submit on this connection (one
+ * connection = one thread, so the submit that follows is the one it belongs
+ * to); the state reports what that submit drew. Only a caller that chained
+ * XrCursorDepthWeaveRequestDXR sends any of these (ADR-046 section 0).
+ *
+ */
+
+static_assert(sizeof(struct ipc_weave_cursor_request_msg) <= IPC_BUF_SIZE,
+              "weave_cursor_request message exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_weave_cursor_request(volatile struct ipc_client_state *ics, const struct xrt_weave_cursor_request *req)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_request");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (req->rect_count > XRT_WEAVE_CURSOR_MAX_RECTS) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	comp_d3d11_service_weave_set_cursor_request(ics->xc, req);
+	return XRT_SUCCESS;
+#else
+	// No weave-rect cursor drawer on this platform yet (macOS, desktop Linux,
+	// Android): the state reports nothing drawn, the caller keeps its fallback.
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_cursor_sprite_texture(volatile struct ipc_client_state *ics,
+                                       const struct xrt_weave_cursor_sprite_texture *info,
+                                       const xrt_graphics_buffer_handle_t *handles,
+                                       uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_sprite_texture");
+	if (auth != XRT_SUCCESS || ics->xc == NULL || handle_count < 1) {
+		weave_submit_release_handles(handles, handle_count);
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		for (uint32_t i = 0; i < handle_count; i++) {
+			if (handles[i] != NULL && ((size_t)handles[i] & 1) == 0) {
+				CloseHandle(handles[i]); // an NT handle duplicated into us
+			}
+		}
+#endif
+		return auth != XRT_SUCCESS ? auth
+		                           : (ics->xc == NULL ? XRT_ERROR_IPC_SESSION_NOT_CREATED : XRT_ERROR_IPC_FAILURE);
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	xrt_graphics_buffer_handle_t h = handles[0];
+	bool is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+	if ((size_t)h & 1) {
+		h = (HANDLE)((size_t)h - 1);
+		is_dxgi = true;
+	}
+	for (uint32_t i = 1; i < handle_count; i++) {
+		if (handles[i] != NULL && ((size_t)handles[i] & 1) == 0) {
+			CloseHandle(handles[i]);
+		}
+	}
+#endif
+	// The compositor takes ownership of h (closes it once imported or replaced).
+	comp_d3d11_service_weave_set_cursor_sprite_texture(ics->xc, h, is_dxgi, info);
+	return XRT_SUCCESS;
+#else
+	(void)info;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_cursor_state(volatile struct ipc_client_state *ics, struct xrt_weave_cursor_state *out_state)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_state);
+	xrt_result_t auth = require_present_owner(ics, "weave_cursor_state");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	comp_d3d11_service_weave_get_cursor_state(ics->xc, out_state);
+#endif
+	return XRT_SUCCESS;
 }
 
 xrt_result_t
@@ -6728,7 +8140,7 @@ ipc_handle_weave_get_fence(volatile struct ipc_client_state *ics,
  *   output fd      one dup per comp_multi_weave_export_output_dmabuf call, owned
  *                  by this handler; same send-then-park rule.
  */
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX // desktop Linux (v10) + Android (v20)
 void
 ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics)
 {
@@ -6767,7 +8179,10 @@ weave_defer_close(volatile struct ipc_client_state *ics, int fd)
 	}
 	ics->weave_deferred_close_fds[ics->weave_deferred_close_count++] = fd;
 }
+#endif // COMP_MULTI_HAVE_WEAVE
+#endif // XRT_OS_LINUX
 
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(COMP_MULTI_HAVE_WEAVE)
 //! DRM_FORMAT_MOD_INVALID, spelled out so the IPC server needs no libdrm header.
 #define WEAVE_DRM_FORMAT_MOD_INVALID 0x00ffffffffffffffULL
 
@@ -6794,13 +8209,17 @@ weave_unpack_dmabuf(const struct ipc_weave_dmabuf *src, int fd, struct xrt_weave
 	dst->buffer_id = src->buffer_id;
 	return true;
 }
-#endif // COMP_MULTI_HAVE_WEAVE
-#endif // XRT_OS_LINUX_DESKTOP
+#endif // XRT_OS_LINUX_DESKTOP && COMP_MULTI_HAVE_WEAVE
 
 // The dma-buf submit is the largest message on the wire; keep it honest.
 static_assert(sizeof(struct ipc_weave_submit_dmabuf_msg) <= IPC_BUF_SIZE,
               "weave_submit_dmabuf message exceeds IPC_BUF_SIZE");
 static_assert(sizeof(struct ipc_weave_submit_msg) <= IPC_BUF_SIZE, "weave_submit message exceeds IPC_BUF_SIZE");
+// v12 (browser-pvt#180): the per-frame origin appended to the dma-buf submit
+// reply. Its layout is part of the wire; pin it.
+static_assert(sizeof(struct ipc_weave_woven_origin) == 40, "ipc_weave_woven_origin layout changed");
+static_assert(sizeof(struct ipc_weave_submit_dmabuf_reply) <= IPC_BUF_SIZE,
+              "weave_submit_dmabuf reply exceeds IPC_BUF_SIZE");
 
 xrt_result_t
 ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
@@ -6811,6 +8230,7 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
                                struct xrt_eye_positions *out_eyes,
+                               struct ipc_weave_woven_origin *out_origin,
                                uint32_t max_release_fence_count,
                                xrt_graphics_sync_handle_t *out_release_fences,
                                uint32_t *out_release_fence_count,
@@ -6824,6 +8244,7 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	*out_height = 0;
 	*out_fence_value = 0;
 	U_ZERO(out_eyes);
+	U_ZERO(out_origin);
 	*out_release_fence_count = 0;
 
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -6902,6 +8323,13 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	uint32_t w = 0, h = 0;
 	uint64_t fv = 0;
 	struct xrt_eye_positions eyes = {0};
+	struct xrt_weave_woven_origin woven = {0};
+	// v13: per submit — a submit without XrWeaveSubmitMonoIn2DDXR clears it.
+	comp_multi_weave_linux_set_mono_in_2d(ics->xc, args->mono_in_2d != 0);
+	// v14/v15: per submit, read only when the DP composites the overlay.
+	comp_multi_weave_linux_set_overlay_hints(ics->xc, args->overlay_unchanged != 0, args->overlay_filter_strength);
+	// #2207: the client's exe basename tags its per-client capture trigger.
+	comp_multi_weave_linux_set_capture_tag(ics->xc, (const char *)ics->input_exe_basename);
 	bool ok = comp_multi_weave_submit_dmabuf(                   //
 	    ics->xc, &in_desc,                                      //
 	    args->have_overlay ? &overlay_desc : NULL,              //
@@ -6911,8 +8339,8 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	    args->weave_frame_first != 0,                           //
 	    layout.view_count > 0 ? &layout : NULL,                 //
 	    args->flat_rect_count,                                  //
-	    args->flat_rect_count > 0 ? flat_rects : NULL,           //
-	    &release_fd, &w, &h, &fv, &eyes);
+	    args->flat_rect_count > 0 ? flat_rects : NULL,          //
+	    &release_fd, &w, &h, &fv, &eyes, &woven);
 	if (!ok) {
 		// Transient engine refusal, not a dead pipe (browser#103). A refused
 		// submit owes the caller no fence; never leak one an engine returned.
@@ -6931,6 +8359,16 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	*out_height = h;
 	*out_fence_value = fv;
 	*out_eyes = eyes;
+	// v12 (browser-pvt#180): the origin THIS submit's weave used, field by
+	// field onto the wire POD (never a byte copy between the two layouts).
+	out_origin->serial = woven.serial;
+	out_origin->valid = woven.valid ? 1u : 0u;
+	out_origin->x = woven.x;
+	out_origin->y = woven.y;
+	out_origin->logical_valid = (woven.valid && woven.logical_valid) ? 1u : 0u;
+	out_origin->logical_x = woven.logical_x;
+	out_origin->logical_y = woven.logical_y;
+	out_origin->logical_scale = woven.logical_scale;
 	return XRT_SUCCESS;
 #else
 	// No desktop-Linux weave engine in this build (every other platform, and
@@ -6941,6 +8379,147 @@ ipc_handle_weave_submit_dmabuf(volatile struct ipc_client_state *ics,
 	(void)dmabuf;
 	(void)max_release_fence_count;
 	(void)out_release_fences;
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+/*
+ *
+ * XR_DXR_weave v20: Android sync_file fences.
+ *
+ * Fd ownership, handler by handler:
+ *
+ *   weave_set_acquire_fence  the received fd is parked in
+ *                  ics->weave_pending_acquire_fd (one slot: a newer one closes
+ *                  the older) until the next weave_submit_sync takes it.
+ *   weave_submit_sync  the parked acquire fd passes to the engine
+ *                  (comp_multi_weave_android_set_sync), which owns it from then
+ *                  on — imported into a semaphore, CPU-polled, or closed on a
+ *                  refusal. The release fence the engine produces is owned by
+ *                  this handler, sent as the reply's out handle and parked in
+ *                  ics->weave_deferred_close_fds like the desktop-Linux one.
+ *
+ */
+
+xrt_result_t
+ipc_handle_weave_set_acquire_fence(volatile struct ipc_client_state *ics,
+                                   const xrt_graphics_sync_handle_t *acquire_fences,
+                                   const uint32_t acquire_fence_count)
+{
+	IPC_TRACE_MARKER();
+
+#if defined(XRT_OS_ANDROID) && defined(COMP_MULTI_HAVE_WEAVE)
+	// Every fd past the first is malformed; never leak one.
+	for (uint32_t i = 1; i < acquire_fence_count; i++) {
+		if (acquire_fences[i] >= 0) {
+			close(acquire_fences[i]);
+		}
+	}
+	int fd = acquire_fence_count >= 1 ? acquire_fences[0] : -1;
+	xrt_result_t auth = require_present_owner(ics, "weave_set_acquire_fence");
+	if (auth != XRT_SUCCESS || acquire_fence_count != 1 || fd < 0) {
+		if (fd >= 0) {
+			close(fd);
+		}
+		return auth != XRT_SUCCESS ? auth : XRT_ERROR_IPC_FAILURE;
+	}
+	if (ics->weave_have_pending_acquire && ics->weave_pending_acquire_fd >= 0) {
+		close(ics->weave_pending_acquire_fd); // a submit that never came; the newer fence covers it
+	}
+	ics->weave_pending_acquire_fd = fd;
+	ics->weave_have_pending_acquire = true;
+	return XRT_SUCCESS;
+#else
+	// Android only. On an fd platform the received descriptors are live in this
+	// process; close them so a misbehaving client cannot exhaust the table.
+#if defined(XRT_GRAPHICS_SYNC_HANDLE_IS_FD)
+	for (uint32_t i = 0; i < acquire_fence_count; i++) {
+		xrt_graphics_sync_handle_t h = acquire_fences[i];
+		u_graphics_sync_unref(&h);
+	}
+#else
+	(void)acquire_fences;
+	(void)acquire_fence_count;
+#endif
+	(void)ics;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_weave_submit_sync(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_weave_submit *args,
+                             uint32_t want_release_fence,
+                             bool *out_have_output,
+                             uint32_t *out_width,
+                             uint32_t *out_height,
+                             uint64_t *out_fence_value,
+                             struct xrt_eye_positions *out_eyes,
+                             uint32_t *out_segment_count,
+                             uint32_t *out_lift_cursor_mask,
+                             uint32_t max_release_fence_count,
+                             xrt_graphics_sync_handle_t *out_release_fences,
+                             uint32_t *out_release_fence_count,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             const uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+
+	*out_release_fence_count = 0;
+
+#if defined(XRT_OS_ANDROID) && defined(COMP_MULTI_HAVE_WEAVE)
+	// The previous v20 reply is on the wire by now: drop the fence it carried.
+	ipc_server_client_weave_flush_deferred_fds(ics);
+
+	int acquire_fd = -1;
+	if (ics->weave_have_pending_acquire) {
+		acquire_fd = ics->weave_pending_acquire_fd;
+		ics->weave_have_pending_acquire = false;
+		ics->weave_pending_acquire_fd = -1;
+	}
+	if (ics->xc != NULL) {
+		// The engine owns acquire_fd from here, whatever the submit does.
+		comp_multi_weave_android_set_sync(ics->xc, acquire_fd, want_release_fence != 0);
+	} else if (acquire_fd >= 0) {
+		close(acquire_fd);
+	}
+
+	// Everything else — auth, validation, the weave — is the v9 submit's,
+	// byte for byte.
+	// weave_submit_sync's reply carries no origin (Android has none to report).
+	struct ipc_weave_woven_origin unused_origin;
+	xrt_result_t xret =
+	    ipc_handle_weave_submit(ics, args, out_have_output, out_width, out_height, out_fence_value, out_eyes,
+	                            out_segment_count, out_lift_cursor_mask, &unused_origin, handles, handle_count);
+
+	// Always collect: also drops a sync request a refused submit never reached.
+	int release_fd = ics->xc != NULL ? comp_multi_weave_android_take_sync_result(ics->xc) : -1;
+	if (xret != XRT_SUCCESS || max_release_fence_count < 1) {
+		if (release_fd >= 0) {
+			close(release_fd); // a refused submit owes the caller no fence
+		}
+		return xret != XRT_SUCCESS ? xret : XRT_ERROR_IPC_FAILURE;
+	}
+	if (release_fd >= 0) {
+		out_release_fences[0] = release_fd;
+		*out_release_fence_count = 1;
+		weave_defer_close(ics, release_fd); // closed after this reply is sent
+	}
+	return XRT_SUCCESS;
+#else
+	(void)args;
+	(void)want_release_fence;
+	(void)out_have_output;
+	(void)out_width;
+	(void)out_height;
+	(void)out_fence_value;
+	(void)out_eyes;
+	(void)out_segment_count;
+	(void)out_lift_cursor_mask;
+	(void)max_release_fence_count;
+	(void)out_release_fences;
+	(void)ics;
 	weave_submit_release_handles(handles, handle_count);
 	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
 #endif
@@ -7045,10 +8624,11 @@ ipc_handle_weave_snap_window_rect(volatile struct ipc_client_state *ics,
 #elif defined(COMP_MULTI_HAVE_WEAVE)
 	// The weave engine owns the service-side display processor, so the snap
 	// routes through it: its xrt_display_processor_vk's snap_window_rect slot
-	// (the same slot the in-process vk_native compositor uses). Identity today
-	// on macOS / Android (sim_display has no interlace lattice, #759); on
-	// desktop Linux it is the real snap through the weave engine's own DP
-	// (#1699 R2) — identity until the first submit has brought that DP up.
+	// (the same slot the in-process vk_native compositor uses). Identity on
+	// Android; on desktop Linux it is the real snap through the weave engine's
+	// own DP (#1699 R2); on macOS the Metal backend routes it to the Metal DP's
+	// snap slot (ADR-050; the vk backend stays identity). Identity until the
+	// first submit has brought that DP up.
 	int32_t sx = target_x, sy = target_y;
 	if (comp_multi_weave_snap_window_rect(ics->xc, origin_x, origin_y, target_x, target_y, &sx, &sy)) {
 		*out_snapped = true;
@@ -7209,13 +8789,15 @@ ipc_handle_compositor_semaphore_destroy(volatile struct ipc_client_state *ics, u
 
 // #962: server-side input focus. A client's device reads are live only while
 // it holds focus (session_focused — controller / relay / overlay sessions are
-// always focused, see handle_focused_client_events) and its io is not muted.
-// Reads session_focused racily on purpose: it is a bool written under
+// always focused, see handle_focused_client_events) — or, since input focus
+// follows the APPLICATION (ipc_app_group.h), while it is a sibling connection
+// of the focused client (input_focus_shared) — and its io is not muted.
+// Reads both bools racily on purpose: they are written under
 // global_state.lock on flush; this is the per-frame hot path and must not lock.
 static inline bool
 client_input_allowed(volatile struct ipc_client_state *ics)
 {
-	return ics->io_active && ics->client_state.session_focused;
+	return ics->io_active && (ics->client_state.session_focused || ics->input_focus_shared);
 }
 
 xrt_result_t
@@ -7374,7 +8956,7 @@ ipc_handle_device_get_view_poses(volatile struct ipc_client_state *ics,
 	                               view_count, NULL, NULL, &reply.head_relation, fovs, poses)) {
 		reply.result = XRT_SUCCESS;
 	} else
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process macOS (#48): DP-sourced server-side Kooima (see
 	// ipc_handle_device_get_view_poses_2 for the rationale).
 	if (ipc_try_get_oop_view_poses(ics, xdev, fallback_eye_relation, at_timestamp_ns, view_count, NULL, NULL,
@@ -7449,7 +9031,7 @@ ipc_handle_device_get_view_poses_2(volatile struct ipc_client_state *ics,
 	                               out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process macOS (#48): null+comp_multi service path. Legacy apps locate
 	// via the non-rig device_get_view_poses, so route them through the same
 	// DP-sourced server-side Kooima as the rig path — otherwise the fallback below
@@ -7521,7 +9103,8 @@ ipc_handle_session_locate_views_rig(volatile struct ipc_client_state *ics,
 	                               out_info->fovs, out_info->poses)) {
 		return XRT_SUCCESS;
 	}
-#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE)
+#elif defined(XRT_OS_ANDROID) || defined(XRT_OS_MACOS) || defined(COMP_MULTI_HAVE_WEAVE) ||                            \
+    defined(COMP_MULTI_SHARED_SURFACE)
 	// Out-of-process Android (#510) / macOS (#48) / desktop Linux (#1699): the
 	// service runs null+comp_multi, not the D3D11 service compositor, so run the
 	// server-side Kooima for that path.
@@ -7923,9 +9506,23 @@ ipc_handle_device_is_form_factor_available(volatile struct ipc_client_state *ics
 	return XRT_SUCCESS;
 }
 
+static void
+input_client_ref(volatile struct ipc_client_state *ics, struct xrt_input_selection_client *out);
+static struct xrt_input_selection *
+input_selection_of(volatile struct ipc_client_state *ics);
+
 xrt_result_t
 ipc_handle_system_devices_get_roles(volatile struct ipc_client_state *ics, struct xrt_system_roles *out_roles)
 {
+	// ADR-034 Am.5 (#2181): THIS connection's roles — its preference overlay
+	// applied, its own monotonic generation. Without selection support, the
+	// system-wide roles as before.
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	if (xis != NULL && xis->get_roles != NULL) {
+		struct xrt_input_selection_client client;
+		input_client_ref(ics, &client);
+		return xrt_input_selection_get_roles(xis, &client, out_roles);
+	}
 	return xrt_system_devices_get_roles(ics->server->xsysd, out_roles);
 }
 
@@ -8072,4 +9669,1190 @@ ipc_handle_device_set_brightness(volatile struct ipc_client_state *ics, uint32_t
 	}
 
 	return xrt_device_set_brightness(xdev, brightness, relative);
+}
+
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — 2D→3D conversion streams.
+ *
+ * Streams belong to the CONNECTION (ics->lift_owner), not to a session: the
+ * calls need no compositor, so `displayxr-cli lift` can drive them headless.
+ * Implemented on the Windows D3D11 service; every other service answers
+ * XRT_ERROR_FEATURE_NOT_SUPPORTED over a healthy pipe (the client reports
+ * XR_ERROR_FEATURE_UNSUPPORTED). A transient refusal (keyed-mutex miss) is
+ * XRT_ERROR_WEAVE_REFUSED, never XRT_ERROR_IPC_FAILURE — the latter would mark
+ * the caller's session lost over a perfectly healthy pipe (browser#103).
+ *
+ */
+
+//! Who may use lift: the browser (PRESENT_OWNER), ordinary apps, and the
+//! diagnostic probe (DIAG, `displayxr-cli lift`).
+static xrt_result_t
+require_lift_client(volatile struct ipc_client_state *ics, const char *what)
+{
+	uint32_t cls = ics->client_state.client_class;
+	if (cls != XRT_CLIENT_CLASS_PRESENT_OWNER && cls != XRT_CLIENT_CLASS_APP && cls != XRT_CLIENT_CLASS_DIAG) {
+		IPC_WARN(ics->server, "%s: denied — caller pid %ld is class %s (lift: PRESENT_OWNER / APP / DIAG).", what,
+		         ics->peer_pid, ipc_server_client_class_str(cls));
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	return XRT_SUCCESS;
+}
+
+//! This connection's owner token, taken on first use from a server-wide
+//! counter. Also the conversion core's client id (ADR-053, #2005).
+static uint64_t
+lift_owner(volatile struct ipc_client_state *ics)
+{
+	if (ics->lift_owner == 0) {
+		static uint64_t s_next_owner = 0;
+		os_mutex_lock(&ics->server->global_state.lock);
+		ics->lift_owner = ++s_next_owner;
+		os_mutex_unlock(&ics->server->global_state.lock);
+	}
+	return ics->lift_owner;
+}
+
+struct conv_core *
+ipc_server_conv_core(struct ipc_server *server)
+{
+	(void)server; // one conversion core per service process
+	return ipc_server_conv_get_core(ipc_server_get_conv());
+}
+
+/*
+ * ADR-053: every v3 lift handler below is served by the conversion core
+ * (ipc_server_conv.h). The `dp-lift` row serves DEPTH / SBS / NVIEW from the
+ * display plug-in's module; GAUSSIANS routes only when a SPLATS_MONO provider
+ * exists. Anything the routing rule does not take is an honest refusal on the
+ * v3 wire (properties: modes 0, UNAVAILABLE; create: FEATURE_UNSUPPORTED) —
+ * the pre-core svc_lift path was deleted in P1b (#2028).
+ */
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+static struct xrt_system_compositor *
+lift_xsysc(volatile struct ipc_client_state *ics)
+{
+	struct xrt_system_compositor *xsysc = ics->server != NULL ? ics->server->xsysc : NULL;
+	return comp_d3d11_service_is_d3d11_service(xsysc) ? xsysc : NULL;
+}
+#endif
+
+/*
+ *
+ * XR_DXR_input_providers (ADR-034 Amendment 5, #2181).
+ *
+ * The connection is the client. Its identity for the per-app pin is the peer
+ * executable resolved at accept (ics->input_exe_basename), its key the
+ * server's monotonic client id — never anything the client sent. The policy
+ * itself lives behind xsysd->input_selection (the arbiter, in this process):
+ * these handlers only build the client reference and forward.
+ *
+ */
+
+void
+ipc_server_client_resolve_input_identity(volatile struct ipc_client_state *ics, long pid)
+{
+	char exe_path[512];
+	char base[XRT_INPUT_EXE_BASENAME_SIZE] = {0};
+	if (pid != 0 && ipc_server_peer_exe_path(pid, exe_path, sizeof(exe_path))) {
+		(void)u_exe_basename_from_path(exe_path, base, sizeof(base));
+	}
+	memcpy((char *)ics->input_exe_basename, base, sizeof(base));
+}
+
+static void
+input_client_ref(volatile struct ipc_client_state *ics, struct xrt_input_selection_client *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->key = (uint64_t)ics->client_state.id; // ++id_generator: never 0, never reused
+	memcpy(out->exe_basename, (const char *)ics->input_exe_basename, sizeof(out->exe_basename));
+	out->exe_basename[sizeof(out->exe_basename) - 1] = '\0';
+}
+
+static struct xrt_input_selection *
+input_selection_of(volatile struct ipc_client_state *ics)
+{
+	struct ipc_server *s = ics->server;
+	return (s != NULL && s->xsysd != NULL) ? s->xsysd->input_selection : NULL;
+}
+
+void
+ipc_server_client_input_release(volatile struct ipc_client_state *ics)
+{
+	struct xrt_input_selection *xis = ics != NULL ? input_selection_of(ics) : NULL;
+	if (xis == NULL) {
+		return;
+	}
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	if (client.key == 0) {
+		// Key 0 is the service's own implicit client; a connection never owns
+		// it. Reaching here means client_state was already cleared — refuse
+		// rather than wipe the service's row (the stale-holder bug, row 6).
+		U_LOG_W("input selection: release on a connection with no client id — skipped");
+		return;
+	}
+	xrt_input_selection_client_detach(xis, &client);
+}
+
+xrt_result_t
+ipc_handle_input_providers_enumerate(volatile struct ipc_client_state *ics,
+                                     uint32_t start,
+                                     struct xrt_input_provider_page *out_page)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_page, 0, sizeof(*out_page));
+	// The service's arbiter publishes xsysd->input_selection when it is
+	// installed; without one (no provider resident) the client lists none.
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	return xrt_input_selection_enumerate(xis, &client, start, out_page);
+}
+
+static_assert(sizeof(struct xrt_input_client_holders) + 16 <= IPC_BUF_SIZE,
+              "system_get_input_holders reply exceeds IPC_BUF_SIZE");
+
+/*!
+ * ADR-034 Am.5 decision 6: one attached client's LIVE holder per family, for
+ * `displayxr-cli input list --json` and the ADR-051 status snapshot. DIAG only
+ * (it names other apps' executables). XRT_ERROR_FEATURE_NOT_SUPPORTED past the
+ * end, or when the system has no per-client selection.
+ */
+xrt_result_t
+ipc_handle_system_get_input_holders(volatile struct ipc_client_state *ics,
+                                    uint32_t index,
+                                    struct xrt_input_client_holders *out_holders)
+{
+	IPC_TRACE_MARKER();
+
+	memset(out_holders, 0, sizeof(*out_holders));
+	xrt_result_t xret = require_status_diag(ics, "system_get_input_holders");
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	return xrt_input_selection_query_holders(input_selection_of(ics), index, out_holders);
+}
+
+xrt_result_t
+ipc_handle_input_set_provider_preference(volatile struct ipc_client_state *ics,
+                                         uint32_t family,
+                                         const struct ipc_input_provider_id *provider,
+                                         bool persist)
+{
+	IPC_TRACE_MARKER();
+
+	if (family >= XRT_INPUT_ROLE_FAMILY_COUNT || provider == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	char id[XRT_INPUT_PROVIDER_ID_SIZE];
+	memcpy(id, provider->id, sizeof(id));
+	id[sizeof(id) - 1] = '\0'; // the wire is untrusted
+
+	struct xrt_input_selection *xis = input_selection_of(ics);
+	struct xrt_input_selection_client client;
+	input_client_ref(ics, &client);
+	if (persist && client.exe_basename[0] == '\0') {
+		// No executable identity (a restricted-token peer): nothing to key a pin on.
+		IPC_WARN(ics->server,
+		         "input_set_provider_preference: client id=%u pid=%ld has no resolvable executable — "
+		         "a persisted pin cannot be keyed; refused (#2181).",
+		         ics->client_state.id, ics->peer_pid);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xrt_input_selection_set_preference(xis, &client, (enum xrt_input_role_family)family, id, persist);
+}
+
+void
+ipc_server_client_lift_release(volatile struct ipc_client_state *ics)
+{
+	if (ics == NULL || ics->lift_owner == 0) {
+		return;
+	}
+	// The conversion core's streams / jobs of this connection die with it.
+	ipc_server_conv_client_gone(ipc_server_get_conv(), ics->lift_owner);
+	ics->lift_owner = 0;
+}
+
+xrt_result_t
+ipc_handle_lift_get_properties(volatile struct ipc_client_state *ics, struct ipc_lift_properties *out_props)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_props);
+	xrt_result_t auth = require_lift_client(ics, "lift_get_properties");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	struct ipc_server_conv *sc = ipc_server_get_conv();
+	if (ipc_server_conv_routes_properties(sc)) {
+		struct xrt_dp_lift_caps caps;
+		ipc_server_conv_lift_properties(sc, &caps);
+		ipc_lift_properties_from_caps(&caps, out_props);
+		return XRT_SUCCESS;
+	}
+	// No conversion core / no GPU glue / no candidate: modes 0, UNAVAILABLE — a
+	// successful answer, not an error.
+	struct xrt_dp_lift_caps none;
+	xrt_dp_lift_caps_init(&none);
+	ipc_lift_properties_from_caps(&none, out_props);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_stream_create(volatile struct ipc_client_state *ics,
+                              uint32_t mode,
+                              uint32_t content_hint,
+                              float input_scale,
+                              uint32_t aux_outputs,
+                              uint32_t aux_depth_format,
+                              uint64_t *out_stream_id)
+{
+	IPC_TRACE_MARKER();
+	*out_stream_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_create");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	struct ipc_server_conv *sc = ipc_server_get_conv();
+	if (ipc_server_conv_routes_create(sc, mode, content_hint)) {
+		return ipc_server_conv_lift_stream_create(sc, lift_owner(ics), mode, content_hint, input_scale,
+		                                          aux_outputs, aux_depth_format, out_stream_id);
+	}
+	// Not routable (GAUSSIANS without a SPLATS_MONO provider, no candidate for
+	// the task, no GPU glue): XR_ERROR_FEATURE_UNSUPPORTED on the v3 wire.
+	(void)input_scale;
+	(void)aux_outputs;
+	(void)aux_depth_format;
+	return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+}
+
+xrt_result_t
+ipc_handle_lift_stream_destroy(volatile struct ipc_client_state *ics, uint64_t stream_id)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_destroy");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner != 0 && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_stream_destroy(ipc_server_get_conv(), ics->lift_owner, stream_id);
+	}
+	// v3: destroy of an unknown stream is a no-op.
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_submit_frame(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_lift_submit *args,
+                             uint64_t *out_frame_id,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_frame_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_submit_frame");
+	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth;
+	}
+	if (handle_count < 1) {
+		return XRT_ERROR_IPC_FAILURE; // malformed request: the wire is not trusted
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), args->stream_id)) {
+		// The core route: the glue imports the input (and owns the handle from here).
+		xrt_graphics_buffer_handle_t ch = handles[0];
+		bool ch_is_dxgi = false;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		if ((size_t)ch & 1) {
+			ch = (HANDLE)((size_t)ch - 1);
+			ch_is_dxgi = true;
+		}
+#endif
+		if (handle_count > 1) {
+			weave_submit_release_handles(handles + 1, handle_count - 1);
+		}
+		// ADR-048: the session's window is the lifted rect, as svc_lift had it.
+		struct xrt_lift_rect_frame frame = {0};
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		struct xrt_system_compositor *fxsysc = lift_xsysc(ics);
+		if (fxsysc != NULL) {
+			comp_d3d11_service_conv_rect_frame(fxsysc, ics->xc, &frame);
+		}
+#endif
+		return ipc_server_conv_lift_submit_framed(ipc_server_get_conv(), lift_owner(ics), args, ch, ch_is_dxgi,
+		                                          &frame, out_frame_id);
+	}
+	// Not a stream of this connection: non-fatal, the handle is released here.
+	weave_submit_release_handles(handles, handle_count);
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+}
+
+xrt_result_t
+ipc_handle_lift_acquire_result(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_ready,
+                               struct ipc_lift_result *out_lift_result)
+{
+	IPC_TRACE_MARKER();
+	*out_ready = false;
+	U_ZERO(out_lift_result);
+	xrt_result_t auth = require_lift_client(ics, "lift_acquire_result");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_acquire(ipc_server_get_conv(), lift_owner(ics), stream_id, out_ready,
+		                                    out_lift_result);
+	}
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
+}
+
+xrt_result_t
+ipc_handle_lift_get_output(volatile struct ipc_client_state *ics,
+                           uint64_t stream_id,
+                           bool *out_have_output,
+                           uint32_t *out_width,
+                           uint32_t *out_height,
+                           uint32_t *out_format,
+                           uint32_t max_handle_count,
+                           xrt_graphics_buffer_handle_t *out_handles,
+                           uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_buffer_handle_t ch = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_output(ipc_server_get_conv(), lift_owner(ics), stream_id, false, &ch,
+		                                       out_width, out_height, out_format)) {
+			// Service-owned: the transport DuplicateHandle's it into the caller.
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_output = true;
+		}
+		return XRT_SUCCESS;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_get_depth_output(volatile struct ipc_client_state *ics,
+                                 uint64_t stream_id,
+                                 bool *out_have_depth,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 uint32_t *out_format,
+                                 uint32_t max_handle_count,
+                                 xrt_graphics_buffer_handle_t *out_handles,
+                                 uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_depth = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_depth_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_buffer_handle_t ch = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_output(ipc_server_get_conv(), lift_owner(ics), stream_id, true, &ch,
+		                                       out_width, out_height, out_format)) {
+			// Service-owned: the transport DuplicateHandle's it into the caller.
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_depth = true;
+		}
+		return XRT_SUCCESS;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_get_fence(volatile struct ipc_client_state *ics,
+                          uint64_t stream_id,
+                          bool *out_have_fence,
+                          uint32_t max_handle_count,
+                          xrt_graphics_sync_handle_t *out_handles,
+                          uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_fence = false;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "lift_get_fence");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1) {
+		return XRT_SUCCESS;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		xrt_graphics_sync_handle_t ch = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
+		if (ipc_server_conv_lift_export_fence(ipc_server_get_conv(), lift_owner(ics), stream_id, &ch)) {
+			out_handles[0] = ch;
+			*out_handle_count = 1;
+			*out_have_fence = true;
+		}
+		return XRT_SUCCESS;
+	}
+	return XRT_SUCCESS;
+}
+
+/*!
+ * Varlen reply: struct ipc_lift_acquire_blob_reply {result, ready, frame_id,
+ * source_time, format, byte_count}, then — only when result is XRT_SUCCESS,
+ * ready, and capacity >= byte_count — byte_count bytes in ONE send. With a
+ * smaller capacity only the header goes (the blob stays latched service-side
+ * for the second call). Rejections ride in reply.result over a healthy pipe.
+ */
+xrt_result_t
+ipc_handle_lift_acquire_blob(volatile struct ipc_client_state *ics, uint64_t stream_id, uint64_t capacity)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_message_channel *imc = (struct ipc_message_channel *)&ics->imc;
+	struct ipc_lift_acquire_blob_reply reply = XRT_STRUCT_INIT;
+	reply.result = require_lift_client(ics, "lift_acquire_blob");
+	uint8_t *bytes = NULL;
+
+	if (reply.result == XRT_SUCCESS && ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		// #2003: the GAUSSIANS photo facade over the job lane (G8).
+		uint64_t cap = capacity > IPC_LIFT_BLOB_MAX_BYTES ? IPC_LIFT_BLOB_MAX_BYTES : capacity;
+		struct xrt_lift_blob_info info = {0};
+		bool ready = false;
+		reply.result = ipc_server_conv_lift_acquire_blob(ipc_server_get_conv(), lift_owner(ics), stream_id, cap,
+		                                                 &ready, &info, &bytes);
+		reply.ready = ready;
+		reply.frame_id = info.frame_id;
+		reply.source_time = info.source_time;
+		reply.format = info.format;
+		reply.byte_count = info.byte_count;
+		if (reply.result == XRT_SUCCESS && info.byte_count > IPC_LIFT_BLOB_MAX_BYTES) {
+			reply.result = XRT_ERROR_ALLOCATION;
+			free(bytes);
+			bytes = NULL;
+		}
+	} else if (reply.result == XRT_SUCCESS) {
+		reply.result = XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
+	}
+
+	xrt_result_t xret = ipc_send(imc, &reply, sizeof(reply));
+	if (xret == XRT_SUCCESS && reply.result == XRT_SUCCESS && bytes != NULL && reply.byte_count > 0) {
+		xret = ipc_send(imc, bytes, (size_t)reply.byte_count);
+	}
+	if (xret != XRT_SUCCESS) {
+		IPC_ERROR(ics->server, "lift_acquire_blob: failed to send the reply");
+	}
+	free(bytes);
+	return xret;
+}
+
+// XR_DXR_lift v3 grew the lift messages (rig per rect; explicit viewpoints
+// ride their own call precisely so these stay inside one pipe message).
+static_assert(sizeof(struct ipc_lift_weave_rects_msg) <= IPC_BUF_SIZE, "lift_weave_rects message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_lift_weave_rect_viewpoints_msg) <= IPC_BUF_SIZE,
+              "lift_weave_rect_viewpoints message exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_lift_submit_frame_msg) <= IPC_BUF_SIZE,
+              "lift_submit_frame message exceeds IPC_BUF_SIZE");
+
+/*
+ * ADR-053 roadmap 11.2 must-verify (#2005): IPC handle capacity per message
+ * and the DIAG row reply size. The generated server receives at most
+ * XRT_MAX_IPC_HANDLES handles per message (proto.py: in_ / out_ handle arrays
+ * are XRT_MAX_IPC_HANDLES long and a larger count is refused).
+ *  - v3 lift_submit_frame: 1 in-handle; lift_get_output / _depth_output /
+ *    _fence: 1 out-handle each.
+ *  - conv_submit (spec 4): XRT_CONV_WIRE_MAX_SUBMIT_IMAGES images, each with
+ *    at most one sync handle -> 2 x 2 = 4 in-handles.
+ *  - conv_acquire_result (spec 4): handles ride the separate get-output calls
+ *    (the v3 pattern); a combined export would need 4 targets + 1 fence = 5.
+ * The status rows cross one per reply, each under the 1 KB DIAG limit, which
+ * IS IPC_BUF_SIZE (the generated row replies are asserted above).
+ */
+static_assert(XRT_CONV_WIRE_MAX_SUBMIT_IMAGES * 2 <= XRT_MAX_IPC_HANDLES,
+              "a conv_submit's image + sync handles exceed XRT_MAX_IPC_HANDLES");
+static_assert(4 + 1 <= XRT_MAX_IPC_HANDLES, "a combined conv result export (4 targets + fence) exceeds the handle cap");
+static_assert(XRT_STATUS_CONV_ROW_REPLY_MAX == IPC_BUF_SIZE, "the DIAG row reply limit must be IPC_BUF_SIZE");
+static_assert(XRT_CONV_WIRE_MSG_MAX_BYTES == IPC_BUF_SIZE, "XRT_CONV_WIRE_MSG_MAX_BYTES != IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_hint_interest_msg) <= IPC_BUF_SIZE, "conv_hint_interest exceeds IPC_BUF_SIZE");
+
+/*!
+ * conv_hint_interest (ADR-053, the prewarm trigger): a lift-capable session's
+ * client sends it once when its instance enabled XR_DXR_lift. The core's
+ * PrewarmOn policy decides (interest: warm now; first-create: wait for the
+ * first create; start: already warm). Never blocks; a malformed struct is an
+ * untrusted-wire failure.
+ */
+xrt_result_t
+ipc_handle_conv_hint_interest(volatile struct ipc_client_state *ics, const struct xrt_conv_wire_hint_interest *hint)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_hint_interest");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (hint->struct_size < sizeof(*hint) || hint->family_version != XRT_CONV_WIRE_FAMILY_VERSION_CURRENT) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	ipc_server_conv_hint_interest(ipc_server_get_conv(), lift_owner(ics), hint->task_mask);
+	return XRT_SUCCESS;
+}
+
+static_assert(sizeof(struct ipc_conv_warm_msg) <= IPC_BUF_SIZE, "conv_warm exceeds IPC_BUF_SIZE");
+
+/*!
+ * conv_warm (ADR-053 §6.2, #2029): `displayxr-cli conv warm` on its DIAG
+ * connection. Warms the task's selected capability; READY is a no-op; an
+ * all-terminal task is retried (the explicit-warm retry trigger, spec §4.3).
+ * Never blocks: the reply carries the state before and right after, and the
+ * CLI follows the rest through the status rows. A malformed struct is an
+ * untrusted-wire failure.
+ */
+xrt_result_t
+ipc_handle_conv_warm(volatile struct ipc_client_state *ics,
+                     const struct xrt_conv_wire_task_request *request,
+                     uint32_t *out_prev_state,
+                     uint32_t *out_state)
+{
+	IPC_TRACE_MARKER();
+	*out_prev_state = 0;
+	*out_state = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_warm");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (request->struct_size < sizeof(*request) ||
+	    request->family_version != XRT_CONV_WIRE_FAMILY_VERSION_CURRENT) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_server_conv_warm(ipc_server_get_conv(), request->task, out_prev_state, out_state);
+}
+
+/*
+ * XR_DXR_lift spec 4 (ADR-053 P3, #2054): the conv_* family. Same callers as
+ * the v3 lift calls (require_lift_client), same connection-owned streams
+ * (lift_owner). Spec-4 streams are ordinary core-route streams, so submit /
+ * export / priority / stats / destroy stay the v3 lift_* calls.
+ */
+
+static_assert(sizeof(struct ipc_conv_enum_task_reply) <= IPC_BUF_SIZE, "conv_enum_task reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_stream_create_msg) <= IPC_BUF_SIZE, "conv_stream_create exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_acquire_result_reply) <= IPC_BUF_SIZE,
+              "conv_acquire_result reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_poll_event_reply) <= IPC_BUF_SIZE, "conv_poll_event reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_submit_frame_msg) <= IPC_BUF_SIZE, "conv_submit_frame exceeds IPC_BUF_SIZE");
+
+static bool
+conv_header_ok(uint32_t struct_size, uint32_t family_version, size_t min_size)
+{
+	return struct_size >= min_size && family_version == XRT_CONV_WIRE_FAMILY_VERSION_CURRENT;
+}
+
+xrt_result_t
+ipc_handle_conv_get_generation(volatile struct ipc_client_state *ics, struct xrt_conv_wire_generation *out_generation)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_generation);
+	xrt_result_t auth = require_lift_client(ics, "conv_get_generation");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	ipc_server_conv_v4_get_generation(ipc_server_get_conv(), lift_owner(ics), out_generation);
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_conv_enum_task(volatile struct ipc_client_state *ics,
+                          uint32_t task,
+                          struct xrt_conv_wire_task_desc *out_desc,
+                          uint64_t *out_image_kinds,
+                          uint64_t *out_export_kinds)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_enum_task");
+	if (auth != XRT_SUCCESS) {
+		U_ZERO(out_desc);
+		*out_image_kinds = 0;
+		*out_export_kinds = 0;
+		return auth;
+	}
+	return ipc_server_conv_v4_enum_task(ipc_server_get_conv(), lift_owner(ics), task, out_desc, out_image_kinds,
+	                                    out_export_kinds);
+}
+
+xrt_result_t
+ipc_handle_conv_request_warm(volatile struct ipc_client_state *ics, const struct xrt_conv_wire_task_request *request)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_request_warm");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(request->struct_size, request->family_version, sizeof(*request))) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	return ipc_server_conv_v4_warm(ipc_server_get_conv(), lift_owner(ics), request->task);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_create(volatile struct ipc_client_state *ics,
+                              const struct xrt_conv_wire_stream_desc *desc,
+                              uint64_t required_outputs,
+                              uint32_t legacy_mode,
+                              float input_scale,
+                              struct xrt_conv_wire_stream_created *out_created)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_created);
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_create");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(desc->struct_size, desc->family_version, sizeof(*desc))) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return ipc_server_conv_v4_stream_create(ipc_server_get_conv(), lift_owner(ics), desc, required_outputs,
+	                                        legacy_mode, input_scale, out_created);
+}
+
+/*
+ * XR_DXR_lift spec 5 (#2178): read-only candidates + the per-create
+ * preference hint. Same callers as the rest of the family.
+ */
+
+static_assert(sizeof(struct ipc_conv_enum_candidates_reply) <= IPC_BUF_SIZE,
+              "conv_enum_candidates reply exceeds IPC_BUF_SIZE");
+static_assert(sizeof(struct ipc_conv_stream_create_v5_msg) <= IPC_BUF_SIZE,
+              "conv_stream_create_v5 exceeds IPC_BUF_SIZE");
+
+xrt_result_t
+ipc_handle_conv_enum_candidates(volatile struct ipc_client_state *ics,
+                                uint32_t task,
+                                uint32_t index,
+                                uint32_t *out_count,
+                                struct xrt_conv_wire_generation *out_generation,
+                                struct xrt_conv_wire_candidate *out_candidate)
+{
+	IPC_TRACE_MARKER();
+	*out_count = 0;
+	U_ZERO(out_generation);
+	U_ZERO(out_candidate);
+	xrt_result_t auth = require_lift_client(ics, "conv_enum_candidates");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	return ipc_server_conv_v5_enum_candidates(ipc_server_get_conv(), lift_owner(ics), task, index, out_count,
+	                                          out_generation, out_candidate);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_create_v5(volatile struct ipc_client_state *ics,
+                                 const struct xrt_conv_wire_stream_desc *desc,
+                                 uint64_t required_outputs,
+                                 uint32_t legacy_mode,
+                                 float input_scale,
+                                 const struct xrt_conv_wire_provider_pref *pref,
+                                 struct xrt_conv_wire_stream_created *out_created)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_created);
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_create_v5");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (!conv_header_ok(desc->struct_size, desc->family_version, sizeof(*desc)) ||
+	    !conv_header_ok(pref->struct_size, pref->family_version, sizeof(*pref))) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	// Untrusted wire: terminate the string before anything reads it.
+	char hint[XRT_CONV_WIRE_PREFERENCE_MAX];
+	memcpy(hint, (const void *)pref->provider, sizeof(hint));
+	hint[sizeof(hint) - 1] = '\0';
+	return ipc_server_conv_v5_stream_create(ipc_server_get_conv(), lift_owner(ics), desc, required_outputs,
+	                                        legacy_mode, input_scale, hint, out_created);
+}
+
+xrt_result_t
+ipc_handle_conv_stream_reset(volatile struct ipc_client_state *ics, uint64_t stream_id)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "conv_stream_reset");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	return ipc_server_conv_v4_stream_reset(ipc_server_get_conv(), ics->lift_owner, stream_id);
+}
+
+xrt_result_t
+ipc_handle_conv_acquire_result(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_ready,
+                               bool *out_discontinuity,
+                               struct ipc_lift_result *out_lift_result,
+                               struct xrt_conv_wire_result *out_meta)
+{
+	IPC_TRACE_MARKER();
+	*out_ready = false;
+	*out_discontinuity = false;
+	U_ZERO(out_lift_result);
+	U_ZERO(out_meta);
+	xrt_result_t auth = require_lift_client(ics, "conv_acquire_result");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0 || !ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // only core-route streams carry spec-4 metadata
+	}
+	return ipc_server_conv_v4_acquire(ipc_server_get_conv(), ics->lift_owner, stream_id, out_ready,
+	                                  out_discontinuity, out_lift_result, out_meta);
+}
+
+xrt_result_t
+ipc_handle_conv_submit_frame(volatile struct ipc_client_state *ics,
+                             const struct ipc_arg_lift_submit *args,
+                             const struct xrt_conv_wire_image *image,
+                             uint32_t region_x,
+                             uint32_t region_y,
+                             uint64_t *out_frame_id,
+                             const xrt_graphics_buffer_handle_t *handles,
+                             uint32_t handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_frame_id = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_submit_frame");
+	if (auth != XRT_SUCCESS) {
+		weave_submit_release_handles(handles, handle_count);
+		return auth;
+	}
+	bool fence = image->sync_kind == XRT_CONV_SYNC_FENCE_NT;
+#if !defined(XRT_OS_WINDOWS)
+	// Step E: a sync_file or a timeline semaphore fd rides as the second handle.
+	fence = fence || image->sync_kind == XRT_CONV_SYNC_SYNC_FD || image->sync_kind == XRT_CONV_SYNC_VK_SEMAPHORE_FD;
+#endif
+	if (handle_count < (fence ? 2u : 1u) || !ipc_server_conv_owns_stream(ipc_server_get_conv(), args->stream_id)) {
+		weave_submit_release_handles(handles, handle_count);
+		return handle_count < 1 ? XRT_ERROR_IPC_FAILURE : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
+	}
+	struct conv_input_import in;
+	memset(&in, 0, sizeof(in));
+	in.handle = handles[0];
+	in.sync_handle = fence ? handles[1] : XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	switch (image->memory_kind) {
+	case XRT_CONV_MEM_WIN32_NT_HANDLE: in.kind = CONV_INPUT_NT; break;
+	case XRT_CONV_MEM_WIN32_KMT_HANDLE:
+		in.kind = CONV_INPUT_DXGI;
+#if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_WIN32_HANDLE)
+		if ((size_t)in.handle & 1) {
+			in.handle = (HANDLE)((size_t)in.handle - 1); // legacy DXGI handles cross low-bit tagged
+		}
+#endif
+		break;
+	case XRT_CONV_MEM_CPU: in.kind = CONV_INPUT_CPU; break;
+#if !defined(XRT_OS_WINDOWS)
+	// Step E: the POSIX GPU kinds (the CPU table's GPU glue imports them).
+	case XRT_CONV_MEM_IOSURFACE: in.kind = CONV_INPUT_IOSURFACE; break;
+	case XRT_CONV_MEM_VK_OPAQUE_FD: in.kind = CONV_INPUT_OPAQUE_FD; break;
+	case XRT_CONV_MEM_DMABUF: in.kind = CONV_INPUT_DMABUF; break;
+#endif
+	default:
+		weave_submit_release_handles(handles, handle_count);
+		return XRT_ERROR_INPUT_UNSUPPORTED; // a kind the service does not take (validated client-side)
+	}
+	if (handle_count > (fence ? 2u : 1u)) {
+		weave_submit_release_handles(handles + (fence ? 2 : 1), handle_count - (fence ? 2u : 1u));
+	}
+	in.sync_kind = image->sync_kind;
+	in.sync_value = image->sync_acquire_value;
+	in.x = region_x;
+	in.y = region_y;
+	in.cpu_row_pitch = image->row_stride;
+	in.cpu_bgra = image->format == XRT_CONV_FMT_BGRA8_UNORM || image->format == XRT_CONV_FMT_BGRA8_SRGB;
+#if !defined(XRT_OS_WINDOWS)
+	in.img_w = image->width;
+	in.img_h = image->height;
+	in.img_format = image->format;
+	in.drm_modifier = image->drm_modifier;
+#endif
+	// ADR-048: the session's window is the lifted rect, as for the v3 submit.
+	struct xrt_lift_rect_frame frame = {0};
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	struct xrt_system_compositor *fxsysc = lift_xsysc(ics);
+	if (fxsysc != NULL) {
+		comp_d3d11_service_conv_rect_frame(fxsysc, ics->xc, &frame);
+	}
+#endif
+	// ADR-053 P5: no window (and no compositor helper filled the panel): the
+	// panel's size, still invalid -- ipc_server_conv_submit_rect fits the
+	// submitted extent's aspect inside it.
+	if (!frame.valid && !(frame.width_m > 0.0f) && ics->server != NULL && ics->server->xsysc != NULL) {
+		frame.width_m = ics->server->xsysc->info.display_width_m;
+		frame.height_m = ics->server->xsysc->info.display_height_m;
+	}
+	return ipc_server_conv_v4_submit(ipc_server_get_conv(), lift_owner(ics), args, &in, &frame, out_frame_id);
+}
+
+xrt_result_t
+ipc_handle_conv_get_cpu_output(volatile struct ipc_client_state *ics,
+                               uint64_t stream_id,
+                               bool *out_have_output,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               uint32_t *out_format,
+                               uint64_t *out_bytes,
+                               uint32_t max_handle_count,
+                               xrt_graphics_buffer_handle_t *out_handles,
+                               uint32_t *out_handle_count)
+{
+	IPC_TRACE_MARKER();
+	*out_have_output = false;
+	*out_width = 0;
+	*out_height = 0;
+	*out_format = 0;
+	*out_bytes = 0;
+	*out_handle_count = 0;
+	xrt_result_t auth = require_lift_client(ics, "conv_get_cpu_output");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (max_handle_count < 1 || ics->lift_owner == 0) {
+		return XRT_SUCCESS;
+	}
+	xrt_graphics_buffer_handle_t h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+	if (ipc_server_conv_v4_cpu_output(ipc_server_get_conv(), ics->lift_owner, stream_id, &h, out_width, out_height,
+	                                  out_format, out_bytes)) {
+		// Glue-owned: the transport DuplicateHandle's it into the caller.
+		out_handles[0] = h;
+		*out_handle_count = 1;
+		*out_have_output = true;
+	}
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_conv_poll_event(volatile struct ipc_client_state *ics, bool *out_has_event, struct xrt_conv_wire_event *out_event)
+{
+	IPC_TRACE_MARKER();
+	*out_has_event = false;
+	U_ZERO(out_event);
+	xrt_result_t auth = require_lift_client(ics, "conv_poll_event");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->lift_owner == 0) {
+		return XRT_SUCCESS; // never latched: no events
+	}
+	return ipc_server_conv_v4_poll_event(ipc_server_get_conv(), ics->lift_owner, out_has_event, out_event);
+}
+
+xrt_result_t
+ipc_handle_lift_weave_rect_viewpoints(volatile struct ipc_client_state *ics,
+                                      const struct ipc_arg_lift_rect_viewpoints *args)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "lift_weave_rect_viewpoints");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (args->viewpoint_count == 0 || args->viewpoint_count > IPC_LIFT_MAX_VIEWS) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+	if (ics->lift_staged_vps_count >= IPC_LIFT_WEAVE_RECTS_MAX) {
+		return XRT_ERROR_WEAVE_REFUSED; // more than one weave submit's worth: drop
+	}
+	// Staged until the next lift_weave_rects on this connection (which clears it).
+	struct ipc_arg_lift_rect_viewpoints *slot =
+	    (struct ipc_arg_lift_rect_viewpoints *)&ics->lift_staged_vps[ics->lift_staged_vps_count];
+	*slot = *args;
+	ics->lift_staged_vps_count++;
+	return XRT_SUCCESS;
+}
+
+xrt_result_t
+ipc_handle_lift_weave_rects(volatile struct ipc_client_state *ics, const struct ipc_arg_lift_weave_rects *args)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_present_owner(ics, "lift_weave_rects");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ics->xc == NULL) {
+		return XRT_ERROR_IPC_SESSION_NOT_CREATED;
+	}
+	if (args->count > IPC_LIFT_WEAVE_RECTS_MAX) {
+		return XRT_ERROR_IPC_FAILURE; // untrusted wire
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR) || defined(XRT_HAVE_VK_CONV_SERVICE)
+	// The POSIX arm (ADR-053 P5 step C): the macOS / desktop-Linux Vulkan weave
+	// engines lift through vk_conv_weave; the wire and this conversion are shared.
+	struct xrt_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
+	for (uint32_t i = 0; i < args->count; i++) {
+		const struct ipc_lift_weave_rect *w = &args->rects[i];
+		U_ZERO(&rects[i]);
+		rects[i].stream_id = w->stream_id;
+		rects[i].rect_index = w->rect_index;
+		rects[i].has_params = w->has_params != 0;
+		rects[i].params.struct_size = (uint32_t)sizeof(rects[i].params);
+		rects[i].params.convergence = w->convergence;
+		rects[i].params.strength = w->strength;
+		rects[i].params.inpaint = w->inpaint;
+		rects[i].params.view_count = w->view_count > IPC_LIFT_MAX_VIEWS ? IPC_LIFT_MAX_VIEWS : w->view_count;
+		rects[i].params.focal_px = w->focal_px;
+		rects[i].has_view_control = w->has_view_control != 0;
+		rects[i].view_control = w->view_control;
+		rects[i].rig = w->rig;
+		rects[i].depth_cursor = w->depth_cursor != 0;
+		// XR_DXR_lift v3: this rect's EXPLICIT viewpoints, staged by
+		// lift_weave_rect_viewpoints just before (none staged = tracked).
+		if (w->viewpoint_count > 0) {
+			for (uint32_t k = 0; k < ics->lift_staged_vps_count; k++) {
+				const struct ipc_arg_lift_rect_viewpoints *sv =
+				    (const struct ipc_arg_lift_rect_viewpoints *)&ics->lift_staged_vps[k];
+				if (sv->stream_id == w->stream_id) {
+					uint32_t n = sv->viewpoint_count > XRT_LIFT_MAX_VIEWS ? XRT_LIFT_MAX_VIEWS
+					                                                      : sv->viewpoint_count;
+					rects[i].viewpoint_floats = 3 * n;
+					memcpy(rects[i].viewpoints, sv->viewpoints, (size_t)n * 3 * sizeof(float));
+					break;
+				}
+			}
+		}
+	}
+	ics->lift_staged_vps_count = 0;
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (!comp_d3d11_service_lift_set_weave_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+#else
+	if (!comp_multi_weave_lift_set_rects(ics->xc, lift_owner(ics), args->count, rects)) {
+#endif
+		// A rect naming a stream this connection does not own (or a non-SBS/NVIEW
+		// one): refused, non-fatal. The submit then weaves those rects as drawn.
+		return XRT_ERROR_WEAVE_REFUSED;
+	}
+	return XRT_SUCCESS;
+#else
+	return args->count == 0 ? XRT_SUCCESS : XRT_ERROR_FEATURE_NOT_SUPPORTED;
+#endif
+}
+
+xrt_result_t
+ipc_handle_lift_stream_set_priority(volatile struct ipc_client_state *ics, uint64_t stream_id, uint32_t priority)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_set_priority");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_set_priority(ipc_server_get_conv(), lift_owner(ics), stream_id, priority);
+	}
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
+}
+
+xrt_result_t
+ipc_handle_lift_stream_stats(volatile struct ipc_client_state *ics,
+                             uint64_t stream_id,
+                             struct xrt_lift_stream_stats *out_stats)
+{
+	IPC_TRACE_MARKER();
+	U_ZERO(out_stats);
+	xrt_result_t auth = require_lift_client(ics, "lift_stream_stats");
+	if (auth != XRT_SUCCESS) {
+		return auth;
+	}
+	if (ipc_server_conv_owns_stream(ipc_server_get_conv(), stream_id)) {
+		return ipc_server_conv_lift_stats(ipc_server_get_conv(), lift_owner(ics), stream_id, out_stats);
+	}
+	return XRT_ERROR_OUTPUT_REQUEST_FAILURE; // unknown stream: non-fatal
+}
+
+
+/*
+ *
+ * The workspace on N screens (ADR-052, XR_DXR_spatial_workspace v25).
+ *
+ */
+
+#if !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+//! No multi-presenter compositor here: list every screen, the system default as the one presenter.
+static void
+workspace_screens_fill_single(const struct xrt_screen_list *list, struct ipc_workspace_screen_list *out)
+{
+	for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && out->count < IPC_WORKSPACE_MAX_SCREENS;
+	     i++) {
+		const struct xrt_screen *x = &list->screens[i];
+		if (x->desktop_width == 0 || x->desktop_height == 0) {
+			continue;
+		}
+		struct ipc_workspace_screen *w = &out->screens[out->count++];
+		w->id = x->id;
+		w->desktop_x = x->desktop_left;
+		w->desktop_y = x->desktop_top;
+		w->desktop_w = x->desktop_width;
+		w->desktop_h = x->desktop_height;
+		w->width_m = x->info.width_m > 0.0f ? x->info.width_m : (float)x->physical_width_mm / 1000.0f;
+		w->height_m = x->info.height_m > 0.0f ? x->info.height_m : (float)x->physical_height_mm / 1000.0f;
+		w->nominal_viewer_m[0] = x->info.nominal_viewer_x_m;
+		w->nominal_viewer_m[1] = x->info.nominal_viewer_y_m;
+		w->nominal_viewer_m[2] = x->info.nominal_viewer_z_m;
+		(void)snprintf(w->plugin_id, sizeof(w->plugin_id), "%s", x->plugin_id);
+		if ((x->flags & XRT_SCREEN_FLAG_TRACKED) != 0) {
+			w->flags |= 8u; // XR_WORKSPACE_SCREEN_TRACKED_BIT_DXR
+		}
+		if (x->plugin_id[0] != '\0') {
+			w->flags |= 2u; // XR_WORKSPACE_SCREEN_3D_BIT_DXR
+		}
+		if ((x->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+			w->flags |= 1u | 4u; // PRIMARY | PRESENTER
+		}
+	}
+}
+#endif
+
+xrt_result_t
+ipc_handle_workspace_enumerate_screens(volatile struct ipc_client_state *_ics,
+                                       struct ipc_workspace_screen_list *out_list)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_server *s = _ics->server;
+	memset(out_list, 0, sizeof(*out_list));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL || !comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	// Re-read the registry so the answer is never staler than the call (a
+	// change found here also raises SCREENS_CHANGED for any later drain).
+	workspace_refresh_screens(s, false);
+	// Only a workspace controller's enumeration subscribes it to the event.
+	const bool is_controller = _ics->client_state.client_class == XRT_CLIENT_CLASS_CONTROLLER;
+	if (!comp_d3d11_service_workspace_get_screens(s->xsysc, is_controller, out_list)) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return XRT_SUCCESS;
+#else
+	if (s->xinst == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	if (xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		workspace_screens_fill_single(list, out_list);
+	}
+	free(list);
+	return XRT_SUCCESS;
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_set_window_placement(volatile struct ipc_client_state *_ics,
+                                          uint32_t client_id,
+                                          const struct ipc_workspace_window_placement *placement)
+{
+	IPC_TRACE_MARKER();
+	xrt_result_t authz = require_workspace_controller(_ics, "workspace_set_window_placement");
+	if (authz != XRT_SUCCESS) {
+		return authz;
+	}
+	struct ipc_server *s = _ics->server;
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	IPC_INFO(s, "Workspace: set_window_placement client_id=%u screen=0x%llx pos=(%.3f,%.3f,%.3f) size=%.3fx%.3f",
+	         client_id, (unsigned long long)placement->screen_id, placement->pose.position.x,
+	         placement->pose.position.y, placement->pose.position.z, placement->width_m, placement->height_m);
+
+	// Same addressing as workspace_set_window_pose: 1000+slot, else by id.
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_set_window_placement(s->xsysc, NULL, (int)(client_id - 1000),
+		                                                         placement);
+	}
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
+		IPC_WARN(s, "Workspace: set_window_placement - client %u not found", client_id);
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_set_window_placement(s->xsysc, target_xc, -1, placement);
+#else
+	// One presenter, no per-screen mapping: only the primary's space exists.
+	if (placement->screen_id != 0) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		bool primary = false;
+		if (list != NULL && s->xinst != NULL &&
+		    xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+			const struct xrt_screen *x = xrt_screen_list_find(list, placement->screen_id);
+			primary = x != NULL && (x->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0;
+		}
+		free(list);
+		if (!primary) {
+			return XRT_ERROR_INPUT_UNSUPPORTED;
+		}
+	}
+	return ipc_handle_workspace_set_window_pose(_ics, client_id, &placement->pose, placement->width_m,
+	                                            placement->height_m);
+#endif
+}
+
+xrt_result_t
+ipc_handle_workspace_get_window_placement(volatile struct ipc_client_state *_ics,
+                                          uint32_t client_id,
+                                          struct ipc_workspace_window_placement *out_placement)
+{
+	IPC_TRACE_MARKER();
+	struct ipc_server *s = _ics->server;
+	memset(out_placement, 0, sizeof(*out_placement));
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	if (client_id >= 1000) {
+		return comp_d3d11_service_workspace_get_window_placement(s->xsysc, NULL, (int)(client_id - 1000),
+		                                                         out_placement);
+	}
+	struct xrt_compositor *target_xc = find_client_xc_by_id(s, client_id); // #957
+	if (target_xc == NULL) {
+		return XRT_ERROR_IPC_FAILURE;
+	}
+	return comp_d3d11_service_workspace_get_window_placement(s->xsysc, target_xc, -1, out_placement);
+#else
+	xrt_result_t xret = ipc_handle_workspace_get_window_pose(_ics, client_id, &out_placement->pose,
+	                                                         &out_placement->width_m, &out_placement->height_m);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list != NULL && s->xinst != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX; i++) {
+			if ((list->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+				out_placement->screen_id = list->screens[i].id;
+				break;
+			}
+		}
+	}
+	free(list);
+	return XRT_SUCCESS;
+#endif
 }

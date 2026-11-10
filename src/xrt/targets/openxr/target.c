@@ -35,9 +35,37 @@ U_TRACE_TARGET_SETUP(U_TRACE_WHICH_SERVICE)
 #include <stdlib.h>
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+#include "util/u_file.h"
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#endif
+
 // Forward declaration of native instance creation from target_instance_hybrid
 xrt_result_t
 native_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xinst);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * Is there a displayxr-service listening socket to dial? (#1744)
+ *
+ * A stat, not a connect: under systemd socket activation the socket file is
+ * owned by systemd from login on, and dialling it just to ask would start the
+ * service for a client that may end up in-process anyway. A stale socket (the
+ * service died without unlinking it) passes this check; the caller falls back
+ * when the real connect then fails.
+ */
+static bool
+linux_service_socket_present(char *out_path, size_t out_path_size)
+{
+	if (u_file_get_path_in_runtime_dir(XRT_IPC_MSG_SOCK_FILENAME, out_path, out_path_size) < 0) {
+		return false;
+	}
+	struct stat st;
+	return stat(out_path, &st) == 0 && S_ISSOCK(st.st_mode);
+}
+#endif
 
 
 xrt_result_t
@@ -91,6 +119,76 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * Desktop-Linux present-owners (#1744).
+	 *
+	 * XR_DXR_weave's present path lives only in the service compositor
+	 * (comp_multi_weave_linux.c, #1699); in-process the bind/submit calls
+	 * return XR_ERROR_FEATURE_UNSUPPORTED. So a present-owner is an IPC client
+	 * by capability — the same rule as the Android block above — with no
+	 * launcher-set XRT_FORCE_MODE required (the browser has no launcher that
+	 * could set one).
+	 *
+	 * A present-owner is a session that enables XR_DXR_weave AND binds no
+	 * window of its own. An app that hands the runtime its own window/surface
+	 * through an XR_DXR_*_window/surface_binding extension owns its
+	 * presentation and is NOT one, even with weave enabled: the Linux demos
+	 * enable weave only for xrWeaveSnapWindowRectDXR / ...GridDXR (drag
+	 * phase-snap), which the in-process vk_native compositor serves. v2.21.7
+	 * routed those apps to the service, where they became HOSTED sessions with
+	 * no external window — their own surface never mapped. Such an app falls
+	 * through to the generic rules below, exactly as before #1744.
+	 *
+	 * Unlike Android, the service is not guaranteed to exist: the .deb
+	 * socket-activates it per user session, but a from-source runtime, a
+	 * container or a box with the user unit disabled has none. There the
+	 * present-owner falls back to in-process rather than failing
+	 * xrCreateInstance. A refusal FROM a service (version skew, client quota)
+	 * is propagated: that is a real answer, not an absent service.
+	 *
+	 * XRT_FORCE_MODE, when set, is authoritative either way (handled by
+	 * u_sandbox_should_use_ipc() below). The decision itself is the pure
+	 * u_sandbox_linux_present_owner_route() (unit-tested).
+	 */
+	if (ii != NULL) {
+		const char *linux_force_mode = getenv("XRT_FORCE_MODE");
+		const bool linux_env_forced = linux_force_mode != NULL && linux_force_mode[0] != '\0';
+		char sock[PATH_MAX] = "";
+		const bool sock_present =
+		    ii->app_info.ext_weave_enabled && linux_service_socket_present(sock, sizeof(sock));
+
+		switch (u_sandbox_linux_present_owner_route(linux_env_forced, ii->app_info.ext_weave_enabled,
+		                                            ii->window_binding_enabled, sock_present)) {
+		case U_SANDBOX_PRESENT_OWNER_NOT_APPLICABLE: break;
+		case U_SANDBOX_PRESENT_OWNER_WINDOW_BOUND:
+			U_LOG_W(
+			    "Hybrid mode: XR_DXR_weave enabled by a window-bound app — not a present-owner, "
+			    "not routed to the service (#1744)");
+			break;
+		case U_SANDBOX_PRESENT_OWNER_SERVICE: {
+			U_LOG_W("Hybrid mode: XR_DXR_weave present-owner — using IPC/service compositor (%s)", sock);
+			xrt_result_t xret = ipc_instance_create(ii, out_xinst);
+			if (xret != XRT_ERROR_IPC_FAILURE) {
+				return xret;
+			}
+			U_LOG_W(
+			    "Hybrid mode: could not reach displayxr-service at %s — falling back to the "
+			    "in-process compositor; XR_DXR_weave is unavailable in-process",
+			    sock);
+			return native_instance_create(ii, out_xinst);
+		}
+		case U_SANDBOX_PRESENT_OWNER_NO_SERVICE:
+			U_LOG_W(
+			    "Hybrid mode: XR_DXR_weave present-owner but no displayxr-service socket (%s) — "
+			    "in-process compositor; XR_DXR_weave is unavailable in-process. Start the service "
+			    "(systemctl --user start displayxr.socket) to weave.",
+			    sock);
+			return native_instance_create(ii, out_xinst);
+		}
+	}
+#endif
+
 	// Workspace controllers (sessions with XR_DXR_spatial_workspace enabled)
 	// always go IPC — the controller talks to the service over IPC by
 	// design, and the in-process native compositor doesn't host the
@@ -99,6 +197,14 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	// hack and stay genuinely runtime-agnostic.
 	if (ii != NULL && ii->app_info.ext_spatial_workspace_enabled) {
 		U_LOG_I("Hybrid mode: workspace controller session — forcing IPC");
+		return ipc_instance_create(ii, out_xinst);
+	}
+
+	// ADR-043 R3: a declared camera-only consumer has no use for an in-process
+	// instance (it enumerates zero cameras — the service is each camera's
+	// single owner), so it always goes to the service.
+	if (ii != NULL && ii->app_info.declared_client_class == XRT_CLIENT_CLASS_CAMERA_CONSUMER) {
+		U_LOG_W("Hybrid mode: stereo-camera consumer instance — forcing IPC");
 		return ipc_instance_create(ii, out_xinst);
 	}
 

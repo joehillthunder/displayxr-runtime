@@ -133,15 +133,15 @@ count_code_lines_with(const std::string &src, const std::string &needle)
 }
 
 //! Every native compositor that composes layers into an atlas the display
-//! processor consumes, relative to the compositor source root. Metal and
-//! vk_native are deliberately absent: their #1589 legs are still open, and a
-//! test that fails for a known-open leg is noise, not a guard. Add a backend
-//! here the moment it grows a compose target.
+//! processor consumes, relative to the compositor source root. Add a backend
+//! here the moment it grows a compose target (Metal: ADR-044).
 const char *const kColorBackends[] = {
     "d3d11/comp_d3d11_renderer.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "d3d12/comp_d3d12_renderer.cpp",
     "gl/comp_gl_compositor.cpp",
+    "vk_native/comp_vk_native_renderer.c",
+    "metal/comp_metal_compositor.m",
 };
 
 /*!
@@ -166,6 +166,15 @@ const char *const kZeroCopyOwners[] = {
     "d3d12/comp_d3d12_compositor.cpp",
     "d3d11_service/comp_d3d11_service.cpp",
     "gl/comp_gl_compositor.cpp",
+    "vk_native/comp_vk_native_compositor.c",
+    "metal/comp_metal_compositor.m",
+};
+
+//! vk_native's compose shaders live beside the renderer as GLSL compiled to
+//! SPIR-V at build time, so the no-OETF pin has to read them too.
+const char *const kVkComposeShaders[] = {
+    "vk_native/shaders/zone_blit.vert", "vk_native/shaders/zone_blit.frag", "vk_native/shaders/zone_blit_array.frag",
+    "vk_native/shaders/equirect2.vert", "vk_native/shaders/equirect2.frag", "vk_native/shaders/equirect2_array.frag",
 };
 
 } // namespace
@@ -294,7 +303,10 @@ TEST_CASE("colour: the D3D12 leg keeps its two source views apart (#1589)")
 
 	// Every SRV the renderer builds over an APP image goes through that
 	// helper; the only direct sample_format() calls left are the ones that
-	// genuinely hand the app's bytes on unchanged (the Local2D flatten).
+	// genuinely hand the app's bytes on unchanged (the Local2D flatten's
+	// legacy arm; #1795 picks its view by the scratch RTV, not compose_active;
+	// and the XR_DXR_swapchain_color_encoding shadow fill, a raw UNORM->UNORM
+	// copy whose decode is the shadow's `_SRGB` view, not this one).
 	size_t direct = 0;
 	size_t pos = 0;
 	while ((pos = src.find("comp_d3d12_swapchain_sample_format(", pos)) != std::string::npos) {
@@ -311,10 +323,12 @@ TEST_CASE("colour: the D3D12 leg keeps its two source views apart (#1589)")
 	}
 	INFO("the D3D12 renderer calls comp_d3d12_swapchain_sample_format() directly "
 	     << direct
-	     << " time(s), expected 2 — one inside layer_source_format() (the fast-path arm) and one "
-	        "in comp_d3d12_renderer_flatten_local_2d(), which hands the app's bytes on unchanged. "
-	        "A new direct call is a draw that blends in the wrong space.");
-	CHECK(direct == 2);
+	     << " time(s), expected 3 — one inside layer_source_format() (the fast-path arm), one "
+	        "in comp_d3d12_renderer_flatten_local_2d(), whose legacy (UNORM-RTV) arm hands the app's "
+	        "bytes on unchanged — its `_SRGB`-RTV arm takes the honest view (#1795) — and one in "
+	        "renderer_fill_compose_shadow(), the raw copy into an encoded image's 8-bit shadow "
+	        "(XR_DXR_swapchain_color_encoding). A new direct call is a draw that blends in the wrong space.");
+	CHECK(direct == 3);
 }
 
 TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
@@ -363,6 +377,21 @@ TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
 		CHECK(publish.find(forbidden) == std::string::npos);
 	}
 
+	// #1795: the Local2D flatten's linear-blend target reaches its GL_RGBA8
+	// scratch the same way — and for the same reason — as the compose target
+	// reaches the atlas.
+	const std::string l2d_publish = function_body(src, "gl_publish_local2d_linear");
+	INFO("gl_publish_local2d_linear() must exist — the Local2D flatten's publish is one named step");
+	REQUIRE_FALSE(l2d_publish.empty());
+	INFO("...and must publish with glCopyImageSubData(): the scratch must receive the encoded "
+	     "bytes the GL_SRGB8_ALPHA8 flatten target wrote, verbatim");
+	CHECK(l2d_publish.find("glCopyImageSubData(") != std::string::npos);
+	for (const char *forbidden : {"glDrawArrays", "glDrawElements", "glBlitFramebuffer"}) {
+		INFO("gl_publish_local2d_linear() calls " << forbidden
+		                                          << " — the publish must be a raw same-class copy");
+		CHECK(l2d_publish.find(forbidden) == std::string::npos);
+	}
+
 	INFO("the GL compositor must pick its source read through ONE helper, so a new bind site "
 	     "cannot quietly keep the non-decoding read while the target encodes");
 	CHECK(contains_in_code(src, "gl_bind_layer_source("));
@@ -377,4 +406,206 @@ TEST_CASE("colour: the GL leg spells the same model in GL (#1589/#1610)")
 	                                                         "gl_bind_layer_source(). Another is a read that "
 	                                                         "decided its own colour space.");
 	CHECK(direct_skip == 1);
+}
+
+TEST_CASE("colour: the Metal leg spells the same model in Metal (ADR-044)")
+{
+	/*
+	 * Metal states the model with the least machinery of any backend, and
+	 * that is exactly what makes it easy to lose in review:
+	 *
+	 *   - the encode is the ATTACHMENT: the atlas is created with
+	 *     MTLTextureUsagePixelFormatView and a frame that owes an encode or a
+	 *     blend renders through its BGRA8Unorm_sRGB VIEW. A pipeline's
+	 *     attachment format must match, so every atlas pipeline has an
+	 *     _sRGB-attachment twin;
+	 *   - the "raw copy to the atlas" is the identity: the view aliases the
+	 *     atlas's storage, so the DP reads the encoded bytes through the
+	 *     UNORM atlas with nothing in between — there is no publish step a
+	 *     draw could sneak into;
+	 *   - "does this sample decode?" is the VIEW the draw binds, chosen in
+	 *     one helper, metal_layer_source_view().
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/metal/comp_metal_compositor.m";
+	const std::string src = read_whole_file(path);
+
+	INFO("the atlas must be created with MTLTextureUsagePixelFormatView, or its _sRGB view is illegal");
+	CHECK(contains_in_code(src, "MTLTextureUsagePixelFormatView"));
+	INFO("...and the compose target must be the atlas's OWN _sRGB view (aliasing = the raw copy)");
+	CHECK(contains_in_code(src, "[c->atlas_texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB]"));
+
+	const std::string twin = function_body(src, "metal_srgb_twin");
+	INFO("metal_srgb_twin() must exist — every atlas pipeline's _sRGB-attachment twin is built in one place");
+	REQUIRE_FALSE(twin.empty());
+	CHECK(twin.find("MTLPixelFormatBGRA8Unorm_sRGB") != std::string::npos);
+	INFO("...and must build nothing under the shared escape hatch");
+	CHECK(twin.find("u_color_legacy_unorm_encoded(") != std::string::npos);
+
+	const std::string pick = function_body(src, "metal_layer_source_view");
+	INFO("metal_layer_source_view() must exist — the single source-view (colour space) choice");
+	REQUIRE_FALSE(pick.empty());
+
+	// The non-decoding read is metal_srgb_to_unorm(); outside its own
+	// definition it may appear only inside metal_layer_source_view(). A second
+	// call site is a draw that decided its own colour space.
+	const size_t direct = count_code_lines_with(src, "metal_srgb_to_unorm(");
+	INFO("comp_metal_compositor.m names metal_srgb_to_unorm( on "
+	     << direct << " code line(s), expected 2 — its definition and the one call in "
+	        "metal_layer_source_view()");
+	CHECK(direct == 2);
+	CHECK(pick.find("metal_srgb_to_unorm(") != std::string::npos);
+}
+
+TEST_CASE("colour: the vk_native leg spells the same model in Vulkan (#1589/#1610)")
+{
+	/*
+	 * The same three facts as the D3D and GL legs, in Vulkan's spelling:
+	 *
+	 *   - the encode is the ATTACHMENT: the private compose target is
+	 *     attached through an `_SRGB` view of a MUTABLE_FORMAT image, and the
+	 *     escape hatch flips that one view format;
+	 *   - "does this sample decode?" is the VIEW the draw binds, so the
+	 *     honest (true-format) view must be picked in exactly one place;
+	 *   - the publish is vkCmdCopyImage between identically formatted images.
+	 *     This file legitimately calls vkCmdBlitImage elsewhere (the fast path
+	 *     and the DP crop), so "the publish is a copy" is asked of the compose
+	 *     pass's BODY, not of the file.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/vk_native/comp_vk_native_renderer.c";
+	const std::string src = read_whole_file(path);
+
+	const std::string view_format = function_body(src, "zone_compose_view_format");
+	INFO("zone_compose_view_format() must exist — the attachment format is the encode, and it "
+	     "must be chosen in one place");
+	REQUIRE_FALSE(view_format.empty());
+	INFO("...and must attach through an _SRGB format (the encode on write) unless the shared "
+	     "escape hatch says otherwise");
+	CHECK(view_format.find("VK_FORMAT_B8G8R8A8_SRGB") != std::string::npos);
+	CHECK(view_format.find("u_color_legacy_unorm_encoded(") != std::string::npos);
+
+	INFO("the private compose target must be MUTABLE_FORMAT — an _SRGB view over a UNORM image "
+	     "is only legal with it");
+	CHECK(contains_in_code(src, "VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT"));
+
+	const std::string pass = function_body(src, "draw_zones_pass");
+	INFO("draw_zones_pass() must exist — it is the compose pass and owns the publish");
+	REQUIRE_FALSE(pass.empty());
+
+	INFO("...and must publish its composite with vkCmdCopyImage: identical formats, raw bytes");
+	CHECK(contains_in_code(pass, "vkCmdCopyImage("));
+
+	INFO("...and must never publish with vkCmdBlitImage, which converts between the sRGB and "
+	     "UNORM interpretations and applies the encode a second time");
+	CHECK_FALSE(contains_in_code(pass, "vkCmdBlitImage("));
+
+	// DXR_ATLAS_FORMAT (experimental deeper atlas): the 8-bit compose target
+	// cannot be raw-copied into a 10-bit / 16F atlas, so that one case blits —
+	// in its own helper, through UNORM storage formats only, never an _SRGB one.
+	const std::string deep = function_body(src, "publish_compose_to_deep_atlas");
+	INFO("publish_compose_to_deep_atlas() must exist — the one converting publish, for a deeper atlas");
+	REQUIRE_FALSE(deep.empty());
+	CHECK(contains_in_code(deep, "vkCmdBlitImage("));
+	INFO("...and must not name an _SRGB format: the blit converts depth, never the encode");
+	CHECK(deep.find("_SRGB") == std::string::npos);
+	INFO("...and the compose pass reaches it only off the 8-bit atlas, which keeps the raw copy");
+	CHECK(contains_in_code(pass, "r->format == VK_FORMAT_B8G8R8A8_UNORM"));
+	CHECK(contains_in_code(pass, "publish_compose_to_deep_atlas("));
+
+	// The Vulkan analogue of the D3D12 direct-call count: the true-format
+	// view IS the decoding read, so it is bound in exactly one code line.
+	const size_t true_view = count_code_lines_with(src, "comp_vk_native_swapchain_get_true_image_view(");
+	INFO("the vk_native renderer picks the true-format source view on "
+	     << true_view
+	     << " code line(s), expected 1 — the compose pass's single source-view choice. Another "
+	        "is a draw that decided its own colour space.");
+	CHECK(true_view == 1);
+
+	for (const char *rel : kVkComposeShaders) {
+		const std::string shader = read_whole_file(std::string(DXR_COMP_SRC_DIR) + "/" + rel);
+		for (const char *magic : {"1.055", "0.055", "0.0031308", "2.4)", "1.0 / 2.4", "1.0/2.4"}) {
+			INFO(rel << " contains the sRGB OETF constant \"" << magic
+			         << "\" — the `_SRGB` attachment applies that curve on write (ADR-021 §2)");
+			CHECK(shader.find(magic) == std::string::npos);
+		}
+	}
+}
+
+TEST_CASE("colour: the D3D11 service's passthrough draws sample raw (#1769)")
+{
+	/*
+	 * The service's per-image SRV is created in the swapchain's OWN format over
+	 * strongly typed storage, so for an `_SRGB` swapchain it DECODES on sample
+	 * and no UNORM view of that storage can be made. That is right for a draw
+	 * into the `_SRGB`-view compose target (which re-encodes on write) and
+	 * wrong for a passthrough draw into the UNORM atlas: there it leaves
+	 * linear values under a stamp that says ENCODED. A standalone probe
+	 * measured it — a stored 0x80 lands as 0x37. The zones composite shipped
+	 * exactly that for a pure-zones commit (the model viewer's full-window
+	 * zone) under a comment claiming "zones sample raw".
+	 *
+	 * So every passthrough shader draw of an app image must go through the
+	 * one helper that samples a same-family decode-free copy, and the zones
+	 * route must pick its view by where the write lands.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/d3d11_service/comp_d3d11_service.cpp";
+	const std::string src = read_whole_file(path);
+
+	const std::string raw = function_body(src, "service_raw_sample_srv");
+	INFO("service_raw_sample_srv() must exist — it is the service's only raw read of an _SRGB app image");
+	REQUIRE_FALSE(raw.empty());
+	INFO("...and must build a TYPELESS copy viewed as UNORM (svc_create_decode_free_copy) and refresh "
+	     "it with a same-family CopyResource — a draw or a cross-family copy would convert the bytes");
+	CHECK(contains_in_code(raw, "svc_create_decode_free_copy("));
+	CHECK(contains_in_code(raw, "CopyResource("));
+	INFO("...and must leave a UNORM source on its own view (it is already raw)");
+	CHECK(contains_in_code(raw, "d3d_dxgi_format_srgb_to_unorm("));
+
+	const std::string resolve = function_body(src, "zones_resolve_src_srv");
+	INFO("zones_resolve_src_srv() must exist — both zones draw sites resolve their view through it");
+	REQUIRE_FALSE(resolve.empty());
+	INFO("...and must choose by where the write lands: the decoding view only when composing "
+	     "(active_write_rtv), the raw one otherwise");
+	CHECK(contains_in_code(resolve, "active_write_rtv"));
+	CHECK(contains_in_code(resolve, "service_raw_sample_srv("));
+
+	const std::string zones = function_body(src, "service_composite_zones_frame");
+	INFO("service_composite_zones_frame() must exist");
+	REQUIRE_FALSE(zones.empty());
+	INFO("the zones composite samples an app image's per-image SRV directly — on a passthrough "
+	     "commit that decodes an _SRGB source into the UNORM atlas");
+	CHECK_FALSE(contains_in_code(zones, "images[img].srv.get()"));
+	CHECK(count_code_lines_with(zones, "zones_resolve_src_srv(") == 2);
+	INFO("the zones stamp must record what the draw DID: an _SRGB format alone is not proof the atlas "
+	     "holds encoded bytes if the sample decoded (#1665)");
+	CHECK_FALSE(contains_in_code(zones, "is_srgb_format(sd.Format),"));
+	CHECK(contains_in_code(zones, "!src_decodes"));
+
+	// The projection loop's two non-composing shader branches (the oversized
+	// scale blit and #1598's later-layer blend) carried the same premise.
+	const size_t direct_proj = count_code_lines_with(src, "view_scs[eye]->images[view_img_indices[eye]].srv.get(), src_x");
+	INFO("a projection shader blit passes the per-image SRV straight to blit_to_atlas_texture "
+	     << direct_proj << " time(s), expected 0 — it must go through proj_src_srv, which is the raw "
+	        "copy whenever the commit is not composing");
+	CHECK(direct_proj == 0);
+	CHECK(count_code_lines_with(src, "sys, &c->render, proj_src_srv, src_x,") == 2);
+}
+
+TEST_CASE("colour: the macOS shared-surface content pass draws into the encoding target")
+{
+	/*
+	 * comp_multi samples each client's content as its DECLARED format, so an
+	 * `_SRGB` client arrives decoded. Drawing that into the encoded atlas
+	 * through its plain UNORM framebuffer stored linear values raw: every
+	 * `_SRGB` app one decode too dark (measured: lum 61 vs 131). The pass must
+	 * take the same resolved target as the decorations (#1795), whose
+	 * framebuffer is the atlas's `_SRGB` view unless the legacy hatch is on.
+	 */
+	const std::string path = std::string(DXR_COMP_SRC_DIR) + "/multi/comp_multi_system.c";
+	const std::string src = read_whole_file(path);
+
+	INFO("the content pass must resolve its target through shared_resolve_deco_target()");
+	CHECK(contains_in_code(src, "shared_resolve_deco_target(msc, vk, &content_target)"));
+
+	INFO("no pass may begin on the bare UNORM atlas framebuffer with the UNORM content pipeline");
+	CHECK_FALSE(contains_in_code(src, "comp_multi_content_blend_begin(&msc->shared_content_blend"));
 }

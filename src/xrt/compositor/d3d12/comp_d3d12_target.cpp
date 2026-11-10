@@ -13,6 +13,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "util/u_setting.h"
 
 #include "os/os_time.h"
 
@@ -44,6 +45,10 @@ static comp_frame_witness g_frame_witness_d3d12{"d3d12"};
 // Latency governor (#850): DXR_LATE_WEAVE_MAX_LATENCY knob + saturation
 // auto-backoff. Lives at file scope for the same memset reason as the log.
 static late_weave_governor g_lw_gov_d3d12;
+//! #2564: frame-latency token ledger and stage-2 gate for this chain (see
+//! comp_weave_latency_win.h). One target per process on this path.
+static late_weave_token_ledger g_lw_ledger_d3d12;
+static late_weave_stage2_gate g_lw_stage2_d3d12;
 
 // Live-path pacing state (#833) — file scope for the same memset reason.
 // Mirrors comp_d3d11_target.cpp: composed chains pace with the DComp
@@ -64,8 +69,12 @@ dxr_late_weave_enabled(void)
 	if (enabled < 0) {
 		// Default ON: late-weave is the product behavior on every path
 		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage. Read
+		// through u_setting so the Dashboard's Developer settings can set
+		// it for apps it never launched (perf-settings Phase 2B); the
+		// environment still wins. Same parse as before.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;
@@ -510,7 +519,10 @@ comp_d3d12_target_create(void *hwnd,
 
 	if ((desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) != 0) {
 		const int lat = g_lw_gov_d3d12.base_latency();
-		target->swapchain->SetMaximumFrameLatency(lat);
+		// #2564: a fresh chain owes no tokens and has no presentation mode yet.
+		g_lw_ledger_d3d12.reset();
+		g_lw_stage2_d3d12.reset();
+		g_lw_ledger_d3d12.apply(target->swapchain, lat);
 		target->frame_latency_waitable = target->swapchain->GetFrameLatencyWaitableObject();
 		U_LOG_W("Late-weave: D3D12 swapchain waitable, max latency %d%s (waitable=%p)", lat,
 		        (lat == 1 && g_lw_gov_d3d12.auto_backoff == 1) ? " + saturation auto-backoff" : "",
@@ -627,6 +639,8 @@ comp_d3d12_target_destroy(struct comp_d3d12_target **target_ptr)
 
 	if (target->frame_latency_waitable != nullptr) {
 		CloseHandle(target->frame_latency_waitable);
+		g_lw_ledger_d3d12.reset();
+		g_lw_stage2_d3d12.reset();
 		target->frame_latency_waitable = nullptr;
 	}
 
@@ -679,7 +693,10 @@ comp_d3d12_target_repaint_pace(struct comp_d3d12_target *target)
 		return;
 	}
 
-	if (target->frame_latency_waitable != nullptr && g_d3d12_scanout_stats_strikes >= 0) {
+	// #2564: no stage 2 on a DWM-composed chain or during a resize (see
+	// late_weave_stage2_gate and late_weave_governor::on_resize).
+	if (target->frame_latency_waitable != nullptr && g_d3d12_scanout_stats_strikes >= 0 &&
+	    !g_lw_gov_d3d12.in_resize_hold() && g_lw_stage2_d3d12.allowed(target->swapchain, "d3d12")) {
 		// Deliberately NOT WaitForSingleObject(frame_latency_waitable) — the
 		// waitable is a SEMAPHORE, and every wait consumes a token that the
 		// app's own layer_commit needs. A repaint thread waiting on it throttles
@@ -773,6 +790,8 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 		}
 		// Queue cap: with max latency 1 this releases right after DWM picks
 		// up the previous present.
+		// #2564: take back tokens a governor depth decrease left behind.
+		g_lw_ledger_d3d12.pay(target->frame_latency_waitable, "d3d12");
 		const uint64_t wait_t0 = os_monotonic_get_ns();
 		wait_timed_out = WaitForSingleObject(target->frame_latency_waitable, 100) == WAIT_TIMEOUT;
 		const uint64_t wait_t1 = os_monotonic_get_ns();
@@ -807,7 +826,11 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 				        (clocked || wait_blocked) ? "DComp compositor clock / tick-aligned pickup"
 				                                  : "none (waitable only)");
 			}
-		} else if (g_d3d12_scanout_stats_strikes >= 0) {
+		} else if (g_d3d12_scanout_stats_strikes >= 0 && !g_lw_gov_d3d12.in_resize_hold() &&
+		           g_lw_stage2_d3d12.allowed(target->swapchain, "d3d12")) {
+			// #2564: not on a DWM-composed chain, not during a resize; see
+			// late_weave_stage2_gate and late_weave_governor::on_resize.
+			//
 			// Scanout pacing: DWM pickup is 2-3 frames before glass, so
 			// additionally wait until DXGI frame statistics report the
 			// previous present actually flipped. At effective depth L>1
@@ -841,7 +864,7 @@ comp_d3d12_target_weave_mark(struct comp_d3d12_target *target, uint64_t predicte
 	if (target->frame_latency_waitable != nullptr) {
 		const int tr = g_lw_gov_d3d12.on_mark(g_weave_latency_d3d12.freq());
 		if (tr != 0) {
-			target->swapchain->SetMaximumFrameLatency((UINT)g_lw_gov_d3d12.effective);
+			g_lw_ledger_d3d12.apply(target->swapchain, g_lw_gov_d3d12.effective);
 			static bool logged_backoff = false, logged_return = false;
 			bool &logged = (tr > 0) ? logged_backoff : logged_return;
 			if (!logged) {
@@ -959,6 +982,12 @@ comp_d3d12_target_resize(struct comp_d3d12_target *target,
 {
 	if (width == target->width && height == target->height) {
 		return XRT_SUCCESS;
+	}
+
+	// #2564: a resize drag's frame cadence must not drive the late-weave
+	// governor (see late_weave_governor::on_resize).
+	if (target->frame_latency_waitable != nullptr) {
+		g_lw_gov_d3d12.on_resize(g_weave_latency_d3d12.freq());
 	}
 
 	// Release current back buffers

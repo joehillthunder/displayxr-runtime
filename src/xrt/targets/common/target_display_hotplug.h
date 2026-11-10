@@ -1,0 +1,337 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Display hotplug: keep the per-monitor display-processor claims live
+ *         (ADR-047 Amendment 8).
+ * @ingroup targets_common
+ *
+ * The per-monitor DP registry used to be built once, at instance create, so a
+ * 3D panel plugged in while an app ran stayed unclaimed until the app was
+ * restarted, and one unplugged stayed listed. This module is the trigger and
+ * the pacing of the re-run; the re-run itself (re-enumerate monitors, re-probe
+ * the plug-ins that are not claim sources yet, re-resolve, publish the new
+ * screen table) belongs to the instance and is passed in as a callback.
+ *
+ * Three ways in, all funnelled into one debounced scheduler on one worker
+ * thread:
+ *
+ * - **the OS** — `os_display_hotplug_subscribe` (macOS: the CoreGraphics
+ *   reconfiguration callback, delivered on the main run loop);
+ * - **a poll** of a cheap topology signature (the OS monitor list: ids, rects,
+ *   modes; plus, where that list is empty or partial, the platform outputs of
+ *   `os_display_topology_read` — Windows `EnumDisplayDevicesW`, desktop-Linux
+ *   DRM connector state) — the safety net for a process whose main thread runs
+ *   no run loop, and the only trigger where the OS notification is not wired
+ *   (Windows, Linux: an in-process runtime owns no window / message loop to
+ *   receive `WM_DISPLAYCHANGE` on, #2305). A changed signature must hold for
+ *   @ref TARGET_HOTPLUG_POLL_STABLE consecutive polls before it is an event,
+ *   so a cable blink that comes back inside one poll period costs nothing;
+ * - **a plug-in** — `xrt_plugin_host_iface::request_display_rescan`, for the
+ *   vendor backend that recognises a panel seconds after the OS saw the monitor.
+ *
+ * An OS / poll event also arms a few follow-up re-runs over the next seconds
+ * (@ref TARGET_HOTPLUG_FOLLOWUPS): the OS reports the monitor at once, but a
+ * vendor service may need a few seconds to authenticate the panel before its
+ * plug-in will claim it, and an older plug-in cannot say when it is ready.
+ *
+ * The pure parts — the scheduler, the screen-list comparison, the topology
+ * hash — are unit-tested by `tests/tests_target_display_hotplug.cpp`.
+ */
+
+#pragma once
+
+#include "xrt/xrt_screen.h"
+
+#include "os/os_display_desktop.h"
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+/*
+ *
+ * Scheduler (pure).
+ *
+ */
+
+//! Quiet time after the last event before the re-run (a plug storm is one re-run).
+#define TARGET_HOTPLUG_SETTLE_NS (300ull * 1000ull * 1000ull)
+//! The longest an event waits however busy the storm (from its first event).
+#define TARGET_HOTPLUG_MAX_DELAY_NS (1000ull * 1000ull * 1000ull)
+/*!
+ * Follow-up re-runs after an OS / poll event's re-run: 0.5, 1, 1.5, 2, 3, 4,
+ * 6, 8, 12, 16, 24 and 32 s. The tail covers a vendor service that needs
+ * several authentication attempts (the Leia SR service retries FPC
+ * authentication with a backoff from 1 s up to 30 s); a plug-in that can say
+ * when its panel is ready (request_display_rescan) does not depend on it.
+ */
+#define TARGET_HOTPLUG_FOLLOWUPS 12u
+//! "No deadline".
+#define TARGET_HOTPLUG_NEVER UINT64_MAX
+
+//! Where an event came from (a bit each, OR-ed into @ref target_hotplug_sched::sources).
+enum target_hotplug_source
+{
+	TARGET_HOTPLUG_SOURCE_OS = 1u << 0,     //!< The OS display-reconfiguration notification.
+	TARGET_HOTPLUG_SOURCE_POLL = 1u << 1,   //!< The topology-signature poll saw a change.
+	TARGET_HOTPLUG_SOURCE_PLUGIN = 1u << 2, //!< A plug-in's request_display_rescan.
+	TARGET_HOTPLUG_SOURCE_TEST = 1u << 3,   //!< A test / debug request.
+};
+
+/*!
+ * Debounce + follow-up pacing. Not thread-safe: the owner serialises.
+ */
+struct target_hotplug_sched
+{
+	uint64_t settle_ns;
+	uint64_t max_delay_ns;
+	//! Follow-up offsets from the triggering re-run, ascending.
+	uint64_t followup_ns[TARGET_HOTPLUG_FOLLOWUPS];
+	uint32_t followup_count;
+
+	bool pending;
+	uint64_t first_ns;
+	uint64_t last_ns;
+	uint32_t sources;
+	//! The pending event wants follow-ups (an OS / poll / test event; a plug-in's does not).
+	bool want_followups;
+
+	bool followups_armed;
+	uint64_t followup_base_ns;
+	uint32_t followup_next;
+};
+
+/*!
+ * Initialise. 0 for @p settle_ns / @p max_delay_ns selects the default; the
+ * follow-ups are @ref TARGET_HOTPLUG_FOLLOWUPS offsets after the triggering
+ * re-run (0.5 s .. 32 s).
+ */
+void
+target_hotplug_sched_init(struct target_hotplug_sched *s, uint64_t settle_ns, uint64_t max_delay_ns);
+
+//! Record an event at @p now_ns.
+void
+target_hotplug_sched_event(struct target_hotplug_sched *s, uint64_t now_ns, enum target_hotplug_source src);
+
+//! When the next re-run is due (@ref TARGET_HOTPLUG_NEVER = nothing scheduled).
+uint64_t
+target_hotplug_sched_deadline(const struct target_hotplug_sched *s);
+
+/*!
+ * Is a re-run due at @p now_ns? Consumes it when it is.
+ *
+ * @param[out] out_followup  (may be NULL) true for a follow-up re-run.
+ * @param[out] out_sources   (may be NULL) the event sources it serves (0 for a follow-up).
+ */
+bool
+target_hotplug_sched_take(struct target_hotplug_sched *s, uint64_t now_ns, bool *out_followup, uint32_t *out_sources);
+
+
+/*
+ *
+ * Screen-list comparison (pure).
+ *
+ */
+
+//! What changed between two published screen lists.
+struct target_screens_change
+{
+	uint32_t added;            //!< Screens only in the new list.
+	uint32_t removed;          //!< Screens only in the old list.
+	uint32_t claimant_changed; //!< Same screen, another winning plug-in.
+	uint32_t geometry_changed; //!< Same screen, another desktop rect / mode / scale.
+	uint32_t claim_changed;    //!< Same screen and claimant, another claim level (confidence).
+	uint32_t other_changed;    //!< Same screen, other fields (flags, info, names, preferred mode).
+	uint32_t metadata_changed; //!< Same screen, ONLY its EDID physical size differs (not a change).
+	bool default_moved;        //!< The SYSTEM_DEFAULT screen is another one.
+};
+
+/*!
+ * Compare two screen lists by screen id.
+ *
+ * A screen whose only difference is its EDID physical size (`physical_*_mm`)
+ * counts in @ref target_screens_change::metadata_changed and is NOT a change:
+ * on macOS that field is refined ~0.5-1 s after a plug-in (CoreGraphics' mm
+ * until IOKit publishes the EDID blob, then the EDID's own) for the same panel,
+ * and republishing for it made every live session rebuild its segment DPs.
+ * Anything the size feeds that an app or a DP sees (the derived metres in
+ * `info`) is compared as usual.
+ *
+ * @return true when the lists differ materially (a new generation is due).
+ */
+bool
+target_screens_compare(const struct xrt_screen_list *before,
+                       const struct xrt_screen_list *after,
+                       struct target_screens_change *out);
+
+/*!
+ * One human-readable line naming each change ("+0x… 'name' (sim-display)",
+ * "-0x…", "0x… claimant sim-display -> leia-sr", "0x… rect …",
+ * "0x… claim level 50 -> 100", "0x… flags 0x0 -> 0x2", "0x… display info",
+ * "0x… physical 598x341 -> 600x340 mm"), so a published generation always
+ * says why.
+ */
+void
+target_screens_change_format(const struct xrt_screen_list *before,
+                             const struct xrt_screen_list *after,
+                             char *buf,
+                             size_t size);
+
+
+/*
+ *
+ * Topology signature (pure hash + the OS read).
+ *
+ */
+
+//! Hash a monitor list (count, ids by device name, rects, modes, scale, primary).
+uint64_t
+target_display_topology_hash(const struct os_display_desktop_info *mons, uint32_t count);
+
+/*!
+ * The current topology signature: the OS monitor list's hash
+ * (`os_display_desktop_enumerate`) mixed with the platform outputs'
+ * (`os_display_topology_read`; Windows, desktop Linux). Cheap: no EDID read.
+ */
+uint64_t
+target_display_topology_signature(void);
+
+//! Consecutive polls a changed signature must hold before it is an event.
+#define TARGET_HOTPLUG_POLL_STABLE 2u
+
+/*!
+ * The poll's blink filter (pure, not thread-safe). The baseline is the
+ * topology the last sweep saw; a signature that differs from it becomes a
+ * candidate, and only a candidate seen @ref stable_needed times in a row is an
+ * event. A signature back at the baseline drops the candidate: an HDMI blink
+ * (the panel's monitor gone and back within a poll or two) is no sweep.
+ */
+struct target_topology_filter
+{
+	bool have_baseline;
+	uint64_t baseline;
+	bool have_candidate;
+	uint64_t candidate;
+	uint32_t candidate_seen;
+	uint32_t stable_needed;
+};
+
+//! Initialise (0 = @ref TARGET_HOTPLUG_POLL_STABLE).
+void
+target_topology_filter_init(struct target_topology_filter *f, uint32_t stable_needed);
+
+/*!
+ * Feed one poll's signature. Returns true when it is an event (the candidate
+ * then becomes the baseline). The first signature only sets the baseline.
+ */
+bool
+target_topology_filter_feed(struct target_topology_filter *f, uint64_t sig);
+
+//! A sweep just ran and saw @p sig: that is the baseline now, any candidate is dropped.
+void
+target_topology_filter_rebase(struct target_topology_filter *f, uint64_t sig);
+
+
+/*
+ *
+ * The monitor (worker thread).
+ *
+ */
+
+/*!
+ * The re-run: re-enumerate, re-probe, re-resolve, publish. Runs on the worker
+ * thread. @p sources is the OR of @ref target_hotplug_source the run serves
+ * (0 for a follow-up). Returns true when the published screen list changed.
+ */
+typedef bool (*target_display_hotplug_rebuild_fn)(void *user, uint32_t sources, bool followup);
+
+struct target_display_hotplug;
+
+/*!
+ * Is the monitor enabled in this process? `DXR_DISPLAY_HOTPLUG=0` turns it
+ * off, `=1` on. Unset: on for in-process sessions on macOS, Windows and
+ * desktop Linux (#2305), off on Android — and off in a host that feeds its
+ * own display re-probe (@ref target_display_hotplug_set_host_feed: the
+ * Windows / desktop-Linux service, whose tray / DRM-uevent / Mutter feeders
+ * already drive `reprobe_run`).
+ */
+bool
+target_display_hotplug_enabled(void);
+
+/*!
+ * The host process re-probes displays on its own OS events (the service on
+ * Windows and desktop Linux). Turns the default of
+ * @ref target_display_hotplug_enabled off so the two do not double up; an
+ * explicit `DXR_DISPLAY_HOTPLUG` still wins. Call before the system is created.
+ */
+void
+target_display_hotplug_set_host_feed(bool host_feeds);
+
+//! Pure: the default decision (exposed for tests). @p env = `DXR_DISPLAY_HOTPLUG` (NULL = unset).
+bool
+target_display_hotplug_default_enabled(const char *env, bool host_feeds);
+
+/*!
+ * Start the worker (one per process; a second start fails). The poll period
+ * is 500 ms (`DXR_DISPLAY_HOTPLUG_POLL_MS`, 0 = no poll). Returns NULL when
+ * disabled (@ref target_display_hotplug_enabled) or on failure.
+ */
+struct target_display_hotplug *
+target_display_hotplug_start(target_display_hotplug_rebuild_fn fn, void *user);
+
+/*!
+ * Stop and join the worker. After it returns the rebuild callback is not
+ * running and will not run again. NULL-safe.
+ */
+void
+target_display_hotplug_stop(struct target_display_hotplug **hp_ptr);
+
+/*!
+ * Request a re-run from anywhere (any thread, never blocks on a re-run). With
+ * no monitor running yet the request is latched and served by the next
+ * @ref target_display_hotplug_start — a plug-in whose panel authenticates
+ * between discovery and system create must not be lost.
+ */
+void
+target_display_hotplug_request(enum target_hotplug_source src, const char *reason);
+
+/*!
+ * The `xrt_plugin_host_iface::request_display_rescan` slot: a plug-in says its
+ * displays may have changed. With no monitor running and a follow-up sink set
+ * (the service, which feeds its own re-probe) it goes to that sink, since a
+ * latched request would never be served there; otherwise as
+ * @ref target_display_hotplug_request.
+ */
+void
+target_display_hotplug_plugin_request(const char *reason);
+
+/*!
+ * Where @ref target_display_hotplug_request_followup goes when no monitor runs
+ * in this process: the host's own re-probe (the service sets its display
+ * re-probe worker, ADR-051 D6). Must not block on a re-run.
+ */
+typedef void (*target_display_followup_sink_fn)(const char *reason);
+
+//! Install (or clear, NULL) the follow-up sink. Any thread.
+void
+target_display_hotplug_set_followup_sink(target_display_followup_sink_fn fn);
+
+/*!
+ * Ask for one more re-enumeration soon because the last one was provisional
+ * (a monitor's EDID was unreadable mid-reseat and its identity was carried
+ * forward — target_plugin_build_descriptors). Served by this process's
+ * monitor when one runs, else by the sink, else dropped. Any thread; never
+ * blocks on a re-run.
+ */
+void
+target_display_hotplug_request_followup(const char *reason);
+
+#ifdef __cplusplus
+}
+#endif

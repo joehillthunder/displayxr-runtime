@@ -40,7 +40,12 @@
  *      the display processor phases the interlace to. X11:
  * XTranslateCoordinates. Wayland: the window-geometry@displayxr.org GNOME Shell
  * extension's GetWindows, converted with u_wayland_geom.h (logical x fractional
- *      scale, monitor-relative, plus the runtime's own panel origin).
+ *      scale, monitor-relative, plus the runtime's own panel origin). Spec
+ *      v12: where the logical origin is known (Wayland) it is bound too
+ *      (XrWeaveWindowLogicalOriginDXR), and every submit reads back the
+ *      origin its output was woven for (XrWeaveOutputOriginDXR) — what a
+ *      present-owner tags its commit with for move-synchronised drag (§9 of
+ *      docs/specs/runtime/wayland-window-geometry.md).
  *   5. DRAG. The window helper's drag goes through the display processor's
  *      snap (DxrWeaveSnap -> xrWeaveSnapWindowRectDXR): every step on X11, and
  *      on Wayland the compositor-run drag lattice (SetDragLattice). After a
@@ -62,10 +67,42 @@
  *                      presented frame == the woven output, or == the SBS input
  *                      with --sbs; woven non-black and != SBS; HUD composited;
  *                      fd counts flat; with --expect-anaglyph, woven ==
- *                      anaglyph(SBS)) and PNGs of the woven output, the SBS
- *                      input and the presented frame. Exit code 0 = PASS.
+ *                      anaglyph(SBS); spec v12: every output reports the
+ *                      origin bound at the last xrWeaveBindWindow2DXR, the
+ *                      logical origin echoed verbatim and a strictly
+ *                      increasing serial, while the fixed headless "window"
+ *                      re-binds every few frames) and PNGs of the woven
+ *                      output, the SBS input and the presented frame. Exit
+ *                      code 0 = PASS.
  *                      --test-resize=WxH@N reallocates mid-run, as a window
  *                      resize or F11 does.
+ *   --test-display-mode[=stale|deferred]  (headless) drive the hardware
+ *                      2D/3D channel the way the browser's tab policy does
+ *                      (xrRequestDisplayModeDXR) and require exactly the
+ *                      matching XrEventDataHardwareDisplayStateChangedDXR
+ *                      events, each batch's events present before the next.
+ *                      stale (default): 2D then 3D BEFORE the first submit
+ *                      (bring-up must NOT apply the withdrawn 2D: no event),
+ *                      2D at frame 20, the fast triple 3D,2D,3D in one frame
+ *                      at 30, a no-op 3D at 40 (no event), 2D at 50 ->
+ *                      events 2D,3D,2D,3D,2D. deferred: 2D before the first
+ *                      submit (recorded, applied at bring-up), 3D at 30, 2D
+ *                      at 50 -> events 2D,3D,2D. Pair it with a service
+ *                      started with SIM_DISPLAY_FAKE_LENS=1 so the weave
+ *                      engine's DP records + logs each request.
+ *   --mono-in-2d       chain XrWeaveSubmitMonoIn2DDXR (spec v13) on every
+ *                      submit: while the hardware is 2D the service presents
+ *                      the centre view flat instead of the weave.
+ *   --hold-2d-at=N / --release-3d-at=M  (headless) request hardware 2D at
+ *                      frame N (and 3D at frame M) — a browser's menu hold.
+ *   --expect-mono      (headless) require woven == the SBS input's LEFT view,
+ *                      unsqueezed to full width (one view, no weave).
+ *   --test-hold-flicker (headless, implies --mono-in-2d) open/close the 2D
+ *                      hold FAST over frames 10..49 — a 1-frame hold, a
+ *                      2-frame hold, and 2D+3D inside one frame, repeated — and
+ *                      read back EVERY frame of that window: each must be mono
+ *                      exactly when the last request before its submit was 2D
+ *                      (no woven frame while held, no stale mono after release).
  *   --lattice-selftest one Wayland drag-lattice table build per output scale
  *                      (100 %, 200 %, 150 %) through the helper's own table
  *                      code (dxr_wl_lattice::probe_via_grid) and the SAME
@@ -207,6 +244,13 @@ struct Options
 	uint32_t resize_w = 0, resize_h = 0;
 	int resize_frame = -1;
 	bool lattice_selftest = false; //!< --lattice-selftest
+	bool test_display_mode = false;   //!< --test-display-mode (headless)
+	bool test_display_deferred = false; //!< --test-display-mode=deferred
+	bool mono_in_2d = false;            //!< --mono-in-2d (spec v13)
+	int hold_2d_frame = -1;             //!< --hold-2d-at=N (headless)
+	int release_3d_frame = -1;          //!< --release-3d-at=M (headless)
+	bool expect_mono = false;           //!< --expect-mono (headless)
+	bool test_hold_flicker = false;     //!< --test-hold-flicker (headless)
 };
 
 static void
@@ -237,6 +281,18 @@ usage(const char *argv0)
 	        "service's fd count to stay flat\n"
 	        "  --test-resize=WxH@N          (headless) reallocate at frame N, "
 	        "like a window resize\n"
+	        "  --test-display-mode[=stale|deferred]  (headless) request hardware "
+	        "2D/3D sequences and require the matching events\n"
+	        "  --mono-in-2d                 chain XrWeaveSubmitMonoIn2DDXR "
+	        "(v13): one flat view while hardware 2D\n"
+	        "  --hold-2d-at=N               (headless) request hardware 2D at "
+	        "frame N\n"
+	        "  --release-3d-at=M            (headless) request hardware 3D at "
+	        "frame M\n"
+	        "  --expect-mono                (headless) require woven == the "
+	        "left view, unsqueezed\n"
+	        "  --test-hold-flicker          (headless) fast 2D hold open/close, "
+	        "every frame checked mono/woven\n"
 	        "  --lattice-selftest           build one drag-lattice table per "
 	        "scale via the grid provider (exit 1 = FAIL)\n"
 	        "  --dump-dir=DIR               where PNGs go (default $TMPDIR, else "
@@ -292,6 +348,22 @@ parse_args(int argc, char **argv, Options &o)
 		} else if (sscanf(a, "--test-resize=%ux%u@%d", &o.resize_w, &o.resize_h, &o.resize_frame) == 3) {
 		} else if (strcmp(a, "--lattice-selftest") == 0) {
 			o.lattice_selftest = true;
+		} else if (strcmp(a, "--test-display-mode") == 0 || strcmp(a, "--test-display-mode=stale") == 0) {
+			o.test_display_mode = true;
+		} else if (strcmp(a, "--test-display-mode=deferred") == 0) {
+			o.test_display_mode = true;
+			o.test_display_deferred = true;
+		} else if (strcmp(a, "--mono-in-2d") == 0) {
+			o.mono_in_2d = true;
+		} else if (strncmp(a, "--hold-2d-at=", 13) == 0) {
+			o.hold_2d_frame = atoi(a + 13);
+		} else if (strncmp(a, "--release-3d-at=", 16) == 0) {
+			o.release_3d_frame = atoi(a + 16);
+		} else if (strcmp(a, "--expect-mono") == 0) {
+			o.expect_mono = true;
+		} else if (strcmp(a, "--test-hold-flicker") == 0) {
+			o.test_hold_flicker = true;
+			o.mono_in_2d = true;
 		} else if (strncmp(a, "--dump-dir=", 11) == 0) {
 			o.dump_dir = a + 11;
 		} else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -345,6 +417,10 @@ struct App
 	PFN_xrWeaveBindWindow2DXR pfn_bind2 = nullptr;
 	PFN_xrWeaveSubmitDXR pfn_submit = nullptr;
 	PFN_xrWeaveSnapWindowRectDXR pfn_snap = nullptr;
+	PFN_xrRequestDisplayModeDXR pfn_request_display_mode = nullptr; //!< --test-display-mode
+	//! --test-display-mode: every XrEventDataHardwareDisplayStateChangedDXR, in order.
+	std::vector<bool> hw_events;
+	bool dm_order_bad = false; //!< --test-display-mode: an event missing before the next request, or a failed call
 	bool has_display_info = false;
 	int32_t panel_left = 0, panel_top = 0;
 	uint32_t panel_w = 0, panel_h = 0;
@@ -416,7 +492,23 @@ struct App
 	int32_t geom_x = 0,
 	        geom_y = 0; //!< bound client origin, desktop-absolute DEVICE px
 	uint32_t geom_w = 0, geom_h = 0;
+	//! v12: the logical origin bound with geom_x/y (Wayland; headless fakes one).
+	bool geom_have_logical = false;
+	int32_t geom_lx = 0, geom_ly = 0;
+	float geom_scale = 0.0f;
 	const char *geom_source = "none";
+
+	// ---- v12 woven-origin check (XrWeaveOutputOriginDXR), every submit
+	struct
+	{
+		uint64_t outputs = 0;     //!< submits that reported an output
+		uint64_t origin_bad = 0;  //!< device origin != the last bind
+		uint64_t logical_bad = 0; //!< logical echo != the last bind
+		uint64_t serial_bad = 0;  //!< serial not strictly increasing
+		uint64_t last_serial = 0;
+		uint64_t distinct = 0; //!< distinct woven origins seen
+		int32_t last_x = INT32_MIN, last_y = INT32_MIN;
+	} v12;
 	bool warned_no_geom = false;
 	double fps = 0.0;
 	int64_t fps_t0 = 0;
@@ -424,6 +516,13 @@ struct App
 	int64_t hud_t = 0;
 	bool dump_requested = false;
 	int submit_failures = 0;
+	//! --test-hold-flicker: the per-frame readback in flight, what that frame
+	//! must be, and the tallies.
+	bool flicker_pending = false;
+	bool flicker_expect_mono = false;
+	int flicker_frame = -1;
+	bool hold_2d_now = false; //!< the last hardware request this run made was 2D
+	int flicker_checked = 0, flicker_mono = 0, flicker_woven = 0, flicker_bad = 0;
 
 	// ---- Wayland drop snap (see wl_drop_snap)
 	struct
@@ -795,6 +894,12 @@ init_session()
 	xrGetInstanceProcAddr(g.instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&g.pfn_bind2);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSubmitDXR", (PFN_xrVoidFunction *)&g.pfn_submit);
 	xrGetInstanceProcAddr(g.instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&g.pfn_snap);
+	if ((g.opt.test_display_mode || g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0 ||
+	     g.opt.test_hold_flicker) &&
+	    g.has_display_info) {
+		xrGetInstanceProcAddr(g.instance, "xrRequestDisplayModeDXR",
+		                      (PFN_xrVoidFunction *)&g.pfn_request_display_mode);
+	}
 	if (!g.pfn_bind2 || !g.pfn_submit || !g.pfn_snap) {
 		LOGE("weave entry points missing");
 		return false;
@@ -1257,13 +1362,29 @@ create_swapchain()
 
 //! This frame's client rect, desktop-absolute DEVICE px. False = unknown.
 static bool
-query_geometry(int32_t *x, int32_t *y, const char **source, WlOwnWindow *wl_out)
+query_geometry(int32_t *x,
+               int32_t *y,
+               const char **source,
+               WlOwnWindow *wl_out,
+               bool *have_logical,
+               int32_t *lx,
+               int32_t *ly,
+               float *lscale)
 {
+	*have_logical = false;
 	if (g.headless) {
-		// A fixed, deliberately non-origin spot on the panel, like the probe.
-		*x = g.panel_left + 64;
-		*y = g.panel_top + 48;
-		*source = "headless (fixed)";
+		// A deliberately non-origin spot on the panel, like the probe — stepped
+		// a few px every 4 frames so the v12 check sees the woven origin follow
+		// re-binds. The logical origin is a fake 150 % desktop's: the runtime
+		// must echo it verbatim, whatever it is.
+		const int32_t step = (int32_t)((g.frame / 4) % 8);
+		*x = g.panel_left + 64 + step * 3;
+		*y = g.panel_top + 48 + step * 2;
+		*have_logical = true;
+		*lx = 1000 + step * 2;
+		*ly = -7 + step; // negative on purpose: a window above the stage origin
+		*lscale = 1.5f;
+		*source = "headless (stepped)";
 		return true;
 	}
 #ifdef DXR_APP_HAVE_WAYLAND
@@ -1286,6 +1407,12 @@ query_geometry(int32_t *x, int32_t *y, const char **source, WlOwnWindow *wl_out)
 		                                    content.logical_h, &rel)) {
 			return false;
 		}
+		// v12: the logical content origin this device origin was derived
+		// from — the quantity a move-sync tag encodes.
+		*have_logical = true;
+		*lx = content.logical_x;
+		*ly = content.logical_y;
+		*lscale = (float)ww.mon_scale;
 		// Monitor-relative is the exact quantity; the absolute base is the
 		// runtime's own panel origin when this IS the panel (so the service's
 		// window - panel subtraction is exact), else the monitor's converted
@@ -1327,7 +1454,10 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 	const char *src = "none";
 	*have_wl = false;
 	WlOwnWindow ww;
-	bool known = query_geometry(&x, &y, &src, &ww);
+	bool have_logical = false;
+	int32_t lx = 0, ly = 0;
+	float lscale = 0.0f;
+	bool known = query_geometry(&x, &y, &src, &ww, &have_logical, &lx, &ly, &lscale);
 	if (known && !g.headless && g.window.backend() == DxrWindowBackend::Wayland) {
 		*wl_out = ww;
 		*have_wl = true;
@@ -1347,14 +1477,23 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 		x = g.panel_left;
 		y = g.panel_top;
 		src = "unknown (panel origin)";
+		have_logical = false;
 	}
-	if (g.have_geom && x == g.geom_x && y == g.geom_y && g.w == g.geom_w && g.h == g.geom_h) {
+	if (g.have_geom && x == g.geom_x && y == g.geom_y && g.w == g.geom_w && g.h == g.geom_h &&
+	    have_logical == g.geom_have_logical &&
+	    (!have_logical || (lx == g.geom_lx && ly == g.geom_ly && lscale == g.geom_scale))) {
 		return true;
 	}
 	XrWeaveWindowGeometryDXR geom = {XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
 	geom.windowOriginOnScreen = {x, y};
 	geom.clientSize = {(int32_t)g.w, (int32_t)g.h};
 	geom.displayId = -1;
+	XrWeaveWindowLogicalOriginDXR logical = {XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR};
+	logical.logicalOrigin = {lx, ly};
+	logical.scale = lscale;
+	if (have_logical) {
+		geom.next = &logical; // v12
+	}
 	XrWeaveBindWindowInfoDXR bind = {XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
 	bind.next = &geom;
 	// X11: the XID, recorded by the service for diagnostics only. Wayland: a
@@ -1376,6 +1515,10 @@ update_geometry(WlOwnWindow *wl_out, bool *have_wl)
 	g.geom_y = y;
 	g.geom_w = g.w;
 	g.geom_h = g.h;
+	g.geom_have_logical = have_logical;
+	g.geom_lx = lx;
+	g.geom_ly = ly;
+	g.geom_scale = lscale;
 	g.geom_source = src;
 	g.overlay_dirty = true;
 	g.weave_snap.set_extent(g.w, g.h);
@@ -1747,6 +1890,61 @@ render_and_release(int k, bool upload_overlay, int *acq_fd)
 }
 
 /*!
+ * Spec v12: the output this submit produced must report the origin bound at the
+ * last xrWeaveBindWindow2DXR (the weave runs inside the submit, so the bind in
+ * effect at weave time IS the last one), the logical origin echoed verbatim, and
+ * a serial that strictly increases. A present-owner would tag its commit with
+ * (wovenOriginLogical mod 256) here.
+ */
+static void
+check_woven_origin(const XrWeaveOutputOriginDXR &o)
+{
+	auto &v = g.v12;
+	v.outputs++;
+	const bool origin_ok = g.have_geom && o.valid == XR_TRUE && o.wovenOriginOnScreen.x == g.geom_x &&
+	                       o.wovenOriginOnScreen.y == g.geom_y;
+	const bool logical_ok = g.geom_have_logical
+	                            ? (o.logicalValid == XR_TRUE && o.wovenOriginLogical.x == g.geom_lx &&
+	                               o.wovenOriginLogical.y == g.geom_ly && o.logicalScale == g.geom_scale)
+	                            : o.logicalValid == XR_FALSE;
+	const bool serial_ok = o.serial > v.last_serial;
+	if (!origin_ok) {
+		v.origin_bad++;
+	}
+	if (!logical_ok) {
+		v.logical_bad++;
+	}
+	if (!serial_ok) {
+		v.serial_bad++;
+	}
+	if ((!origin_ok || !logical_ok || !serial_ok) && v.origin_bad + v.logical_bad + v.serial_bad <= 3) {
+		LOGW(
+		    "v12 woven origin MISMATCH (frame %llu): valid=%d (%d,%d) logical=%d (%d,%d)@%.3f serial %llu; "
+		    "bound "
+		    "(%d,%d) logical=%d (%d,%d)@%.3f, last serial %llu",
+		    (unsigned long long)g.frame, (int)o.valid, o.wovenOriginOnScreen.x, o.wovenOriginOnScreen.y,
+		    (int)o.logicalValid, o.wovenOriginLogical.x, o.wovenOriginLogical.y, (double)o.logicalScale,
+		    (unsigned long long)o.serial, g.geom_x, g.geom_y, (int)g.geom_have_logical, g.geom_lx, g.geom_ly,
+		    (double)g.geom_scale, (unsigned long long)v.last_serial);
+	}
+	if (o.valid == XR_TRUE && (o.wovenOriginOnScreen.x != v.last_x || o.wovenOriginOnScreen.y != v.last_y)) {
+		v.distinct++;
+		v.last_x = o.wovenOriginOnScreen.x;
+		v.last_y = o.wovenOriginOnScreen.y;
+		if (g.headless || v.distinct <= 2) {
+			// The tag a move-synchronised present-owner would attach
+			// (non-negative mod 256, §9). Logged on origin change only.
+			auto tag = [](int32_t l) { return ((l % 256) + 256) % 256; };
+			LOGI("v12 woven origin (%d,%d) logical (%d,%d)@%.3f serial %llu -> move-sync tag (%d,%d)",
+			     o.wovenOriginOnScreen.x, o.wovenOriginOnScreen.y, o.wovenOriginLogical.x,
+			     o.wovenOriginLogical.y, (double)o.logicalScale, (unsigned long long)o.serial,
+			     tag(o.wovenOriginLogical.x), tag(o.wovenOriginLogical.y));
+		}
+	}
+	v.last_serial = o.serial;
+}
+
+/*!
  * xrWeaveSubmitDXR, spec v10. Every fd passed in is the runtime's on success
  * and still ours otherwise. @p release_fd receives this frame's release fence.
  */
@@ -1778,12 +1976,23 @@ weave_submit(int k, bool with_overlay, int acq_fd, int *release_fd)
 	} else {
 		batch.next = &in_desc;
 	}
+	// v13: one flat view while the hardware is 2D. Chained first; a runtime
+	// older than v13 skips it.
+	XrWeaveSubmitMonoIn2DDXR mono = {XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR};
+	mono.monoIn2D = XR_TRUE;
 	XrWeaveSubmitInfoDXR submit = {XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
-	submit.next = &batch;
+	if (g.opt.mono_in_2d) {
+		mono.next = &batch;
+		submit.next = &mono;
+	} else {
+		submit.next = &batch;
+	}
 	submit.firstChunk = XR_TRUE;
 
+	XrWeaveOutputOriginDXR out_origin = {XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR}; // v12, zeroed
 	XrWeaveOutputSyncDXR out_sync = {XR_TYPE_WEAVE_OUTPUT_SYNC_DXR};
 	out_sync.releaseFenceFd = -1;
+	out_sync.next = &out_origin;
 	XrWeaveOutputDmabufDXR out_dmabuf = {XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR};
 	out_dmabuf.fd = -1;
 	out_dmabuf.next = &out_sync;
@@ -1798,6 +2007,7 @@ weave_submit(int k, bool with_overlay, int acq_fd, int *release_fd)
 		close(acq_fd);
 		return r;
 	}
+	check_woven_origin(out_origin);
 	if (out.eyeCount >= 2 && out.eyesValid) {
 		g.eyes[0] = out.eyes[0];
 		g.eyes[1] = out.eyes[1];
@@ -2017,6 +2227,7 @@ struct Verdict
 	double diff_vs_sbs = 0.0;    //!< mean |woven - sbs| per channel: did the weave
 	                             //!< transform anything?
 	double anaglyph_err = 0.0;   //!< mean |woven - anaglyph(sbs)| per channel, outside the HUD
+	double mono_err = 0.0;       //!< mean |woven - left view of sbs, unsqueezed| per channel, outside the HUD
 	bool hud_ok = true;          //!< a HUD-box pixel reads the HUD colour (2D composited
 	                             //!< over the weave)
 	double presented_err = -1.0; //!< (headless) mean |presented - (sbs mode ? sbs : woven)|
@@ -2036,7 +2247,7 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 {
 	Verdict v;
 	const uint32_t ew = w / 2;
-	double luma = 0.0, diff = 0.0, aerr = 0.0;
+	double luma = 0.0, diff = 0.0, aerr = 0.0, merr = 0.0;
 	uint64_t n = 0, nb = 0, na = 0;
 	const bool hud = g.opt.hud && g.hud_w > 0;
 	for (uint32_t y = 1; y + 1 < h; y += 2) {
@@ -2056,7 +2267,10 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 			// sim_display anaglyph: red from the left tile, green+blue from
 			// the right, each sampled (bilinear) at u/2 — take the best of the
 			// two nearest source columns.
-			double best = 1e9;
+			// Mono (spec v13): the left view alone, unsqueezed to full width
+			// (a LINEAR stretch of the left half) — same best-of-neighbours
+			// tolerance.
+			double best = 1e9, best_mono = 1e9;
 			for (int dx = -1; dx <= 1; dx++) {
 				const int lx = std::clamp((int)(x / 2) + dx, 0, (int)ew - 1);
 				int lr, lg, lb, rr, rg, rb;
@@ -2064,8 +2278,11 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 				px(sbs, w, (int)ew + lx, (int)y, &rr, &rg, &rb);
 				const double e = (std::abs(wr - lr) + std::abs(wg - rg) + std::abs(wb - rb)) / 3.0;
 				best = std::min(best, e);
+				const double em = (std::abs(wr - lr) + std::abs(wg - lg) + std::abs(wb - lb)) / 3.0;
+				best_mono = std::min(best_mono, em);
 			}
 			aerr += best;
+			merr += best_mono;
 			na++;
 		}
 	}
@@ -2073,6 +2290,7 @@ analyze(const uint8_t *woven, const uint8_t *sbs, uint32_t w, uint32_t h)
 	v.nonblack = n ? (double)nb / (double)n : 0.0;
 	v.diff_vs_sbs = n ? diff / (double)n : 0.0;
 	v.anaglyph_err = na ? aerr / (double)na : 0.0;
+	v.mono_err = na ? merr / (double)na : 0.0;
 	if (hud) {
 		// A pixel inside the HUD box, below the text lines' left margin.
 		int r, gg, b;
@@ -2121,9 +2339,9 @@ dump_and_analyze(const char *tag)
 	}
 	LOGI(
 	    "%s: woven mean luma %.1f, non-black %.1f%%, mean |woven - sbs| %.1f, "
-	    "mean |woven - anaglyph(sbs)| %.1f, "
+	    "mean |woven - anaglyph(sbs)| %.1f, mean |woven - left view| %.1f, "
 	    "HUD %s",
-	    tag, v.woven_luma, v.nonblack * 100.0, v.diff_vs_sbs, v.anaglyph_err,
+	    tag, v.woven_luma, v.nonblack * 100.0, v.diff_vs_sbs, v.anaglyph_err, v.mono_err,
 	    !g.opt.hud ? "off" : (v.hud_ok ? "composited" : "MISSING"));
 	return v;
 }
@@ -2148,6 +2366,11 @@ poll_xr_events()
 		} else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
 			LOGW("instance loss pending — leaving");
 			return false;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR) {
+			const auto *h = (const XrEventDataHardwareDisplayStateChangedDXR *)&ev;
+			g.hw_events.push_back(h->hardwareDisplay3D == XR_TRUE);
+			LOGI("event: hardware display state -> %s (frame %llu)", h->hardwareDisplay3D ? "3D" : "2D",
+			     (unsigned long long)g.frame);
 		}
 		ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	}
@@ -2182,6 +2405,23 @@ run()
 		if (!wait_frame_fences()) {
 			return 1;
 		}
+		// --test-hold-flicker: classify the previous frame's readback.
+		if (g.flicker_pending) {
+			g.flicker_pending = false;
+			const Verdict fv = analyze(g.rb_woven.map, g.rb_sbs.map, g.w, g.h);
+			const bool is_mono = fv.mono_err + 2.0 < fv.anaglyph_err;
+			const bool is_woven = fv.anaglyph_err + 2.0 < fv.mono_err;
+			g.flicker_checked++;
+			g.flicker_mono += is_mono ? 1 : 0;
+			g.flicker_woven += is_woven ? 1 : 0;
+			const bool ok = g.flicker_expect_mono ? is_mono : is_woven;
+			if (!ok) {
+				g.flicker_bad++;
+				LOGE("hold flicker: frame %d expected %s, got %s (|w-anaglyph| %.1f, |w-left| %.1f)",
+				     g.flicker_frame, g.flicker_expect_mono ? "MONO (held 2D)" : "WOVEN (released)",
+				     is_mono ? "mono" : (is_woven ? "woven" : "neither"), fv.anaglyph_err, fv.mono_err);
+			}
+		}
 		// A frame's dump readback is complete once its fences are waited.
 		if (g.dump_requested) {
 			g.dump_requested = false;
@@ -2192,6 +2432,94 @@ run()
 		}
 		if (!poll_xr_events()) {
 			break;
+		}
+		if (g.opt.test_display_mode && g.pfn_request_display_mode != nullptr) {
+			// The browser's tab policy, as batches of requests at given frames
+			// (frame 0 runs BEFORE the first submit: the service's weave
+			// engine does not exist yet). events_before = how many events
+			// must already have arrived when the batch is issued — the
+			// runtime answers each request on its own IPC call, or at engine
+			// bring-up on the first submit.
+			struct Batch
+			{
+				int frame;
+				size_t events_before;
+				std::vector<bool> reqs; // true = 3D
+			};
+			static const std::vector<Batch> stale = {
+			    {0, 0, {false, true}},       // 2D then 3D pre-engine: bring-up applies nothing
+			    {20, 0, {false}},            // no stale event so far; 2D
+			    {30, 1, {true, false, true}}, // fast triple in one frame
+			    {40, 4, {true}},             // no-op: already 3D, no event
+			    {50, 4, {false}},
+			};
+			static const std::vector<Batch> deferred = {
+			    {0, 0, {false}}, // pre-engine 2D: applied at bring-up
+			    {30, 1, {true}},
+			    {50, 2, {false}},
+			};
+			for (const Batch &b : g.opt.test_display_deferred ? deferred : stale) {
+				if (b.frame != f) {
+					continue;
+				}
+				if (g.hw_events.size() != b.events_before) {
+					LOGE("display-mode test: %zu event(s) before the frame-%d batch, expected %zu",
+					     g.hw_events.size(), f, b.events_before);
+					g.dm_order_bad = true;
+				}
+				for (bool want_3d : b.reqs) {
+					const XrResult r = g.pfn_request_display_mode(
+					    g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
+					LOGI("frame %d: xrRequestDisplayModeDXR(%s) -> %d", f, want_3d ? "3D" : "2D", (int)r);
+					if (XR_FAILED(r)) {
+						g.dm_order_bad = true;
+					}
+				}
+			}
+		}
+
+		if (g.headless && g.pfn_request_display_mode != nullptr &&
+		    (f == g.opt.hold_2d_frame || f == g.opt.release_3d_frame)) {
+			// A browser's menu hold: the lens off at N, back on at M.
+			const bool want_3d = (f == g.opt.release_3d_frame);
+			const XrResult r = g.pfn_request_display_mode(g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR
+			                                                                 : XR_DISPLAY_MODE_2D_DXR);
+			LOGI("frame %d: hold %s -> xrRequestDisplayModeDXR(%s) -> %d", f, want_3d ? "released" : "taken",
+			     want_3d ? "3D" : "2D", (int)r);
+			if (XR_FAILED(r)) {
+				g.dm_order_bad = true;
+			}
+			g.hold_2d_now = !want_3d;
+		}
+		if (g.headless && g.opt.test_hold_flicker && g.pfn_request_display_mode != nullptr && f >= 10 &&
+		    f < 50) {
+			// Six-frame cycle: a 1-frame hold (2D at +0, 3D at +1), a 2-frame
+			// hold (2D at +2, 3D at +4), and a hold opened and closed inside
+			// ONE frame (+5: 2D then 3D before the submit -> woven). Every
+			// request is answered inline (the DP confirms on the IPC call), so
+			// the submit right after it must already show the new state.
+			std::vector<bool> reqs; // true = 3D
+			switch ((f - 10) % 6) {
+			case 0: reqs = {false}; break;
+			case 1: reqs = {true}; break;
+			case 2: reqs = {false}; break;
+			case 4: reqs = {true}; break;
+			case 5: reqs = {false, true}; break;
+			default: break;
+			}
+			for (bool want_3d : reqs) {
+				const XrResult r = g.pfn_request_display_mode(g.session, want_3d ? XR_DISPLAY_MODE_3D_DXR
+				                                                                 : XR_DISPLAY_MODE_2D_DXR);
+				if (XR_FAILED(r)) {
+					g.dm_order_bad = true;
+				}
+				g.hold_2d_now = !want_3d;
+			}
+			if (f == 49 && g.hold_2d_now) {
+				// End released, so the final dump is woven.
+				g.pfn_request_display_mode(g.session, XR_DISPLAY_MODE_3D_DXR);
+				g.hold_2d_now = false;
+			}
 		}
 
 		if (!g.headless) {
@@ -2290,10 +2618,16 @@ run()
 		} else if (g.opt.anaglyph_check && dump_trigger_present()) {
 			dump = true;
 		}
-		if (!present(release_fd, dump)) {
+		const bool flicker_dump = g.headless && g.opt.test_hold_flicker && f >= 10 && f < 50;
+		if (!present(release_fd, dump || flicker_dump)) {
 			return 1;
 		}
 		g.dump_requested = dump;
+		if (flicker_dump) {
+			g.flicker_pending = true;
+			g.flicker_expect_mono = g.hold_2d_now;
+			g.flicker_frame = f;
+		}
 		g.frame++;
 
 		if (g.headless && f == 0) {
@@ -2328,18 +2662,53 @@ run()
 	check(v.presented_err >= 0.0 && v.presented_err < 0.01,
 	      g.opt.sbs ? "presented frame == SBS input (--sbs)" : "presented frame == woven output");
 	check(v.nonblack > 0.5 && v.woven_luma > 10.0, "woven frame is not black");
-	check(v.diff_vs_sbs > 5.0, "woven frame differs from the SBS input (weave ran)");
+	check(v.diff_vs_sbs > 5.0, "woven frame differs from the SBS input (not the raw SBS)");
 	if (g.opt.hud) {
 		check(v.hud_ok, "HUD overlay composited over the weave");
 	}
 	if (g.opt.expect_anaglyph) {
 		check(v.anaglyph_err < 10.0, "woven == red/cyan anaglyph of the SBS input");
+		if (g.opt.mono_in_2d) {
+			// The opt-in is chained: proving the weave ran needs the output to
+			// be told apart from the mono one, not only matched to anaglyph.
+			check(v.anaglyph_err + 2.0 < v.mono_err, "woven is the anaglyph, NOT the mono view");
+		}
+	}
+	if (g.opt.expect_mono) {
+		check(v.mono_err < 10.0, "v13 mono: woven == the left view, unsqueezed");
+		check(v.mono_err + 2.0 < v.anaglyph_err, "v13 mono: woven is NOT the anaglyph (no weave)");
+	}
+	if (g.opt.test_hold_flicker) {
+		LOGI("hold flicker: %d frames checked, %d mono, %d woven, %d wrong", g.flicker_checked, g.flicker_mono,
+		     g.flicker_woven, g.flicker_bad);
+		check(g.flicker_checked == 40, "hold flicker: every frame of 10..49 read back");
+		check(g.flicker_bad == 0, "hold flicker: no woven frame while held, no stale mono after release");
+		check(g.flicker_mono > 0 && g.flicker_woven > 0, "hold flicker: both states seen");
+		check(!g.dm_order_bad, "hold flicker: every xrRequestDisplayModeDXR succeeded");
+	}
+	if (g.opt.hold_2d_frame >= 0 || g.opt.release_3d_frame >= 0) {
+		check(g.pfn_request_display_mode != nullptr && !g.dm_order_bad, "hold: xrRequestDisplayModeDXR resolved + succeeded");
 	}
 	LOGI(
 	    "fd counts (steady state) -> frame %d: app %d -> %d, service(pid %ld) "
 	    "%d -> %d",
 	    total, fds_early, fds_late, g.opt.service_pid, svc_early, svc_late);
 	check(fds_early == fds_late && svc_early == svc_late, "fd counts flat");
+	LOGI("v12: %llu outputs, %llu distinct woven origins, last serial %llu", (unsigned long long)g.v12.outputs,
+	     (unsigned long long)g.v12.distinct, (unsigned long long)g.v12.last_serial);
+	check(g.v12.outputs > 0 && g.v12.origin_bad == 0, "v12 woven origin == last bound origin, every output");
+	check(g.v12.outputs > 0 && g.v12.logical_bad == 0, "v12 logical origin + scale echoed verbatim");
+	check(g.v12.outputs > 0 && g.v12.serial_bad == 0, "v12 serial strictly increasing per output");
+	check(total < 8 || g.v12.distinct >= 2, "v12 woven origin followed the re-binds");
+	if (g.opt.test_display_mode) {
+		const std::vector<bool> want = g.opt.test_display_deferred ? std::vector<bool>{false, true, false}
+		                                                           : std::vector<bool>{false, true, false, true, false};
+		check(g.pfn_request_display_mode != nullptr && total > 55, "display-mode: xrRequestDisplayModeDXR resolved");
+		check(!g.dm_order_bad, "display-mode: each batch's events arrived before the next batch");
+		check(g.hw_events == want, g.opt.test_display_deferred
+		                               ? "display-mode: events 2D, 3D, 2D (deferred 2D applied at bring-up)"
+		                               : "display-mode: events 2D,3D,2D,3D,2D (no stale 2D, triple, no-op)");
+	}
 	LOGI("%s", pass ? "PASS" : "FAIL");
 	return pass ? 0 : 1;
 }

@@ -22,6 +22,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef XRT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
+
 /*!
  * Maximum number of images in a swapchain.
  */
@@ -42,14 +46,54 @@ struct comp_vk_native_swapchain
 	//! Vulkan bundle (borrowed from compositor).
 	struct vk_bundle *vk;
 
+	//! Owning compositor: told about the images before they are destroyed (#1782).
+	struct comp_vk_native_compositor *c;
+
+	/*!
+	 * #2095 / ADR-055: per image, the commit serial of the LAST in-process
+	 * weave whose GPU work reads it (0 = never read by a chained frame).
+	 * Written by the compositor at commit, read at wait_image/destroy — both
+	 * under the compositor's weave-sync lock, never bare. The commit thread
+	 * no longer waits for that GPU work, so this is what keeps the app from
+	 * re-acquiring an image the weave is still sampling: backpressure, only
+	 * when the app laps the compositor.
+	 */
+	uint64_t read_serial[MAX_SWAPCHAIN_IMAGES];
+
+	/*!
+	 * #2356: per image, the serial of the last commit-time window-space stamp
+	 * that reads it (0 = none) — the compositor's ws_stamp, separate from the
+	 * #2095 ring above. Same rule: written at commit and read at
+	 * wait_image/destroy, both under the compositor's ws_stamp lock.
+	 */
+	uint64_t stamp_serial[MAX_SWAPCHAIN_IMAGES];
+
 	//! VkImages.
 	VkImage images[MAX_SWAPCHAIN_IMAGES];
 
 	//! VkDeviceMemory for each image.
 	VkDeviceMemory memories[MAX_SWAPCHAIN_IMAGES];
 
-	//! VkImageViews for sampling.
+	//! VkImageViews for sampling in @ref raw_format — NON-decoding, the
+	//! UNORM sibling for an sRGB swapchain. Model A / the blit path.
 	VkImageView views[MAX_SWAPCHAIN_IMAGES];
+
+	/*!
+	 * VkImageViews in the format the APP ASKED FOR (#1589/#1610).
+	 *
+	 * The compose render pass composites in LINEAR light, so it wants the
+	 * GPU to decode an `_SRGB` source on sample — the opposite of what
+	 * @ref views does. For a non-sRGB swapchain these are the same format
+	 * and the two arrays are interchangeable; for an sRGB one this is the
+	 * only view that reads the app's bytes as what they are.
+	 *
+	 * Creatable in every case because #1559/#1572 already set
+	 * MUTABLE_FORMAT plus a two-entry format list on exactly the
+	 * swapchains that need it, so an sRGB view is legal even when the
+	 * IMAGE is the UNORM sibling (which it is whenever the true-format
+	 * feature is off).
+	 */
+	VkImageView true_views[MAX_SWAPCHAIN_IMAGES];
 
 	//! Number of images.
 	uint32_t image_count;
@@ -100,6 +144,72 @@ vk_swapchain_true_format_enabled(void)
 		}
 		cached = true;
 	}
+	return value;
+}
+
+/*!
+ * Kill switch for the compose path's sRGB read (#1935). Default ON: the
+ * renderer composes a truthful-sRGB swapchain by SAMPLING its UNORM view
+ * (sc->views[], legal because the image is MUTABLE_FORMAT with both siblings
+ * in its format list) in a draw straight into the atlas, so no per-frame
+ * vkCmdCopyImage and no scratch image exist. `DXR_VK_SRGB_MUTABLE_VIEW=0` (or,
+ * on Android where an app cannot set the runtime's env, the system property
+ * `debug.dxr.vk_srgb_mutable_view=0`) restores the #1559 scratch copy + blit
+ * for a one-binary A/B. The env, when set non-empty, wins over the property.
+ */
+bool
+comp_vk_native_srgb_mutable_view_enabled(void)
+{
+	static bool cached = false;
+	static bool value = true;
+	if (cached) {
+		return value;
+	}
+	const char *v = getenv("DXR_VK_SRGB_MUTABLE_VIEW");
+#ifdef XRT_OS_ANDROID
+	char sp[PROP_VALUE_MAX] = {0};
+	if ((v == NULL || v[0] == '\0') && __system_property_get("debug.dxr.vk_srgb_mutable_view", sp) > 0) {
+		v = sp;
+	}
+#endif
+	if (v != NULL && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+	                  (v[0] == 'o' && (v[1] == 'f' || v[1] == 'F')))) {
+		value = false;
+	}
+	cached = true;
+	U_LOG_W(
+	    "#1935: sRGB swapchain compose read %s (DXR_VK_SRGB_MUTABLE_VIEW / debug.dxr.vk_srgb_mutable_view=0 "
+	    "restores the scratch copy)",
+	    value ? "= sample the UNORM mutable-format view, no copy"
+	          : "= #1559 raw vkCmdCopyImage into a UNORM scratch, then blit");
+	return value;
+}
+
+bool
+comp_vk_native_zones_copy_to_draw_enabled(void)
+{
+	static bool cached = false;
+	static bool value = true;
+	if (cached) {
+		return value;
+	}
+	const char *v = getenv("DXR_VK_ZONES_COPY_TO_DRAW");
+#ifdef XRT_OS_ANDROID
+	char sp[PROP_VALUE_MAX] = {0};
+	if ((v == NULL || v[0] == '\0') && __system_property_get("debug.dxr.vk_zones_copy_to_draw", sp) > 0) {
+		v = sp;
+	}
+#endif
+	if (v != NULL && (v[0] == '0' || v[0] == 'n' || v[0] == 'N' || v[0] == 'f' || v[0] == 'F' ||
+	                  (v[0] == 'o' && (v[1] == 'f' || v[1] == 'F')))) {
+		value = false;
+	}
+	cached = true;
+	U_LOG_W(
+	    "zones/Local2D hand-offs %s (DXR_VK_ZONES_COPY_TO_DRAW / debug.dxr.vk_zones_copy_to_draw=0 restores "
+	    "the copies)",
+	    value ? "= draws (compose target -> atlas, weave target -> weave_scratch), no per-frame copy"
+	          : "= vkCmdCopyImage (compose target -> atlas, weave target -> weave_scratch)");
 	return value;
 }
 
@@ -178,17 +288,58 @@ vk_swapchain_wait_image(struct xrt_swapchain *xsc, int64_t timeout_ns, uint32_t 
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	(void)timeout_ns;
 
-	// The app owns these images; there is no runtime-side GPU work to wait on
-	// (the compositor reads them at layer_commit, after release). The state
-	// tracker enforces the FIFO acquire->wait->release order, so this only has
-	// to move the named image on and reject an index that is not acquired.
+	// The app owns these images. The state tracker enforces the FIFO
+	// acquire->wait->release order, so this only has to move the named image
+	// on and reject an index that is not acquired.
 	xrt_result_t xret = comp_swapchain_ring_wait(&sc->ring, index);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Wait on non-acquired swapchain image index %u (image_count=%u)", index, sc->image_count);
 		return xret;
 	}
 
+	// #2095 / ADR-055: on the host-wait path the compositor had finished
+	// reading this image before layer_commit returned, so there was nothing to
+	// wait. Under the GPU chain the weave that read it may still be in flight:
+	// wait the fence of the last commit that read THIS image (no-op when it
+	// has retired, which is the common case). Bounded; a timeout WARNs and
+	// lets the app proceed rather than wedging xrWaitSwapchainImage.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_wait_swapchain_read(sc->c, xsc, index);
+	}
+
 	return XRT_SUCCESS;
+}
+
+uint64_t
+comp_vk_native_swapchain_get_read_serial(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return index < sc->image_count ? sc->read_serial[index] : 0;
+}
+
+void
+comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index < sc->image_count && serial > sc->read_serial[index]) {
+		sc->read_serial[index] = serial;
+	}
+}
+
+uint64_t
+comp_vk_native_swapchain_get_stamp_serial(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	return index < sc->image_count ? sc->stamp_serial[index] : 0;
+}
+
+void
+comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index < sc->image_count && serial > sc->stamp_serial[index]) {
+		sc->stamp_serial[index] = serial;
+	}
 }
 
 static xrt_result_t
@@ -220,7 +371,24 @@ vk_swapchain_destroy(struct xrt_swapchain *xsc)
 	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
 	struct vk_bundle *vk = sc->vk;
 
+	// #2095 / ADR-055: a chained weave may still be sampling one of these
+	// images on the GPU (the commit thread no longer waits for it). Wait the
+	// last commit that read ANY of them before the VkImages go away.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_wait_swapchain_read(sc->c, xsc, UINT32_MAX);
+	}
+
+	// #1782: the compositor's HUD cache is keyed by VkImage, and the driver
+	// hands these handle values to the next images it creates.
+	if (sc->c != NULL) {
+		comp_vk_native_compositor_swapchain_images_destroyed(sc->c, sc->images, sc->image_count);
+	}
+
 	for (uint32_t i = 0; i < sc->image_count; i++) {
+		if (sc->true_views[i] != VK_NULL_HANDLE) {
+			vk->vkDestroyImageView(vk->device, sc->true_views[i], NULL);
+			sc->true_views[i] = VK_NULL_HANDLE;
+		}
 		if (sc->views[i] != VK_NULL_HANDLE) {
 			vk->vkDestroyImageView(vk->device, sc->views[i], NULL);
 		}
@@ -267,6 +435,7 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	}
 
 	sc->vk = vk;
+	sc->c = c;
 	sc->info = *info;
 	sc->image_count = image_count;
 	comp_swapchain_ring_init(&sc->ring, image_count);
@@ -296,10 +465,21 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 	 * MUTABLE_FORMAT + a format list carrying both siblings, and give every
 	 * runtime-internal reader the UNORM sibling instead:
 	 *   - sampling paths use sc->views[], created below in `raw_format`;
-	 *   - the one format-sensitive reader, the compose blit, goes through
-	 *     comp_vk_native_swapchain_stage_unorm_copy() — a raw vkCmdCopyImage
+	 *   - the one format-sensitive reader, the compose fast path, used to be
+	 *     a vkCmdBlitImage — and a blit reads in the IMAGE's format, there is
+	 *     no view to put in front of it. So #1559 staged a raw vkCmdCopyImage
 	 *     (size-compatible formats, no conversion anywhere) into an UNORM
-	 *     scratch, which is then the blit source;
+	 *     scratch every frame and blitted from that. On Adreno that copy
+	 *     turned out to be the frame (#1935: xrEndFrame 52-54 ms of a 53 ms
+	 *     frame on the NP02J tablet, the driver allocating + zeroing GPU
+	 *     memory inside it, cost scaling with the whole image). The fast
+	 *     path now DRAWS a truthful-sRGB swapchain into the atlas instead,
+	 *     sampling sc->views[] — the UNORM view of the same memory, which
+	 *     reads the stored bytes with no decode, i.e. exactly the bytes the
+	 *     copy produced, with no copy and no scratch. The copy + blit is kept
+	 *     only behind DXR_VK_SRGB_MUTABLE_VIEW=0
+	 *     (comp_vk_native_srgb_mutable_view_enabled) and as the fallback if
+	 *     the draw cannot be built;
 	 *   - zero-copy is disabled for these swapchains, so no DP is ever handed
 	 *     an sRGB VkImage (same shape as the #918 guard: a placement fact
 	 *     applied to u_tiling_can_zero_copy()'s RESULT, not a second gate).
@@ -504,6 +684,20 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 			U_LOG_W("Failed to create image view for swapchain %u: %d", i, res);
 		}
 
+		/*
+		 * The TRUE-format twin (#1589/#1610): the format the APP asked
+		 * for, so the compose render pass gets the GPU to decode an
+		 * `_SRGB` source to linear on sample. Identical to the view
+		 * above for every non-sRGB swapchain — created anyway so the
+		 * pass never has to ask which array to use.
+		 */
+		view_ci.format = vk_format;
+		res = vk->vkCreateImageView(vk->device, &view_ci, NULL, &sc->true_views[i]);
+		if (res != VK_SUCCESS) {
+			U_LOG_W("Failed to create true-format image view for swapchain %u: %d", i, res);
+			sc->true_views[i] = VK_NULL_HANDLE;
+		}
+
 		// Populate xrt_swapchain_vk.images[] so vk_enumerate_images can return them
 		sc->base.images[i] = sc->images[i];
 	}
@@ -526,13 +720,18 @@ comp_vk_native_swapchain_create(struct comp_vk_native_compositor *c,
 		if (!true_srgb_reported) {
 			true_srgb_reported = true;
 			U_LOG_W(
-			    "#1559: sRGB swapchain: truthful format, compose via UNORM scratch copy; "
-			    "zero-copy disabled (DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 restores the substitution)");
+			    "#1559: sRGB swapchain: truthful format, compose reads it as UNORM (%s); "
+			    "zero-copy disabled (DXR_VK_SWAPCHAIN_TRUE_FORMAT=0 restores the substitution)",
+			    comp_vk_native_srgb_mutable_view_enabled() ? "mutable-format view, #1935"
+			                                               : "scratch copy, DXR_VK_SRGB_MUTABLE_VIEW=0");
 		}
 	}
 
 	U_LOG_I("Created VK native swapchain: %ux%u, %u images, format %d",
 	        info->width, info->height, image_count, (int)vk_format);
+
+	// #886: one-shot runtime#2039 guard (log only) — see the callee.
+	comp_vk_native_compositor_note_app_swapchain(c, image_count);
 
 	return XRT_SUCCESS;
 }
@@ -545,6 +744,45 @@ comp_vk_native_swapchain_get_image_view(struct xrt_swapchain *xsc, uint32_t inde
 		return 0;
 	}
 	return (uint64_t)(uintptr_t)sc->views[index];
+}
+
+uint64_t
+comp_vk_native_swapchain_get_true_image_view(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	if (index >= sc->image_count) {
+		return 0;
+	}
+	// Fall back to the non-decoding view if the true-format one could not be
+	// created: passthrough is wrong for colour but is what the blit path has
+	// always done, which is a better failure than sampling nothing.
+	if (sc->true_views[index] == VK_NULL_HANDLE) {
+		return (uint64_t)(uintptr_t)sc->views[index];
+	}
+	return (uint64_t)(uintptr_t)sc->true_views[index];
+}
+
+bool
+comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_swapchain *sc = vk_sc(xsc);
+	// The format the APP REQUESTED, never the IMAGE's: the image is the
+	// UNORM sibling whenever the true-format feature is off, and
+	// `true_srgb` answers about the image, not about the app's intent.
+	const VkFormat f = xrt_format_to_vk(sc->info.format);
+	return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+int32_t
+comp_vk_native_swapchain_get_declared_format(struct xrt_swapchain *xsc)
+{
+	if (xsc == NULL) {
+		return (int32_t)VK_FORMAT_UNDEFINED;
+	}
+	return (int32_t)xrt_format_to_vk(vk_sc(xsc)->info.format);
 }
 
 uint64_t
@@ -596,6 +834,12 @@ comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc)
  * The vkDeviceWaitIdle that guarded the destroy could not help: nothing had
  * been submitted yet. A swapchain's extent is fixed for its lifetime, so the
  * full-size scratch is the only size it ever needs.
+ *
+ * One scratch per swapchain (not per image slot) is enough: its only reader is
+ * the compose blit recorded right after the copy in the SAME command buffer,
+ * and comp_vk_native_renderer_draw() waits that submit idle before returning.
+ * The weave reads the renderer's atlas, never this scratch, so no later
+ * commit's copy can overwrite it while anything still reads it (#1935).
  */
 static bool
 vk_swapchain_ensure_scratch(struct comp_vk_native_swapchain *sc)

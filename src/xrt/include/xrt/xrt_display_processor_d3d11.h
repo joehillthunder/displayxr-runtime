@@ -23,6 +23,7 @@
 #include "xrt/xrt_display_color.h"
 #include "xrt/xrt_display_zones.h"
 #include "xrt/xrt_display_scanout.h"
+#include "xrt/xrt_dp_lift.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -583,6 +584,293 @@ struct xrt_display_processor_d3d11
 	 */
 	bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
 	                               struct xrt_dp_background_preview *out_preview);
+
+	/*
+	 * ── 2D→3D conversion ("lift", ADR-042, XR_DXR_lift) ─────────────────────
+	 *
+	 * Five optional slots, appended together per ADR-020 and announced by ONE
+	 * define, XRT_DP_D3D11_HAS_LIFT. A plug-in with no conversion module leaves
+	 * all five NULL (or an older plug-in's struct_size stops short of them);
+	 * the runtime then reports XR_DXR_lift supportedModes = 0, state
+	 * UNAVAILABLE.
+	 *
+	 * THREADING. The runtime calls every lift slot from ONE thread — its lift
+	 * thread — on a display processor instance it created FOR lift, through
+	 * the plug-in's lift-only factory (xrt_plugin_iface::create_dp_d3d11_lift;
+	 * fallback: create_dp_d3d11 with a NULL window): a dedicated D3D11 device
+	 * on the service's adapter, @p d3d11_context its immediate context. That
+	 * instance is never asked to weave, so it must build no weaver and open no
+	 * tracker session. The context has ID3D11Multithread protection enabled,
+	 * so a module that flushes or signals it from its own worker is safe.
+	 *
+	 * SYNCHRONOUS. lift_convert / lift_convert_blob run one conversion and
+	 * return its output. Asynchrony, latest-wins dropping, timestamps and the
+	 * copy of the output into a runtime ring are RUNTIME code — the plug-in
+	 * never queues or timestamps.
+	 */
+
+	/*!
+	 * Report the module's capabilities and state (@ref xrt_dp_lift_caps). The
+	 * caller pre-sets struct_size; write only fields within it. Called at DP
+	 * creation and then ≤ 1 Hz while the state is not READY (to see
+	 * ACTIVATING → READY). Return false = no module (same as a NULL slot).
+	 */
+	bool (*lift_get_caps)(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out);
+
+	/*!
+	 * Create a conversion stream; return the plug-in's own id in @p out_id.
+	 * False = refused (mode unsupported, too many streams): the runtime fails
+	 * the app's stream.
+	 */
+	bool (*lift_stream_create)(struct xrt_display_processor_d3d11 *xdp,
+	                           const struct xrt_dp_lift_stream_info *info,
+	                           uint64_t *out_id);
+
+	//! Destroy stream @p id and every resource it returned.
+	void (*lift_stream_destroy)(struct xrt_display_processor_d3d11 *xdp, uint64_t id);
+
+	/*!
+	 * Convert one frame of stream @p id (texture modes: DEPTH, SBS, NVIEW).
+	 *
+	 * @param input_resource  ID3D11Resource* on the lift device, RGBA8, exactly
+	 *                        @p w x @p h. Valid for the duration of the call.
+	 * @param p               per-frame parameters (never NULL).
+	 * @param viewpoints_xyz  @p viewpoint_floats / 3 eye positions (metres) to
+	 *                        synthesize for, in the frame @p p->viewpoint_frame
+	 *                        names: relative to the lifted RECT's centre from a
+	 *                        runtime with XRT_DP_LIFT_HAS_VIEWPOINT_POLICY (the
+	 *                        viewpoint policy already applied, ADR-048), else
+	 *                        relative to the panel centre. The runtime ALWAYS
+	 *                        passes them when it has them: the app's explicit
+	 *                        viewpoints, else the panel DP's predicted tracked
+	 *                        eyes (the pair; a module spreads N views around
+	 *                        it). A plug-in must give these precedence over any
+	 *                        tracker of its own — the lift DP has no tracker
+	 *                        session. NULL / 0 only when no eyes are known yet.
+	 * @param out_resource    ID3D11Resource* the DP owns, valid until the NEXT
+	 *                        call on this stream (the runtime copies it out
+	 *                        before then). SBS = 2 views side by side; NVIEW =
+	 *                        view_count views side by side, view 0 leftmost;
+	 *                        DEPTH = one channel.
+	 * @param out_format      DXGI_FORMAT of @p out_resource.
+	 * @return false = no output this frame (the runtime keeps the previous one).
+	 */
+	bool (*lift_convert)(struct xrt_display_processor_d3d11 *xdp,
+	                     uint64_t id,
+	                     void *d3d11_context,
+	                     void *input_resource,
+	                     uint32_t w,
+	                     uint32_t h,
+	                     const struct xrt_dp_lift_params *p,
+	                     const float *viewpoints_xyz,
+	                     uint32_t viewpoint_floats,
+	                     void **out_resource,
+	                     uint32_t *out_w,
+	                     uint32_t *out_h,
+	                     uint32_t *out_format);
+
+	/*!
+	 * Convert one photo of a GAUSSIANS stream @p id into a splat blob.
+	 *
+	 * Same threading and input contract as @ref lift_convert. Returns the blob
+	 * as bytes the DP owns, valid until the NEXT call on this stream (the
+	 * runtime copies them), in @p out_format (XRT_DP_LIFT_BLOB_*). Expected to
+	 * take seconds; the runtime calls it off every latency-sensitive thread.
+	 */
+	bool (*lift_convert_blob)(struct xrt_display_processor_d3d11 *xdp,
+	                          uint64_t id,
+	                          void *d3d11_context,
+	                          void *input_resource,
+	                          uint32_t w,
+	                          uint32_t h,
+	                          const struct xrt_dp_lift_params *p,
+	                          uint32_t *out_format,
+	                          const void **out_bytes,
+	                          size_t *out_size);
+
+	/*!
+	 * Hand the DP this frame's window-sized 2D OVERLAY layer, to composite
+	 * OVER the woven 3D inside the weave of the very next @ref process_atlas
+	 * (ADR-027 Amendment — 2D under the lens).
+	 *
+	 * The layer is flat 2D content that sits in front of (or around) the
+	 * woven 3D: page text, labels, chrome. Composited after the weave as
+	 * plain pixels, every eye samples a different panel column of it through
+	 * the lens, so it aliases. A DP that owns the lens phase can filter it per
+	 * subpixel first; that is why this layer goes to the DP and not to a
+	 * runtime blit.
+	 *
+	 * Layer contract: target-sized (the same pixel space as process_atlas's
+	 * target), PREMULTIPLIED alpha, RGBA8 / BGRA8 UNORM, alpha = where 2D
+	 * covers the output. @p encoding declares its colour state; v1 producers
+	 * send @ref XRT_ATLAS_ENCODING_ENCODED only, and the DP composites in
+	 * that encoded space (premul "over" onto the encoded woven result, the
+	 * same arithmetic as the runtime's fallback blit).
+	 *
+	 * Stateless, per frame: the runtime calls this before EVERY process_atlas
+	 * on a path that has an overlay — with @p overlay_srv NULL when this frame
+	 * has none (including a missed keyed-mutex acquire). The SRV is on the
+	 * same device as process_atlas, valid until that process_atlas returns;
+	 * the DP must not use it after.
+	 *
+	 * @return true  = the DP will composite the layer in the next weave; the
+	 *                 runtime does nothing more with it.
+	 *         false = not composited (unsupported now — e.g. the vendor
+	 *                 runtime lacks the capability — or NULL passed); the
+	 *                 runtime falls back to compositing it post-weave itself.
+	 *
+	 * Optional — absent slot or NULL ⟹ runtime fallback blit (today's
+	 * behaviour). Appended per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param d3d11_context  D3D11 immediate context (ID3D11DeviceContext*).
+	 * @param overlay_srv    ID3D11ShaderResourceView* of the layer, or NULL.
+	 * @param width          Layer width in pixels.
+	 * @param height         Layer height in pixels.
+	 * @param encoding       Colour state of the layer (v1: ENCODED).
+	 * @param layer_unchanged The caller declared the layer's pixels identical to
+	 *                       the previous call's (XR_DXR_weave v14): a DP that
+	 *                       caches a lens prefilter of the layer may reuse it.
+	 *                       Advisory — false is always correct, only slower.
+	 */
+	bool (*set_overlay_2d)(struct xrt_display_processor_d3d11 *xdp,
+	                       void *d3d11_context,
+	                       void *overlay_srv,
+	                       uint32_t width,
+	                       uint32_t height,
+	                       enum xrt_atlas_encoding encoding,
+	                       bool layer_unchanged);
+
+	/*!
+	 * Lens-filter strength for the 2D over-layer of the NEXT @ref process_atlas
+	 * (XR_DXR_weave v15, ADR-027 Amendment). A DP that band-limits the layer
+	 * for its lens trades aliasing against softness; @p strength picks the
+	 * point: 0 = no lens filtering, 1 = the DP's full filter. NEGATIVE = the
+	 * DP's own default (a vendor-tuned value; the caller did not set one).
+	 *
+	 * Stateless, per frame: called right before @ref set_overlay_2d whenever an
+	 * overlay goes to the DP, so a DP that keeps the value sticky must take it
+	 * from here every frame. Separate from set_overlay_2d because that slot
+	 * shipped (v2.25.2) and its signature is frozen (ADR-020).
+	 *
+	 * Optional — absent slot or NULL ⟹ the DP's default is used. Appended per
+	 * ADR-020 (append-only within a major).
+	 *
+	 * @param xdp       Pointer to self.
+	 * @param strength  [0,1], or negative for the DP's default.
+	 */
+	void (*set_overlay_2d_filter_strength)(struct xrt_display_processor_d3d11 *xdp, float strength);
+
+	/*!
+	 * Multi-screen M6 (ADR-047 D2 on Windows, the D3D11 twin of
+	 * @ref xrt_display_processor_vk::set_present_origin): where the window's
+	 * client area sits on the DP's screen, so a WINDOWLESS DP (created
+	 * through `create_dp_d3d11_for_screen` with a NULL window) can phase its
+	 * interlace to the panel. Phase = this origin + the canvas offset handed
+	 * to @ref process_atlas, in that screen's device pixels relative to its
+	 * top-left; either may be negative for a window that starts off-screen.
+	 * The compositor calls it every frame it weaves (cheap; a drag moves it).
+	 *
+	 * A DP that has the real HWND derives its phase from the window itself
+	 * and may ignore this call.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * DP has no windowed-phase support and weaves display-scoped. Appended
+	 * after @ref set_overlay_2d_filter_strength per ADR-020 (append-only
+	 * within a major; no version bump — gated by @ref XRT_DP_HAS_SLOT).
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param panel_x  Window client-area left edge, screen-relative device px.
+	 * @param panel_y  Window client-area top edge, screen-relative device px.
+	 */
+	void (*set_present_origin)(struct xrt_display_processor_d3d11 *xdp, int32_t panel_x, int32_t panel_y);
+
+	/*!
+	 * The auxiliary DEPTH map of the conversion @ref lift_convert just
+	 * returned for stream @p id (ADR-048 Addendum A, XR_DXR_lift v3).
+	 *
+	 * Called by the runtime on its lift thread, immediately after a
+	 * successful lift_convert of an SBS / NVIEW stream that was created with
+	 * XRT_DP_LIFT_AUX_DEPTH in xrt_dp_lift_stream_info::aux_outputs — never
+	 * for any other stream, never before the stream's first conversion.
+	 * Same threading, device and context as lift_convert.
+	 *
+	 * The depth should come from the SAME inference that produced the views
+	 * (report it in xrt_dp_lift_depth::same_inference). @p out->resource is
+	 * DP-owned and must stay valid until the next lift_convert on @p id —
+	 * the runtime copies it into its own export texture before then, so a
+	 * module may keep one depth texture per stream and overwrite it.
+	 *
+	 * @p out arrives zeroed with struct_size pre-set (xrt_dp_lift_depth_init);
+	 * write only fields within it.
+	 *
+	 * Optional — an absent slot (older plug-in struct_size) or NULL ⟹ no
+	 * auxiliary depth (XrLiftDepthResultDXR::depthValid stays XR_FALSE).
+	 * Report the capability through xrt_dp_lift_caps::aux_outputs. Appended
+	 * after @ref set_present_origin per ADR-020 (append-only within a major,
+	 * no ABI bump), announced by XRT_DP_D3D11_HAS_LIFT_DEPTH.
+	 *
+	 * @param xdp            Pointer to self.
+	 * @param id             The plug-in's stream id (lift_stream_create).
+	 * @param d3d11_context  The lift device's immediate context.
+	 * @param[out] out       Depth map + metadata (struct_size pre-set).
+	 * @return false = no depth for this conversion.
+	 */
+	bool (*lift_get_depth)(struct xrt_display_processor_d3d11 *xdp,
+	                       uint64_t id,
+	                       void *d3d11_context,
+	                       struct xrt_dp_lift_depth *out);
+
+	/*!
+	 * Eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144).
+	 *
+	 * @p target_ns is when the pixels the caller is about to produce are
+	 * expected to be SEEN — a display time on the `os_monotonic_get_ns()`
+	 * clock: xrLocateViews passes the frame's displayTime, a compositor its
+	 * weave / scan-out instant, a status query "now". The DP predicts (or
+	 * samples) its tracker for THAT instant and fills @p out exactly as
+	 * @ref get_predicted_eye_positions does; `out->timestamp_ns` is the time
+	 * of the tracker sample the answer is based on — not the target — so the
+	 * caller can tell how far it was predicted.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime falls back to @ref get_predicted_eye_positions ("now + the
+	 * vendor's default horizon") and uses that answer UNCHANGED — today's
+	 * behaviour; implementing the slot opts in to display-time sampling.
+	 * Appended after
+	 * @ref lift_get_depth per ADR-020 (append-only within a major; no
+	 * version bump — gated by @ref XRT_DP_HAS_SLOT), announced by
+	 * XRT_DP_D3D11_HAS_EYE_POSITIONS_AT.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param      target_ns  Monotonic time the eyes are wanted for.
+	 * @param[out] out        Eye positions at @p target_ns.
+	 * @return true if @p out is valid.
+	 */
+	bool (*get_eye_positions_at)(struct xrt_display_processor_d3d11 *xdp,
+	                             int64_t target_ns,
+	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Will the DP weave an atlas in @p encoding if told so through
+	 * @ref set_atlas_encoding? Asked before the runtime sends any encoding
+	 * beyond the ENCODED/LINEAR pair that @ref get_color_capability
+	 * negotiates — today @ref XRT_ATLAS_ENCODING_PQ (HDR10 atlases, #2273).
+	 * A new capability value was deliberately NOT added for this: runtimes
+	 * compare that capability with `== XRT_DP_COLOR_EITHER`, so a DP
+	 * reporting an unknown value to an older runtime would lose its LINEAR
+	 * path.
+	 *
+	 * Optional — an absent slot (older plug-in `struct_size`) or NULL ⟹ only
+	 * ENCODED/LINEAR are ever sent, exactly as before. Appended after
+	 * @ref get_eye_positions_at per ADR-020, announced by
+	 * XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY.
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param encoding The encoding the runtime would send.
+	 * @return true if the DP weaves @p encoding correctly.
+	 */
+	bool (*accepts_atlas_encoding)(struct xrt_display_processor_d3d11 *xdp, enum xrt_atlas_encoding encoding);
 };
 
 
@@ -658,7 +946,36 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_predicted_sca
  */
 #define XRT_DP_D3D11_HAS_PREDICTED_SCANOUT 1
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_background_preview) == XRT_DP_D3D11_BASE_OFF + 24 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_get_caps)          == XRT_DP_D3D11_BASE_OFF + 25 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_create)     == XRT_DP_D3D11_BASE_OFF + 26 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_stream_destroy)    == XRT_DP_D3D11_BASE_OFF + 27 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert)           == XRT_DP_D3D11_BASE_OFF + 28 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_convert_blob)      == XRT_DP_D3D11_BASE_OFF + 29 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d)         == XRT_DP_D3D11_BASE_OFF + 30 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_overlay_2d_filter_strength) == XRT_DP_D3D11_BASE_OFF + 31 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, set_present_origin)     == XRT_DP_D3D11_BASE_OFF + 32 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, lift_get_depth)         == XRT_DP_D3D11_BASE_OFF + 33 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, get_eye_positions_at)   == XRT_DP_D3D11_BASE_OFF + 34 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_d3d11, accepts_atlas_encoding) == XRT_DP_D3D11_BASE_OFF + 35 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                                == XRT_DP_D3D11_BASE_OFF + 36 * sizeof(void *), XRT_DP_ABI_MSG);
+
+/*!
+ * Defined when this header carries the five lift slots (lift_get_caps,
+ * lift_stream_create, lift_stream_destroy, lift_convert, lift_convert_blob —
+ * ADR-042, XR_DXR_lift), so a plug-in built against an older runtime can
+ * #ifdef-guard its conversion module — the coupled-ABI-addition pattern used
+ * by every other appended slot. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_LIFT 1
+
+/*!
+ * Defined when this header carries the lift_get_depth slot (ADR-048
+ * Addendum A, XR_DXR_lift v3 auxiliary depth), so a plug-in built against an
+ * older runtime can #ifdef-guard it. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_LIFT_DEPTH 1
 
 /*!
  * Defined when this header carries the get_background_preview slot, so a
@@ -686,6 +1003,43 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_d3d11)                    
  * coupled-ABI-addition pattern (see XRT_DP_VK_HAS_PRESENT_ORIGIN).
  */
 #define XRT_DP_D3D11_HAS_BACKEND_STATE 1
+
+/*!
+ * Defined when this header carries the set_overlay_2d slot (ADR-027
+ * Amendment — 2D under the lens), so a plug-in built against an older runtime
+ * can #ifdef-guard its implementation. Purely additive: no
+ * XRT_PLUGIN_API_VERSION_CURRENT bump (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_OVERLAY_2D 1
+
+/*!
+ * Defined when this header carries the set_overlay_2d_filter_strength slot
+ * (XR_DXR_weave v15), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_OVERLAY_2D_FILTER_STRENGTH 1
+
+/*!
+ * Defined when this header carries the set_present_origin slot (multi-screen
+ * M6), so a plug-in built against an older runtime can #ifdef-guard its
+ * implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_PRESENT_ORIGIN 1
+
+/*!
+ * Defined when this header carries the get_eye_positions_at slot (ADR-054
+ * §4.1 / N6 Part 1, #2144 — the target-time eye query), so a plug-in built
+ * against an older runtime can #ifdef-guard its implementation. Purely
+ * additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the accepts_atlas_encoding slot and
+ * @ref XRT_ATLAS_ENCODING_PQ (#2273), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY 1
 
 // clang-format on
 
@@ -1158,6 +1512,231 @@ xrt_display_processor_d3d11_get_background_preview(struct xrt_display_processor_
 		return false;
 	}
 	return xdp->get_background_preview(xdp, out_preview);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::lift_get_caps
+ *
+ * Returns false when the slot is absent (older plug-in `struct_size`), NULL, or
+ * the DP has no module — every one of those reads as "no lift": modes 0,
+ * state UNAVAILABLE. @p out is initialised here either way.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
+{
+	xrt_dp_lift_caps_init(out);
+	if (!XRT_DP_HAS_SLOT(xdp, lift_get_caps) || xdp->lift_get_caps == NULL) {
+		return false;
+	}
+	if (!xdp->lift_get_caps(xdp, out)) {
+		xrt_dp_lift_caps_init(out);
+		return false;
+	}
+	out->backend[sizeof(out->backend) - 1] = '\0';
+	return true;
+}
+
+/*!
+ * True when @p xdp carries the whole texture-mode lift contract (caps + stream
+ * create/destroy + convert). A DP must provide all four or none.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_has_lift(struct xrt_display_processor_d3d11 *xdp)
+{
+	return XRT_DP_HAS_SLOT(xdp, lift_convert) && xdp->lift_get_caps != NULL && xdp->lift_stream_create != NULL &&
+	       xdp->lift_stream_destroy != NULL && xdp->lift_convert != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::lift_get_depth
+ *
+ * Helper: pre-sets @p out (xrt_dp_lift_depth_init) and returns false — no
+ * depth — when the slot is absent (older plug-in struct_size) or NULL, when
+ * the DP declines, or when it returned no resource.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
+                                           uint64_t id,
+                                           void *d3d11_context,
+                                           struct xrt_dp_lift_depth *out)
+{
+	xrt_dp_lift_depth_init(out);
+	if (!XRT_DP_HAS_SLOT(xdp, lift_get_depth) || xdp->lift_get_depth == NULL) {
+		return false;
+	}
+	if (!xdp->lift_get_depth(xdp, id, d3d11_context, out) || out->resource == NULL || out->width == 0 ||
+	    out->height == 0) {
+		xrt_dp_lift_depth_init(out);
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_overlay_2d
+ *
+ * Helper for calling through the function pointer: false (⟹ the caller
+ * blits the layer itself) when the slot is absent or NULL.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_set_overlay_2d(struct xrt_display_processor_d3d11 *xdp,
+                                           void *d3d11_context,
+                                           void *overlay_srv,
+                                           uint32_t width,
+                                           uint32_t height,
+                                           enum xrt_atlas_encoding encoding,
+                                           bool layer_unchanged)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_overlay_2d) || xdp->set_overlay_2d == NULL) {
+		return false;
+	}
+	return xdp->set_overlay_2d(xdp, d3d11_context, overlay_srv, width, height, encoding, layer_unchanged);
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_overlay_2d_filter_strength
+ *
+ * Helper for calling through the function pointer; a no-op (the DP's default
+ * applies) when the slot is absent or NULL.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_overlay_2d_filter_strength(struct xrt_display_processor_d3d11 *xdp, float strength)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_overlay_2d_filter_strength) || xdp->set_overlay_2d_filter_strength == NULL) {
+		return;
+	}
+	xdp->set_overlay_2d_filter_strength(xdp, strength);
+}
+
+//! True when @p xdp also carries lift_convert_blob (GAUSSIANS).
+static inline bool
+xrt_display_processor_d3d11_has_lift_blob(struct xrt_display_processor_d3d11 *xdp)
+{
+	return XRT_DP_HAS_SLOT(xdp, lift_convert_blob) && xdp->lift_convert_blob != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::set_present_origin
+ *
+ * Helper for calling through the function pointer; a no-op when the slot is
+ * absent (older plug-in `struct_size`) or NULL.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline void
+xrt_display_processor_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp,
+                                               int32_t panel_x,
+                                               int32_t panel_y)
+{
+	if (!XRT_DP_HAS_SLOT(xdp, set_present_origin) || xdp->set_present_origin == NULL) {
+		return;
+	}
+	xdp->set_present_origin(xdp, panel_x, panel_y);
+}
+
+/*!
+ * Does this DP answer a target-time eye query itself (the
+ * @ref xrt_display_processor_d3d11::get_eye_positions_at slot is present and
+ * non-NULL)? When not, the trunk uses the DP's
+ * get_predicted_eye_positions answer unchanged (no display-time sampling).
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_has_eye_positions_at(struct xrt_display_processor_d3d11 *xdp)
+{
+	return xdp != NULL && XRT_DP_HAS_SLOT(xdp, get_eye_positions_at) && xdp->get_eye_positions_at != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::get_eye_positions_at
+ *
+ * Falls back to @ref xrt_display_processor_d3d11_get_predicted_eye_positions
+ * when the slot is absent (older plug-in `struct_size`) or NULL — an older
+ * plug-in keeps working and its answer means "now + the vendor's default
+ * horizon". @ref xrt_display_processor_d3d11_has_eye_positions_at tells the
+ * two apart.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_get_eye_positions_at(struct xrt_display_processor_d3d11 *xdp,
+                                                 int64_t target_ns,
+                                                 struct xrt_eye_positions *out)
+{
+	if (!xrt_display_processor_d3d11_has_eye_positions_at(xdp)) {
+		return xrt_display_processor_d3d11_get_predicted_eye_positions(xdp, out);
+	}
+	return xdp->get_eye_positions_at(xdp, target_ns, out);
+}
+
+/*!
+ * Does the DP's output survive a display-server resample
+ * (@ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE)? Every "didn't answer" case —
+ * absent slot, NULL, false return — is false: the conservative reading, under
+ * which the runtime's 1:1 gates behave exactly as they did before the flag.
+ * The D3D11 twin of @ref xrt_display_processor_vk_tolerates_resample.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_tolerates_resample(struct xrt_display_processor_d3d11 *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_d3d11_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
+}
+
+/*!
+ * May this instance weave a window it does not hold
+ * (@ref XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN)? Every "didn't answer"
+ * case — NULL DP, absent slot, NULL, false return — is false, so a plug-in
+ * built before the bit keeps its window-bound path.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_phases_from_present_origin(struct xrt_display_processor_d3d11 *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_d3d11_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN) != 0;
+}
+
+/*!
+ * @copydoc xrt_display_processor_d3d11::accepts_atlas_encoding
+ *
+ * Every "didn't answer" case — NULL DP, absent slot, NULL — is false.
+ *
+ * @public @memberof xrt_display_processor_d3d11
+ */
+static inline bool
+xrt_display_processor_d3d11_accepts_atlas_encoding(struct xrt_display_processor_d3d11 *xdp,
+                                                   enum xrt_atlas_encoding encoding)
+{
+	if (xdp == NULL || !XRT_DP_HAS_SLOT(xdp, accepts_atlas_encoding) || xdp->accepts_atlas_encoding == NULL) {
+		return false;
+	}
+	return xdp->accepts_atlas_encoding(xdp, encoding);
 }
 
 #ifdef __cplusplus

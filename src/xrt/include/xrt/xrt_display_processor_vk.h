@@ -631,6 +631,213 @@ struct xrt_display_processor_vk
 	 *                opaque and the DP may idle its transparency work.
 	 */
 	void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool active);
+
+	/*!
+	 * The runtime's 2D over-layer for the NEXT @ref xrt_display_processor::process_atlas
+	 * (ADR-027 Amendment, "2D under the lens") — the Vulkan twin of
+	 * @ref xrt_display_processor_d3d11::set_overlay_2d.
+	 *
+	 * 2D composited as plain pixels AFTER the weave aliases per eye wherever the
+	 * lens is on; only the DP knows the per-subpixel lens phase needed to
+	 * band-limit it. Returning true says the DP composites @p overlay_view
+	 * (premultiplied "over", in encoded space, onto the encoded woven result)
+	 * inside that process_atlas, and the runtime then does NOT composite the
+	 * layer itself. Returning false (or an absent slot) keeps the runtime's
+	 * post-weave composite exactly as before, so a DP without the capability is
+	 * unchanged.
+	 *
+	 * ## Contract
+	 *
+	 * - **Stateless, per frame.** Called before every process_atlas that carries
+	 *   an overlay, with the layer for THAT call only; a process_atlas not
+	 *   preceded by a call has no layer. The DP consumes and clears it in
+	 *   process_atlas (also on an early return), so it can never leak into a
+	 *   later weave.
+	 * - **Layer:** a 2D image view of exactly the process_atlas TARGET size
+	 *   (@p width x @p height = target_width x target_height; texel (0,0) is
+	 *   the target's top-left), RGBA8 or BGRA8 (`_UNORM`, or the `_SRGB` view of
+	 *   one), premultiplied alpha, values encoded sRGB as they would be written
+	 *   to an 8-bit swapchain (@p encoding = XRT_ATLAS_ENCODING_ENCODED; a DP
+	 *   returns false for anything else), alpha = 2D coverage.
+	 * - **Synchronisation:** the image is in
+	 *   `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`, owned by the queue family of
+	 *   process_atlas' command buffer, with its writes made visible to
+	 *   fragment-shader reads, by the time that command buffer executes, and
+	 *   stays alive until it has completed. The DP reads it only; it never
+	 *   transitions or releases it.
+	 * - The process_atlas target-layout contract is unchanged (a
+	 *   command-recording DP still returns the target in PRESENT_SRC_KHR).
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ the
+	 * runtime composites the layer post-weave. Appended after
+	 * @ref set_transparency_active per ADR-020 (append-only within a major).
+	 *
+	 * @param xdp             Pointer to self.
+	 * @param overlay_view    VkImageView of the layer (never VK_NULL_HANDLE).
+	 * @param format          VkFormat of @p overlay_view.
+	 * @param width           Layer width in pixels.
+	 * @param height          Layer height in pixels.
+	 * @param encoding        Colour state of the layer (v1: ENCODED).
+	 * @param layer_unchanged The caller declared the layer's pixels identical to
+	 *                        the previous call's (XR_DXR_weave v14): a DP that
+	 *                        caches a lens prefilter of the layer may reuse it.
+	 *                        Advisory — false is always correct, only slower.
+	 * @return true when the DP composites the layer in the next process_atlas.
+	 */
+	bool (*set_overlay_2d)(struct xrt_display_processor_vk *xdp,
+	                       VkImageView overlay_view,
+	                       VkFormat_XDP format,
+	                       uint32_t width,
+	                       uint32_t height,
+	                       enum xrt_atlas_encoding encoding,
+	                       bool layer_unchanged);
+
+	/*!
+	 * Lens-filter strength for the 2D over-layer of the NEXT process_atlas
+	 * (XR_DXR_weave v15) — the Vulkan twin of
+	 * @ref xrt_display_processor_d3d11::set_overlay_2d_filter_strength.
+	 * 0 = no lens filtering, 1 = the DP's full filter, NEGATIVE = the DP's own
+	 * default. Called right before @ref set_overlay_2d whenever an overlay goes
+	 * to the DP, so a DP that keeps the value sticky must take it from here
+	 * every frame.
+	 *
+	 * Optional — absent slot or NULL ⟹ the DP's default is used. Appended per
+	 * ADR-020.
+	 *
+	 * @param xdp       Pointer to self.
+	 * @param strength  [0,1], or negative for the DP's default.
+	 */
+	void (*set_overlay_2d_filter_strength)(struct xrt_display_processor_vk *xdp, float strength);
+
+	/*!
+	 * GPU synchronisation for the NEXT @ref xrt_display_processor::process_atlas
+	 * only (XR_DXR_weave v20, Android sync_file weave) — how a SELF-SUBMITTING
+	 * DP (one whose process_atlas submits its own work to a queue instead of
+	 * recording into the given command buffer, e.g. the Leia CNSDK weaver) joins
+	 * the runtime's semaphore chain instead of forcing the runtime to wait for it
+	 * on the CPU.
+	 *
+	 * Without this slot the runtime cannot hand a self-submitting DP a wait or a
+	 * signal, so it has to (a) finish its own pre-weave GPU work before the DP's
+	 * first submit can be trusted to see it, and (b) `vkWaitForFences` the whole
+	 * frame before it can tell anyone the woven target is complete. Both turn a
+	 * pipelined GPU frame into a CPU-serialised one.
+	 *
+	 * ## Contract
+	 *
+	 * - **Per call.** Called before the process_atlas it applies to (only
+	 *   set_target_color_view may come between the two), and applies to THAT
+	 *   process_atlas only; a process_atlas not preceded by a call carries no
+	 *   semaphores. The DP consumes and clears the pair inside process_atlas.
+	 *   A runtime that armed the pair and then could not reach process_atlas
+	 *   clears it with a NULL/NULL call.
+	 * - **true** = the DP commits, for that process_atlas, to WAIT @p wait_sem
+	 *   before its first read of the atlas (or of any other runtime-provided
+	 *   image, e.g. the set_overlay_2d layer) and to SIGNAL @p signal_sem after
+	 *   its last write of the target, both on the GPU (in the vkQueueSubmit(s)
+	 *   it issues). Either handle may be VK_NULL_HANDLE, meaning "nothing to
+	 *   wait" / "nothing to signal". The wait's dstStageMask must cover the
+	 *   stage that first READS the atlas (fragment / compute shader, or
+	 *   transfer) — COLOR_ATTACHMENT_OUTPUT alone lets a sampling pass run
+	 *   ahead of the wait. Signal after all target writes are complete.
+	 * - **false** (or an absent slot / NULL pointer) = the DP does not take
+	 *   them; the runtime keeps its own CPU waits for that frame. A DP that
+	 *   records into the command buffer (sim_display) has no use for the slot.
+	 * - **Values.** @p wait_value / @p signal_value 0 = BINARY semaphores (the
+	 *   only form used today: each is waited / signalled exactly once per call).
+	 *   Non-zero is reserved for timeline semaphores; a DP that does not support
+	 *   timelines returns false for a non-zero value.
+	 * - **Drops.** A DP that returned true MUST wait @p wait_sem and signal
+	 *   @p signal_sem even when the frame is dropped (an early return, a failed
+	 *   vendor submit — LeiaInc/CNSDK#734: a failed vkQueueSubmit never
+	 *   signals), e.g. with an empty submit that only waits + signals. The runtime
+	 *   nevertheless treats @ref get_last_frame_dropped == true as "signal not
+	 *   guaranteed": for that frame it does not wait @p signal_sem on the GPU,
+	 *   falls back to a CPU wait, drains the queue, DESTROYS and RECREATES both
+	 *   semaphores before any later process_atlas (so a DP that cannot tell
+	 *   whether its vendor weaver consumed @p wait_sem must NOT wait it again),
+	 *   and reports no release fence to its caller.
+	 * - Queue: the runtime hands the DP factory the bundle whose main_queue is
+	 *   the queue it weaves on; a DP that captures `vk->main_queue` at creation
+	 *   submits where the runtime drains.
+	 * - Queue: the DP may signal on any queue of the runtime's VkDevice; the
+	 *   runtime only waits the semaphore, it assumes nothing about the queue.
+	 *
+	 * Optional — absent slot (older plug-in `struct_size`) or NULL ⟹ false.
+	 * Appended after @ref set_overlay_2d_filter_strength per ADR-020
+	 * (append-only within a major; no version bump).
+	 *
+	 * @param xdp           Pointer to self.
+	 * @param wait_sem      Semaphore to wait before the first atlas read, or VK_NULL_HANDLE.
+	 * @param wait_value    0 = binary; non-zero reserved (timeline).
+	 * @param signal_sem    Semaphore to signal after the final target write, or VK_NULL_HANDLE.
+	 * @param signal_value  0 = binary; non-zero reserved (timeline).
+	 * @return true when the DP takes both semaphores for the next process_atlas.
+	 */
+	bool (*set_weave_sync)(struct xrt_display_processor_vk *xdp,
+	                       VkSemaphore_XDP wait_sem,
+	                       uint64_t wait_value,
+	                       VkSemaphore_XDP signal_sem,
+	                       uint64_t signal_value);
+
+	/*!
+	 * Eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144).
+	 *
+	 * @p target_ns is when the pixels the caller is about to produce are
+	 * expected to be SEEN — a display time on the `os_monotonic_get_ns()`
+	 * clock: xrLocateViews passes the frame's displayTime, a compositor its
+	 * weave / scan-out instant, a status query "now". The DP predicts (or
+	 * samples) its tracker for THAT instant and fills @p out exactly as
+	 * @ref xrt_display_processor::get_predicted_eye_positions does;
+	 * `out->timestamp_ns` is the time of the tracker sample the answer is
+	 * based on — not the target — so the caller can tell how far it was
+	 * predicted.
+	 *
+	 * Lives on the VK variant, not the base: the variant embeds the base by
+	 * value, so growing the base would move every variant slot (see the note
+	 * above @ref set_window_screen_rect). The base IS the Vulkan interface,
+	 * so this costs no reach.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
+	 * the runtime falls back to the base's get_predicted_eye_positions ("now
+	 * + the vendor\'s default horizon") and uses that answer UNCHANGED —
+	 * today\'s behaviour; implementing the slot opts in. Appended after
+	 * @ref set_weave_sync per ADR-020 (append-only within a major; no
+	 * version bump), announced by XRT_DP_VK_HAS_EYE_POSITIONS_AT.
+	 *
+	 * @param      xdp        Pointer to self.
+	 * @param      target_ns  Monotonic time the eyes are wanted for.
+	 * @param[out] out        Eye positions at @p target_ns.
+	 * @return true if @p out is valid.
+	 */
+	bool (*get_eye_positions_at)(struct xrt_display_processor_vk *xdp,
+	                             int64_t target_ns,
+	                             struct xrt_eye_positions *out);
+
+	/*!
+	 * Will the DP weave an atlas in @p encoding if told so through the base's
+	 * @ref xrt_display_processor::set_atlas_encoding? Asked before the
+	 * runtime sends any encoding beyond the ENCODED/LINEAR pair that
+	 * @ref xrt_display_processor::get_handoff_color_capability negotiates —
+	 * today @ref XRT_ATLAS_ENCODING_PQ (HDR10 atlases, #2340). The Vulkan
+	 * twin of the D3D11 slot of the same name (#2294), and a query rather
+	 * than a new capability value for the same reason: runtimes compare
+	 * that capability with `== XRT_DP_COLOR_EITHER`.
+	 *
+	 * Lives on the VK variant, not the base, for the reason
+	 * @ref get_eye_positions_at does: growing the embedded base would move
+	 * every variant slot.
+	 *
+	 * Optional — an absent slot (older plug-in `base.struct_size`) or NULL ⟹
+	 * only ENCODED/LINEAR are ever sent, exactly as before. Appended after
+	 * @ref get_eye_positions_at per ADR-020 (append-only within a major; no
+	 * version bump), announced by XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY.
+	 *
+	 * @param xdp      Pointer to self.
+	 * @param encoding The encoding the runtime would send.
+	 * @return true if the DP weaves @p encoding correctly.
+	 */
+	bool (*accepts_atlas_encoding)(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding);
 };
 
 /*!
@@ -741,7 +948,12 @@ XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_background_previ
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_last_frame_dropped) == sizeof(struct xrt_display_processor) + 12 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, snap_window_rect)          == sizeof(struct xrt_display_processor) + 13 * sizeof(void *), XRT_DP_ABI_MSG);
 XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_transparency_active)   == sizeof(struct xrt_display_processor) + 14 * sizeof(void *), XRT_DP_ABI_MSG);
-XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d)            == sizeof(struct xrt_display_processor) + 15 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_overlay_2d_filter_strength) == sizeof(struct xrt_display_processor) + 16 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, set_weave_sync)            == sizeof(struct xrt_display_processor) + 17 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, get_eye_positions_at)     == sizeof(struct xrt_display_processor) + 18 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(offsetof(struct xrt_display_processor_vk, accepts_atlas_encoding)   == sizeof(struct xrt_display_processor) + 19 * sizeof(void *), XRT_DP_ABI_MSG);
+XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_display_processor) + 20 * sizeof(void *), XRT_DP_ABI_MSG);
 
 /*!
  * Defined when this header carries the @ref
@@ -768,6 +980,46 @@ XRT_DP_ABI_ASSERT(sizeof(struct xrt_display_processor_vk) == sizeof(struct xrt_d
  * appended slot.
  */
 #define XRT_DP_VK_HAS_TRANSPARENCY_ACTIVE 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_overlay_2d slot (ADR-027 Amendment, "2D under
+ * the lens" on Vulkan), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_OVERLAY_2D 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_overlay_2d_filter_strength slot
+ * (XR_DXR_weave v15). Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_OVERLAY_2D_FILTER_STRENGTH 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::set_weave_sync slot (XR_DXR_weave v20, the Android
+ * sync_file weave), so a plug-in built against an older runtime can
+ * #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_WEAVE_SYNC 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::get_eye_positions_at slot (ADR-054 §4.1 / N6
+ * Part 1, #2144 — the target-time eye query), so a plug-in built against an
+ * older runtime can #ifdef-guard its implementation. Purely additive
+ * (ADR-020).
+ */
+#define XRT_DP_VK_HAS_EYE_POSITIONS_AT 1
+
+/*!
+ * Defined when this header carries the @ref
+ * xrt_display_processor_vk::accepts_atlas_encoding slot and
+ * @ref XRT_ATLAS_ENCODING_PQ (#2340), so a plug-in built against an older
+ * runtime can #ifdef-guard its implementation. Purely additive (ADR-020).
+ */
+#define XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY 1
 // clang-format on
 
 /*!
@@ -1064,6 +1316,25 @@ xrt_display_processor_vk_get_weave_scope(struct xrt_display_processor_vk *xdp)
 }
 
 /*!
+ * Does the DP's output survive a display-server resample
+ * (@ref XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE)? Every "didn't answer" case —
+ * absent slot, NULL, false return — is false: the conservative reading, under
+ * which the runtime's 1:1 gates behave exactly as they did before the flag.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_tolerates_resample(struct xrt_display_processor_vk *xdp)
+{
+	struct xrt_dp_scanout_caps caps;
+	xrt_dp_scanout_caps_init(&caps);
+	if (!xrt_display_processor_vk_get_scanout_caps(xdp, &caps)) {
+		return false;
+	}
+	return (caps.flags & XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) != 0;
+}
+
+/*!
  * @copydoc xrt_display_processor_vk::get_background_preview
  *
  * Returns false when the slot is absent (older plug-in `struct_size`), NULL,
@@ -1199,6 +1470,163 @@ xrt_display_processor_vk_set_transparency_active(struct xrt_display_processor_vk
 	}
 	xdp->set_transparency_active(xdp, active);
 	return true;
+}
+
+/*!
+ * Does this DP carry @ref xrt_display_processor_vk::set_overlay_2d (its
+ * `base.struct_size` covers the slot and the pointer is set)? Lets a caller
+ * skip preparing the layer for a DP that could never take it.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_supports_overlay_2d(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_overlay_2d + sizeof(xdp->set_overlay_2d);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->set_overlay_2d != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_overlay_2d
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the caller then composites the layer
+ * post-weave itself, as before.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_overlay_2d(struct xrt_display_processor_vk *xdp,
+                                        VkImageView overlay_view,
+                                        VkFormat_XDP format,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        enum xrt_atlas_encoding encoding,
+                                        bool layer_unchanged)
+{
+	if (!xrt_display_processor_vk_supports_overlay_2d(xdp)) {
+		return false;
+	}
+	return xdp->set_overlay_2d(xdp, overlay_view, format, width, height, encoding, layer_unchanged);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_overlay_2d_filter_strength
+ *
+ * No-op if not supported (the DP's default strength applies).
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline void
+xrt_display_processor_vk_set_overlay_2d_filter_strength(struct xrt_display_processor_vk *xdp, float strength)
+{
+	if (xdp == NULL) {
+		return;
+	}
+	const char *slot_end =
+	    (const char *)&xdp->set_overlay_2d_filter_strength + sizeof(xdp->set_overlay_2d_filter_strength);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_overlay_2d_filter_strength == NULL) {
+		return;
+	}
+	xdp->set_overlay_2d_filter_strength(xdp, strength);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::set_weave_sync
+ *
+ * Returns false if not supported (the plug-in's `base.struct_size` doesn't cover
+ * the slot, or the pointer is NULL) — the runtime then keeps its CPU waits for
+ * that frame. Like the wrappers above, the presence check reads
+ * `xdp->base.struct_size` because the variant embeds the base — see ADR-020.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_set_weave_sync(struct xrt_display_processor_vk *xdp,
+                                        VkSemaphore_XDP wait_sem,
+                                        uint64_t wait_value,
+                                        VkSemaphore_XDP signal_sem,
+                                        uint64_t signal_value)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->set_weave_sync + sizeof(xdp->set_weave_sync);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->set_weave_sync == NULL) {
+		return false;
+	}
+	return xdp->set_weave_sync(xdp, wait_sem, wait_value, signal_sem, signal_value);
+}
+
+/*!
+ * Does this DP answer a target-time eye query itself (the
+ * @ref xrt_display_processor_vk::get_eye_positions_at slot is covered by the
+ * plug-in's `base.struct_size` and non-NULL)? When not, the trunk uses the
+ * DP's get_predicted_eye_positions answer unchanged (no display-time sampling).
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_has_eye_positions_at(struct xrt_display_processor_vk *xdp)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->get_eye_positions_at + sizeof(xdp->get_eye_positions_at);
+	return slot_end <= (const char *)xdp + xdp->base.struct_size && xdp->get_eye_positions_at != NULL;
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::get_eye_positions_at
+ *
+ * Falls back to the base's @ref xrt_display_processor_get_predicted_eye_positions
+ * when the slot is absent (older plug-in `base.struct_size`) or NULL — an
+ * older plug-in keeps working and its answer means "now + the vendor's
+ * default horizon". @ref xrt_display_processor_vk_has_eye_positions_at tells
+ * the two apart. Takes the VARIANT pointer; a base `xrt_display_processor *`
+ * from a Vulkan factory is the same object (the variant embeds the base at
+ * offset 0), so callers cast as the other vk wrappers' callers do.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_get_eye_positions_at(struct xrt_display_processor_vk *xdp,
+                                              int64_t target_ns,
+                                              struct xrt_eye_positions *out)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	if (!xrt_display_processor_vk_has_eye_positions_at(xdp)) {
+		return xrt_display_processor_get_predicted_eye_positions(&xdp->base, out);
+	}
+	return xdp->get_eye_positions_at(xdp, target_ns, out);
+}
+
+/*!
+ * @copydoc xrt_display_processor_vk::accepts_atlas_encoding
+ *
+ * Every "didn't answer" case — NULL DP, absent slot (older plug-in
+ * `base.struct_size`), NULL — is false. Takes the VARIANT pointer; cast a base
+ * `xrt_display_processor *` from a Vulkan factory as the other vk wrappers'
+ * callers do.
+ *
+ * @public @memberof xrt_display_processor_vk
+ */
+static inline bool
+xrt_display_processor_vk_accepts_atlas_encoding(struct xrt_display_processor_vk *xdp, enum xrt_atlas_encoding encoding)
+{
+	if (xdp == NULL) {
+		return false;
+	}
+	const char *slot_end = (const char *)&xdp->accepts_atlas_encoding + sizeof(xdp->accepts_atlas_encoding);
+	if (slot_end > (const char *)xdp + xdp->base.struct_size || xdp->accepts_atlas_encoding == NULL) {
+		return false;
+	}
+	return xdp->accepts_atlas_encoding(xdp, encoding);
 }
 
 #ifdef __cplusplus

@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -27,12 +29,19 @@ struct ipc_server;
  * Lazily bootstraps NSApplication on first call. Safe to call every poll
  * iteration; cheap when idle. Must be called from the main thread.
  *
- * @p s is the IPC server (for the workspace lifecycle hotkeys, #61): Ctrl+Space
+ * @p s is the IPC server (for the workspace lifecycle hotkeys, #61): Control+Shift+Space
  * toggles the workspace controller (spawn when absent / SIGTERM when present),
  * read from `s->workspace_controller_pid`. May be NULL (hotkeys become no-ops).
  */
 void
 ipc_server_macos_pump_main_thread(struct ipc_server *s);
+
+/*!
+ * XR_DXR_stereo_camera R3 foreground rule: does @p pid belong to a running
+ * application that is not hidden (NSRunningApplication)? Any thread.
+ */
+bool
+ipc_server_macos_pid_app_visible(long pid);
 
 #ifdef __cplusplus
 }

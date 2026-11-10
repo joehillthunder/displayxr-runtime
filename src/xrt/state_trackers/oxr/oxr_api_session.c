@@ -21,6 +21,7 @@
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 
+#include "oxr_segment_views.h"
 #include "oxr_frame_sync.h"
 #include "oxr_objects.h"
 #include "oxr_logger.h"
@@ -270,7 +271,17 @@ oxr_xrRequestExitSession(XrSession session)
 	OXR_VERIFY_SESSION_NOT_LOST(&log, sess);
 	OXR_VERIFY_SESSION_RUNNING(&log, sess);
 
-	return oxr_session_request_exit(&log, sess);
+	/* #2467: an app may call this on one thread while it polls events on
+	 * another (`session` is not externsync here). xrPollEvent makes its state
+	 * changes (VISIBLE -> FOCUSED) under sessions_mutex; without the same lock
+	 * a promotion could land between this walk's VISIBLE and STOPPING and leave
+	 * the session FOCUSED, so the app's xrEndSession fails NOT_STOPPING. */
+	struct oxr_instance *inst = sess->sys->inst;
+	os_mutex_lock(&inst->sessions_mutex);
+	XrResult ret = oxr_session_request_exit(&log, sess);
+	os_mutex_unlock(&inst->sessions_mutex);
+
+	return ret;
 }
 
 XRAPI_ATTR XrResult XRAPI_CALL
@@ -320,6 +331,11 @@ oxr_xrLocateViews(XrSession session,
 		                 viewLocateInfo->viewConfigurationType);
 	}
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	// v9 (ADR-060): a texture target chained on the locate frames THESE views
+	// only (the window metrics read during it); xrEndFrame's value is untouched.
+	oxr_texture_target_locate(&log, sess, viewLocateInfo);
+#endif
 	XrResult res = oxr_session_locate_views( //
 	    &log,                                //
 	    sess,                                //
@@ -328,6 +344,9 @@ oxr_xrLocateViews(XrSession session,
 	    viewCapacityInput,                   //
 	    viewCountOutput,                     //
 	    views);                              //
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	oxr_texture_target_locate_end(sess);
+#endif
 
 	// Cache recommended-view signal for MCP introspection.
 	if (res == XR_SUCCESS && viewCapacityInput > 0 && views != NULL) {
@@ -1401,12 +1420,21 @@ oxr_xrRequestDisplayModeDXR(XrSession session, XrDisplayModeDXR displayMode)
 	// woven atlas flat (blurry), and an app fading its parallax to zero
 	// converges back to a sharp image — the MANUAL tracking-loss transition.
 	bool want_3d = (displayMode == XR_DISPLAY_MODE_3D_DXR);
-	bool changed = (sess->hardware_display_3d != want_3d);
+	// Auto-2D (util/u_mono_auto_2d.h) may be holding the panel 2D over the
+	// session's recorded 3D: compare against what the panel really shows.
+	const bool auto_2d_engaged = sess->mono_auto_2d.active;
+	bool changed = ((auto_2d_engaged ? false : sess->hardware_display_3d) != want_3d);
 
 	XrResult res = oxr_session_request_display_mode(&log, sess, want_3d);
 	if (res != XR_SUCCESS) {
 		return res;
 	}
+
+	// An explicit choice wins over auto-2D for the rest of the session. The
+	// request above is recorded under the compositor's hold, so releasing the
+	// hold after it applies the app's choice in one step (no 3D blip on the
+	// way to an explicit 2D). This entry point sends its own event below.
+	(void)oxr_session_mono_auto_2d_explicit(&log, sess, /*push_event=*/false);
 
 	// oxr_session_request_display_mode records the new state on success;
 	// surface the flip to the app the same way a mode-driven change does.
@@ -1465,6 +1493,12 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 	struct oxr_session *sess;
 	struct oxr_logger log;
 	OXR_VERIFY_SESSION_AND_INIT_LOG(&log, session, sess, "xrRequestDisplayRenderingModeDXR");
+
+	// An explicit mode choice: auto-2D (util/u_mono_auto_2d.h) stays out of
+	// this session's way from here on, whatever the outcome below. An engaged
+	// hold is released after the request is applied (end of this function);
+	// on the early-return paths the next xrEndFrame releases it.
+	sess->display_mode_explicit = true;
 
 	// Workspace/IPC mode: the workspace controller drives rendering mode changes, not the app.
 	// The app receives mode changes via XrEventDataRenderingModeChanged events
@@ -1577,7 +1611,11 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		// Same fallback as the floor: a session that somehow has no view
 		// count yet is a 2-view session, NOT a session that can fill nothing
 		// (passing 0 to oxr_mode_fillable_by would deny every mode).
-		const uint32_t max_submit = sess->view_config_view_count != 0 ? sess->view_config_view_count : 2;
+		// Multi-screen M3: a multiview session reports one view set per
+		// window segment; what fills a mode is ONE segment's share.
+		const uint32_t max_submit = oxr_segment_views_per_segment_capacity(
+		    sess->view_config_view_count != 0 ? sess->view_config_view_count : 2,
+		    sess->view_config_type == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, head->hmd->view_count);
 
 		if (!oxr_mode_fillable_by(&head->rendering_modes[modeIndex], max_submit)) {
 			U_LOG_W(
@@ -1657,6 +1695,11 @@ oxr_xrRequestDisplayRenderingModeDXR(XrSession session, uint32_t modeIndex)
 		oxr_event_push_XrEventDataHardwareDisplayStateChanged(
 			&log, sess, mode->hardware_display_3d ? XR_TRUE : XR_FALSE);
 	}
+
+	// 7. Release an engaged auto-2D hold now that the mode's own hardware
+	//    state is recorded under it: the panel goes straight to that state.
+	//    Sends the 3D event when the release turns the panel back to 3D.
+	(void)oxr_session_mono_auto_2d_explicit(&log, sess, /*push_event=*/true);
 
 	return XR_SUCCESS;
 }

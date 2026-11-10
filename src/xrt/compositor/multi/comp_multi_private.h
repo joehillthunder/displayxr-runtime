@@ -25,11 +25,13 @@
 
 #include "os/os_time.h"
 #include "os/os_threading.h"
+#include "util/u_time.h"
 
 #include "util/u_hud.h"
 #include "util/u_pacing.h"
 #include "util/comp_bg2d.h"
 #include "util/comp_target_service.h"
+#include "util/u_weave_present_origin.h"
 #include "multi/comp_multi_interface.h"
 
 // Vulkan types needed for Y-flip SBS image and display processor support
@@ -38,6 +40,12 @@
 #include "vk/vk_hud_blend.h"
 #include "vk/vk_local2d_composite.h"
 #include "multi/comp_multi_content_blend.h"
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP)
+#include "multi/comp_multi_weave_lift.h"
+#include "multi/comp_multi_weave_capture.h"
+#elif defined(XRT_OS_ANDROID)
+#include "multi/comp_multi_weave_capture.h"
+#endif
 
 #include "render/render_interface.h"
 
@@ -45,9 +53,13 @@
 struct comp_target;
 struct xrt_eye_positions;
 struct xrt_weave_atlas_layout;
+struct xrt_display_processor_metal;
+struct comp_multi_weave_macos_backend;
 struct android_custom_surface;
 struct xrt_window_metrics;
 struct xrt_system_devices;
+struct xrt_screen_list;
+struct comp_vk_native_segments;
 
 #ifdef XRT_OS_WINDOWS
 struct comp_d3d11_window;
@@ -188,6 +200,33 @@ struct comp_multi_weave_linux_slot
 };
 #endif
 
+/*!
+ * Rect slots of the per-eye un-squeeze staging in the Vulkan weave engines'
+ * batch path (Android / desktop Linux / macOS): one per submitted rect, so it
+ * equals IPC_WEAVE_SUBMIT_RECTS_MAX (the IPC server rejects more).
+ */
+#define COMP_MULTI_WEAVE_EYE_STAGE_SLOTS 32
+
+/*!
+ * One eye's staging image for the batch weave's 2x horizontal un-squeeze.
+ *
+ * vkCmdBlitImage with VK_FILTER_LINEAR clamps at the edge of the WHOLE source
+ * image, not at srcOffsets, so stretching a half-rect straight out of the
+ * window-sized input reads 25 % of the texel just outside it: the caller's
+ * never-cleared ring on the outer edge, the other eye at the midline. The half-
+ * rect is instead copied 1:1 into an image of EXACTLY its size and that whole
+ * image is blitted, so the edge clamp is the rect's own outermost texel centres
+ * (the Vulkan twin of the D3D11 blit shader's clamp). Cached per rect slot and
+ * eye; reallocated only when that slot's size or format changes.
+ */
+struct comp_multi_weave_eye_stage
+{
+	VkImage image; //!< TRANSFER_DST (1:1 copy in) + TRANSFER_SRC (stretch out); no view.
+	VkDeviceMemory memory;
+	uint32_t w, h;
+	VkFormat format; //!< The input's format, so the copy is a same-format box copy.
+};
+
 struct multi_compositor
 {
 	struct xrt_compositor_native base;
@@ -294,6 +333,13 @@ struct multi_compositor
 	 */
 	struct multi_layer_slot delivered;
 
+	/*!
+	 * When the shared surface first had content from this client while a
+	 * workspace controller was active but had not placed it yet (0 = not yet).
+	 * Render-loop only. Bounds how long an unplaced client is held back.
+	 */
+	int64_t ws_unplaced_since_ns;
+
 	struct u_pacing_app *upa;
 
 	float current_refresh_rate_hz;
@@ -368,6 +414,23 @@ struct multi_compositor
 
 		//! Index of buffer with pending fence (-1 = none)
 		int32_t fenced_buffer;
+
+		//! #1007 per-client stall deadline: set when this client's GPU work
+		//! did not land within @ref MULTI_FENCE_DEADLINE_NS. While set, the
+		//! main loop only POLLS the pending fence (zero timeout) and skips
+		//! this client's frame (stale-frame reuse, #922), so a hung device or
+		//! DP never blocks the other clients. Cleared when the fence lands.
+		bool gpu_stalled;
+
+		//! #1007: when @ref gpu_stalled was set (monotonic ns), for the log.
+		int64_t gpu_stalled_since_ns;
+
+		//! #1006: earliest time the lazy per-session init may be retried
+		//! after a failure (monotonic ns, 0 = now).
+		int64_t init_retry_after_ns;
+
+		//! #1006: consecutive lazy-init failures (drives the 1-2-4-8 s back-off).
+		uint32_t init_fail_count;
 
 		//! True if swapchain needs recreation (set on VK_SUBOPTIMAL_KHR)
 		bool swapchain_needs_recreate;
@@ -543,7 +606,9 @@ struct multi_compositor
 	 * into a window-sized 2x1 SBS scratch atlas, run ONE DP process_atlas
 	 * into an IOSurface-backed output, and wait completion before the IPC
 	 * reply (synchronous contract — no cross-process fence on macOS).
-	 * Implemented in comp_multi_weave_macos.c.
+	 * Implemented in comp_multi_weave_macos.c (front end) over one of two
+	 * backends — comp_multi_weave_macos_vk.c (MoltenVK, the fields below) or
+	 * comp_multi_weave_macos_metal.m (native Metal, opaque `metal` state).
 	 */
 	struct
 	{
@@ -563,23 +628,56 @@ struct multi_compositor
 		 */
 		bool fence_pending;
 		VkRenderPass render_pass; //!< Output fb's pass (DP-compatible, BGRA8).
-		struct xrt_display_processor *dp;
+		struct xrt_display_processor *dp; //!< vk backend's DP (Vulkan vtable only).
+
+		//! @name Backend seam (comp_multi_weave_macos_backend.h)
+		//! @{
+		//! The backend owning the GPU objects, picked once at the first submit
+		//! (DXR_WEAVE_MAC_BACKEND=auto|metal|vk). NULL until then.
+		const struct comp_multi_weave_macos_backend *backend;
+		bool backend_ready;  //!< ensure_engine succeeded at least once.
+		//! Metal backend state (opaque; comp_multi_weave_macos_metal.m).
+		void *metal;
+		//! The Metal backend's DP. NEVER stored in `dp`: comp_multi_compositor.c
+		//! calls the Vulkan vtable on `dp`.
+		struct xrt_display_processor_metal *dp_metal;
+		//! @}
+
+		//! Hardware 2D as last confirmed by the backend's DP
+		//! (comp_multi_weave_macos_request_display_mode).
+		bool hw_2d_confirmed;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (future phase use).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous on macOS.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
-		//! Recorded here purely as the placement authority's report (ADR-033):
-		//! macOS derives its weave geometry from the input IOSurface, so nothing
-		//! feeds a DP phase slot — but a weave-only session has no
-		//! `session_render`, so this is the ONLY window rect
-		//! multi_compositor_get_window_metrics() can report (#1116).
+		//! The placement authority's report (ADR-033). On macOS the origin is
+		//! global CoreGraphics space in BACKING pixels (y down). The Metal
+		//! backend feeds the DP its panel-relative present origin from it every
+		//! submit; a weave-only session has no `session_render`, so this is
+		//! also the ONLY window rect multi_compositor_get_window_metrics() can
+		//! report (#1116).
 		//! @{
 		bool have_geometry;
 		int32_t win_x, win_y;
 		uint32_t win_w, win_h;
 		int32_t win_display_id;
 		bool metrics_logged; //!< One-shot log of the first metrics report.
+		//! Geometry changed since the present origin was last resolved.
+		bool geometry_dirty;
+		//! Cached panel-relative present origin (resolved when geometry_dirty).
+		bool have_present_origin;
+		int32_t present_origin_x, present_origin_y;
+		//! The panel the cached origin was resolved against + its backing-px
+		//! origin and scale, re-checked every N submits so a display
+		//! reconfiguration (arrangement / scale change) re-resolves it.
+		uint32_t present_panel;
+		int32_t present_panel_x, present_panel_y;
+		uint32_t present_panel_w, present_panel_h; //!< Its backing-px size.
+		double present_panel_scale;
+		bool present_panel_fallback; //!< Resolved via the main-display fallback.
+		uint32_t present_check_counter;
+		bool present_ambiguity_logged; //!< One-shot "send displayId" hint.
 		//! @}
 
 		//! @name Cached input import (rebuilt when the IOSurfaceID changes)
@@ -615,6 +713,11 @@ struct multi_compositor
 		bool sbs_first_use;
 		//! @}
 
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
+		//! @}
+
 		//! @name IOSurface-backed weaved output (exported to the caller)
 		//! @{
 		VkImage out_image;
@@ -642,6 +745,36 @@ struct multi_compositor
 		struct vk_local2d_composite overlay_blend; //!< premul-over flatten pipeline.
 		bool overlay_blend_initialized;
 		//! @}
+
+		//! XR_DXR_lift §6: lifted weave rects (vk backend; comp_multi_weave_lift.h).
+		struct comp_multi_weave_lift lift;
+
+		//! #2470: file-trigger capture (input / atlas / woven PNGs) —
+		//! comp_multi_weave_capture.h. The front end reads the input and the
+		//! woven IOSurfaces; the backend fills the atlas stage inside its
+		//! record_and_wait and leaves no Vulkan object behind. Under @ref mutex.
+		struct comp_multi_weave_capture capture;
+
+		/*!
+		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
+		 * A bound window not wholly on the system-default screen is woven per
+		 * screen: each screen's part by the DP of THAT screen (a windowless
+		 * per-screen DP from its own registry claimant, per-screen preference
+		 * included), the default screen's part by the backend's own DP. The
+		 * manager is the in-process compositor's of the backend's API —
+		 * comp_vk_native_segments (vk) or comp_metal_segments (metal) — built
+		 * from the system's screen-list snapshot. A one-screen system never
+		 * enables it: byte for byte the single-DP weave. Under @ref mutex.
+		 * @{
+		 */
+		void *segs;                                   //!< the backend's manager (opaque here)
+		uint64_t segs_generation;                     //!< msc weave_screens generation it was built from
+		struct xrt_screen_list *segs_list;            //!< that list (heap; CGDisplayBounds points)
+		struct xrt_system_compositor_info *segs_info; //!< and its registry (heap)
+		struct xrt_screen_list *segs_proj;            //!< vk: last CG projection handed to the manager (heap)
+		bool segs_split;                              //!< the last submit was woven per screen
+		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
+		//! @}
 	} weave;
 #endif
 
@@ -662,6 +795,21 @@ struct multi_compositor
 		struct os_mutex mutex; //!< Serializes submits + teardown for this client.
 
 		bool engine_initialized;
+		//! Eye-tracking mode (XrEyeTrackingModeDXR) the client asked for, +1 (0 = never asked).
+		//! A weave-only client has no session_render DP, so the request is held here
+		//! and applied to @ref dp when it exists (and again at engine bring-up).
+		uint32_t eye_tracking_mode_plus1;
+		/*!
+		 * Hardware 2D/3D as last CONFIRMED by @ref dp and reported to this
+		 * client's session (comp_multi_weave_android_request_display_mode).
+		 * Stored inverted so the zero-initialised struct means 3D, the state
+		 * every session starts in. The standing WISH is mc->hardware_display_3d.
+		 */
+		bool hw_2d_confirmed;
+		//! The client sent a hardware request before @ref dp existed: apply the
+		//! standing wish at engine bring-up. A client that never asks keeps the
+		//! DP's own default (3D), exactly as before.
+		bool display_mode_requested;
 		bool engine_failed; //!< One-shot: don't retry a hopeless bring-up every frame.
 		VkCommandPool cmd_pool;
 		VkCommandBuffer cmd;
@@ -696,6 +844,9 @@ struct multi_compositor
 		//! @name Cached input import (rebuilt when the AHardwareBuffer changes)
 		//! @{
 		void *in_ahb; //!< Acquired AHardwareBuffer * (adopted from the IPC receive).
+		//! AHardwareBuffer_getId of @c in_ahb (0 = unknown) — the cache key (#1865).
+		uint64_t in_ahb_id;
+		uint32_t in_imports; //!< Input imports so far (throttles the import WARN).
 		VkImage in_image;
 		VkDeviceMemory in_memory;
 		VkImageView in_view; //!< Full-image view (v6 zero-copy DP sample source).
@@ -719,6 +870,11 @@ struct multi_compositor
 		VkImageView sbs_view;
 		uint32_t sbs_w, sbs_h;
 		bool sbs_first_use;
+		//! @}
+
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
 		//! @}
 
 		//! @name AHardwareBuffer-backed weaved output (exported to the caller)
@@ -749,6 +905,9 @@ struct multi_compositor
 		//! @name v4 DP-composited 2D overlay atlas (browser#18)
 		//! @{
 		void *overlay_ahb;
+		//! AHardwareBuffer_getId of @c overlay_ahb (0 = unknown) — the cache key (#1865).
+		uint64_t overlay_ahb_id;
+		uint32_t overlay_imports; //!< Overlay imports so far (throttles the import WARN).
 		VkImage overlay_image;
 		VkDeviceMemory overlay_memory;
 		VkImageView overlay_view;
@@ -756,6 +915,93 @@ struct multi_compositor
 		bool overlay_first_use;
 		struct vk_local2d_composite overlay_blend;
 		bool overlay_blend_initialized;
+		/*!
+		 * XR_DXR_weave v18: THIS submit chained an overlay. The import above is
+		 * a cache (an AHardwareBuffer is re-sent every frame and matched by
+		 * buffer id, #1865), so @c overlay_image outlives the submit that brought it; the
+		 * overlay is composited only when the current submit carries one.
+		 */
+		bool overlay_this_submit;
+		//! Submits refused because their chained overlay could not be imported.
+		uint32_t overlay_refusals;
+		//! @}
+
+		/*!
+		 * @name Rect-scoped batch weave (debug.dxr.weave_rect_scoped, default 1)
+		 * The SBS scratch is cleared only where the previous frame wrote and this
+		 * one does not (instead of all 2 x window every frame), and each eye is
+		 * un-squeezed by ONE clamped-sampling draw straight out of the input (no
+		 * per-rect staging copy, no staging image to reallocate — and so no
+		 * vkQueueWaitIdle — when a rect changes size under scroll).
+		 * @c sbs_dirty holds every scratch rect (both eyes) written since the last
+		 * clear; @c sbs_dirty_full forces one whole-image clear (fresh scratch,
+		 * the kill switch flipped, or more rects than the list holds).
+		 * @{
+		 */
+		bool rect_scoped_checked; //!< Prop read once per client.
+		bool rect_scoped;
+		struct vk_local2d_composite unsqueeze; //!< Clamped-copy pipeline.
+		bool unsqueeze_initialized;
+		bool unsqueeze_failed; //!< Init failed once: stay on the copy+blit path.
+		VkFramebuffer sbs_fb;  //!< sbs_view in unsqueeze.flatten_rp.
+		VkRect2D sbs_dirty[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		uint32_t sbs_dirty_count;
+		bool sbs_dirty_full;
+		//! @}
+
+		/*!
+		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
+		 * Android twin of the desktop-Linux fields: per-submit overlay hints set by
+		 * comp_multi_weave_android_set_overlay_hints right before each submit
+		 * (never sticky), forwarded to the DP with the overlay when its
+		 * set_overlay_2d slot takes it. @c overlay_in_dp is the last verdict so the
+		 * WARN fires on a change only.
+		 * @{
+		 */
+		bool overlay_unchanged;
+		float overlay_filter_strength;
+		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+		//! `debug.dxr.overlay_filter_strength` dev override, read once per client
+		//! (a browser restart re-reads it). NaN = unset: pass the app's value.
+		bool filter_strength_override_checked;
+		float filter_strength_override;
+		//! @}
+
+		//! #2501: file-trigger capture (input / atlas / woven / overlay PNGs) —
+		//! comp_multi_weave_capture.h. Guarded by the weave mutex. The tag is the
+		//! client's package name, resolved from its uid by the IPC handler.
+		struct comp_multi_weave_capture capture;
+		bool capture_tag_resolved; //!< capture.tag holds the lookup for capture_tag_uid
+		long capture_tag_uid;
+
+		/*!
+		 * @name sync_file weave (XR_DXR_weave v20)
+		 * A caller that chains XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR has
+		 * its acquire sync_file waited on the GPU and gets a release sync_file
+		 * back instead of the CPU vkWaitForFences. The request is set by
+		 * comp_multi_weave_android_set_sync right before a submit and collected
+		 * by comp_multi_weave_android_take_sync_result right after it; nothing is
+		 * sticky. A self-submitting DP joins the chain through the VK DP slot
+		 * set_weave_sync (pre_sem -> DP -> dp_sem); a recording DP needs nothing.
+		 * `debug.dxr.weave_sync_fd=0` disables the GPU chain (acquire CPU-polled,
+		 * release -1).
+		 * @{
+		 */
+		bool sync_requested;    //!< set_sync was called for the next submit
+		bool sync_have_acquire; //!< sync_acquire_fd is engine-owned and unconsumed
+		int sync_acquire_fd;
+		bool sync_want_release;
+		bool sync_have_release; //!< sync_release_fd was produced by the last submit
+		int sync_release_fd;
+		bool fence_pending; //!< the last submit returned without a CPU wait on @c fence
+		bool sync_sems_tried;
+		bool sync_sems_ok;
+		bool sync_dirty;              //!< a semaphore may hold a stale signal/payload: recreate before reuse
+		uint8_t sync_last_mode;       //!< last logged decision (WARN on change only)
+		VkSemaphore sync_acquire_sem; //!< temporary SYNC_FD import target
+		VkSemaphore sync_pre_sem;     //!< runtime pre-weave batch -> self-submitting DP
+		VkSemaphore sync_dp_sem;      //!< self-submitting DP -> runtime post-weave batch
+		VkSemaphore sync_release_sem; //!< exportable SYNC_FD, signalled by the final batch
 		//! @}
 
 		//! @name Arch-C weave satellite (#1277 P0) — service-presented weave
@@ -850,6 +1096,7 @@ struct multi_compositor
 		struct xrt_display_processor *dp;
 
 		uint64_t window_id;   //!< Present-owner window id from bind (an XID; recorded only).
+		bool window_bound;    //!< A bind has happened (first-bind WARN; repeats are silent).
 		uint64_t fence_value; //!< Monotonic; completion is synchronous in stage A.
 
 		//! @name Explicit window geometry (spec v7 XrWeaveWindowGeometryDXR)
@@ -863,6 +1110,70 @@ struct multi_compositor
 		int32_t win_display_id;
 		bool geometry_dirty; //!< Log the change once, not per frame.
 		bool metrics_logged; //!< One-shot log of the first metrics report (#1116).
+		//! The panel frame (the system info's desktop description of the
+		//! panel) the present origin was last logged against. A live
+		//! display-scale / arrangement change re-resolves that info under the
+		//! running engine (#2251); a differing frame re-logs the origin.
+		struct u_weave_panel_frame panel_frame;
+		bool have_panel_frame;
+		//! v12 (browser-pvt#180): the caller's logical origin + scale, latched
+		//! verbatim with the device geometry above by the same bind (a bind
+		//! without one clears it).
+		struct xrt_weave_logical_origin win_logical;
+		//! v12: the origin the LAST successful weave was phase-locked to —
+		//! snapshotted where the weave feeds the DP (weave_feed_dp_geometry),
+		//! committed only when the weave succeeds. Serial source below.
+		struct xrt_weave_woven_origin woven_origin;
+		uint64_t woven_serial; //!< Bumped per successful weave; first output = 1.
+		//! Off-panel state of the last submit (#1654 on the service path): the
+		//! band count, | 0x100 when the window is entirely off the panel. The
+		//! WARN fires on a change only.
+		uint32_t last_offpanel_band_count;
+		//! @}
+
+		/*!
+		 * Hardware 2D/3D as last CONFIRMED by mc->weave.dp and reported to
+		 * this client's session (comp_multi_weave_linux_request_display_mode).
+		 * Stored inverted so the zero-initialised struct means 3D, the state
+		 * every session starts in. The standing WISH is mc->hardware_display_3d.
+		 */
+		bool hw_2d_confirmed;
+
+		/*!
+		 * Spec v13 (XrWeaveSubmitMonoIn2DDXR): the caller asked, on the submit
+		 * being processed, for one flat view instead of the weave while
+		 * hw_2d_confirmed. Set by comp_multi_weave_linux_set_mono_in_2d right
+		 * before each submit (per submit, never sticky); @c mono_active is the
+		 * state the last submit actually rendered, so the WARN fires on an edge
+		 * only.
+		 */
+		bool mono_in_2d;
+		bool mono_active;
+
+		/*!
+		 * @name 2D under the lens (ADR-027 Amendment, XR_DXR_weave v14/v15)
+		 * Per-submit overlay hints, set by comp_multi_weave_linux_set_overlay_hints
+		 * right before each submit (never sticky), forwarded to the DP with the
+		 * overlay when its set_overlay_2d slot takes it. @c overlay_in_dp is the
+		 * last verdict (DP composites vs runtime post-weave blend) so the WARN
+		 * fires on a change only.
+		 * @{
+		 */
+		bool overlay_unchanged;
+		float overlay_filter_strength;
+		uint8_t overlay_in_dp; //!< 0 = no overlay seen yet, 1 = runtime blend, 2 = DP composites
+		//! @}
+
+		//! @name Flat regions (spec v8, browser#88, on desktop Linux)
+		//! The sticky screen-space latch (xrWeaveSetScreenFlatRegionsDXR),
+		//! absolute screen device px; a SET, count 0 clears. Unioned with
+		//! each submit's own flat rects and painted flat in the output.
+		//! @{
+		struct xrt_rect screen_flat_rects[8]; //!< IPC_WEAVE_SET_SCREEN_FLAT_RECTS_MAX
+		uint32_t screen_flat_rect_count;
+		//! Flat rects painted by the last submit (0 = none); the WARN fires on
+		//! a change of this count only.
+		uint32_t last_flat_count;
 		//! @}
 
 		//! @name Input + overlay import caches (keyed by buffer id / fd inode)
@@ -873,6 +1184,29 @@ struct multi_compositor
 		//! @{
 		struct comp_multi_weave_linux_slot in_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
 		struct comp_multi_weave_linux_slot ov_slots[COMP_MULTI_WEAVE_LINUX_SLOTS];
+
+		/*!
+		 * @name Per-screen display processors (#2218 item 6, ADR-047 D2)
+		 * A bound window that is not wholly on the system-default screen is
+		 * woven per screen: each screen's part by the DP of THAT screen
+		 * (a windowless per-screen DP from its own registry claimant, per-
+		 * screen preference included), the default screen's part by
+		 * @ref dp. The manager (comp_vk_native_segments, shared with the
+		 * in-process Vulkan compositor) is built from the system's screen
+		 * list snapshot and rebuilt when it changes (hotplug, re-claim). A
+		 * one-screen system never enables it: byte for byte the single-DP
+		 * weave. Touched only under @ref mutex.
+		 * @{
+		 */
+		struct comp_vk_native_segments *segs;
+		uint64_t segs_generation;                     //!< msc weave_screens generation it was built from
+		struct xrt_screen_list *segs_list;            //!< that list (heap)
+		struct xrt_system_compositor_info *segs_info; //!< and its registry (heap)
+		struct xrt_screen_list *segs_proj;            //!< last projection handed to the manager (heap)
+		int segs_frame;                               //!< last enum comp_weave_frame (-1 = none yet)
+		bool segs_split;                              //!< the last submit was woven per screen
+		uint64_t segs_logged_key;                     //!< what the last WARN described (change-only)
+		//! @}
 		uint64_t slot_clock;    //!< LRU tick, bumped per lookup.
 		bool size_probe_warned; //!< One-shot: lseek could not size an opaque fd.
 		uint32_t imports_logged; //!< Import WARNs emitted (capped; a re-importing producer would spam).
@@ -894,6 +1228,11 @@ struct multi_compositor
 		VkImageView sbs_view;
 		uint32_t sbs_w, sbs_h;
 		bool sbs_first_use;
+		//! @}
+
+		//! @name Per-eye un-squeeze staging (batch path; see comp_multi_weave_eye_stage)
+		//! @{
+		struct comp_multi_weave_eye_stage eye_stage[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS][2];
 		//! @}
 
 		//! @name Exportable weaved output (handed to the caller)
@@ -950,6 +1289,32 @@ struct multi_compositor
 		bool release_fallback_warned;   //!< One-shot: release export failed, back to synchronous.
 		bool out_kind_warned;           //!< One-shot: output kind switched on a client request.
 		                                //! @}
+		//! Submits refused because their chained overlay could not be
+		//! imported (weave_overlay_refused; throttles its log line).
+		uint32_t overlay_refusals;
+
+		/*!
+		 * @name Stale overlay (resize race)
+		 * A chained overlay whose real / declared size is not the window
+		 * size of the submit it rides (the producer has not reallocated it
+		 * after a resize yet) is IGNORED for that frame — not refused, not
+		 * blended — see weave_overlay_gate. @c overlay_stale is the current
+		 * state so the WARN fires once per transition; @c overlay_force_changed
+		 * makes the next overlay offered to the DP carry layer_unchanged =
+		 * false, since the DP's cached layer predates the ignored frames.
+		 * @{
+		 */
+		bool overlay_stale;
+		bool overlay_force_changed;
+		uint32_t overlay_stale_frames; //!< Frames ignored in the current stale run.
+		                               //! @}
+
+		//! XR_DXR_lift §6: lifted weave rects (comp_multi_weave_lift.h).
+		struct comp_multi_weave_lift lift;
+
+		//! #2207: file-trigger capture (input / atlas / woven PNGs) —
+		//! comp_multi_weave_capture.h. Guarded by the weave mutex.
+		struct comp_multi_weave_capture capture;
 	} weave;
 #endif
 };
@@ -964,6 +1329,20 @@ multi_compositor(struct xrt_compositor *xc)
 {
 	return (struct multi_compositor *)xc;
 }
+
+/*!
+ * Is @p xc really a @ref multi_compositor (identified by its destroy slot)?
+ *
+ * The state tracker reaches multi_compositor() as the in-process fallback of
+ * its per-compositor dispatchers, keyed on "the system has an xmcc". That key
+ * says nothing about the SESSION's compositor: a session presented by a native
+ * compositor whose is_*_native flag was not set fell through and was cast —
+ * the macOS VK-via-Metal SIGBUS. Check with this before casting.
+ *
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_is(const struct xrt_compositor *xc);
 
 /*!
  * Create a multi client wrapper compositor.
@@ -1105,6 +1484,10 @@ struct multi_system_compositor
 	//! Render loop thread.
 	struct os_thread_helper oth;
 
+	//! Set by the render thread as its last act (#1815): lets a macOS main-thread
+	//! destroy wait while still servicing the render thread's dispatch_sync()s.
+	volatile bool render_thread_done;
+
 	struct
 	{
 		/*!
@@ -1132,9 +1515,37 @@ struct multi_system_compositor
 
 	/*!
 	 * This mutex protects the list of client compositor
-	 * and the rendering timings on it.
+	 * and the rendering timings on it. Lock order (#1005):
+	 * render_lock -> list_and_timing_lock -> slot_lock — see the "Locking"
+	 * section of comp_multi_interface.h.
 	 */
 	struct os_mutex list_and_timing_lock;
+
+	/*!
+	 * #1005: held by the main loop for the whole transfer + render + present
+	 * of one frame, so GPU work, DP calls and present run WITHOUT
+	 * list_and_timing_lock. Taken BEFORE list_and_timing_lock by everything
+	 * that must not overlap a frame in flight: client destroy (unlist),
+	 * end_session (session-render teardown), the DP detach, and the
+	 * system-wide display-mode request. Never take it while holding
+	 * list_and_timing_lock or a slot_lock.
+	 */
+	struct os_mutex render_lock;
+
+	/*!
+	 * #1005: the clients the current frame renders, snapshotted from
+	 * @ref clients under list_and_timing_lock (with render_lock held, so no
+	 * entry can be destroyed until the frame ends). Render-thread only.
+	 */
+	struct multi_compositor *render_set[MULTI_MAX_CLIENTS];
+
+	/*!
+	 * #1005: per render_set entry, "retire its delivered frame". The render
+	 * pass only records this; the retire itself touches the client's pacer
+	 * (u_pa), which list_and_timing_lock guards, so the main loop applies it
+	 * after the render with that lock re-taken. Render-thread only.
+	 */
+	bool render_retire[MULTI_MAX_CLIENTS];
 
 	struct
 	{
@@ -1164,7 +1575,7 @@ struct multi_system_compositor
 	int android_window_valid_state;
 #endif
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	/*!
 	 * @name Shared spatial surface (#59, the spatial-desktop re-architecture)
 	 *
@@ -1180,6 +1591,37 @@ struct multi_system_compositor
 	 * @{
 	 */
 	bool shared_surface_initialized; //!< True once the shared window + resources exist.
+
+	/*!
+	 * #1006 Android overlay: the on_pause/on_resume state last pushed to
+	 * @ref shared_dp, as a @ref multi_dp_visibility (UNKNOWN until the first
+	 * push). Visible = overlay mode applied AND the controller's surface is
+	 * live; anything else releases the shared DP's lens vote (ADR-036 D7).
+	 * Render-thread only.
+	 */
+	int shared_dp_visibility;
+
+	//! #1006 / R2: the shared DP is being held back because per-session DPs
+	//! are still alive in this process (logged once per hold).
+	bool shared_dp_deferred_logged;
+	int64_t shared_init_retry_ns;    //!< After a failed target create: no retry before this (0 = none pending).
+	//! D-5 (#967): the hardware 2D/3D state last applied to shared_dp
+	//! (-1 = never), converged each frame from the lens owner's wish
+	//! (mc->hardware_display_3d of the focused client, or of a lone client).
+	int shared_hw_3d_applied;
+
+	/*!
+	 * #967 D-5: the workspace controller's hardware 2D/3D request (1 = 3D,
+	 * 0 = 2D, -1 = none). When set it overrides the focused / lone client's
+	 * wish in shared_converge_display_mode_locked. Written by the IPC thread,
+	 * read by the render thread (a plain int, last writer wins).
+	 */
+	int shared_hw_3d_controller_wish;
+	//! FRAME_TICK viewer (eye midpoint, display m) last read from shared_dp, and
+	//! how many frames in a row the DP has had no eyes (drops valid after ~0.5 s).
+	float shared_tick_viewer[3];
+	bool shared_tick_viewer_valid;
+	uint32_t shared_tick_viewer_fail_count;
 	bool shared_window_visible;      //!< #61: full-screen window currently shown (orderFront) vs hidden (orderOut).
 	struct comp_target *shared_target;             //!< The one full-screen NSWindow target.
 	struct xrt_display_processor *shared_dp;       //!< The one DP that weaves the combined atlas.
@@ -1190,6 +1632,19 @@ struct multi_system_compositor
 	VkFence *shared_fences;
 	uint32_t shared_buffer_count;
 	int shared_fenced_buffer;
+
+	//! #1007: shared-surface counterpart of session_render.gpu_stalled.
+	bool shared_gpu_stalled;
+
+	/*!
+	 * #1006 Android workspace overlay: the mode the render thread has
+	 * APPLIED — the value @ref multi_shared_surface_active reports where the
+	 * per-session path is also compiled in. Written only by the render thread
+	 * (overlay transition at the top of a frame); unused where the shared
+	 * surface is the only path.
+	 */
+	bool shared_mode_active;
+	int64_t shared_gpu_stalled_since_ns;
 	VkRenderPass shared_render_pass;
 	VkFramebuffer *shared_framebuffers;
 
@@ -1218,7 +1673,44 @@ struct multi_system_compositor
 	//! shared_atlas_fb (render-pass compatible with shared_chrome_blend).
 	struct comp_multi_content_blend shared_content_blend;
 	bool shared_content_blend_initialized;
+
+	//! #1795 (ADR-044 §7): format-honest decorations. The atlas holds ENCODED
+	//! bytes (the DP and the content pass see its plain view), so the chrome /
+	//! overlay / cursor pass renders through an `_SRGB` view of it instead:
+	//! sources are sampled as their DECLARED format, blend in linear light and
+	//! are encoded once on write. The atlas is created MUTABLE_FORMAT with that
+	//! sibling in its view-format list, so the view is legal and no copy is
+	//! needed. All UNDEFINED / VK_NULL_HANDLE under the legacy hatch.
+	VkFormat shared_atlas_deco_format;      //!< `_SRGB` sibling the atlas is mutable for.
+	VkImageView shared_atlas_deco_view;     //!< `_SRGB` view of the atlas (decoration target).
+	VkFramebuffer shared_atlas_deco_fb;     //!< Framebuffer over shared_atlas_deco_view.
+	VkImageView shared_atlas_deco_fb_view;  //!< The deco view the fb was built for (recreate key).
+	struct vk_hud_blend shared_deco_blend;  //!< Flat decorations into the `_SRGB` view.
+	bool shared_deco_blend_initialized;
+	struct comp_multi_content_blend shared_deco_content_blend; //!< Quad / SBS decorations, `_SRGB` view.
+	bool shared_deco_content_blend_initialized;
+	bool shared_deco_honest_failed; //!< Sticky: setup failed once, legacy decorations from then on.
+	bool shared_deco_logged;        //!< The one-time regime WARN has been emitted.
 	//! @}
+#endif // COMP_MULTI_SHARED_SURFACE
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+	/*!
+	 * #2218 item 6: the screen list + DP registry the XR_DXR_weave
+	 * present-owner engines segment against (one DP per screen a window
+	 * covers). Handed in by the IPC server (comp_multi_system_set_screens) at
+	 * start-up and after every display re-probe; each engine snapshots it
+	 * when @ref generation moved (multi_system_weave_screens_snapshot).
+	 * Leaf lock: taken alone, never while holding a compositor lock.
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		bool mutex_initialized;
+		struct xrt_screen_list *list;            //!< NULL until the first set
+		struct xrt_system_compositor_info *info; //!< the registry it was resolved with
+		uint64_t generation;                     //!< 0 = never set; bumps on a real change only
+	} weave_screens;
 #endif
 };
 
@@ -1228,6 +1720,37 @@ struct multi_system_compositor
  * @ingroup comp_multi
  * @private @memberof multi_system_compositor
  */
+/*!
+ * Is the shared spatial surface the render path right now? (#1006, see
+ * COMP_MULTI_PER_SESSION_TARGET in comp_multi_interface.h.)
+ *
+ * - macOS / desktop Linux: a compile-time `true` — the shared surface is their
+ *   only service path, so nothing there changes.
+ * - Android: `shared_mode_active`, the workspace-overlay mode the RENDER THREAD
+ *   has applied (it follows `workspace_active` at the top of a frame). False
+ *   unless a verified workspace controller activated the overlay, so the
+ *   default stays today's per-session path.
+ * - Elsewhere (Windows fallback): false.
+ *
+ * Read from IPC threads too: a plain bool, the render thread is its only
+ * writer, and a reader racing a transition sees either side of it.
+ *
+ * @ingroup comp_multi
+ */
+static inline bool
+multi_shared_surface_active(const struct multi_system_compositor *msc)
+{
+#if defined(COMP_MULTI_SHARED_SURFACE) && !defined(COMP_MULTI_PER_SESSION_TARGET)
+	(void)msc;
+	return true;
+#elif defined(COMP_MULTI_SHARED_SURFACE)
+	return msc != NULL && msc->shared_mode_active;
+#else
+	(void)msc;
+	return false;
+#endif
+}
+
 static inline struct multi_system_compositor *
 multi_system_compositor(struct xrt_system_compositor *xsc)
 {
@@ -1301,9 +1824,10 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 
 /*!
  * @p flat_rect_count / @p flat_rects (spec v8, browser#88) name the regions of
- * this submit that must be physically FLAT. ACCEPTED AND IGNORED here: the
- * per-region hardware wish is published through the D3D11 service's zone-wish
- * channel, which has no macOS / Android counterpart yet. Same shape as v7's
+ * this submit that must be physically FLAT. macOS / Android: ACCEPTED AND
+ * IGNORED — the per-region hardware wish is published through the D3D11
+ * service's zone-wish channel, which has no counterpart there yet. Desktop
+ * Linux: painted flat in the woven output (comp_multi_weave_linux.c). Same shape as v7's
  * Windows-only handle kinds — the parameter exists so the wire and the call
  * signature stay one thing across platforms.
  */
@@ -1339,6 +1863,26 @@ void
 comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
 
 /*!
+ * Hold the client's eye-tracking mode (MANAGED/MANUAL) for a weave-only session
+ * and apply it to the weave engine's DP (now, or at engine bring-up).
+ */
+void
+comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
+
+/*!
+ * Hardware 2D/3D request for an Android XR_DXR_weave present-owner (the twin of
+ * comp_multi_weave_linux_request_display_mode): a weave-only session has no
+ * session_render, so multi_compositor_request_display_mode routes here and the
+ * request reaches the weave engine's own DP, inline on the IPC thread under
+ * mc->weave.mutex. Before the engine exists the wish is recorded and applied at
+ * engine bring-up. Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE once
+ * the DP accepted a change (a DP without the slot is mode-neutral and counts as
+ * accepted).
+ */
+bool
+comp_multi_weave_android_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
  * Has THIS client painted the satellite overlay and not cleared it since?
  *
  * #1387 defect 2: the stale-frame guard above must fire for every client the
@@ -1348,6 +1892,42 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc);
  */
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc);
+
+/*!
+ * XR_DXR_weave v14/v15 overlay hints for the NEXT comp_multi_weave_submit only
+ * (Android twin of comp_multi_weave_linux_set_overlay_hints). @p filter_strength
+ * outside [0, 1] (incl. NaN) means "not set by the app": the DP's own default.
+ */
+void
+comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * #2501: tag the client's per-client capture trigger
+ * (`displayxr_atlas_trigger.<package>`, comp_multi_weave_capture.h) with the
+ * package name of @p peer_uid. Resolved once per uid (a JNI call), then cached;
+ * an unknown uid polls only the service-process and global triggers.
+ */
+void
+comp_multi_weave_android_set_capture_uid(struct xrt_compositor *xc, long peer_uid);
+
+/*!
+ * XR_DXR_weave v20 sync_file request for the NEXT comp_multi_weave_submit only.
+ * Takes ownership of @p acquire_fence_fd (-1 = none) on every path — it is
+ * imported into a semaphore, CPU-polled, or closed. @p want_release_fence asks
+ * for a release sync_file instead of the synchronous completion; collect it
+ * with @ref comp_multi_weave_android_take_sync_result after the submit.
+ */
+void
+comp_multi_weave_android_set_sync(struct xrt_compositor *xc, int acquire_fence_fd, bool want_release_fence);
+
+/*!
+ * Collect the release sync_file of the submit that followed
+ * @ref comp_multi_weave_android_set_sync (caller-owned; -1 = the weave completed
+ * synchronously, or the submit was refused) and drop whatever of the request
+ * that submit never consumed. Always call it after a set_sync'd submit.
+ */
+int
+comp_multi_weave_android_take_sync_result(struct xrt_compositor *xc);
 #endif
 
 bool
@@ -1358,6 +1938,59 @@ comp_multi_weave_export_output(struct xrt_compositor *xc,
 
 bool
 comp_multi_weave_export_fence(struct xrt_compositor *xc, xrt_graphics_sync_handle_t *out_handle);
+
+#ifdef XRT_OS_MACOS
+/*!
+ * Hardware 2D/3D request for a macOS XR_DXR_weave present-owner (the twin of
+ * comp_multi_weave_linux_request_display_mode): a weave-only session has no
+ * session_render, so multi_compositor_request_display_mode routes here and the
+ * request reaches the weave engine's own DP (vk or Metal backend), inline on
+ * the IPC thread under mc->weave.mutex. Before the engine exists the wish is
+ * recorded and applied at engine bring-up. Emits
+ * XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE once the DP accepted a change
+ * (a DP without the slot is mode-neutral and counts as accepted).
+ */
+bool
+comp_multi_weave_macos_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
+ * Where a macOS XR_DXR_weave present-owner's window sits on its panel, for the
+ * per-window Kooima (ipc_try_get_oop_view_poses): the bound geometry (global
+ * CoreGraphics BACKING px, y down) re-based to the resolved panel's backing
+ * origin — the same panel and origin the weave feeds the DP phase slot — plus
+ * that panel's backing size. False when no geometry was bound.
+ */
+bool
+comp_multi_weave_macos_window_on_panel(struct multi_compositor *mc,
+                                       int32_t *out_x,
+                                       int32_t *out_y,
+                                       uint32_t *out_w,
+                                       uint32_t *out_h,
+                                       uint32_t *out_panel_w,
+                                       uint32_t *out_panel_h);
+
+/*!
+ * #2470: the weave client's executable basename (the IPC server's OS-derived
+ * per-connection key), the tag of its per-client capture trigger
+ * `$TMPDIR/displayxr_atlas_trigger.<tag>` (comp_multi_weave_capture.h) — the
+ * twin of comp_multi_weave_linux_set_capture_tag. The IPC handler sets it
+ * before every submit; a NULL / empty tag polls only the service-process and
+ * global triggers.
+ */
+void
+comp_multi_weave_macos_set_capture_tag(struct xrt_compositor *xc, const char *tag);
+
+#ifdef COMP_MULTI_WEAVE_HAVE_METAL
+/*!
+ * The Metal weave backend DP's predicted eyes, read inside an autorelease
+ * pool (the caller runs on an IPC pthread with none). Plain-C entry for
+ * multi_compositor_get_predicted_eye_positions.
+ */
+bool
+comp_multi_weave_macos_metal_predicted_eyes(struct xrt_display_processor_metal *dp,
+                                            struct xrt_eye_positions *out_eye_pos);
+#endif
+#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 /*!
@@ -1391,10 +2024,98 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
-                               struct xrt_eye_positions *out_eyes);
+                               struct xrt_eye_positions *out_eyes,
+                               struct xrt_weave_woven_origin *out_origin); // v12; NULL = not wanted
+
+/*!
+ * comp_multi_weave_set_window_geometry plus the caller's LOGICAL origin + scale
+ * (spec v12, browser-pvt#180), latched as one unit under the engine lock.
+ * @p logical NULL or !valid clears the logical latch — the logical origin of the
+ * new geometry is unknown. Stored verbatim; the engine never converts between
+ * device and logical pixels.
+ */
+bool
+comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             uint32_t client_w,
+                                             uint32_t client_h,
+                                             int32_t display_id,
+                                             const struct xrt_weave_logical_origin *logical);
 
 bool
 comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weave_dmabuf_output_desc *out);
+
+/*!
+ * Latch the present-owner's STICKY screen-space flat regions (spec v8,
+ * xrWeaveSetScreenFlatRegionsDXR) — absolute screen device px, a SET (count 0
+ * clears). Unioned with every later submit's own flat rects, clipped to the
+ * bound window and painted flat in the woven output. Takes effect at the next
+ * submit: the service produces output pixels only when asked to.
+ */
+bool
+comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                         uint32_t rect_count,
+                                         const struct xrt_rect *screen_rects);
+
+/*!
+ * HARDWARE 2D/3D request (xrRequestDisplayModeDXR, #533) for a present-owner
+ * on desktop Linux — routed here by multi_compositor_request_display_mode,
+ * whose per-session-render branch a present-owner never reaches (it has no
+ * window, so session_render is never initialised). Applies the request to the
+ * weave engine's OWN display processor (mc->weave.dp — the only DP in the
+ * service process, the one holding the vendor's lens), inline on the calling
+ * (IPC) thread under mc->weave.mutex: a present-owner that asks for 2D has, by
+ * definition, stopped submitting, so a frame-gated apply would never run (the
+ * D3D11 service's #815 for the same browser#55 flow). Before the engine exists
+ * the wish is recorded and applied at engine bring-up.
+ *
+ * Emits XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE (carrying the
+ * REQUESTED state) to this client's session only once the DP ACCEPTED a change
+ * (#961 semantics; a DP with no request_display_mode slot is mode-neutral and
+ * counts as accepted); a request for the state already confirmed sends none.
+ * Logs one WARN per transition with the DP call's duration and, as information
+ * only, the DP's read-back (a vendor lens may switch asynchronously, so it can
+ * lag the request).
+ *
+ * @return true if the request was applied (or recorded for bring-up).
+ */
+bool
+comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool enable_3d);
+
+/*!
+ * Spec v13 (XrWeaveSubmitMonoIn2DDXR): what the NEXT submit asked for. The IPC
+ * handler calls this with the submit's own flag immediately before handing the
+ * submit to the engine, so the value is per submit (a submit without the chain
+ * sets false). While it is set AND this session's hardware state is 2D (as last
+ * confirmed by mc->weave.dp — hw_2d_confirmed), the frame skips the weave and
+ * paints the whole output with one view of the submitted content (stereo: the
+ * left view; N > 2: nearest the display axis, u_weave_flat_view_index), the
+ * source the off-panel bands use. In 3D it has no effect.
+ */
+void
+comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d);
+
+/*!
+ * XR_DXR_weave v14/v15 overlay hints of the NEXT submit (same per-submit shape
+ * as comp_multi_weave_linux_set_mono_in_2d): @p overlay_unchanged = the overlay
+ * holds the previous accepted submit's pixels; @p filter_strength = the app's
+ * lens-filter strength, [0,1], negative = the DP's default. Used only when the
+ * DP composites the overlay inside the weave (set_overlay_2d, ADR-027
+ * Amendment); the runtime's own post-weave blend ignores both.
+ */
+void
+comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength);
+
+/*!
+ * #2207: the weave client's executable basename (the IPC server's OS-derived
+ * per-connection key), the tag of its per-client capture trigger
+ * `$TMPDIR/displayxr_atlas_trigger.<tag>` (comp_multi_weave_capture.h). The IPC
+ * handler sets it before every submit; a NULL / empty tag polls only the
+ * service-process and global triggers.
+ */
+void
+comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *tag);
 /*! @} */
 #endif // XRT_OS_LINUX_DESKTOP
 
@@ -1458,6 +2179,41 @@ multi_compositor_set_window_visible_locked(struct multi_compositor *mc, bool vis
 #endif // XRT_OS_ANDROID
 
 /*!
+ * #1007 bounded waits. One wait slice — the same 100 ms the per-client wait
+ * thread already uses (`wait_fence` / `wait_semaphore`).
+ */
+#define MULTI_FENCE_TIMEOUT_NS (100 * U_TIME_1MS_IN_NS)
+
+/*!
+ * #1007: total budget for one fence wait on the multi main loop, or on a client
+ * teardown path. On expiry the caller SKIPS (keeps the fence pending, reuses the
+ * last frame) instead of blocking every other client behind one dead device.
+ */
+#define MULTI_FENCE_DEADLINE_NS (500 * U_TIME_1MS_IN_NS)
+
+/*!
+ * #1007: the comp_multi swapchain acquire timeout (`comp_target::acquire_timeout_ns`).
+ * A FIFO swapchain whose consumer stopped releasing buffers must not park the
+ * main loop forever inside vkAcquireNextImageKHR.
+ */
+#define MULTI_ACQUIRE_TIMEOUT_NS (500 * U_TIME_1MS_IN_NS)
+
+/*!
+ * Wait for @p count fences (all of them), in @ref MULTI_FENCE_TIMEOUT_NS slices,
+ * for at most @p budget_ns in total (0 = poll once). Logs one WARN per expired
+ * slice, tagged with @p what.
+ *
+ * @return VK_SUCCESS when all fences are signalled, VK_TIMEOUT when the budget
+ *         ran out (the fences are still pending — do NOT reset or reuse them),
+ *         or the Vulkan error (e.g. VK_ERROR_DEVICE_LOST).
+ *
+ * @ingroup comp_multi
+ */
+VkResult
+multi_wait_fences_bounded(
+    struct vk_bundle *vk, uint32_t count, const VkFence *fences, int64_t budget_ns, const char *what);
+
+/*!
  * Get predicted eye positions from the session's display processor.
  * Uses the display processor's eye tracking (e.g. SR SDK LookaroundFilter).
  *
@@ -1470,6 +2226,42 @@ multi_compositor_set_window_visible_locked(struct multi_compositor *mc, bool vis
  */
 bool
 multi_compositor_get_predicted_eye_positions(struct multi_compositor *mc, struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (same source order as
+ * @ref multi_compositor_get_predicted_eye_positions), else that "latest"
+ * answer.
+ *
+ * @param mc          The multi_compositor.
+ * @param target_ns   When the pixels will be seen (monotonic ns).
+ * @param[out] out_eye_pos The eye positions (in meters).
+ * @return true if valid eye positions are available, false otherwise.
+ *
+ * @ingroup comp_multi
+ * @private @memberof multi_compositor
+ */
+bool
+multi_compositor_get_eye_positions_at(struct multi_compositor *mc,
+                                      int64_t target_ns,
+                                      struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * Create a Vulkan display processor through the plug-in factory. On Android
+ * the call is marshalled onto the service main thread (the vendor DP's async
+ * init needs a pumped Looper, #510 M2) with a 2 s bound (#1007): on timeout the
+ * factory is abandoned and XRT_TIMEOUT returned. Elsewhere it runs inline.
+ * Shared by the per-session DP and the shared-surface DP.
+ *
+ * @ingroup comp_multi
+ */
+xrt_result_t
+multi_dp_factory_create(xrt_dp_factory_vk_fn_t factory,
+                        void *vk_bundle,
+                        void *vk_cmd_pool,
+                        void *window_handle,
+                        int32_t target_format,
+                        struct xrt_display_processor **out_xdp);
 
 /*!
  * Get window metrics for adaptive FOV and eye position adjustment.
@@ -1562,6 +2354,104 @@ multi_compositor_set_rendering_mode(struct multi_compositor *mc,
  */
 void
 multi_compositor_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode);
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+/*!
+ * @name Display status reads (ADR-051 D3) — desktop-Linux service
+ *
+ * Read-only views the IPC server's status snapshot gathers on a DIAG
+ * consumer's thread. Locking: each takes ONLY
+ * multi_system_compositor::list_and_timing_lock, copies plain fields out and
+ * releases it — no render lock, no GPU wait, no vendor call under it. The
+ * workspace placement (comp_multi_workspace_load_window_px_rect /
+ * _is_window_hidden, pointer-keyed, their own leaf lock) is read after it is
+ * released, never nested. The one vendor call
+ * (@ref multi_compositor_status_get_shared_dp's eye / backend query) runs
+ * after the lock is released, on `shared_dp`, which lives until the system
+ * compositor is destroyed (the same lock-free trade
+ * multi_compositor_get_predicted_eye_positions makes for it). A per-client
+ * weave DP is never called from here: comp_multi_weave_fini() tears it down
+ * before the client leaves `clients[]`.
+ * @{
+ */
+
+//! One client of the desktop-Linux service, as the status snapshot sees it.
+struct multi_compositor_status_client
+{
+	//! Composited into the shared spatial surface (a projection-layer client);
+	//! false for an XR_DXR_weave present-owner (it presents its own window).
+	bool shared_surface;
+	//! In the shared surface's composite: a delivered projection layer, not minimized.
+	bool in_composite;
+	//! Views of the delivered projection layer (0 = nothing delivered).
+	uint32_t view_count;
+	//! XR_DXR_weave present-owner: bound a window or brought up a weave DP.
+	bool weave_owner;
+	//! A display processor weaves this client (the shared DP, or its weave DP).
+	bool has_dp;
+	//! ...and its content is woven 3D (not hardware-2D / mono).
+	bool woven;
+	//! The window rect, desktop-absolute device pixels (+ metres when the panel size is known).
+	struct xrt_window_metrics window;
+};
+
+//! The shared surface's display processor (the one the service presents with).
+struct multi_compositor_status_shared_dp
+{
+	bool present;           //!< shared_dp exists (created lazily with the surface).
+	bool eyes_answered;     //!< get_predicted_eye_positions returned true.
+	bool is_tracking;       //!< ...and reports a tracked viewer.
+	bool backend_known;     //!< The DP exposes get_backend_state.
+	uint32_t backend_state; //!< XRT_DP_BACKEND_STATE_* (valid iff @ref backend_known).
+	bool hardware_3d;       //!< The lens state last applied to it is 3D.
+	int32_t panel_left;     //!< The panel the surface covers, desktop-absolute px.
+	int32_t panel_top;      //!< ...
+	uint32_t panel_width;   //!< ...
+	uint32_t panel_height;  //!< ...
+};
+
+/*!
+ * Fill @p out for client compositor @p xc of system compositor @p xsysc.
+ * @p xc is matched by pointer identity against `msc->clients[]` under
+ * list_and_timing_lock and dereferenced only while found there.
+ *
+ * @return false when @p xsysc is not a comp_multi system or @p xc is not (or
+ *         no longer) one of its clients.
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_status_get_client(struct xrt_system_compositor *xsysc,
+                                   const struct xrt_compositor *xc,
+                                   struct multi_compositor_status_client *out);
+
+/*!
+ * Fill @p out with the shared surface's DP state. False when @p xsysc is not
+ * a comp_multi system; `out->present` is false while no shared DP exists.
+ * @ingroup comp_multi
+ */
+bool
+multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
+                                      struct multi_compositor_status_shared_dp *out);
+
+/*! @} */
+#endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+/*!
+ * #2218 item 6: copy the system's screen list + registry into @p out_list /
+ * @p out_info when its generation differs from @p have_generation. Returns the
+ * current generation (0 = never set: nothing copied); the copies are written
+ * only when it differs from @p have_generation. Takes the weave_screens leaf
+ * lock only.
+ *
+ * @ingroup comp_multi
+ */
+uint64_t
+multi_system_weave_screens_snapshot(struct multi_system_compositor *msc,
+                                    uint64_t have_generation,
+                                    struct xrt_screen_list *out_list,
+                                    struct xrt_system_compositor_info *out_info);
+#endif
 
 
 #ifdef __cplusplus

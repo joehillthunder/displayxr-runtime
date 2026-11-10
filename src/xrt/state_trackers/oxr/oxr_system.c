@@ -15,12 +15,16 @@
 #include <assert.h>
 
 #include "xrt/xrt_device.h"
+#include "xrt/xrt_instance.h"
+#include "xrt/xrt_screen.h"
 #include "util/u_debug.h"
+#include "util/u_misc.h"
 #include "util/u_verify.h"
 
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
+#include "oxr_segment_views.h"
 #include "oxr_chain.h"
 #include "oxr_api_verify.h"
 #include "oxr_conversions.h"
@@ -165,6 +169,96 @@ oxr_system_fill_in(
 	 * extension enabled, not only on devices whose max exceeds 2 - so an app
 	 * can select it uniformly and get 2 views where 2 is all there is.
 	 */
+	/*
+	 * Multi-screen M3: advertise one view set per segment only where a
+	 * window can ever be split — the in-process Vulkan compositor on desktop
+	 * Linux, the in-process D3D11 / D3D12 / Vulkan compositors or the D3D11
+	 * service on Windows, or the in-process Metal compositor on macOS, with at
+	 * least two registry screens that have a DP factory. A single-screen box, a Linux service
+	 * session and every other platform keep the pre-M3 count, so existing
+	 * multiview apps and the CTS see no change.
+	 */
+	{
+		uint32_t with_factory = 0;
+		bool can_segment = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+		// DXR_SEGMENTS=0 (the segmentation kill switch) also keeps the
+		// pre-M3 count: no window is ever split.
+		const char *segs_env = getenv("DXR_SEGMENTS");
+		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
+		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode && !segments_off) {
+			can_segment = true;
+			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
+			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				if (reg->entries[e].dp_factory_vk != NULL) {
+					with_factory++;
+				}
+			}
+		}
+#elif defined(XRT_OS_WINDOWS) && (defined(XRT_HAVE_D3D11_NATIVE_COMPOSITOR) ||                                         \
+                                  defined(XRT_HAVE_D3D12_NATIVE_COMPOSITOR) || defined(XRT_HAVE_VK_NATIVE_COMPOSITOR))
+		// Multi-screen M3 on Windows: the in-process D3D11, D3D12, Vulkan and
+		// OpenGL compositors segment a window the same way
+		// (comp_d3d11_segments, comp_d3d12_segments, comp_vk_native_segments —
+		// or, for Vulkan under the #918 split, comp_d3d11_segments on the
+		// scanout adapter — and comp_gl_segments); a registry D3D11, D3D12,
+		// Vulkan or GL factory is what says a screen has a DP. The capacity is
+		// per system, so a session whose compositor does not segment on the
+		// same box advertises the doubled count too and never splits — the
+		// tail views then repeat view 0, which the contract allows.
+		//
+		// Service sessions too (ADR-047 Amendment 3): the D3D11 service
+		// segments a direct IPC client's window the same way. The registry
+		// counted here is then the SERVICE's — `xrt_system_compositor_info`
+		// crosses the wire by value, so each entry's factory pointer is a
+		// service-process address: never called here, only tested for NULL
+		// ("the service can make a D3D11 DP for that screen"). A
+		// single-screen box still counts 1 and keeps the pre-M3 count.
+		const char *segs_env = getenv("DXR_SEGMENTS");
+		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
+		if (sys->xsysc != NULL && !segments_off) {
+			can_segment = true;
+			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
+			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				bool has_dp = oxr_segment_views_win_entry_has_dp(reg->entries[e].dp_factory_d3d11,
+				                                                 reg->entries[e].dp_factory_d3d12,
+				                                                 reg->entries[e].dp_factory_vk);
+#ifdef XRT_HAVE_GL_NATIVE_COMPOSITOR
+				// Multi-screen M6 (OpenGL): the in-process GL compositor
+				// segments a window too (comp_gl_segments), so a GL factory
+				// makes the screen DP-backed as well.
+				has_dp = has_dp || oxr_segment_views_win_entry_has_gl_dp(reg->entries[e].dp_factory_gl);
+#endif
+				if (has_dp) {
+					with_factory++;
+				}
+			}
+		}
+#elif defined(XRT_OS_MACOS) && defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR)
+		// Multi-screen on macOS: the in-process Metal compositor segments a
+		// window the same way (comp_metal_segments); the registry's Metal
+		// factory is what says a screen has a DP. Same per-system caveat as
+		// Windows: a GL / Vulkan session on the same box advertises the
+		// doubled count too and never splits (the tail repeats view 0).
+		const char *segs_env = getenv("DXR_SEGMENTS");
+		const bool segments_off = segs_env != NULL && segs_env[0] == '0';
+		if (sys->xsysc != NULL && !sys->xsysc->info.is_service_mode && !segments_off) {
+			can_segment = true;
+			const struct xrt_dp_factory_registry *reg = &sys->xsysc->info.dp_registry;
+			for (uint32_t e = 0; e < reg->entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				if (reg->entries[e].dp_factory_metal != NULL) {
+					with_factory++;
+				}
+			}
+		}
+#endif
+		sys->multiview_set_capacity = oxr_segment_views_set_capacity(with_factory, can_segment);
+		if (sys->multiview_set_capacity > 1) {
+			U_LOG_I("multi-screen: %u DP-backed screens — PRIMARY_MULTIVIEW_DXR carries up to %u view sets",
+			        with_factory, sys->multiview_set_capacity);
+		}
+	}
+
 	sys->view_config_legacy = debug_get_bool_option_view_config_legacy();
 	if (sys->view_config_legacy) {
 		sys->view_config_count = 1;
@@ -187,10 +281,20 @@ oxr_system_fill_in(
 #ifdef OXR_HAVE_DXR_display_info
 		if (inst->extensions.DXR_display_info) {
 			sys->view_config_types[1] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR;
-			sys->view_config_view_counts[1] = view_count;
+			// Multi-screen M3 (ADR-047 D3): one view set per window
+			// segment. A window on one screen locates exactly what it did
+			// before and aliases the larger tail (ADR-041).
+			sys->view_config_view_counts[1] =
+			    oxr_segment_views_multiview_count(view_count, sys->multiview_set_capacity);
 			sys->view_config_count = 2;
 		}
 #endif
+	}
+	sys->view_config_max_count = view_count > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : view_count;
+	for (uint32_t t = 0; t < sys->view_config_count; t++) {
+		if (sys->view_config_view_counts[t] > sys->view_config_max_count) {
+			sys->view_config_max_count = sys->view_config_view_counts[t];
+		}
 	}
 	U_LOG_D("sys->view_config_types[0] = %d (%u views), count = %u", sys->view_config_types[0],
 	        sys->view_config_view_counts[0], sys->view_config_count);
@@ -359,9 +463,13 @@ oxr_system_fill_in(
 	}
 #endif // OXR_HAVE_DXR_display_info
 
-	for (uint32_t i = 0; i < view_count; ++i) {
-		uint32_t w_max = info->views[i].max.width_pixels;
-		uint32_t h_max = info->views[i].max.height_pixels;
+	// Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports more views than the
+	// device has (one set per segment). Every view is the same worst-case
+	// (full canvas x scale) envelope, so the extra entries copy the device's.
+	for (uint32_t i = 0; i < sys->view_config_max_count; ++i) {
+		const uint32_t di = i < view_count ? i : 0;
+		uint32_t w_max = info->views[di].max.width_pixels;
+		uint32_t h_max = info->views[di].max.height_pixels;
 
 		uint32_t w, h;
 		if (view_scale_x > 0.0f && view_scale_y > 0.0f &&
@@ -378,8 +486,8 @@ oxr_system_fill_in(
 			}
 		} else {
 			// Legacy: no display processor, use compositor recommended directly
-			w = (uint32_t)(info->views[i].recommended.width_pixels * scale);
-			h = (uint32_t)(info->views[i].recommended.height_pixels * scale);
+			w = (uint32_t)(info->views[di].recommended.width_pixels * scale);
+			h = (uint32_t)(info->views[di].recommended.height_pixels * scale);
 		}
 
 		w = imin(w, w_max);
@@ -399,8 +507,8 @@ oxr_system_fill_in(
 		sys->views[i].maxImageRectWidth = w_max;
 		sys->views[i].recommendedImageRectHeight = h;
 		sys->views[i].maxImageRectHeight = h_max;
-		sys->views[i].recommendedSwapchainSampleCount = info->views[i].recommended.sample_count;
-		sys->views[i].maxSwapchainSampleCount = info->views[i].max.sample_count;
+		sys->views[i].recommendedSwapchainSampleCount = info->views[di].recommended.sample_count;
+		sys->views[i].maxSwapchainSampleCount = info->views[di].max.sample_count;
 
 		// Store actual recommended dims for legacy apps (first view = per-eye size)
 		if (i == 0 && info->legacy_app_tile_scaling) {
@@ -414,7 +522,7 @@ oxr_system_fill_in(
 	// #1488: seed the live-view shadow from the snapshot we just computed.
 	// Leaves views_change.valid false, so xrEnumerateViewConfigurationViews
 	// keeps answering from sys->views until a real change lands.
-	oxr_views_change_seed(&sys->views_change, sys->views, sys->view_count);
+	oxr_views_change_seed(&sys->views_change, sys->views, sys->view_config_max_count);
 
 
 	/*
@@ -919,6 +1027,12 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 	}
 #endif // OXR_HAVE_META_body_tracking_calibration
 
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	if (sys->inst->extensions.DXR_win32_window_binding) {
+		oxr_texture_target_system_properties(sys, properties);
+	}
+#endif
+
 #ifdef OXR_HAVE_DXR_display_info
 	XrDisplayInfoDXR *display_info = NULL;
 	if (sys->inst->extensions.DXR_display_info) {
@@ -1005,6 +1119,183 @@ oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSyst
 
 	return XR_SUCCESS;
 }
+
+/*
+ *
+ * Multi-screen M1: per-display enumeration (XR_DXR_display_info v22).
+ *
+ */
+
+void
+oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list)
+{
+	memset(out_list, 0, sizeof(*out_list));
+
+	struct xrt_instance *xinst = (sys != NULL && sys->inst != NULL) ? sys->inst->xinst : NULL;
+	if (xrt_instance_enumerate_displays(xinst, out_list) != XRT_SUCCESS) {
+		memset(out_list, 0, sizeof(*out_list));
+	}
+	if (out_list->count > 0 || sys == NULL || sys->xsysc == NULL) {
+		return;
+	}
+
+	// The instance could not enumerate (or knows no monitor): the system's
+	// own display is still a display. Synthesize it from the system info so
+	// the list always carries exactly one SYSTEM_DEFAULT entry.
+	const struct xrt_system_compositor_info *info = &sys->xsysc->info;
+	if (!(info->display_width_m > 0.0f) || !(info->display_height_m > 0.0f)) {
+		return;
+	}
+	struct xrt_screen *scr = &out_list->screens[0];
+	scr->id = XRT_SCREEN_ID_SYNTHETIC_DEFAULT;
+	scr->flags = XRT_SCREEN_FLAG_SYSTEM_DEFAULT;
+	if (info->display_is_primary) {
+		scr->flags |= XRT_SCREEN_FLAG_PRIMARY;
+	}
+	if (info->supported_eye_tracking_modes != 0) {
+		scr->flags |= XRT_SCREEN_FLAG_TRACKED;
+	}
+	scr->desktop_left = info->display_screen_left;
+	scr->desktop_top = info->display_screen_top;
+	scr->desktop_width = info->display_desktop_width;
+	scr->desktop_height = info->display_desktop_height;
+	scr->native_width = info->display_desktop_native_width;
+	scr->native_height = info->display_desktop_native_height;
+	scr->desktop_scale = info->display_desktop_scale;
+	(void)snprintf(scr->plugin_id, sizeof(scr->plugin_id), "%s", info->active_plugin_id);
+	(void)snprintf(scr->device_name, sizeof(scr->device_name), "%.*s", (int)(sizeof(scr->device_name) - 1),
+	               info->display_device_name);
+	scr->info.width_m = info->display_width_m;
+	scr->info.height_m = info->display_height_m;
+	scr->info.nominal_viewer_x_m = info->nominal_viewer_x_m;
+	scr->info.nominal_viewer_y_m = info->nominal_viewer_y_m;
+	scr->info.nominal_viewer_z_m = info->nominal_viewer_z_m;
+	scr->info.recommended_view_scale_x = info->recommended_view_scale_x;
+	scr->info.recommended_view_scale_y = info->recommended_view_scale_y;
+	scr->info.pixel_width = info->display_pixel_width;
+	scr->info.pixel_height = info->display_pixel_height;
+	scr->info.supported_eye_tracking_modes = info->supported_eye_tracking_modes;
+	scr->info.default_eye_tracking_mode = info->default_eye_tracking_mode;
+	scr->info.source = XRT_SCREEN_INFO_SOURCE_SYSTEM;
+	out_list->count = 1;
+}
+
+bool
+oxr_system_get_info(struct oxr_system *sys, struct xrt_system_compositor_info *out_info)
+{
+	if (sys == NULL || sys->xsysc == NULL || out_info == NULL) {
+		return false;
+	}
+	// The snapshot hands out the screen list too; only the info is wanted.
+	struct xrt_instance *xinst = sys->inst != NULL ? sys->inst->xinst : NULL;
+	struct xrt_screen_list *scratch = U_TYPED_CALLOC(struct xrt_screen_list);
+	const bool locked =
+	    scratch != NULL && xrt_instance_get_display_snapshot(xinst, scratch, out_info, NULL) == XRT_SUCCESS;
+	free(scratch);
+	if (!locked) {
+		// No live claim sweep on this instance: nothing rewrites the info.
+		*out_info = sys->xsysc->info;
+	}
+	return true;
+}
+
+#ifdef OXR_HAVE_DXR_display_info
+static void
+fill_display_dxr(struct oxr_system *sys, const struct xrt_screen *scr, XrDisplayDXR *d)
+{
+	const struct xrt_screen_info *si = &scr->info;
+
+	d->type = XR_TYPE_DISPLAY_DXR;
+	// d->next is the app's: left as it is, only XrDisplayStableKeyDXR (v24) on it is written.
+	d->displayId = scr->id;
+
+	d->info.type = XR_TYPE_DISPLAY_INFO_DXR;
+	d->info.next = NULL;
+	d->info.displaySizeMeters.width = si->width_m;
+	d->info.displaySizeMeters.height = si->height_m;
+	d->info.nominalViewerPositionInDisplaySpace.x = si->nominal_viewer_x_m;
+	d->info.nominalViewerPositionInDisplaySpace.y = si->nominal_viewer_y_m;
+	d->info.nominalViewerPositionInDisplaySpace.z = si->nominal_viewer_z_m;
+	float scale_x = si->recommended_view_scale_x;
+	float scale_y = si->recommended_view_scale_y;
+	if ((scr->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+		// Exactly what XrDisplayInfoDXR on XrSystemProperties reports: the
+		// ACTIVE mode's per-view scale at query time (see
+		// oxr_system_get_properties).
+		xrt_device_get_active_mode_view_scale(GET_XDEV_BY_ROLE(sys, head), &scale_x, &scale_y);
+	}
+	d->info.recommendedViewScaleX = scale_x;
+	d->info.recommendedViewScaleY = scale_y;
+	d->info.displayPixelWidth = si->pixel_width;
+	d->info.displayPixelHeight = si->pixel_height;
+
+	d->desktopRect.offset.x = scr->desktop_left;
+	d->desktopRect.offset.y = scr->desktop_top;
+	d->desktopRect.extent.width = (int32_t)scr->desktop_width;
+	d->desktopRect.extent.height = (int32_t)scr->desktop_height;
+	d->nativePixelWidth = scr->native_width;
+	d->nativePixelHeight = scr->native_height;
+	d->desktopScale = scr->desktop_scale;
+
+	d->eyeTracking.type = XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR;
+	d->eyeTracking.next = NULL;
+	d->eyeTracking.supportedModes = (XrEyeTrackingModeCapabilityFlagsDXR)si->supported_eye_tracking_modes;
+	d->eyeTracking.defaultMode = (XrEyeTrackingModeDXR)si->default_eye_tracking_mode;
+
+	d->flags = 0;
+	if ((scr->flags & XRT_SCREEN_FLAG_PRIMARY) != 0) {
+		d->flags |= XR_DISPLAY_PRIMARY_BIT_DXR;
+	}
+	if ((scr->flags & XRT_SCREEN_FLAG_TRACKED) != 0) {
+		d->flags |= XR_DISPLAY_TRACKED_BIT_DXR;
+	}
+	if ((scr->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0) {
+		d->flags |= XR_DISPLAY_SYSTEM_DEFAULT_BIT_DXR;
+	}
+
+	(void)snprintf(d->vendorPluginId, sizeof(d->vendorPluginId), "%s", scr->plugin_id);
+	(void)snprintf(d->deviceName, sizeof(d->deviceName), "%s", scr->device_name);
+
+	XrDisplayStableKeyDXR *stable_key =
+	    OXR_GET_OUTPUT_FROM_CHAIN(d, XR_TYPE_DISPLAY_STABLE_KEY_DXR, XrDisplayStableKeyDXR);
+	if (stable_key != NULL) {
+		(void)snprintf(stable_key->key, sizeof(stable_key->key), "%s", scr->key);
+	}
+}
+
+XrResult
+oxr_system_enumerate_displays(struct oxr_logger *log,
+                              struct oxr_system *sys,
+                              uint32_t displayCapacityInput,
+                              uint32_t *displayCountOutput,
+                              XrDisplayDXR *displays)
+{
+	struct xrt_screen_list list;
+	oxr_system_get_screens(sys, &list);
+
+	*displayCountOutput = list.count;
+	if (displayCapacityInput == 0) {
+		return XR_SUCCESS;
+	}
+	if (displays == NULL) {
+		return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "(displays == NULL) with displayCapacityInput > 0");
+	}
+	if (displayCapacityInput < list.count) {
+		return oxr_error(log, XR_ERROR_SIZE_INSUFFICIENT, "(displayCapacityInput == %u) < %u",
+		                 displayCapacityInput, list.count);
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		if (displays[i].type != XR_TYPE_DISPLAY_DXR) {
+			return oxr_error(log, XR_ERROR_VALIDATION_FAILURE, "(displays[%u].type != XR_TYPE_DISPLAY_DXR)",
+			                 i);
+		}
+	}
+	for (uint32_t i = 0; i < list.count; i++) {
+		fill_display_dxr(sys, &list.screens[i], &displays[i]);
+	}
+	return XR_SUCCESS;
+}
+#endif // OXR_HAVE_DXR_display_info
 
 bool
 oxr_system_lookup_view_config(const struct oxr_system *sys, XrViewConfigurationType type, uint32_t *out_view_count)

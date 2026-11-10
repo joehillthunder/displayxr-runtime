@@ -1,7 +1,7 @@
 ---
 status: Active
 owner: David Fattal
-updated: 2026-06-05
+updated: 2026-10-10
 issues: [81, 441]
 code-paths: [src/external/openxr_includes/openxr/XR_DXR_display_info.h, src/xrt/state_trackers/oxr/]
 ---
@@ -78,6 +78,95 @@ notification primitive for MANUAL mode (replaces per-frame polling of
 `XrViewEyeTrackingStateDXR`); it fires in MANAGED mode too, where apps may use it to drive
 optional UI. Edge detection happens in the runtime's `xrLocateViews` path, so an app that
 never locates views receives no events (it also has no use for them).
+
+### Multi-screen: the session is tracked when any of its screens is (ADR-047 Amendment 7)
+
+On a multi-screen rig every screen has its own DP and its own tracker (ADR-047), and a window
+can present through several of them at once: the session's own DP plus a segment DP per other
+screen it spans (in-process and the service's direct pipeline), the secondary workspace
+presenters of its workspace (ADR-052; every one, not only those its tile touches — a viewer
+seen by any panel keeps every tile tracked), or the per-screen segment DPs of a present-owner's weave
+(`XR_DXR_weave`, Amendment 4). Per-screen **eyes** stay per screen: each segment's views come
+from its own screen's DP, as before. The session-level **boolean** is the OR over every DP
+presenting for the session:
+
+```
+isTracking = active_mode.has_tracking && debounce(own_dp.tracked || any(other_presenting_dp.tracked))
+```
+
+- **Rises immediately** when any of them sees a viewer.
+- **One DP presenting** (a window on one screen — every window on a single-screen box): falls
+  immediately, exactly the pre-amendment rule, so MANUAL's "immediate" contract is unchanged.
+- **Several DPs presenting:** falls only after the OR has been false for 0.5 s
+  (`U_TRACKING_ANY_HOLD_NS`), so a viewer walking from one screen to the other never produces a
+  false edge when the first screen lets go a moment before the second acquires. Each DP's own
+  signal is still the vendor's (MANAGED grace period, MANUAL immediate); the hold covers only the
+  hand-over between screens.
+
+What hangs off it: `XrViewEyeTrackingStateDXR.isTracking`, the
+`XrEventDataEyeTrackingStateChangedDXR` edge, `XrWeaveOutputDXR.eyesTracking`, and the
+service's system display status (`system_get_display_status`, an undebounced read). A DP's
+"viewer present" is decided in one place, `u_tracking_dp_viewer_present()`
+(`src/xrt/auxiliary/util/u_tracking_any.h`) — today the DP's eye validity; that is the hook a
+vendor's per-display user-presence signal (e.g. LeiaSR's `SR_EVENT_TYPE_DISPLAY_USER_PRESENCE`,
+capability-gated) will feed through an optional DP slot, with no vendor SDK in the runtime.
+
+The workspace controller's FRAME_TICK viewer follows the same rule: when the primary's DP sees
+nobody but a secondary presenter's DP does, the published viewer is that presenter's, mapped into
+the primary's display space through the workspace's desktop-pixel layout (`comp_ws_map_pose`:
+x/y by each screen's pixel pitch, z unchanged — the screens are treated as coplanar, ADR-052 D2).
+It switches to a secondary only after that screen has been the only one seeing a viewer for
+100 ms (`U_TRACKING_SOURCE_DWELL_NS`), so a presence edge that reaches the DPs a frame apart does
+not flip it for a frame; the primary wins back at once.
+
+Per-screen views are unaffected: the per-view raw block (`XR_DXR_view_rig`) and
+`XrWeaveOutputRectPartsDXR` keep each screen's own `isTracking`. The vendor's MANAGED 2D/3D
+auto-switch also stays per panel: each DP drives its own lens from its own tracker.
+
+### Target-time query (ADR-054 §4.1 / N6 Part 1, #2144)
+
+Every eye consumer asks for the eyes **at the instant the pixels it is about to produce will be
+seen**, not for "the latest prediction". The DP eye query has two forms:
+
+| Slot | Meaning |
+|---|---|
+| `get_predicted_eye_positions(xdp, out)` | The original slot, unchanged: the eyes at **now + the vendor's default horizon** (a horizon the caller cannot see or control). |
+| `get_eye_positions_at(xdp, target_ns, out)` | **New, optional** (ADR-020 append-only slot on all five per-API vtables, announced by `XRT_DP_<API>_HAS_EYE_POSITIONS_AT`): the eyes at `target_ns`. |
+
+The contract:
+
+- **Clock** — `target_ns` is on the `os_monotonic_get_ns()` clock, the same clock as
+  `xrt_eye_positions.timestamp_ns`.
+- **Target** — the expected **display time** of the pixels: `xrLocateViews` passes the frame's
+  `displayTime` (converted from `XrTime` to monotonic), a compositor its weave / scan-out instant,
+  a status query "now". Over IPC, `compositor_get_predicted_eye_positions` carries the client's
+  `target_ns` to the service, which answers from that client's DP; `target_ns = 0` on the wire
+  means "latest" (the pre-N6 behaviour).
+- **Answer** — `out` is filled exactly as `get_predicted_eye_positions` fills it (same
+  `valid` / `is_tracking` / never-zeros rules as *Tracking loss* below); `out->timestamp_ns` is the
+  time of the **tracker sample** the answer is based on, so the caller can tell how far it was
+  predicted.
+- **Fallback — a DP without the slot keeps today's latest-answer behaviour; implementing the slot
+  opts in to display-time sampling.** When the slot is absent (`struct_size` does not cover it: a
+  plug-in built against an older header) or NULL, every path — the in-process compositors, the
+  D3D11 service's per-client getters, the IPC server — returns the DP's own
+  `get_predicted_eye_positions` answer **unchanged**. That answer is already vendor-predicted, so
+  the runtime never re-samples or extrapolates it to the target (that would apply the horizon
+  twice).
+- **Ring** — every answer a compositor gets from its DP (per-frame and per-locate) is still pushed
+  into a **trunk-side ring** (`util/u_eye_history.h`), keyed by when it was asked. It is read only
+  when a DP **has** the slot and the slot fails or returns `valid = false`, and then **clamped**:
+  exact / interpolated between samples (per eye; `is_tracking` is the AND of the neighbours, so a
+  tracking-lost edge is never interpolated away) / the newest sample for any later target —
+  **never extrapolated** / **stale** once the newest sample is older than 500 ms (last-known
+  positions, `is_tracking = false`).
+
+The in-process compositors (D3D11, D3D12, GL, Metal, Vulkan) each own one ring next to their DP.
+The D3D11 service keeps one ring per DP it asks (a small fixed table; the render thread's
+per-frame viewer publish feeds the presenter's ring); the macOS / Linux `comp_multi` service asks
+the DP's slot and otherwise answers "latest". `sim_display` implements the slot on every variant;
+with `TRACKING=1` its fake tracker can sway deterministically in the target time
+(`TRACKING_SWAY_MM`, `TRACKING_SWAY_PERIOD_MS`; default 0 = static) so the round trip is testable.
 
 ### Tracking loss and eye position reporting
 
@@ -171,6 +260,7 @@ The display processor must:
 1. **Store the active eye tracking mode** (like it now stores `view_count`)
 2. **On mode change** (`xrRequestEyeTrackingModeDXR`): call vendor SDK to enable/disable managed behavior
 3. **In `get_predicted_eye_positions()`**: vendor SDK already behaves differently based on the mode setting -- no display processor post-processing needed for MANAGED vs MANUAL (the SDK does it)
+4. **Optionally implement `get_eye_positions_at(target_ns)`** (see *Target-time query*): predict for the caller's display time with the SDK's own predictor (e.g. a predict-with-latency call) instead of its default horizon. Without it the runtime keeps using your `get_predicted_eye_positions()` answer unchanged (today's behaviour).
 
 ### Event propagation for vendor-initiated transitions (MANAGED mode)
 
@@ -236,6 +326,7 @@ Ideally vendors support **both** modes (bits = 3), giving developers the choice.
 - [ ] Vendor display processors pass eye tracking mode to the SDK wrapper when `xrRequestEyeTrackingModeDXR` is called (vendor-side; tracked per plug-in repo)
 - [ ] Event propagation path exists for vendor-initiated 2D/3D switches (MANAGED mode auto-transitions fire `XrEventDataRenderingModeChangedDXR` + `XrEventDataHardwareDisplayStateChangedDXR`)
 - [x] sim_display honest: `supported_eye_tracking_modes = 0`, all modes untracked; `SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL_BIT + tracked modes (+ `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS` square wave) for hardware-free testing (#441, runtime v1.13.0)
+- [ ] sim_display webcam tracking (#1855, ADR-022 Amendment 1): `SIM_DISPLAY_WEBCAM_TRACKING=1` + a built-in face estimator → MANAGED_BIT, MANAGED default, tracked 3D modes; collapse to nominal 300 ms after the face is lost. Plumbing landed; the estimator (model + inference dependency) is open, so the toggle is inert today. **Deprecated alias** since the tracker moved to the `sim-tracking` provider (`SOURCE=webcam`, `docs/specs/runtime/tracking-provider-discovery.md` §8); removed next release
 - [x] Per-mode `has_tracking` plumbed plugin → `xrt_rendering_mode.mode_flags` → chained `XrDisplayRenderingModeTrackingInfoDXR` (#441, ABI v3 / header v14 — see ADR-022)
 - [x] `XrEventDataEyeTrackingStateChangedDXR` queued on every derived-isTracking edge (#441; validated against real view-zone edges on 3D-display hardware)
 - [x] `is_tracking` transported over IPC; fake-TRUE fallback removed (#441 Phase 2, PR #446)

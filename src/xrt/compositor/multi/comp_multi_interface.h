@@ -14,6 +14,37 @@
  * (#967); platform shape: `docs/architecture/service-architecture.md` §7.
  */
 
+/*!
+ * @page comp_multi_locking comp_multi locking (#1005, #1007)
+ *
+ * Three locks, ONE order — always acquire left to right, never the reverse:
+ *
+ *     msc->render_lock  ->  msc->list_and_timing_lock  ->  mc->slot_lock
+ *
+ * - **render_lock** — held by the multi main loop for one whole frame:
+ *   layer transfer, native layer_commit, and every per-client / shared-surface
+ *   record, submit, bounded fence wait, DP call (`process_atlas`, on_pause /
+ *   on_resume) and present. Also taken by anything that must not overlap a
+ *   frame in flight: client destroy (around the unlist), end_session (around
+ *   the session-render teardown flags), the session-DP detach, the system-wide
+ *   display-mode request, and the Android visibility tick (trylock — a busy
+ *   lock means the main loop is running that pass itself). It is NEVER taken
+ *   while holding list_and_timing_lock or a slot_lock.
+ * - **list_and_timing_lock** — `msc->clients[]`, the pacing timings and every
+ *   client's app pacer (`u_pa_*`), slot moves. Held only for SHORT bookkeeping
+ *   sections; no GPU work, no fence wait, no DP call and no present runs under
+ *   it (the main loop renders a snapshot, `msc->render_set`, taken under it
+ *   with render_lock held). A read-only accessor that only needs a consistent
+ *   view of `clients[]` / per-client state may take list_and_timing_lock
+ *   alone; it must not call into a DP or Vulkan while holding it.
+ * - **slot_lock** — per client, the progress/scheduled slot handshake with
+ *   that client's wait thread.
+ *
+ * Consequences: a client create/destroy or a pacing call waits for at most
+ * the bookkeeping, not for a frame; a destroy waits for at most the frame in
+ * flight (whose waits are bounded, #1007) and never for another client's GPU.
+ */
+
 #pragma once
 
 #include "xrt/xrt_config_os.h"
@@ -42,6 +73,42 @@
 #if defined(XRT_OS_MACOS) || defined(XRT_OS_ANDROID) ||                                                                \
     (defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID) && defined(XRT_FEATURE_COMP_MULTI_WEAVE_LINUX))
 #define COMP_MULTI_HAVE_WEAVE
+#endif
+
+/*!
+ * @def COMP_MULTI_SHARED_SURFACE
+ * Defined when this build COMPILES the comp_multi SHARED SPATIAL SURFACE
+ * (#59): one service-owned full-screen target, every client app composited
+ * into one combined atlas at its workspace pose, one display-processor weave,
+ * one present (the analogue of the Windows D3D11 monolith). Whether it is the
+ * path a given frame takes is @ref multi_shared_surface_active — see
+ * COMP_MULTI_PER_SESSION_TARGET.
+ *
+ * - macOS: service-owned NSWindow (comp_window_macos).
+ * - Desktop Linux (#710, #967): service-owned X11 window, Xorg or XWayland
+ *   (comp_window_linux).
+ * - Android (#1006, ADR-036 D4): the WORKSPACE OVERLAY MODE — the target is
+ *   the verified workspace controller's own fullscreen surface, and the mode
+ *   is entered only while that controller is active.
+ */
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
+#define COMP_MULTI_SHARED_SURFACE
+#endif
+
+/*!
+ * @def COMP_MULTI_PER_SESSION_TARGET
+ * Defined when this build compiles the per-session target path
+ * (render_session_to_own_target: one target + one DP per client) — Android's
+ * default (ADR-036 D1/D3) and the unused Windows fallback.
+ *
+ * Where BOTH are defined (Android) the mode is chosen at runtime by
+ * @ref multi_shared_surface_active: per-session unless a verified workspace
+ * controller has activated the overlay. Where only COMP_MULTI_SHARED_SURFACE is
+ * defined (macOS, desktop Linux) the predicate is a compile-time `true`, so
+ * those builds are unchanged.
+ */
+#if !defined(XRT_OS_MACOS) && !defined(XRT_OS_LINUX_DESKTOP)
+#define COMP_MULTI_PER_SESSION_TARGET
 #endif
 
 
@@ -76,6 +143,41 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
                                     struct xrt_system_compositor **out_xsysc);
 
 
+struct vk_bundle;
+
+/*!
+ * ADR-053 P5: the Vulkan bundle the system compositor's target service owns
+ * (the null compositor's device on macOS and desktop Linux), for service-side
+ * GPU work that is not a session's (the conversion core's Vulkan glue).
+ * NULL when @p xsysc is not a multi system compositor or has no Vulkan device.
+ * Borrowed: valid until @p xsysc is destroyed.
+ *
+ * @public @memberof multi_system_compositor
+ */
+struct vk_bundle *
+comp_multi_system_get_vk(struct xrt_system_compositor *xsysc);
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+struct xrt_screen_list;
+
+/*!
+ * #2218 item 6: hand the system's screens (xrt_instance_enumerate_displays)
+ * to the multi system compositor, together with the DP registry as it stands
+ * in @p xsysc's info right now. The desktop-Linux and macOS XR_DXR_weave
+ * engines weave each present-owner window with the display processor of every
+ * screen it covers, against this list. Called by the IPC server at start-up,
+ * after every display re-probe and whenever the display-topology generation
+ * moves (the macOS hotplug sweep); a call that changes nothing (the 10 s
+ * fallback re-probe), or only refines a screen's EDID physical size (#2097),
+ * does not disturb a live engine. No-op when @p xsysc is not a multi system
+ * compositor.
+ *
+ * @public @memberof multi_system_compositor
+ */
+void
+comp_multi_system_set_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
@@ -85,7 +187,8 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
  * #1278: drive the Android visibility/weave-idle convergent pass from an
  * always-running context (the IPC server 20 Hz mainloop). The multi main loop
  * only runs with composited sessions; a pure present-owner weave client
- * leaves it parked. Safe to call from any thread; takes the system lock.
+ * leaves it parked. Safe to call from any thread; try-takes render_lock, then
+ * list_and_timing_lock (see @ref comp_multi_locking).
  */
 void
 multi_system_compositor_android_visibility_tick(struct xrt_system_compositor *xsysc);

@@ -70,5 +70,10 @@ bool GetD3D11GraphicsRequirements(XrSessionManager& xr, LUID* outAdapterLuid);
 // Create session with D3D11 device, the app's shared texture HANDLE (the
 // runtime's composite target — the texture-mode marker), and the app window
 // (weaver position tracking) via XR_DXR_win32_window_binding.
+// ADR-060 smoke mode (DXR_TEXTURE_TARGET=1): the session names its texture target.
+bool TextureTargetEnabled();
+// DXR_TEXTURE_TARGET_INSET=x,y: the target rect (and the blit) start at (x,y) of the client area.
+void TextureTargetInset(int* x, int* y);
+
 bool CreateSession(XrSessionManager& xr, ID3D11Device* d3d11Device,
                    HANDLE sharedTextureHandle, HWND appHwnd);

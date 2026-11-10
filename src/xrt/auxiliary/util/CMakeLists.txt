@@ -19,11 +19,33 @@ add_library(
 	aux_util STATIC
 	u_camera_profile.c
 	u_camera_profile.h
+	u_exe_basename.c
+	u_exe_basename.h
 	u_autoexpgain.c
 	u_autoexpgain.h
 	u_bg_neutrality.c
 	u_bg_neutrality.h
 	u_bitwise.c
+	u_conv_viewsyn.c
+	u_conv_viewsyn.h
+	u_cursor_depth.c
+	u_cursor_depth.h
+	u_stereo_comfort.c
+	u_stereo_comfort.h
+	u_lift_autoconv.c
+	u_lift_autoconv.h
+	u_lift_cursor.c
+	u_lift_cursor.h
+	u_lift_depth.c
+	u_lift_depth.h
+	u_lift_mailbox.c
+	u_lift_mailbox.h
+	u_lift_reproject.c
+	u_lift_reproject.h
+	u_lift_rig.c
+	u_lift_rig.h
+	u_lift_viewpoint.c
+	u_lift_viewpoint.h
 	u_snap_grid.c
 	u_snap_grid.h
 	u_bitwise.h
@@ -31,6 +53,31 @@ add_library(
 	u_builders.h
 	u_capture_dims.c
 	u_capture_dims.h
+	u_app_share_fake.c
+	u_app_share_fake.h
+	u_share_link.c
+	u_share_link.h
+	u_camera_consent.c
+	u_camera_consent.h
+	u_camera_consent_android.c
+	u_camera_consent_android.h
+	u_camera_consent_store.c
+	u_camera_calib.c
+	u_camera_calib.h
+	u_client_class.c
+	u_credential.c
+	u_credential.h
+	u_client_class.h
+	u_sha256.c
+	u_sha256.h
+	u_stereo_camera.c
+	u_stereo_camera.h
+	u_stereo_rectify.c
+	u_stereo_rectify.h
+	u_stereo_vrefine.c
+	u_stereo_vrefine.h
+	u_stereo_uvc.c
+	u_stereo_uvc.h
 	u_color_encoding.h
 	u_debug.c
 	u_debug.h
@@ -43,6 +90,8 @@ add_library(
 	u_distortion_mesh.c
 	u_distortion_mesh.h
 	u_documentation.h
+	u_eye_history.c
+	u_eye_history.h
 	u_file.c
 	u_file.cpp
 	u_file.h
@@ -78,6 +127,8 @@ add_library(
 	u_limited_unique_id.h
 	u_live_stats.cpp
 	u_live_stats.h
+	u_openxr_layers.c
+	u_openxr_layers.h
 	u_logging.c
 	u_logging.h
 	u_file_logging.c
@@ -88,17 +139,25 @@ add_library(
 	u_metrics.h
 	u_misc.c
 	u_misc.h
+	u_screen_home.c
+	u_screen_home.h
+	u_mcp_capability.c
+	u_mcp_capability.h
 	u_app_partition.c
 	u_app_partition.h
 	u_native_images_debug.h
 	u_overlay_lease.c
 	u_overlay_lease.h
 	u_pacing.h
+	u_pointer_sink.c
+	u_pointer_sink.h
 	u_pacing_app.c
 	u_pacing_compositor.c
 	u_pacing_compositor_fake.c
 	u_pretty_print.c
 	u_pretty_print.h
+	u_openxr_runtime.c
+	u_openxr_runtime.h
 	u_prober.c
 	u_prober.h
 	u_rear_budget.c
@@ -107,12 +166,20 @@ add_library(
 	u_resampler.h
 	u_sandbox.c
 	u_sandbox.h
+	u_sd_notify.c
+	u_sd_notify.h
 	u_session.c
 	u_session.h
 	u_setting.c
 	u_setting.h
+	u_shm_ring.c
+	u_shm_ring.h
+	u_viewer_pose_page.c
+	u_viewer_pose_page.h
 	u_space_overseer.c
 	u_space_overseer.h
+	u_status_snapshot.c
+	u_status_snapshot.h
 	u_string_list.cpp
 	u_string_list.h
 	u_string_list.hpp
@@ -162,7 +229,10 @@ if(WIN32)
 	target_sources(aux_util PRIVATE u_windows.c u_windows.h)
 	# shell32 needed for SHGetFolderPathA in u_file_logging.c
 	# advapi32 needed for ACL/security APIs (AppContainer write access) in u_file_logging.c
-	target_link_libraries(aux_util PRIVATE shell32 advapi32)
+	# bcrypt: BCryptGenRandom seeds the stereo camera persistentId secret (u_camera_consent_store.c)
+	# wintrust + crypt32: Authenticode signer check for user-writable consent-delegating
+	# entries; ole32 (CoTaskMemFree) + uuid (FOLDERID_*): SHGetKnownFolderPath (u_camera_consent_store.c)
+	target_link_libraries(aux_util PRIVATE shell32 advapi32 bcrypt wintrust crypt32 ole32 uuid)
 endif()
 
 # WIL is lacking official support on MINGW.
@@ -180,9 +250,20 @@ endif()
 # (compositors use mcp_capture, oxr uses mcp_server / mcp_log_ring).
 target_link_libraries(aux_util PUBLIC displayxr_mcp::mcp)
 
+# XR_DXR_lift app rig (u_lift_rig.c, ADR-048 Addendum A) runs the shared
+# displayxr-common rig core - the same functions xrLocateViews runs (aux_math
+# FetchContents displayxr-common before this directory).
+target_link_libraries(aux_util PRIVATE displayxr::math_core)
+
 # CoreFoundation needed for CFRetain/CFRelease in u_handles.c (Metal handle ref counting).
 if(APPLE)
 	target_link_libraries(aux_util PRIVATE "-framework CoreFoundation")
+	# Security: SecItemCopyMatching, the Keychain reader of u_credential.c (ADR-057).
+	target_link_libraries(aux_util PRIVATE "-framework Security")
+endif()
+# u_credential.c loads libsecret at run time (dlopen) on desktop Linux.
+if(XRT_HAVE_LINUX AND NOT ANDROID)
+	target_link_libraries(aux_util PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # Is basically used everywhere, unavoidable.

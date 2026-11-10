@@ -25,6 +25,9 @@ struct xrt_display_processor_d3d12;
 struct xrt_display_processor_metal;
 struct xrt_display_processor_gl;
 struct vk_bundle;
+struct xrt_plugin_instance;
+struct xrt_screen_binding;
+struct xrt_eye_positions;
 
 /*!
  * @defgroup drv_sim_display Simulation 3D Display Driver
@@ -33,9 +36,9 @@ struct vk_bundle;
  * @brief Simulates a tracked 3D display on any 2D screen.
  *
  * Supports multiple output modes selected via SIM_DISPLAY_OUTPUT env var:
- * - "2d" (default): single-view full-resolution passthrough
+ * - "2d": single-view full-resolution passthrough
  * - "sbs": side-by-side left/right views
- * - "anaglyph": red-cyan anaglyph stereoscopy
+ * - "anaglyph" (default): red-cyan anaglyph stereoscopy
  * - "blend": 50/50 alpha blend of both views
  * - "interlaced": 1-pixel column interlace (phase-sensitive weave proxy, #817)
  *
@@ -145,6 +148,136 @@ bool
 sim_display_fake_tracking_is_tracking(void);
 
 /*!
+ * One sample of the simulated tracking state AND how many tracking edges the
+ * square wave has produced so far, read off the same clock reading so the two
+ * always agree (ADR-051: the per-screen status `change_counter` moves exactly
+ * when @ref sim_display_fake_tracking_is_tracking flips).
+ *
+ * @param[out] out_edges Edge count: 0 when fake tracking is off or has no
+ *                       period, else elapsed half-periods (monotonic). May be
+ *                       NULL.
+ * @return The same value @ref sim_display_fake_tracking_is_tracking returns.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_sample(uint64_t *out_edges);
+
+/*!
+ * @ref sim_display_fake_tracking_sample evaluated at @p target_ns instead of
+ * now (N6 Part 1: the target-time eye query, #2144). Deterministic.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_fake_tracking_sample_at(int64_t target_ns, uint64_t *out_edges);
+
+/*!
+ * The ONE eye answer every sim_display DP gives (N6 Part 1, #2144): the
+ * synthetic viewer (nominal, or the fake-tracking sway when `TRACKING_SWAY_MM`
+ * is set) in the N-view layout, evaluated at @p target_ns, `is_tracking` from
+ * the fake tracker's square wave at that instant, then the webcam override
+ * sampled at the target through its ring. `get_predicted_eye_positions`
+ * passes now; `get_eye_positions_at` the caller's target.
+ *
+ * @param[out] out            Filled completely.
+ * @param view_count          1 / 2 / ≥4 layout.
+ * @param nominal_x_m,nominal_y_m,nominal_z_m,ipd_m  The DP's viewer.
+ * @param target_ns           Monotonic time the eyes are wanted for.
+ * @param webcam_dp_ref       The DP's tracker reference (NULL for a
+ *                            screen-bound segment DP: never webcam-tracked).
+ * @return true (always valid: the contract never hands out zeros).
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_eyes_at(struct xrt_eye_positions *out,
+                    uint32_t view_count,
+                    float nominal_x_m,
+                    float nominal_y_m,
+                    float nominal_z_m,
+                    float ipd_m,
+                    int64_t target_ns,
+                    bool *webcam_dp_ref);
+
+/*!
+ * Webcam eye tracking (#1855), opt-in: the `WEBCAM_TRACKING` setting
+ * (legacy env `SIM_DISPLAY_WEBCAM_TRACKING=1`). DEPRECATED for one release:
+ * the tracker moved to the sim-tracking provider (`SOURCE=webcam`); this
+ * alias runs the same core (sim_tracking/sim_webcam_source.h) and WARNs once.
+ * Was it asked for? (Cached setting read; all of the below are no-ops without it.)
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_requested(void);
+
+/*!
+ * Requested AND a face estimator is built in — only then does sim_display
+ * advertise MANAGED tracking (and HAS_TRACKING on its 3D modes) and open a
+ * camera. See sim_tracking/sim_face_estimator.h.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_enabled(void);
+
+/*!
+ * Override a DP's nominal @p out with the webcam-tracked eyes (keeping
+ * out->count's layout: 1 = midpoint, 2 = the pair, 4 = the pair 32 mm below
+ * and above). The first call with *@p dp_ref false takes a reference on the
+ * process tracker (starting it); @ref sim_display_webcam_tracking_release
+ * drops it. Pass @p dp_ref NULL for a screen-bound DP (never tracked).
+ * Never blocks on the camera.
+ * @return false (and @p out untouched) when webcam tracking is off or not running.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_apply(
+    struct xrt_eye_positions *out, float nominal_x_m, float nominal_y_m, float nominal_z_m, float ipd_m, bool *dp_ref);
+
+/*!
+ * @ref sim_display_webcam_tracking_apply for a TARGET time (N6 Part 1,
+ * #2144): the tracker's latest pair goes through a `u_eye_history` ring that
+ * is sampled at @p target_ns (interpolated / extrapolated / stale per that
+ * ring's rules); `out->timestamp_ns` becomes the sample time the answer is
+ * based on and `out->is_tracking` the ring's answer.
+ * @ingroup drv_sim_display
+ */
+bool
+sim_display_webcam_tracking_apply_at(struct xrt_eye_positions *out,
+                                     float nominal_x_m,
+                                     float nominal_y_m,
+                                     float nominal_z_m,
+                                     float ipd_m,
+                                     int64_t target_ns,
+                                     bool *dp_ref);
+
+//! Drop a DP's tracker reference (DP destroy). Stops the camera with the last one.
+void
+sim_display_webcam_tracking_release(bool *dp_ref);
+
+/*!
+ * Tracker state for the per-screen status (ADR-051): is_tracking now and the
+ * edge count. @return false when webcam tracking is not enabled.
+ */
+bool
+sim_display_webcam_tracking_status(bool *out_tracking, uint64_t *out_edges);
+
+/*!
+ * ADR-043 Amendment 5 (xrt_plugin_iface::get_claimed_cameras): the webcam
+ * the opt-in eye tracker reads, so the service's UVC stereo source never
+ * claims it. Requested tracking only (WEBCAM_TRACKING); the
+ * device is resolved by the tracker's own selection over an enumeration that
+ * opens nothing. Writes the OS device id. @return the count (0 or 1).
+ */
+uint32_t
+sim_display_webcam_claimed_cameras(uint32_t capacity, char (*out_ids)[256]);
+
+/*!
+ * The eye-tracking control contracts the session display advertises:
+ * MANUAL under SIM_DISPLAY_FAKE_TRACKING, MANAGED under enabled webcam
+ * tracking (the default when both), none otherwise.
+ */
+void
+sim_display_eye_tracking_caps(uint32_t *out_supported, uint32_t *out_default);
+
+/*!
  * Set the view count for the active rendering mode.
  *
  * Thread-safe (atomic). Called when the rendering mode changes.
@@ -194,6 +327,18 @@ sim_display_get_display_info(struct xrt_device *xdev, struct sim_display_info *o
  */
 void
 sim_display_get_panel_metrics(float *out_w_m, float *out_h_m, uint32_t *out_px_w, uint32_t *out_px_h);
+
+/*!
+ * The simulated panel's DEFAULT geometry — physical size (SIM_DISPLAY_WIDTH_M /
+ * SIM_DISPLAY_HEIGHT_M), nominal eye height and viewing distance
+ * (SIM_DISPLAY_NOMINAL_Z_M) — without a device. Used to describe a monitor
+ * whose EDID gives no physical size (multi-screen M1,
+ * get_display_info_for_monitor). Any out-param may be NULL.
+ *
+ * @ingroup drv_sim_display
+ */
+void
+sim_display_get_default_viewer(float *out_w_m, float *out_h_m, float *out_nominal_y_m, float *out_nominal_z_m);
 
 /*!
  * Create a simulated 3D display HMD device.
@@ -270,6 +415,22 @@ sim_display_dp_factory_d3d11(void *d3d11_device,
                               struct xrt_display_processor_d3d11 **out_xdp);
 
 /*!
+ * Multi-screen M6: per-screen D3D11 factory, the Windows twin of
+ * `sim_display_dp_factory_vk_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_d3d11_for_screen`. The DP describes the bound
+ * screen and confines its draw to the canvas it is handed.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d11_device,
+                                        void *d3d11_context,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d11 **out_xdp);
+
+/*!
  * Create a simulation D3D12 display processor.
  *
  * For SBS mode, shaders are still compiled but act as a pass-through.
@@ -307,6 +468,22 @@ sim_display_dp_factory_d3d12(void *d3d12_device,
                               void *d3d12_command_queue,
                               void *window_handle,
                               struct xrt_display_processor_d3d12 **out_xdp);
+
+/*!
+ * Multi-screen M6: per-screen D3D12 factory, the D3D12 twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_d3d12_for_screen`. The DP describes the bound
+ * screen and confines its draw (viewport + scissor) to the canvas it is handed.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_d3d12_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d12_device,
+                                        void *d3d12_command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d12 **out_xdp);
 
 /*!
  * Set an external device as the pose source for a sim_display HMD.
@@ -361,6 +538,24 @@ sim_display_dp_factory_vk(void *vk_bundle,
                           struct xrt_display_processor **out_xdp);
 
 /*!
+ * Per-screen twin of @ref sim_display_dp_factory_vk (multi-screen M2) —
+ * `xrt_plugin_iface::create_dp_vk_for_screen`. The DP describes the bound
+ * screen (its EDID size, native pixels, desktop origin), confines its output to
+ * the canvas it is handed, and preserves the target outside it, so several of
+ * these can weave one window's segments into one surface.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_vk_for_screen(struct xrt_plugin_instance *inst,
+                                     void *vk_bundle,
+                                     void *vk_cmd_pool,
+                                     void *window_handle,
+                                     int32_t target_format,
+                                     const struct xrt_screen_binding *binding,
+                                     struct xrt_display_processor **out_xdp);
+
+/*!
  * Create a simulation Metal display processor.
  *
  * For SBS mode, shaders are still compiled but act as a pass-through.
@@ -400,6 +595,22 @@ sim_display_dp_factory_metal(void *metal_device,
                              struct xrt_display_processor_metal **out_xdp);
 
 /*!
+ * Multi-screen on macOS: per-screen Metal factory, the twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_metal_for_screen`. The DP describes the bound
+ * screen and confines its draw to the canvas it is handed (load, scissor).
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_metal_for_screen(struct xrt_plugin_instance *inst,
+                                        void *metal_device,
+                                        void *command_queue,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_metal **out_xdp);
+
+/*!
  * Create a simulation GL display processor.
  *
  * All 3 GLSL shaders (SBS, anaglyph, blend) are compiled at init
@@ -431,6 +642,22 @@ sim_display_processor_gl_create(enum sim_display_output_mode mode,
 xrt_result_t
 sim_display_dp_factory_gl(void *window_handle,
                            struct xrt_display_processor_gl **out_xdp);
+
+/*!
+ * Multi-screen M6: per-screen GL factory, the GL twin of
+ * `sim_display_dp_factory_d3d11_for_screen` — matches
+ * `xrt_plugin_iface::create_dp_gl_for_screen`. The DP describes the bound
+ * screen, confines its draw (viewport + scissor) to the canvas it is handed and
+ * takes its interlace phase from set_present_origin. The compositor's GL
+ * context must be current.
+ *
+ * @ingroup drv_sim_display
+ */
+xrt_result_t
+sim_display_dp_factory_gl_for_screen(struct xrt_plugin_instance *inst,
+                                     void *window_handle,
+                                     const struct xrt_screen_binding *binding,
+                                     struct xrt_display_processor_gl **out_xdp);
 
 /*!
  * Create the simulation display system builder.

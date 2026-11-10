@@ -59,7 +59,19 @@ set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.24.0
+    # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
+    # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
+    # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
+    # v2.28.0: dxr::VkFrameRing (common/vk_frame_ring.h) — N frames in flight,
+    # one vkQueueSubmit per frame (INV-4.10, #1917). The Vulkan cubes use it.
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h, ADR-046 Amendment 2).
+    # v2.30.1: the Wayland geometry payload is read by structure, in any key order
+    # (displayxr-common#76) — a KWin publisher's sorted keys crashed the old parser (#1928).
+    # v2.31.2: u_wayland_geom.h gains u_wl_window_device_rect, the publisher's
+    # buffer_device (displayxr-common#81, #1991); the aux guard needs the same bytes.
+    # v2.32.0: DxrLinuxWindowDesc::start_hidden — the window is never mapped or made
+    # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
+    GIT_TAG v2.32.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

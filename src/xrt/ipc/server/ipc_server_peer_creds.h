@@ -44,6 +44,15 @@ long
 ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns);
 
 /*!
+ * The OS-derived UID of the process at the other end of @p handle
+ * (`SO_PEERCRED` on Linux / Android), or -1 when it cannot be derived or the
+ * platform has no such notion. On Android the UID is the app identity the
+ * package manager resolves (#1006 workspace-controller verification).
+ */
+long
+ipc_server_derive_peer_uid(xrt_ipc_handle_t handle);
+
+/*!
  * #960: best-effort absolute executable path of a peer process, for class
  * verification (CONTROLLER = a registered controller binary; DIAG = a binary in
  * the runtime's own directory).
@@ -58,6 +67,15 @@ ipc_server_derive_peer_pid(xrt_ipc_handle_t handle, uint64_t *out_create_ns);
  */
 bool
 ipc_server_peer_exe_path(long pid, char *out_path, size_t out_len);
+
+/*!
+ * The parent process id of @p pid, or 0 when it cannot be derived (unknown
+ * platform, the process is gone, or we may not open it). Best-effort, read
+ * once at describe_client: it feeds the "same application, several
+ * connections" input-focus rule (ipc_app_group.h), never a privilege gate.
+ */
+long
+ipc_server_peer_parent_pid(long pid);
 
 /*!
  * browser#103 RC-1: **the enforcement point for the IL-monotonicity rule.**

@@ -59,6 +59,7 @@
 #include "util/u_trace_marker.h"
 #include "util/u_logging.h"
 #include "util/u_snap_grid.h"
+#include "util/u_weave_rect_parts.h"
 
 #include "oxr_api_funcs.h"
 #include "oxr_api_verify.h"
@@ -79,13 +80,23 @@
 #include "vk_native/comp_vk_native_compositor.h"
 #endif
 
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+// macOS (ADR-050): the same pure DP query for an in-process Metal session —
+// the route an app that opted OUT of the runtime-owned placement
+// (XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR) snaps its own moves through.
+#include "metal/comp_metal_compositor.h"
+#endif
+
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
-#ifdef XRT_OS_LINUX_DESKTOP
+// sync_file fences (XrWeaveSubmitSyncDXR / XrWeaveOutputSyncDXR): desktop Linux
+// from spec v10 (#1699), Android from spec v20.
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_ANDROID)
+#define OXR_WEAVE_HAVE_SYNC_FD 1
 #include <errno.h>
 #include <poll.h>
 #include <unistd.h>
@@ -99,6 +110,25 @@ static_assert(sizeof(XrWeaveSnapGridPointDXR) == 2 && offsetof(XrWeaveSnapGridPo
 static_assert(XR_WEAVE_SNAP_GRID_MAX_POINTS_DXR == U_SNAP_GRID_MAX_POINTS, "grid point bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_MAX_AXIS_DXR == U_SNAP_GRID_MAX_AXIS, "grid axis bound mismatch");
 static_assert(XR_WEAVE_SNAP_GRID_NO_DELTA_DXR == U_SNAP_GRID_NO_DELTA, "grid sentinel mismatch");
+// Spec v19 (#1884): the per-screen table is the per-segment views' table.
+static_assert(XR_WEAVE_MAX_SEGMENTS_DXR == XRT_MAX_SEGMENTS, "weave segment bound mismatch");
+static_assert(XR_WEAVE_MAX_EYES_DXR <= ARRAY_SIZE(((struct xrt_eye_positions *)0)->eyes), "weave eye bound mismatch");
+
+#ifdef OXR_HAVE_DXR_lift
+#include "xrt/xrt_lift.h"
+#include "oxr_handle.h"
+#include "oxr_lift_rules.h"
+//! XR_DXR_lift (ADR-042) bridge: latch the lift-flagged rects of the next submit.
+xrt_result_t
+comp_ipc_client_compositor_lift_weave_rects(struct xrt_compositor *xc,
+                                            uint32_t count,
+                                            const struct xrt_lift_weave_rect *rects);
+//! XrLiftViewControlDXR -> xrt (oxr_conv.c).
+XrResult
+oxr_lift_view_control_from_xr(struct oxr_logger *log, const XrLiftViewControlDXR *v, struct xrt_lift_view_control *out);
+bool
+oxr_lift_rig_from_chain(const void *direct, const void *options, struct xrt_lift_rig *out);
+#endif
 
 // Forward decls of the IPC-bridge wrappers (defined in ipc_client_compositor.c).
 struct xrt_compositor;
@@ -112,13 +142,18 @@ ipc_client_connection_export(enum u_logging_level log_level, xrt_ipc_handle_t *o
 xrt_result_t
 comp_ipc_client_compositor_weave_bind_window(struct xrt_compositor *xc, uint64_t hwnd);
 
+//! XR_DXR_weave v19 (#1884): the last weave's per-screen segment table.
+xrt_result_t
+comp_ipc_client_compositor_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out_metrics);
+
 xrt_result_t
 comp_ipc_client_compositor_weave_set_window_geometry(struct xrt_compositor *xc,
                                                      int32_t origin_x,
                                                      int32_t origin_y,
                                                      uint32_t client_w,
                                                      uint32_t client_h,
-                                                     int32_t display_id);
+                                                     int32_t display_id,
+                                                     const struct xrt_weave_logical_origin *logical);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
@@ -138,11 +173,28 @@ comp_ipc_client_compositor_weave_submit(struct xrt_compositor *xc,
                                         const struct xrt_weave_atlas_layout *layout,
                                         uint32_t flat_rect_count,
                                         const struct xrt_rect *flat_rects,
+                                        bool mono_in_2d,
+                                        bool overlay_unchanged,
+                                        float overlay_filter_strength,
                                         bool *out_have_output,
                                         uint32_t *out_width,
                                         uint32_t *out_height,
                                         uint64_t *out_fence_value,
-                                        struct xrt_eye_positions *out_eyes);
+                                        struct xrt_eye_positions *out_eyes,
+                                        uint32_t *out_segment_count,
+                                        uint32_t *out_lift_cursor_mask,
+                                        struct xrt_weave_woven_origin *out_origin);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                       xrt_graphics_buffer_handle_t handle,
+                                                       const struct xrt_weave_cursor_sprite_texture *info);
+
+xrt_result_t
+comp_ipc_client_compositor_weave_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_set_screen_flat_regions(struct xrt_compositor *xc,
@@ -179,17 +231,54 @@ comp_ipc_client_compositor_weave_submit_dmabuf(struct xrt_compositor *xc,
                                                const struct xrt_weave_atlas_layout *layout,
                                                uint32_t flat_rect_count,
                                                const struct xrt_rect *flat_rects,
+                                               bool mono_in_2d,
+                                               bool overlay_unchanged,
+                                               float overlay_filter_strength,
                                                int *out_release_fence_fd,
                                                bool *out_have_output,
                                                uint32_t *out_width,
                                                uint32_t *out_height,
                                                uint64_t *out_fence_value,
-                                               struct xrt_eye_positions *out_eyes);
+                                               struct xrt_eye_positions *out_eyes,
+                                               struct xrt_weave_woven_origin *out_origin);
 
 xrt_result_t
 comp_ipc_client_compositor_weave_get_output_dmabuf(struct xrt_compositor *xc,
                                                    bool *out_have_output,
                                                    struct xrt_weave_dmabuf_output_desc *out_desc);
+#endif
+
+#ifdef XRT_OS_ANDROID
+// Spec v20 Android sync_file submit, same file + pattern as above.
+xrt_result_t
+comp_ipc_client_compositor_weave_submit_sync(struct xrt_compositor *xc,
+                                             xrt_graphics_buffer_handle_t in_handle,
+                                             int32_t rect_x,
+                                             int32_t rect_y,
+                                             uint32_t rect_w,
+                                             uint32_t rect_h,
+                                             uint32_t rect_count,
+                                             const struct xrt_rect *rects,
+                                             xrt_graphics_buffer_handle_t overlay_handle,
+                                             uint32_t overlay_rect_count,
+                                             const struct xrt_rect *overlay_rects,
+                                             bool weave_frame_first,
+                                             const struct xrt_weave_atlas_layout *layout,
+                                             uint32_t flat_rect_count,
+                                             const struct xrt_rect *flat_rects,
+                                             bool mono_in_2d,
+                                             bool overlay_unchanged,
+                                             float overlay_filter_strength,
+                                             int acquire_fence_fd,
+                                             bool want_release_fence,
+                                             int *out_release_fence_fd,
+                                             bool *out_have_output,
+                                             uint32_t *out_width,
+                                             uint32_t *out_height,
+                                             uint64_t *out_fence_value,
+                                             struct xrt_eye_positions *out_eyes,
+                                             uint32_t *out_segment_count,
+                                             uint32_t *out_lift_cursor_mask);
 #endif
 
 xrt_result_t
@@ -289,7 +378,9 @@ weave_dmabuf_from_xr(const XrWeaveDmabufDescDXR *src, struct xrt_weave_dmabuf_de
 	dst->buffer_id = src->bufferId;
 	return true;
 }
+#endif // XRT_OS_LINUX_DESKTOP
 
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 /*!
  * The v9 contract for a caller that did not chain XrWeaveOutputSyncDXR: the
  * output must be complete when xrWeaveSubmitDXR returns, so wait the release
@@ -319,7 +410,7 @@ weave_wait_and_close_release_fd(int fd)
 	}
 	close(fd);
 }
-#endif // XRT_OS_LINUX_DESKTOP
+#endif // OXR_WEAVE_HAVE_SYNC_FD
 
 //! IPC sessions hold a native-compositor handle (the IPC client compositor) but
 //! none of the in-process native-compositor flags are set. Mirrors oxr_capture.c.
@@ -387,6 +478,31 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 	// required on Android. Forwarded to the DP's per-window phase slot.
 	const XrWeaveWindowGeometryDXR *geom =
 	    OXR_GET_INPUT_FROM_CHAIN(bindInfo, XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR, XrWeaveWindowGeometryDXR);
+	// Spec v12 (browser-pvt#180): the caller's own logical origin + scale,
+	// latched verbatim with this bind's device geometry and echoed per woven
+	// output (XrWeaveOutputOriginDXR). Meaningless without the geometry it
+	// describes.
+	const XrWeaveWindowLogicalOriginDXR *lgeom =
+	    OXR_GET_INPUT_FROM_CHAIN(bindInfo, XR_TYPE_WEAVE_WINDOW_LOGICAL_ORIGIN_DXR, XrWeaveWindowLogicalOriginDXR);
+	struct xrt_weave_logical_origin logical = {0};
+	if (lgeom != NULL) {
+		if (geom == NULL) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveBindWindow2DXR: XrWeaveWindowLogicalOriginDXR requires a chained "
+			                 "XrWeaveWindowGeometryDXR");
+		}
+		// (scale > 0) is false for NaN; the upper bound rejects +inf.
+		if (!(lgeom->scale > 0.0f) || lgeom->scale > 64.0f) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveBindWindow2DXR: XrWeaveWindowLogicalOriginDXR::scale (%f) must be "
+			                 "finite and in (0, 64]",
+			                 (double)lgeom->scale);
+		}
+		logical.valid = true;
+		logical.x = lgeom->logicalOrigin.x;
+		logical.y = lgeom->logicalOrigin.y;
+		logical.scale = lgeom->scale;
+	}
 	if (geom != NULL) {
 		if (geom->clientSize.width <= 0 || geom->clientSize.height <= 0) {
 			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
@@ -396,10 +512,120 @@ oxr_xrWeaveBindWindow2DXR(XrSession session, const XrWeaveBindWindowInfoDXR *bin
 		}
 		xret = comp_ipc_client_compositor_weave_set_window_geometry(
 		    &sess->xcn->base, geom->windowOriginOnScreen.x, geom->windowOriginOnScreen.y,
-		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId);
+		    (uint32_t)geom->clientSize.width, (uint32_t)geom->clientSize.height, geom->displayId, &logical);
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveBindWindow2DXR: geometry update failed (xrt_result=%d)",
 		                   (int)xret);
 	}
+	return XR_SUCCESS;
+}
+
+/*!
+ * Spec v19 (#1884, ADR-047 Amendment 4): fill a chained
+ * XrWeaveOutputRectPartsDXR from the service's per-screen table of the submit
+ * that just landed — every screen's eyes, and the submitted @p rects cut at
+ * the seams (u_weave_rect_parts). segmentCount 0 (the window was woven by one
+ * display processor, or this platform's service does not segment) leaves the
+ * caller on the base eyes.
+ *
+ * @return XR_SUCCESS, or the lost-connection error when the fetch hit a dead
+ *         pipe. Any other failure is reported as "not segmented".
+ */
+static XrResult
+oxr_weave_fill_rect_parts(struct oxr_logger *log,
+                          struct oxr_session *sess,
+                          uint32_t rect_count,
+                          const struct xrt_rect *rects,
+                          uint32_t submit_segment_count,
+                          XrWeaveOutputRectPartsDXR *out)
+{
+	out->segmentCount = 0;
+	out->partCount = 0;
+	out->generation = 0;
+	memset(out->segments, 0, sizeof(out->segments));
+	memset(out->parts, 0, sizeof(out->parts));
+	// The submit's own reply says whether this weave was per screen (legacy
+	// single-rect submits never are): a window on one screen — every window
+	// on a single-screen box — costs no second round trip.
+	if (!u_weave_segments_fetch_needed(rect_count, submit_segment_count)) {
+		return XR_SUCCESS;
+	}
+
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+#ifdef XRT_OS_WINDOWS
+	// Only the D3D11 service segments a present-owner's window; elsewhere the
+	// answer is always "one display processor", so do not pay a round trip.
+	xrt_result_t xret = comp_ipc_client_compositor_weave_get_segments(&sess->xcn->base, &m);
+	if (xret == XRT_ERROR_IPC_FAILURE) {
+		OXR_CHECK_XRET_MSG(log, sess, xret,
+		                   "xrWeaveSubmitDXR: weave segment table fetch failed (xrt_result=%d)", (int)xret);
+	}
+	if (xret != XRT_SUCCESS) {
+		memset(&m, 0, sizeof(m));
+	}
+#else
+	(void)log;
+	(void)sess;
+#endif
+	if (m.count == 0 || m.count > XR_WEAVE_MAX_SEGMENTS_DXR) {
+		return XR_SUCCESS;
+	}
+
+	for (uint32_t k = 0; k < m.count; k++) {
+		const struct xrt_segment_metric *g = &m.seg[k];
+		XrWeaveScreenSegmentDXR *o = &out->segments[k];
+		o->displayId = g->screen_id;
+		o->windowRect.offset.x = g->window_rect.offset.w; // xrt_offset names its fields w/h
+		o->windowRect.offset.y = g->window_rect.offset.h;
+		o->windowRect.extent.width = g->window_rect.extent.w;
+		o->windowRect.extent.height = g->window_rect.extent.h;
+		o->screenRect.offset.x = g->screen_rect.offset.w;
+		o->screenRect.offset.y = g->screen_rect.offset.h;
+		o->screenRect.extent.width = g->screen_rect.extent.w;
+		o->screenRect.extent.height = g->screen_rect.extent.h;
+		o->screenSize.width = (int32_t)g->screen_desktop_width;
+		o->screenSize.height = (int32_t)g->screen_desktop_height;
+		o->screenSizeMeters.width = g->screen_width_m;
+		o->screenSizeMeters.height = g->screen_height_m;
+		o->isPrimary = g->is_primary ? XR_TRUE : XR_FALSE;
+		o->woven = g->woven ? XR_TRUE : XR_FALSE;
+		const bool have = g->have_eyes && g->eyes.valid;
+		uint32_t ec = have ? g->eyes.count : 0;
+		if (ec > XR_WEAVE_MAX_EYES_DXR) {
+			ec = XR_WEAVE_MAX_EYES_DXR;
+		}
+		o->eyeCount = ec;
+		for (uint32_t i = 0; i < ec; i++) {
+			o->eyes[i].x = g->eyes.eyes[i].x;
+			o->eyes[i].y = g->eyes.eyes[i].y;
+			o->eyes[i].z = g->eyes.eyes[i].z;
+		}
+		o->eyesValid = have ? XR_TRUE : XR_FALSE;
+		o->eyesTracking = have && g->eyes.is_tracking ? XR_TRUE : XR_FALSE;
+	}
+	out->segmentCount = m.count;
+	out->generation = m.generation;
+
+	struct u_weave_rect_part parts[XR_WEAVE_MAX_RECT_PARTS_DXR];
+	const uint32_t n = u_weave_rect_parts(&m, rects, rect_count, parts, XR_WEAVE_MAX_RECT_PARTS_DXR);
+	for (uint32_t i = 0; i < n; i++) {
+		XrWeaveRectPartDXR *o = &out->parts[i];
+		o->rectIndex = parts[i].rect_index;
+		o->segmentIndex = parts[i].segment_index;
+		o->windowRect.offset.x = parts[i].window_rect.offset.w;
+		o->windowRect.offset.y = parts[i].window_rect.offset.h;
+		o->windowRect.extent.width = parts[i].window_rect.extent.w;
+		o->windowRect.extent.height = parts[i].window_rect.extent.h;
+		o->rectRelative.offset.x = parts[i].rect_rel.offset.w;
+		o->rectRelative.offset.y = parts[i].rect_rel.offset.h;
+		o->rectRelative.extent.width = parts[i].rect_rel.extent.w;
+		o->rectRelative.extent.height = parts[i].rect_rel.extent.h;
+		o->screenRect.offset.x = parts[i].screen_rect.offset.w;
+		o->screenRect.offset.y = parts[i].screen_rect.offset.h;
+		o->screenRect.extent.width = parts[i].screen_rect.extent.w;
+		o->screenRect.extent.height = parts[i].screen_rect.extent.h;
+	}
+	out->partCount = n;
 	return XR_SUCCESS;
 }
 
@@ -528,6 +754,37 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
+	// Spec v13: a chained XrWeaveSubmitMonoIn2DDXR asks for one flat view
+	// instead of the weave while this session's hardware state is 2D. The
+	// desktop-Linux engine honours it; every other service ignores it. Per
+	// submit, no latch — an absent chain is byte-for-byte pre-v13.
+	const XrWeaveSubmitMonoIn2DDXR *mono =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_MONO_IN_2D_DXR, XrWeaveSubmitMonoIn2DDXR);
+	const bool mono_in_2d = mono != NULL && mono->monoIn2D == XR_TRUE;
+
+	// Spec v14: a chained XrWeaveSubmitOverlayUnchangedDXR declares the overlay
+	// atlas unchanged since the previous submit (advisory; the IPC client drops
+	// it when this submit carries no overlay).
+	const XrWeaveSubmitOverlayUnchangedDXR *ovu = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAY_UNCHANGED_DXR, XrWeaveSubmitOverlayUnchangedDXR);
+	const bool overlay_unchanged = ovu != NULL && ovu->overlayUnchanged == XR_TRUE;
+
+	// Spec v15: a chained XrWeaveSubmitOverlayFilterDXR sets the lens-filter
+	// strength for the overlay; absent = the display processor's default (-1 on
+	// the wire). (x >= 0 && x <= 1) is false for NaN.
+	float overlay_filter_strength = -1.0f;
+	const XrWeaveSubmitOverlayFilterDXR *ovf = OXR_GET_INPUT_FROM_CHAIN(
+	    submitInfo, XR_TYPE_WEAVE_SUBMIT_OVERLAY_FILTER_DXR, XrWeaveSubmitOverlayFilterDXR);
+	if (ovf != NULL) {
+		if (!(ovf->filterStrength >= 0.0f && ovf->filterStrength <= 1.0f)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitOverlayFilterDXR::filterStrength (%f) must be "
+			                 "in [0, 1]",
+			                 (double)ovf->filterStrength);
+		}
+		overlay_filter_strength = ovf->filterStrength;
+	}
+
 	// Spec v6 (#774): a chained XrWeaveSubmitLayoutDXR declares that the input
 	// is a worst-case-sized N-view atlas (tiles packed contiguously from the
 	// top-left at contentViewWidth/Height) instead of per-rect squeezed SBS.
@@ -585,12 +842,35 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_DMABUF_DXR, XrWeaveOutputDmabufDXR);
 	XrWeaveOutputSyncDXR *out_sync =
 	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_SYNC_DXR, XrWeaveOutputSyncDXR);
+	// Spec v12 (browser-pvt#180): portable like the two above — every path
+	// that has no origin to report writes valid = XR_FALSE, serial 0.
+	XrWeaveOutputOriginDXR *out_origin =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_ORIGIN_DXR, XrWeaveOutputOriginDXR);
+	struct xrt_weave_woven_origin woven = {0};
 
-#ifndef XRT_OS_LINUX_DESKTOP
+#if defined(XRT_OS_ANDROID)
+	// Spec v20: the sync_file pair rides an AHardwareBuffer submit (no dma-buf
+	// descriptor — the AHardwareBuffer IS the Android transport).
+	if (dmabuf_in != NULL || dmabuf_ov != NULL) {
+		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+		                 "xrWeaveSubmitDXR: XrWeaveDmabufDescDXR / XrWeaveOverlayDmabufDescDXR are "
+		                 "desktop-Linux only (spec v10)");
+	}
+	int acquire_fd = -1;
+	if (sync_in != NULL) {
+		if (sync_in->acquireFenceFd < -1) {
+			return oxr_error(
+			    &log, XR_ERROR_VALIDATION_FAILURE,
+			    "xrWeaveSubmitDXR: XrWeaveSubmitSyncDXR::acquireFenceFd (%d) must be >= 0 or -1",
+			    sync_in->acquireFenceFd);
+		}
+		acquire_fd = sync_in->acquireFenceFd;
+	}
+#elif !defined(XRT_OS_LINUX_DESKTOP)
 	if (dmabuf_in != NULL || dmabuf_ov != NULL || sync_in != NULL) {
 		return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
 		                 "xrWeaveSubmitDXR: XrWeaveDmabufDescDXR / XrWeaveOverlayDmabufDescDXR / "
-		                 "XrWeaveSubmitSyncDXR are desktop-Linux only (spec v10)");
+		                 "XrWeaveSubmitSyncDXR are desktop-Linux and Android only (spec v10 / v20)");
 	}
 #else
 	struct xrt_weave_dmabuf_desc in_desc = {0};
@@ -670,10 +950,219 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 #endif
 
+#ifdef OXR_HAVE_DXR_lift
+	// XR_DXR_lift (ADR-042): rects whose content is 2D and must be lifted
+	// before weaving. Sent as its own call right before the submit it belongs
+	// to (same connection, so the order is the service's order); the service
+	// consumes the set with that submit. Ignored unless XR_DXR_lift is enabled.
+	const XrWeaveSubmitLiftRectsDXR *lifts =
+	    OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR, XrWeaveSubmitLiftRectsDXR);
+	if (lifts != NULL && lifts->liftCount > 0 && sess->sys->inst->extensions.DXR_lift) {
+		if (lifts->liftCount > XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR || lifts->lifts == NULL) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLiftRectsDXR::liftCount (%u) must be 1..%u with "
+			                 "a non-NULL lifts array",
+			                 lifts->liftCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR);
+		}
+		if (rect_count == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrWeaveSubmitLiftRectsDXR needs XrWeaveSubmitRectsDXR (the "
+			                 "lift indexes its rects)");
+		}
+		struct xrt_lift_weave_rect lr[XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR];
+		memset(lr, 0, sizeof(lr));
+		for (uint32_t i = 0; i < lifts->liftCount; i++) {
+			const XrWeaveRectLiftDXR *e = &lifts->lifts[i];
+			if (e->type != XR_TYPE_WEAVE_RECT_LIFT_DXR || e->rectIndex >= rect_count) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: lifts[%u] has a bad type or rectIndex (%u >= %u)", i,
+				                 e->rectIndex, rect_count);
+			}
+			struct oxr_lift_stream_dxr *ls = XRT_CAST_OXR_HANDLE_TO_PTR(struct oxr_lift_stream_dxr *, e->stream);
+			if (ls == NULL || ls->handle.debug != OXR_XR_DEBUG_LIFTSTREAM ||
+			    ls->handle.state != OXR_HANDLE_STATE_LIVE || ls->sess != sess) {
+				return oxr_error(&log, XR_ERROR_HANDLE_INVALID, "xrWeaveSubmitDXR: lifts[%u].stream", i);
+			}
+			if (ls->mode != XRT_DP_LIFT_MODE_SBS && ls->mode != XRT_DP_LIFT_MODE_NVIEW) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: lifts[%u].stream must be an SBS or NVIEW stream", i);
+			}
+			lr[i].stream_id = ls->id;
+			lr[i].rect_index = e->rectIndex;
+			const XrLiftOptionsDXR *o = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_OPTIONS_DXR, XrLiftOptionsDXR);
+			if (o != NULL) {
+				// #2005 G2: NVIEW viewCount is bounded by the module's maxViews.
+				if (sess->lift_max_views > 0) {
+					ls->max_views = sess->lift_max_views;
+				}
+				if (!oxr_lift_view_count_ok(ls->mode, o->viewCount, ls->max_views) ||
+				    (o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR &&
+				     o->viewpointSource != XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR)) {
+					return oxr_error(
+					    &log, XR_ERROR_VALIDATION_FAILURE,
+					    "xrWeaveSubmitDXR: lifts[%u] options: viewCount <= %u (maxViews) and a valid "
+					    "viewpointSource",
+					    i,
+					    ls->mode == XRT_DP_LIFT_MODE_NVIEW ? oxr_lift_view_bound(ls->max_views)
+					                                       : (uint32_t)XR_LIFT_MAX_VIEWS_DXR);
+				}
+				// XR_DXR_lift v3: EXPLICIT viewpoints on a lifted rect, with the
+				// same validation as on a submit.
+				if (o->viewpointSource == XR_LIFT_VIEWPOINT_SOURCE_EXPLICIT_DXR) {
+					if (o->viewCount == 0 || o->viewpoints == NULL) {
+						return oxr_error(
+						    &log, XR_ERROR_VALIDATION_FAILURE,
+						    "xrWeaveSubmitDXR: lifts[%u] options: EXPLICIT viewpoints need "
+						    "viewCount >= 1 and viewpoints",
+						    i);
+					}
+					for (uint32_t k = 0; k < o->viewCount; k++) {
+						lr[i].viewpoints[3 * k + 0] = o->viewpoints[k].x;
+						lr[i].viewpoints[3 * k + 1] = o->viewpoints[k].y;
+						lr[i].viewpoints[3 * k + 2] = o->viewpoints[k].z;
+					}
+					lr[i].viewpoint_floats = 3 * o->viewCount;
+				}
+				lr[i].has_params = true;
+				lr[i].params.struct_size = (uint32_t)sizeof(lr[i].params);
+				lr[i].params.convergence =
+				    o->convergence < 0.0f ? -1.0f : (o->convergence > 1.0f ? 1.0f : o->convergence);
+				lr[i].params.strength = o->strength >= 0.0f ? o->strength : 1.0f;
+				lr[i].params.inpaint = o->inpaint == XR_TRUE ? 1u : 0u;
+				lr[i].params.view_count = o->viewCount;
+				lr[i].params.focal_px = o->focalPx > 0.0f ? o->focalPx : 0.0f;
+			}
+			// Spec v2 (ADR-048): the viewpoint policy, chained directly on the
+			// rect (wins) or on its XrLiftOptionsDXR.
+			const XrLiftViewControlDXR *v =
+			    OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_LIFT_VIEW_CONTROL_DXR, XrLiftViewControlDXR);
+			if (v == NULL && o != NULL) {
+				v = OXR_GET_INPUT_FROM_CHAIN(o, XR_TYPE_LIFT_VIEW_CONTROL_DXR, XrLiftViewControlDXR);
+			}
+			if (v != NULL) {
+				XrResult vr = oxr_lift_view_control_from_xr(&log, v, &lr[i].view_control);
+				if (vr != XR_SUCCESS) {
+					return vr;
+				}
+				lr[i].has_view_control = true;
+			}
+			// Spec v3 (ADR-048 Addendum A): an app rig, directly on the rect
+			// (wins) or on its XrLiftOptionsDXR.
+			(void)oxr_lift_rig_from_chain(e, o, &lr[i].rig);
+#ifdef OXR_HAVE_DXR_cursor_depth
+			// XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): the runtime draws
+			// the depth cursor into this rect's lifted views.
+			if (sess->sys->inst->extensions.DXR_cursor_depth) {
+				lr[i].depth_cursor = OXR_GET_INPUT_FROM_CHAIN(e, XR_TYPE_CURSOR_DEPTH_LIFT_RECT_DXR,
+				                                              XrCursorDepthLiftRectDXR) != NULL;
+			}
+#endif
+		}
+		xrt_result_t lx = comp_ipc_client_compositor_lift_weave_rects(&sess->xcn->base, lifts->liftCount, lr);
+		if (lx == XRT_ERROR_IPC_FAILURE) {
+			OXR_CHECK_XRET_MSG(&log, sess, lx, "xrWeaveSubmitDXR: lift rects failed (xrt_result=%d)", (int)lx);
+		}
+		// Any other refusal is non-fatal: the rects are then woven as drawn.
+	}
+#endif
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	// XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): the runtime draws the cursor
+	// on the caller's weave rects. Like the lift rects, staged by its own call
+	// right before the submit it belongs to (same connection, same order); a
+	// submit without the struct sends nothing (ADR-046 section 0).
+	bool cursor_requested = false;
+	const XrCursorDepthWeaveRequestDXR *creq = NULL;
+	if (sess->sys->inst->extensions.DXR_cursor_depth) {
+		creq = OXR_GET_INPUT_FROM_CHAIN(submitInfo, XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR,
+		                                XrCursorDepthWeaveRequestDXR);
+	}
+	if (creq != NULL) {
+		if (creq->rectCount > XR_WEAVE_SUBMIT_MAX_RECTS_DXR || (creq->rectCount > 0 && creq->rects == NULL)) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR::rectCount (%u) must be 0..%u with "
+			                 "a non-NULL rects array",
+			                 creq->rectCount, (uint32_t)XR_WEAVE_SUBMIT_MAX_RECTS_DXR);
+		}
+		if (creq->rectCount > 0 && rect_count == 0) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR needs XrWeaveSubmitRectsDXR (its "
+			                 "rects index it)");
+		}
+		const XrCursorDepthWeaveSpriteDXR *sp = &creq->sprite;
+		if ((uint32_t)sp->kind > (uint32_t)XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: XrCursorDepthWeaveSpriteDXR::kind (%d) is not a valid kind",
+			                 (int)sp->kind);
+		}
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
+		    (sp->texture == NULL || sp->extent.width <= 0 || sp->extent.height <= 0 || sp->extent.width > 256 ||
+		     sp->extent.height > 256 || !weave_handle_kind_ok(sp->textureKind))) {
+			return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+			                 "xrWeaveSubmitDXR: a TEXTURE sprite needs a texture handle this platform accepts and "
+			                 "an extent of 1..256 x 1..256 (got %dx%d, kind %d)",
+			                 sp->extent.width, sp->extent.height, (int)sp->textureKind);
+		}
+		struct xrt_weave_cursor_request xreq;
+		memset(&xreq, 0, sizeof(xreq));
+		xreq.sprite_kind = (uint32_t)sp->kind;
+		xreq.sprite_generation = sp->generation;
+		xreq.os_cursor = sp->osCursor;
+		xreq.size_m = sp->sizeMeters;
+		xreq.rect_count = creq->rectCount;
+		for (uint32_t i = 0; i < creq->rectCount; i++) {
+			const XrCursorDepthWeaveRectDXR *e = &creq->rects[i];
+			if (e->rectIndex >= rect_count) {
+				return oxr_error(&log, XR_ERROR_VALIDATION_FAILURE,
+				                 "xrWeaveSubmitDXR: XrCursorDepthWeaveRequestDXR rects[%u].rectIndex (%u) >= "
+				                 "rectCount (%u)",
+				                 i, e->rectIndex, rect_count);
+			}
+			xreq.rects[i].rect_index = e->rectIndex;
+			xreq.rects[i].has_content = e->hasContent == XR_TRUE ? 1u : 0u;
+			xreq.rects[i].disparity_px = e->disparityPx;
+			xreq.rects[i].sample_u = e->sampleUV.x;
+			xreq.rects[i].sample_v = e->sampleUV.y;
+			xreq.rects[i].flags = e->flags;
+		}
+#if defined(XR_USE_PLATFORM_WIN32)
+		// The texture carrier crosses once per generation, with its handle.
+		if (sp->kind == XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR &&
+		    sp->generation != sess->weave.cursor_tex_generation_sent) {
+			struct xrt_weave_cursor_sprite_texture ti;
+			memset(&ti, 0, sizeof(ti));
+			ti.generation = sp->generation;
+			ti.width = (uint32_t)sp->extent.width;
+			ti.height = (uint32_t)sp->extent.height;
+			ti.hot_x = sp->hotSpotPx.x;
+			ti.hot_y = sp->hotSpotPx.y;
+			ti.size_m = sp->sizeMeters;
+			ti.is_dxgi = sp->textureKind == XR_WEAVE_HANDLE_KIND_D3D11_DXGI_DXR ? 1u : 0u;
+			xrt_result_t tx = comp_ipc_client_compositor_weave_cursor_sprite_texture(
+			    &sess->xcn->base, (xrt_graphics_buffer_handle_t)sp->texture, &ti);
+			if (tx == XRT_ERROR_IPC_FAILURE) {
+				OXR_CHECK_XRET_MSG(&log, sess, tx, "xrWeaveSubmitDXR: cursor sprite texture failed (xrt_result=%d)",
+				                   (int)tx);
+			}
+			if (tx == XRT_SUCCESS) {
+				sess->weave.cursor_tex_generation_sent = sp->generation;
+			}
+		}
+#endif
+		xrt_result_t cx = comp_ipc_client_compositor_weave_cursor_request(&sess->xcn->base, &xreq);
+		if (cx == XRT_ERROR_IPC_FAILURE) {
+			OXR_CHECK_XRET_MSG(&log, sess, cx, "xrWeaveSubmitDXR: cursor request failed (xrt_result=%d)", (int)cx);
+		}
+		cursor_requested = cx == XRT_SUCCESS;
+	}
+#endif
+
 	bool have_out = false;
 	uint32_t w = 0, h = 0;
 	uint64_t fence_value = 0;
 	struct xrt_eye_positions eyes = {0};
+	uint32_t submit_segment_count = 0; // v19: screens this submit was woven on (0 = one DP)
+	uint32_t lift_cursor_mask = 0; // XR_DXR_cursor_depth v6; the dma-buf path never draws one
 	int release_fd = -1; // v10: per-frame release sync_file, owned by us until handed out
 	xrt_result_t xret;
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -686,8 +1175,25 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
 		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL,
 		    overlay_rect_count, submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL,
-		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, &release_fd, &have_out, &w, &h,
-		    &fence_value, &eyes);
+		    flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, overlay_filter_strength, &release_fd, &have_out, &w,
+		    &h, &fence_value, &eyes, &woven);
+	} else
+#endif
+#ifdef XRT_OS_ANDROID
+	    if (acquire_fd >= 0 || out_sync != NULL) {
+		// Spec v20: only a caller that chained a fence takes this path, so a
+		// v9 caller sends exactly the pre-v20 messages. The bridge sends a copy
+		// of the acquire fd (SCM_RIGHTS); the caller's original is closed only
+		// once this call is certain to return XR_SUCCESS (bottom of function).
+		xret = comp_ipc_client_compositor_weave_submit_sync(
+		    &sess->xcn->base, (xrt_graphics_buffer_handle_t)(intptr_t)submitInfo->inputTexture,
+		    submitInfo->rect.offset.x, submitInfo->rect.offset.y, (uint32_t)submitInfo->rect.extent.width,
+		    (uint32_t)submitInfo->rect.extent.height, rect_count, rect_count > 0 ? rects : NULL, overlay_handle,
+		    overlay_rect_count, overlay_rect_count > 0 ? overlay_rects : NULL,
+		    submitInfo->firstChunk == XR_TRUE, layout.view_count > 0 ? &layout : NULL, flat_rect_count,
+		    flat_rect_count > 0 ? flat_rects : NULL, mono_in_2d, overlay_unchanged, overlay_filter_strength,
+		    acquire_fd, out_sync != NULL, &release_fd, &have_out, &w, &h, &fence_value, &eyes,
+		    &submit_segment_count, &lift_cursor_mask);
 	} else
 #endif
 	{
@@ -698,7 +1204,8 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		    rect_count > 0 ? rects : NULL, overlay_handle, overlay_is_dxgi, overlay_rect_count,
 		    overlay_rect_count > 0 ? overlay_rects : NULL, submitInfo->firstChunk == XR_TRUE,
 		    layout.view_count > 0 ? &layout : NULL, flat_rect_count, flat_rect_count > 0 ? flat_rects : NULL,
-		    &have_out, &w, &h, &fence_value, &eyes);
+		    mono_in_2d, overlay_unchanged, overlay_filter_strength, &have_out, &w, &h, &fence_value, &eyes,
+		    &submit_segment_count, &lift_cursor_mask, &woven);
 	}
 	if (xret == XRT_ERROR_FEATURE_NOT_SUPPORTED) {
 		// The service has no weave engine for this platform (desktop Linux
@@ -734,6 +1241,19 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	if (out_sync != NULL) {
 		out_sync->releaseFenceFd = -1;
 	}
+	if (out_origin != NULL) {
+		// Echoed as the service latched it; no conversion here either.
+		const bool ov = woven.valid;
+		const bool lv = ov && woven.logical_valid;
+		out_origin->valid = ov ? XR_TRUE : XR_FALSE;
+		out_origin->wovenOriginOnScreen.x = ov ? woven.x : 0;
+		out_origin->wovenOriginOnScreen.y = ov ? woven.y : 0;
+		out_origin->logicalValid = lv ? XR_TRUE : XR_FALSE;
+		out_origin->wovenOriginLogical.x = lv ? woven.logical_x : 0;
+		out_origin->wovenOriginLogical.y = lv ? woven.logical_y : 0;
+		out_origin->logicalScale = lv ? woven.logical_scale : 0.0f;
+		out_origin->serial = woven.serial;
+	}
 
 	// Eyes flow OUT: the caller renders its NEXT pre-weave frame's off-axis
 	// projection from these tracked positions (look-around). The interlace
@@ -750,6 +1270,52 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 	}
 	output->eyesValid = eyes.valid ? XR_TRUE : XR_FALSE;
 	output->eyesTracking = eyes.is_tracking ? XR_TRUE : XR_FALSE;
+
+	// Spec v19 (#1884, ADR-047 Amendment 4): a window across a seam is woven
+	// per screen; the caller that asks gets every screen's eyes and its rects
+	// cut at the seams. Fetched only when the struct is chained, so a pre-v19
+	// caller sends exactly the pre-v19 messages — and only when the submit's
+	// reply says it was woven per screen (segment count > 0), so a window
+	// on one screen costs a v19 caller nothing either.
+	XrWeaveOutputRectPartsDXR *out_parts =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_WEAVE_OUTPUT_RECT_PARTS_DXR, XrWeaveOutputRectPartsDXR);
+	if (out_parts != NULL) {
+		XrResult pr = oxr_weave_fill_rect_parts(&log, sess, rect_count, rects, submit_segment_count, out_parts);
+		if (pr != XR_SUCCESS) {
+			return pr; // a dead connection only
+		}
+	}
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	XrCursorDepthLiftStateDXR *cursor_state =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_CURSOR_DEPTH_LIFT_STATE_DXR, XrCursorDepthLiftStateDXR);
+	if (cursor_state != NULL) {
+		cursor_state->drawnLiftMask = lift_cursor_mask;
+	}
+	// v8: what this submit's weave-rect cursor drew. Fetched only for a submit
+	// that carried a request AND chained the state (a missing state = not drawn).
+	XrCursorDepthWeaveStateDXR *weave_cursor_state =
+	    OXR_GET_OUTPUT_FROM_CHAIN(output, XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR, XrCursorDepthWeaveStateDXR);
+	if (weave_cursor_state != NULL) {
+		struct xrt_weave_cursor_state cs;
+		memset(&cs, 0, sizeof(cs));
+		if (cursor_requested) {
+			xrt_result_t sx = comp_ipc_client_compositor_weave_cursor_state(&sess->xcn->base, &cs);
+			if (sx == XRT_ERROR_IPC_FAILURE) {
+				OXR_CHECK_XRET_MSG(&log, sess, sx, "xrWeaveSubmitDXR: cursor state failed (xrt_result=%d)",
+				                   (int)sx);
+			}
+		}
+		weave_cursor_state->drawnRectMask = cs.drawn_rect_mask;
+		weave_cursor_state->spriteGeneration = cs.sprite_generation;
+		weave_cursor_state->drawnBounds.offset.x = cs.bounds_x;
+		weave_cursor_state->drawnBounds.offset.y = cs.bounds_y;
+		weave_cursor_state->drawnBounds.extent.width = cs.bounds_w;
+		weave_cursor_state->drawnBounds.extent.height = cs.bounds_h;
+	}
+#else
+	(void)lift_cursor_mask;
+#endif
 
 	bool need_export = !sess->weave.exported || w != sess->weave.last_w || h != sess->weave.last_h;
 	if (have_out && w != 0 && h != 0 && need_export) {
@@ -788,7 +1354,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			uint32_t gw = 0, gh = 0;
 			xrt_graphics_buffer_handle_t tex_h = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
 			xret = comp_ipc_client_compositor_weave_get_output(&sess->xcn->base, &have_tex, &gw, &gh, &tex_h);
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 			if (xret != XRT_SUCCESS && release_fd >= 0) {
 				close(release_fd);
 			}
@@ -813,16 +1379,18 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		bool have_fence = false;
 		xrt_graphics_sync_handle_t fence_h = XRT_GRAPHICS_SYNC_HANDLE_INVALID;
 		xret = comp_ipc_client_compositor_weave_get_fence(&sess->xcn->base, &have_fence, &fence_h);
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
 		if (xret != XRT_SUCCESS) {
 			// Not handing out this frame: drop what it already produced.
 			if (release_fd >= 0) {
 				close(release_fd);
 			}
+#ifdef XRT_OS_LINUX_DESKTOP
 			if (out_dmabuf != NULL && out_dmabuf->fd >= 0) {
 				close(out_dmabuf->fd);
 				out_dmabuf->fd = -1;
 			}
+#endif
 		}
 #endif
 		OXR_CHECK_XRET_MSG(&log, sess, xret, "xrWeaveSubmitDXR: weave fence export failed (xrt_result=%d)",
@@ -869,14 +1437,27 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 		}
 	}
 
-#ifdef XRT_OS_LINUX_DESKTOP
-	// v10 release fence, PER FRAME: to the caller if it asked for it, otherwise
-	// honour the v9 synchronous contract for it by waiting here.
+#ifdef OXR_WEAVE_HAVE_SYNC_FD
+	// v10 / v20 release fence, PER FRAME: to the caller if it asked for it,
+	// otherwise honour the v9 synchronous contract for it by waiting here. (On
+	// Android the service only produces one when asked, so the wait branch
+	// sees -1 there.)
 	if (out_sync != NULL) {
 		out_sync->releaseFenceFd = release_fd; // caller-owned (or -1 = already complete)
 	} else {
 		weave_wait_and_close_release_fd(release_fd);
 	}
+#endif
+
+#ifdef XRT_OS_ANDROID
+	// Spec v20, XR_SUCCESS is now certain: the acquire fd the caller passed IN
+	// is ours; the service holds its own copy, so the original is closed.
+	if (acquire_fd >= 0) {
+		close(acquire_fd);
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
 
 	// XR_SUCCESS is now certain: the fds the caller passed IN are ours. The
 	// service holds its own copies, so these originals are simply closed.
@@ -889,7 +1470,7 @@ oxr_xrWeaveSubmitDXR(XrSession session, const XrWeaveSubmitInfoDXR *submitInfo, 
 			close(acquire_fd);
 		}
 	}
-#else
+#elif !defined(OXR_WEAVE_HAVE_SYNC_FD)
 	(void)release_fd;
 #endif
 
@@ -943,6 +1524,20 @@ oxr_xrWeaveSnapWindowRectDXR(XrSession session,
 			return XR_SUCCESS;
 		}
 #endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		if (sess->is_metal_native_compositor) {
+			// Backing px of the Metal DP's lattice; identity when the DP has
+			// no snap_window_rect slot (sim_display by default, older
+			// plug-ins) or declines (no tracked viewer yet).
+			(void)comp_metal_compositor_snap_window_rect(&sess->xcn->base, originRect->offset.x,
+			                                             originRect->offset.y, targetRect->offset.x,
+			                                             targetRect->offset.y, &sx, &sy);
+			snappedRect->offset.x = sx;
+			snappedRect->offset.y = sy;
+			snappedRect->extent = targetRect->extent;
+			return XR_SUCCESS;
+		}
+#endif
 		return oxr_error(&log, XR_ERROR_FEATURE_UNSUPPORTED,
 		                 "xrWeaveSnapWindowRectDXR: no in-process snap route for this session's "
 		                 "compositor (the rest of the weave service is out-of-process only)");
@@ -973,6 +1568,22 @@ grid_point_vk_native(void *userdata,
 {
 	return comp_vk_native_compositor_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y,
 	                                                  target_x, target_y, out_x, out_y);
+}
+#endif
+
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+//! u_snap_grid_point_fn over the in-process Metal DP's per-point snap (ADR-050).
+static bool
+grid_point_metal_native(void *userdata,
+                        int32_t origin_x,
+                        int32_t origin_y,
+                        int32_t target_x,
+                        int32_t target_y,
+                        int32_t *out_x,
+                        int32_t *out_y)
+{
+	return comp_metal_compositor_snap_window_rect((struct xrt_compositor *)userdata, origin_x, origin_y, target_x,
+	                                              target_y, out_x, out_y);
 }
 #endif
 
@@ -1031,6 +1642,15 @@ oxr_xrWeaveSnapWindowGridDXR(XrSession session,
 #if defined(XRT_HAVE_VK_NATIVE_COMPOSITOR) && defined(XRT_OS_LINUX) && !defined(XRT_OS_ANDROID)
 		if (sess->is_vk_native_compositor) {
 			u_snap_grid_eval(&grid, grid_point_vk_native, &sess->xcn->base, out, &dec, NULL, NULL);
+			if (declined != NULL) {
+				*declined = dec ? XR_TRUE : XR_FALSE;
+			}
+			return XR_SUCCESS;
+		}
+#endif
+#ifdef XRT_HAVE_METAL_NATIVE_COMPOSITOR
+		if (sess->is_metal_native_compositor) {
+			u_snap_grid_eval(&grid, grid_point_metal_native, &sess->xcn->base, out, &dec, NULL, NULL);
 			if (declined != NULL) {
 				*declined = dec ? XR_TRUE : XR_FALSE;
 			}

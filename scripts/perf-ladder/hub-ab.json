@@ -1,0 +1,333 @@
+{
+  "kit": "DXRHubAB",
+  "kitVersion": "0.6.0",
+  "issue": "#2317 P1d, P2a, step 2 (d3d11 hub default), P3 (gl, opt-in), d3d12 hybrid reroute at full rate",
+  "windowSeconds": 20,
+  "warmupSeconds": 6,
+  "reps": 3,
+  "cooldownSeconds": 5,
+  "startupTimeoutSec": 60,
+  "noWitnessSettleSec": 12,
+  "appDir": "..\\..\\test_apps\\build\\bin",
+  "baseEnv": {
+    "DXR_FRAME_WITNESS": "5",
+    "VK_LOADER_LAYERS_DISABLE": "*"
+  },
+  "topologies": {
+    "default": {},
+    "same-adapter": {
+      "DXR_D3D_FORCE_GPU": "scanout",
+      "DXR_VK_FORCE_GPU": "scanout"
+    }
+  },
+  "paths": {
+    "native": "per-API in-process compositor weaves + presents (no output-device split, no hub)",
+    "fill-arm": "D3D11 fill arm (comp_vk_native_split): #1264 d3d12 reroute or the VK output-device split",
+    "own-split": "the API's own #918 output-device split (d3d12 own legs / d3d11 own split) - NOT the hub",
+    "hub": "comp_hub_d3d11 - 'hub placement: hub=1': the D3D11 shim (DXR_HUB=1, P1b) or, since P2a, the d3d12 #1264 reroute / the VK split (ring deposits)"
+  },
+  "apps": [
+    {
+      "name": "d3d11",
+      "exe": "cube_handle_d3d11_win.exe",
+      "nativeSite": "d3d11",
+      "arms": [
+        {
+          "name": "native",
+          "env": {
+            "DXR_HUB": "0"
+          },
+          "expectPath": "own-split",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
+        },
+        {
+          "name": "hub",
+          "env": {},
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge"
+        },
+        {
+          "name": "native",
+          "env": {
+            "DXR_HUB": "0"
+          },
+          "expectPath": "own-split",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=0 reason=disabled_by_env"
+        },
+        {
+          "name": "hub-direct",
+          "env": {
+            "DXR_HUB": "1"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct"
+        },
+        {
+          "name": "hub-xbridge",
+          "env": {
+            "DXR_HUB": "1",
+            "DXR_HUB_INGRESS": "xbridge"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge"
+        },
+        {
+          "name": "kill-switch",
+          "env": {
+            "DXR_WEAVE_ON_SCANOUT": "0"
+          },
+          "expectPath": "native",
+          "optional": true
+        },
+        {
+          "name": "default-same",
+          "env": {},
+          "expectPath": "own-split",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=0 reason=same_adapter_opt_in",
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "d3d12",
+      "exe": "cube_handle_d3d12_win.exe",
+      "nativeSite": "d3d12",
+      "arms": [
+        {
+          "name": "native",
+          "env": {
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE": "0",
+            "DXR_APP_FRAME_DIVISOR": "0",
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
+          },
+          "expectPath": "own-split",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=0 reason=hybrid_reroute_disabled_by_env",
+          "note": "Kill switch (#2375): the own-legs #918 split (its D3D12 DP on the scanout device, xbridge transport), the hybrid default before the flip.",
+          "rejectLines": [
+            "#1257 partition: xrWaitFrame throttles the app"
+          ]
+        },
+        {
+          "name": "hub",
+          "env": {
+            "DXR_APP_FRAME_DIVISOR": "0",
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLines": [
+            "heavy-d3d12 reroute ACTIVE",
+            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_default_on"
+          ],
+          "note": "#2375: the default env - the hybrid reroute onto the D3D11 hub at the app's full frame rate (no divisor). Cross-adapter, so ingress=xbridge ingress_reason=cross_adapter.",
+          "rejectLines": [
+            "#1257 partition: xrWaitFrame throttles the app"
+          ]
+        },
+        {
+          "name": "hub-divisor2",
+          "env": {
+            "DXR_APP_FRAME_DIVISOR": "2",
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "0"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLines": [
+            "heavy-d3d12 reroute ACTIVE",
+            "hub placement: hub=1 .*ingress=xbridge.* reason=hybrid_reroute_default_on",
+            "#1257 partition: xrWaitFrame throttles the app to every 2th vblank"
+          ],
+          "note": "Control: the pre-#2317 gate shape (reroute + DXR_APP_FRAME_DIVISOR=2, #1309). Expect 60 presents = 30 weaves + 30 repaints."
+        },
+        {
+          "name": "needs-divisor",
+          "env": {
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE": "1",
+            "DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR": "1",
+            "DXR_APP_FRAME_DIVISOR": "0"
+          },
+          "expectPath": "own-split",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=0 reason=hybrid_reroute_needs_divisor",
+          "optional": true,
+          "note": "Token check: the restored #1309 gate without a divisor stays on the own split."
+        },
+        {
+          "name": "native",
+          "env": {
+            "DXR_WEAVE_ON_SCANOUT": "0"
+          },
+          "expectPath": "native",
+          "topologies": [
+            "same-adapter"
+          ]
+        },
+        {
+          "name": "hub",
+          "env": {},
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=default_xbridge",
+          "note": "Default: xbridge on every route until the single-GPU desktop gate (#2317)."
+        },
+        {
+          "name": "hub-direct",
+          "env": {
+            "DXR_HUB_INGRESS": "direct"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a opt-in: DIRECT ingress, 0 transport copies."
+        },
+        {
+          "name": "own-split",
+          "env": {
+            "DXR_SPLIT_D3D12_ROUTE": "own"
+          },
+          "expectPath": "own-split",
+          "optional": true
+        },
+        {
+          "name": "kill-switch",
+          "env": {
+            "DXR_WEAVE_ON_SCANOUT": "0"
+          },
+          "expectPath": "native",
+          "topologies": [
+            "default"
+          ],
+          "optional": true
+        }
+      ]
+    },
+    {
+      "name": "vk",
+      "exe": "cube_handle_vk_win.exe",
+      "nativeSite": "vk",
+      "arms": [
+        {
+          "name": "native",
+          "env": {
+            "DXR_WEAVE_ON_SCANOUT": "0"
+          },
+          "expectPath": "native"
+        },
+        {
+          "name": "hub",
+          "env": {},
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=cross_adapter"
+        },
+        {
+          "name": "hub",
+          "env": {},
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=default_xbridge",
+          "note": "Default: xbridge on every route until the single-GPU desktop gate (#2317)."
+        },
+        {
+          "name": "hub-direct",
+          "env": {
+            "DXR_HUB_INGRESS": "direct"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct",
+          "note": "P2a opt-in: DIRECT ingress, 0 transport copies."
+        }
+      ]
+    },
+    {
+      "name": "gl",
+      "exe": "cube_handle_gl_win.exe",
+      "nativeSite": "gl",
+      "note": "GL has no device-selection API (ADR-037 5): DXR_D3D_FORCE_GPU does not move it. The same-adapter topology needs a per-exe UserGpuPreferences pin (GpuPreference=1;) on cube_handle_gl_win.exe for the run, removed afterwards.",
+      "arms": [
+        {
+          "name": "native",
+          "env": {},
+          "expectPath": "native",
+          "placementRequired": false,
+          "witnessRequired": false
+        },
+        {
+          "name": "hub",
+          "env": {
+            "DXR_HUB": "1"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "default"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=xbridge ingress_reason=cross_adapter import=",
+          "note": "#2317 P3: the GL atlas in a D3D11 deposit on the GL adapter (dGPU), the hub on the scanout iGPU."
+        },
+        {
+          "name": "hub-direct",
+          "env": {
+            "DXR_HUB": "1"
+          },
+          "expectPath": "hub",
+          "topologies": [
+            "same-adapter"
+          ],
+          "expectLine": "hub placement: hub=1 .*ingress=direct import=",
+          "note": "#2317 P3: GL, deposit and hub on one adapter - DIRECT ingress, 0 transport copies."
+        },
+        {
+          "name": "hub-interop",
+          "env": {
+            "DXR_HUB": "1",
+            "DXR_HUB_GL_IMPORT": "interop"
+          },
+          "expectPath": "hub",
+          "expectLine": "hub placement: hub=1 .*import=nv_dx_interop import_reason=forced_by_env",
+          "optional": true,
+          "note": "#2317 P3: the WGL_NV_DX_interop2 fallback import, forced (A/B control)."
+        }
+      ]
+    }
+  ],
+  "maxRetries": 3,
+  "armNotes": "An arm runs only on the topologies it lists (absent = all). 'native' = the per-API leg that is not the hub (for most apps the path main takes by default; VK: the kill switch, its only non-hub path; d3d11 since #2317 step 2: DXR_HUB=0, the tier's own #918 split / same-adapter engage). d3d11 hub arms: the default env on the hybrid (cross-adapter) topology; DXR_HUB=1 on same-adapter, where the default stays native until the single-dGPU desktop run (optional arm 'default-same' checks that). expectLine = an extra regex the app log must match."
+}

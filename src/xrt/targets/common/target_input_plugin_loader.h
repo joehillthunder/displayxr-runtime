@@ -32,6 +32,8 @@
 
 #include "xrt/xrt_input_plugin.h"
 
+#include "target_input_pref.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -53,16 +55,68 @@ struct target_input_plugin_desc
 	char version[64];
 	char binary_path[512];
 	uint32_t probe_order; /* lower wins; missing defaults to 100 */
-	bool enabled;         /* Windows `Enabled` DWORD; true when absent */
+	bool enabled;         /* Windows `Enabled` DWORD (HKCU over HKLM) / manifest `enabled`; true when absent */
+	/*!
+	 * Where @ref enabled came from (N3a, ADR-054 verb `enable|disable`):
+	 *  - "user": a per-user HKCU `Enabled` is in force, whatever its value
+	 *    (`TARGET_COMPONENT_FLAG_USER_OVERLAY`) — so an explicit HKCU
+	 *    `Enabled` = 1 reads "user";
+	 *  - "machine": disabled by HKLM `Enabled` = 0 (Windows);
+	 *  - "manifest": disabled by the POSIX manifest's `"enabled": false`;
+	 *  - "default": enabled with no per-user value — which includes an
+	 *    explicit HKLM `Enabled` = 1 / `"enabled": true`, because the shared
+	 *    row reader records the value, not its presence.
+	 */
+	char enabled_source[12];
+	/*! ADR-054 N4b: `enum target_component_provenance` of the binary, as
+	 * @ref target_input_plugin_enumerate classified it (a lister checks
+	 * explicitly; the verdict is cached per file for the process). */
+	uint32_t provenance;
+	char provenance_reason[160]; //!< one line: why that verdict
+	char signer[128];            //!< leaf certificate CN when SIGNED; "" otherwise
 };
 
 /*!
  * Enumerate registered input providers WITHOUT loading them. Writes up to
  * @p max descriptors and returns the count (0 if the discovery root is
- * absent / empty). Re-reads the discovery root every call.
+ * absent / empty). Re-reads the discovery root every call, and runs the N4b
+ * provenance check on every listed binary (cached per file).
  */
 int
 target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max);
+
+/*!
+ * The REGISTRATION id (registry subkey / manifest `id`) of the @p index'th
+ * resident provider in priority order, or "" when out of range. Distinct
+ * from `iface->id`, which is the binary's own: one DLL registered under two
+ * ids (CI's `sim-input` + `sim-input-alt`) is two rows with one `iface->id`,
+ * and `PreferredPlugin` names a ROW — so this is what says which row won
+ * (`selftest --json` `input_providers.ranked`, N3b).
+ */
+const char *
+target_input_plugin_get_row_id(int index);
+
+struct target_component_class;
+
+/*!
+ * The input class's row in the shared component loader (ADR-054 N2): what
+ * the one options contract keys on (`target_component_get_setting`,
+ * `displayxr-cli input options|set|unset`, N3c). Static, never NULL.
+ */
+const struct target_component_class *
+target_input_plugin_component_class(void);
+
+struct target_component_setting_desc;
+
+/*!
+ * The settings provider @p id declares (N3c): its manifest `settings_schema`
+ * (POSIX) merged with the binary's `describe_settings` slot, which means
+ * loading + negotiating the registered binary (no probe) and unloading it
+ * again. Returns the count written to @p out (up to @p max); 0 for an
+ * unregistered id or a binary that declares nothing.
+ */
+int
+target_input_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max);
 
 /*!
  * How many providers loaded, ABI-passed and probed successfully.
@@ -138,6 +192,14 @@ void
 target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
 
 /*!
+ * Providers the ADR-054 N4b provenance gate REFUSED at the last scan (unsigned,
+ * not allowlisted, no admissible override) — not part of @p out_failed above,
+ * so a verdict can name the gate instead of "failed to load".
+ */
+int
+target_input_plugin_get_scan_untrusted(void);
+
+/*!
  * Read the ForceQwerty debug override — `HKLM\Software\DisplayXR\Input\
  * ForceQwerty` (DWORD != 0) on Windows, a `force_qwerty` file in the
  * per-user manifest dir on POSIX (first byte '0' = off, anything else =
@@ -147,6 +209,140 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed);
  */
 bool
 target_input_plugin_get_force_qwerty(void);
+
+/*!
+ * ADR-054 N7 (#2143): the `EmulatedControllers` gate — may the qwerty
+ * emulated controller PAIR exist at all? True (the default, absent = 1)
+ * keeps today's floor: the pair is created, sits in the device list and
+ * takes any hand role no provider holds. False: the pair is not published —
+ * no qwerty left/right device, and the arbiter's floor becomes "no hand
+ * roles" (both -1, `xrGetCurrentInteractionProfile` = XR_NULL_PATH) whenever
+ * no provider is present. The qwerty head is NOT gated: it is the
+ * look-around fallback, not a controller.
+ *
+ * Windows: `InputProviders\Policy\EmulatedControllers` (DWORD), HKCU first
+ * (`displayxr-cli input emulated on|off`), then the HKLM 64-bit view
+ * (`--machine`), HKCU ignored under `InputProviders\Policy\Lock` = 1 — the
+ * shared loader's root-policy read, so the service's policy watch and the
+ * N3 overlay rules cover it unchanged. POSIX: an `emulated_controllers` file
+ * in the per-user manifest dir next to `force_qwerty` (first byte '0' = off,
+ * anything else = on); no machine tier. Android: always on.
+ *
+ * @p out_source (may be NULL) receives a static string: "user" / "machine"
+ * (the registry tier), "file" (the POSIX per-user file), or "default"
+ * (nothing set it). Never the environment: this is class policy, not a
+ * component setting, and it is read here — never via `getenv`.
+ *
+ * Orthogonal to ForceQwerty: ForceQwerty = 1 skips the providers,
+ * EmulatedControllers = 0 withholds the pair; both together is a box with no
+ * hand devices at all (the builder logs one WARN naming both).
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source);
+
+/*!
+ * Read the `PreferredPlugin` override (N3a, ADR-054 verb `prefer`; the
+ * input twin of DP spec §2.1/§3.3): the id of the provider ranked FIRST,
+ * ahead of ProbeOrder, for the hand/rig arbitration. Windows: HKCU
+ * `Software\DisplayXR\InputProviders\PreferredPlugin`, then HKLM (what
+ * `displayxr-cli input use <id> [--machine]` writes). POSIX:
+ * `XRT_PREFERRED_INPUT_PLUGIN_ID` in the environment, then the
+ * `input-preferred` file in the per-user manifest dir
+ * (`target_component_user_dir`). A preferred provider that is
+ * disabled, unregistered or declines falls through to normal ProbeOrder.
+ * Writes "" and returns false when nothing is set.
+ */
+bool
+target_input_plugin_get_preferred(char *out, size_t cap);
+
+/*
+ *
+ * Per-client selection policy (ADR-034 Amendment 5, #2181).
+ *
+ */
+
+//! Outcome of a per-app pin write (`displayxr-cli input use <id> --app <exe>`, a persisted app request).
+enum target_input_pin_write
+{
+	TARGET_INPUT_PIN_WRITE_OK = 0,
+	TARGET_INPUT_PIN_WRITE_INVALID = 1,     //!< not a usable exe basename / provider id — nothing written
+	TARGET_INPUT_PIN_WRITE_DENIED = 2,      //!< the store refused the write (permissions)
+	TARGET_INPUT_PIN_WRITE_UNSUPPORTED = 3, //!< no per-user store on this platform (Android; POSIX without HOME)
+	TARGET_INPUT_PIN_WRITE_FAILED = 4,
+};
+
+/*!
+ * The user's per-app pin for executable @p exe_basename: the provider id that
+ * app's controller / hand / gamepad roles prefer, ahead of the app's own
+ * request and of `PreferredPlugin`. Windows: HKCU
+ * `Software\DisplayXR\InputProviders\PerApp\<exe-basename>\PreferredPlugin`
+ * (REG_SZ) — hidden under HKLM `InputProviders\Policy\Lock` = 1, the N3
+ * kiosk rule every per-user value of the class follows. POSIX: the one-line
+ * `input-preferred-<exe-basename>` file in the per-user manifest dir, next to
+ * `input-preferred`. Android: never set. Writes "" and returns false when
+ * nothing is pinned or @p exe_basename is not a valid key
+ * (`u_exe_basename_valid`). Shares the per-title keyspace of #1381: the
+ * actual executable's file name, never `applicationName`.
+ */
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap);
+
+/*!
+ * Write (@p provider_id non-empty) or clear (NULL / "") the per-app pin of
+ * @p exe_basename, in the store @ref target_input_plugin_get_app_pin reads.
+ * Per user, no admin. Does not poke the service: the caller does (the CLI's
+ * reselect poke), or the component-policy watch picks the edit up (#2051 —
+ * the Windows watch covers the subtree; POSIX folds every
+ * `input-preferred-*` file into the input fingerprint). An unregistered id is
+ * written anyway (a preference ahead of registration, as `input use`).
+ */
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id);
+
+//! One per-app pin row, for `input list --json` `per_app`.
+struct target_input_app_pin
+{
+	char exe_basename[128];
+	char provider_id[64];
+};
+
+/*!
+ * Every per-app pin in the per-user store (Windows: HKCU `PerApp` subkeys
+ * with a non-empty `PreferredPlugin`; POSIX: the `input-preferred-*` files),
+ * up to @p max, in store order. Returns the count. Ignores `Policy\Lock` —
+ * this is what is STORED; the caller reports the lock beside it.
+ */
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max);
+
+// The per-family precedence (`target_input_resolve_preference`) is pure and lives in
+// target_input_pref.h, so the arbiter and its standalone tests share it.
+
+/*!
+ * ADR-054 N3d (#2051): re-read the class's policy — `PreferredPlugin` (HKCU
+ * then HKLM / the `input-preferred` file) and every registered row's
+ * `Enabled` (HKLM with the HKCU overlay / the manifest) — and re-rank the
+ * resident providers with it (@ref t_input_arbiter_rerank): the preferred
+ * one to priority 0, the rest to their ProbeOrder, a disabled one withdrawn.
+ * The loader's own ranked table follows, so `get_priority(i)` and `info`
+ * agree with the arbiter. What it cannot do: load a provider that was
+ * disabled (or unregistered) when this process scanned — the provider set is
+ * fixed per process, so enabling one of those still takes a restart, which
+ * the log says. Returns the number of candidates whose standing changed.
+ * Runs discovery first if nothing did yet. Any thread.
+ *
+ * N7 (#2143): the `EmulatedControllers` gate is re-read too and applied the
+ * same way — as a WITHDRAWAL of the qwerty floor candidate
+ * (@ref t_input_arbiter_set_floor_withdrawn), never as a device add/remove:
+ * a pair created at system build stays resident and is withdrawn (roles go
+ * to -1 when no provider is present) or re-admitted at once; a pair NOT
+ * created at build (the process started with the gate off) cannot appear
+ * until the next start, which the log says. With no provider resident the
+ * arbiter is not installed and the gate, like `Enabled`, applies at the next
+ * start — logged once per process.
+ */
+int
+target_input_plugin_reread_policy(void);
 
 /*!
  * Publish the active display processor's nominal panel + viewer geometry to
@@ -179,6 +375,50 @@ target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geo
  */
 const struct xrt_input_plugin_host_iface *
 target_input_plugin_get_host_iface(void);
+
+/*
+ *
+ * Shared stereo camera (the host iface's open_shared_camera slots, ADR-043 /
+ * tracking-provider-discovery.md §10 item 2).
+ *
+ */
+
+/*!
+ * What implements the host iface's shared-camera slots. This library is
+ * linked into both the service and the in-process runtime, but the camera
+ * manager exists only in the service (the IPC server), so the service
+ * registers its implementation here (`targets/service/main.c`); with nothing
+ * registered — the in-process runtime — every open returns
+ * `XRT_ERROR_FEATURE_NOT_SUPPORTED`.
+ *
+ * The loader resolves the calling provider by its id first (unknown id =
+ * `XRT_ERROR_NOT_AUTHORIZED`) and passes its display name and its ADR-054 N4b
+ * verdict (`enum target_component_provenance`) to @ref open; it hands the
+ * ops FULL-size structs and copies the provider's `struct_size` prefix in and
+ * out, so an implementation never deals with ABI versions. @p impl is the
+ * implementation's own per-stream handle.
+ */
+struct target_input_shared_camera_ops
+{
+	xrt_result_t (*open)(void *ctx,
+	                     const char *provider_id,
+	                     const char *display_name,
+	                     uint32_t provenance,
+	                     struct xrt_input_host_camera_open *inout,
+	                     void **out_impl);
+	xrt_result_t (*acquire)(
+	    void *ctx, void *impl, uint32_t timeout_ms, struct xrt_input_host_camera_frame *out, uint32_t *out_state);
+	void (*release)(void *ctx, void *impl, uint64_t frame_index);
+	void (*close)(void *ctx, void *impl);
+};
+
+/*!
+ * Register (or clear, NULL) the shared-camera implementation. @p ops must stay
+ * valid for the process lifetime (static storage). Register before providers
+ * open a camera; streams already open keep the ops they were opened with.
+ */
+void
+target_input_plugin_loader_set_shared_camera_ops(const struct target_input_shared_camera_ops *ops, void *ctx);
 
 #ifdef __cplusplus
 }

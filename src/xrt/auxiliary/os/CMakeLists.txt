@@ -27,8 +27,24 @@ endif()
 # EDID-based display identification (vendor-neutral monitor enumeration)
 target_sources(aux_os PRIVATE os_display_edid.h)
 if(WIN32)
-	target_sources(aux_os PRIVATE os_display_edid_win32.c)
+	target_sources(aux_os PRIVATE os_display_edid_win32.c os_display_edid_parse.h os_display_edid_parse.c)
 	target_link_libraries(aux_os PRIVATE setupapi)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux (multi-screen M0): RandR monitors joined to DRM sysfs
+	# connectors. Needs os_display_desktop_x11.c + os_display_connector_linux.c,
+	# added below under the same condition.
+	target_sources(
+		aux_os PRIVATE os_display_edid_linux.h os_display_edid_linux.c os_display_edid_parse.h
+			       os_display_edid_parse.c
+		)
+elseif(APPLE)
+	# macOS: CoreGraphics displays (os_display_desktop_macos.c, added below)
+	# joined to the EDID blobs IOKit publishes. IOKit is a system framework.
+	target_sources(
+		aux_os PRIVATE os_display_edid_macos.c os_display_macos.h os_display_edid_parse.h
+			       os_display_edid_parse.c
+		)
+	target_link_libraries(aux_os PRIVATE "-framework IOKit")
 else()
 	target_sources(aux_os PRIVATE os_display_edid_stubs.c)
 endif()
@@ -58,6 +74,9 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
 	# which only exists from CMake 3.25 and would silently evaluate FALSE here
 	# (this project requires 3.22), dropping us to the stub with no diagnostic.
 	target_sources(aux_os PRIVATE os_display_desktop_x11.c)
+	# The device mode + compositor scale behind each X11 monitor, by connector
+	# name: Mutter DisplayConfig (libdbus dlopen'd) else DRM sysfs (#1831).
+	target_sources(aux_os PRIVATE os_display_connector_linux.h os_display_connector_linux.c)
 	# X11 global-scale / placement-quantum detection: RandR rects joined to the
 	# DRM connector modes read from sysfs (no libdrm). See os_display_scale.h.
 	target_sources(aux_os PRIVATE os_display_scale_linux.c)
@@ -70,21 +89,82 @@ if(NOT (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
 	target_sources(aux_os PRIVATE os_display_scale_stubs.c)
 endif()
 
+# Display hotplug (ADR-047 Amendment 8): the OS display-reconfiguration
+# notification. macOS has one (CoreGraphics); elsewhere the runtime polls.
+target_sources(aux_os PRIVATE os_display_hotplug.h)
+if(APPLE)
+	target_sources(aux_os PRIVATE os_display_hotplug_macos.c)
+else()
+	target_sources(aux_os PRIVATE os_display_hotplug_stubs.c)
+endif()
+# The cheap topology read the hotplug sweep polls (#2305): Windows has no
+# desktop enumeration and pure Wayland no RandR, so the sweep's signature needs
+# a platform part there. EnumDisplayDevicesW only (user32, already linked by
+# every Windows process); sysfs reads on desktop Linux.
+target_sources(aux_os PRIVATE os_display_topology.h os_display_topology.c)
+if(WIN32)
+	target_sources(aux_os PRIVATE os_display_topology_win32.c)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	target_sources(aux_os PRIVATE os_display_topology_linux.c)
+else()
+	target_sources(aux_os PRIVATE os_display_topology_stubs.c)
+endif()
+
 if(APPLE)
 	target_sources(aux_os PRIVATE os_macos.c)
 endif()
 
+# ADR-053 D5 (#2032): child processes, the control channel, handle transfer
+# and the wake signal of the conversion-host satellite. Windows: kernel32 /
+# advapi32 only (job object, named pipe, token query). Desktop Linux + macOS:
+# POSIX (fork/exec, socketpair + SCM_RIGHTS). Not on Android (its
+# `:conversion` service is a different mechanism).
+if(WIN32)
+	target_sources(aux_os PRIVATE os_process.h os_process_win32.c)
+	target_link_libraries(aux_os PRIVATE advapi32)
+elseif(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	target_sources(aux_os PRIVATE os_process.h os_process_posix.c)
+endif()
+
+# ADR-054 N8: named shared memory (the viewer pose page a tracking host writes
+# and the service + in-process runtimes read). Windows: a Local\ section with
+# an explicit DACL (advapi32, linked above). Desktop Linux + macOS: shm_open
+# (librt on older glibc). Not on Android (bionic has no shm_open).
+if(WIN32)
+	target_sources(aux_os PRIVATE os_shm.h os_shm_win32.c)
+elseif(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	target_sources(aux_os PRIVATE os_shm.h os_shm_posix.c)
+	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+		target_link_libraries(aux_os PRIVATE rt)
+	endif()
+endif()
+
 ####
-# BLE library
+# UVC capture backend of the vendor-neutral stereo camera source (ADR-043
+# Amendment 4, util/u_stereo_uvc.h). Its own library so the capture DLL
+# imports (Media Foundation) land only in the processes that capture — the
+# service and displayxr-cli — never in the runtime library apps load.
 #
 
-add_library(aux_os_ble STATIC os_ble.h)
-target_link_libraries(aux_os_ble PUBLIC aux-includes aux_os)
-
-if(XRT_HAVE_DBUS)
-	target_sources(aux_os_ble PRIVATE os_ble_dbus.c)
-	target_link_libraries(aux_os_ble PRIVATE ${DBUS_LIBRARIES})
-	target_include_directories(aux_os_ble SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+add_library(aux_os_uvc STATIC os_uvc_capture.h)
+target_link_libraries(aux_os_uvc PUBLIC aux-includes aux_os aux_util)
+if(WIN32)
+	target_sources(aux_os_uvc PRIVATE os_uvc_capture_mf.cpp)
+	# mf: MFEnumDeviceSources / MFCreateDeviceSource; mfplat: MFStartup, media
+	# types; mfreadwrite: the source reader; mfuuid: the MF GUIDs.
+	# d3d11 + dxgi: the hardware MJPEG decode path (IMFDXGIDeviceManager on the
+	# adapter that has a hardware MJPEG decoder MFT; staging readback).
+	target_link_libraries(aux_os_uvc PRIVATE mf mfplat mfreadwrite mfuuid ole32 d3d11 dxgi)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Desktop Linux: V4L2 (kernel uapi headers only) + an MJPEG decoder that
+	# dlopens libturbojpeg when present and otherwise uses the in-tree
+	# stb_image — no new DT_NEEDED (the .deb's STABLE_SONAMES list is unchanged).
+	target_sources(
+		aux_os_uvc PRIVATE os_uvc_capture_v4l2.c os_uvc_capture_v4l2.h os_uvc_mjpeg.c os_uvc_mjpeg.h
+		)
+	target_include_directories(aux_os_uvc PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+	target_link_libraries(aux_os_uvc PRIVATE ${CMAKE_DL_LIBS} xrt-pthreads)
 else()
-	target_sources(aux_os_ble PRIVATE os_ble_stubs.c)
+	# Everything else has no capture backend.
+	target_sources(aux_os_uvc PRIVATE os_uvc_capture_stubs.c)
 endif()

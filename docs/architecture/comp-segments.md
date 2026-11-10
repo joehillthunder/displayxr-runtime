@@ -1,0 +1,816 @@
+# Window segments: one window, one DP per screen
+
+*How the compositor weaves a window that spans several screens (multi-screen M2), and
+how each screen gets its own views (M3).
+Companion to ADR-047 (`docs/adr/ADR-047-multi-screen-segments-and-per-screen-views.md`, lands with PR #1849)
+decision D2 and the multi-screen plan (`docs/roadmap/multi-screen.md`, lands with PR #1849).
+Code: `src/xrt/compositor/util/comp_segments.{h,c}` (backend-agnostic math and
+policy, unit-tested by `tests/tests_comp_segments.cpp`) and
+`src/xrt/compositor/vk_native/comp_vk_native_segments.{h,c}` (the Vulkan
+in-process compositor's use of it).*
+
+## What a segment is
+
+A **screen** is an OS monitor in the per-monitor DP registry; each one is won by
+a plug-in, which can make a display processor (DP) for it. A **segment** is the
+part of a window's canvas that lands on one screen:
+
+```
+segment = canvas ∩ screen
+```
+
+Each segment has:
+
+| field | meaning |
+|---|---|
+| `window_rect` | the segment in **window pixels** — the canvas handed to `process_atlas` |
+| `screen_rect` | the segment in **that screen's pixels** — where it lands on the panel |
+| `present_origin` | the window's origin relative to that screen (`set_present_origin`; may be negative). The DP adds the canvas offset: `present_origin + window_rect.origin = screen_rect.origin`, the phase input |
+| `screen_1to1` | whether window pixels reach that screen unresampled (desktop rect == device mode), or unknown |
+
+The table is ordered left to right by desktop position (the order M3's
+per-segment views will use). The rect math is `u_multi_display_compute_slices`,
+half-open, so a window flush to a seam belongs to exactly one screen.
+
+## Who weaves what
+
+- The **primary screen** is the system-default screen, the one the session's own
+  DP (`comp_vk_native_compositor::display_processor`) was made for. Its segment is
+  woven by that DP. Its eyes feed that segment's views (M3, below).
+- Every **other screen** gets a segment DP from that screen's registry entry —
+  **whichever plug-in won that screen** (M3 lifted M2's one-vendor rule: the entry carries
+  the owning plug-in's iface + instance, kept resident by the loader as a claim source,
+  M0): its ABI-checked factory
+  `xrt_plugin_iface::create_dp_vk_for_screen` with an `xrt_screen_binding`
+  (monitor id, desktop rect, native px, mm, serial) — only that slot: a plug-in
+  without it gets a flat 2D view on its other screens, never a plain `create_dp_vk`
+  DP (which would describe the wrong panel and may clear the whole target). It is
+  created against the #868 runtime-owned queue, like the primary.
+  It is windowless (NULL window): its phase is `set_present_origin`, fed per frame,
+  ADR-033. A plug-in's DP made for a screen describes that screen
+  (`get_display_dimensions` / `get_display_pixel_info`). Every segment DP follows the
+  session's 2D/3D mode on the screens the window covers (`request_display_mode`, on
+  creation and on every change) — see *The lens wish follows coverage* below.
+- A window entirely on the primary screen — the common case — never leaves the
+  single-DP path: `comp_segments_table_is_split()` is false and the frame is
+  byte-for-byte what shipped before.
+
+## The frame (split path)
+
+`comp_vk_native_segments_record()`, called where the single-DP `process_atlas`
+was:
+
+1. **Clear** the target (whatever no segment covers would otherwise be undefined).
+2. **Crop per segment.** The atlas holds the whole canvas; each woven segment gets
+   its own image with exactly its views (each tile cut to the segment, edges rounded
+   independently so neighbours share the seam column). Crop before the DP is the
+   law (ADR-030): a DP's atlas holds exactly its canvas.
+3. **Weave**, primary first, then left to right. Each DP gets `canvas = segment`;
+   between two DPs the target goes `PRESENT_SRC_KHR → COLOR_ATTACHMENT_OPTIMAL`
+   with its contents preserved.
+4. **Flat 2D** for every segment that cannot be woven and for canvas no segment
+   covers: one view (the middle one, the left eye of a stereo pair), scaled from the
+   view tile to the window rect — the same content and seam registration as the
+   shipped #1654 band.
+
+It leaves the target in `PRESENT_SRC_KHR`, exactly as the single-DP path does, so
+the Local2D composite, the HUD and the present after it are unchanged.
+
+## Who sets viewport and scissor
+
+The **DP**, from the canvas. A Vulkan DP records its own render pass, so the
+compositor cannot set dynamic state inside it; what it guarantees is the canvas
+argument, the cropped atlas and the target layout (`COLOR_ATTACHMENT_OPTIMAL` on
+entry). The contract a segment DP must honour (`create_dp_vk_for_screen` doc):
+
+- **render area, viewport AND scissor = the canvas.** A windowless weaver's default
+  scissor is its panel rect, so a backbuffer wider than the panel is clipped unless
+  both are set (multi-screen plan, risk 7);
+- **not the first writer**: preserve the target outside the canvas.
+
+sim_display implements both (a screen-bound DP uses a render-pass variant starting
+in `COLOR_ATTACHMENT_OPTIMAL` with the clear confined to the render area). A DP
+built before M2 may still clear its whole target, which is why the primary runs
+first.
+
+**sim_display behaviour change for every caller, on purpose.** sim's viewport and
+scissor now follow the canvas for the unbound (primary) DP too — the split path
+needs it, and it is what the `process_atlas` contract always said. It is identical
+to before whenever the canvas is the whole target (every single-screen in-process
+frame); it differs when the canvas is smaller — the one-or-two-frame window-shrink
+transient before the swapchain is recreated, the shared-texture path, and a
+`comp_multi` zone canvas — where sim used to stretch the canvas-sized atlas across
+the whole target. The interlace phase does NOT change for the unbound DP: it stays
+`canvas_offset_x`; only a screen-bound segment DP takes its phase from
+`set_present_origin`.
+
+## The 1:1 policy
+
+A lenticular weave is a ~1-pixel-period pattern: if the display server resamples
+the window on its way to the panel, every view leaks into its neighbour
+(#1595, #1831 — refuse rather than resample). Anaglyph, side-by-side and blend do
+not care. So the gate is per segment and per DP capability
+(`comp_segments_decide`):
+
+| DP for the segment | screen 1:1 | rendered |
+|---|---|---|
+| none | — | flat 2D |
+| needs 1:1 | no | flat 2D |
+| needs 1:1 | yes / unknown | woven |
+| tolerates a resample | any | woven |
+
+"Unknown never degrades." The capability is `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`
+in `xrt_dp_scanout_caps::flags`, read through the existing `get_scanout_caps` slot
+(the flags word was `reserved[0]`, so every older plug-in reads as "needs 1:1").
+The primary segment keeps the session-level gates, which now also let a tolerant
+primary DP weave (the X11 gate of #1831 and the resample reasons of the Wayland
+gate of #1595). On `ds1-linux` both monitors are resampled under XWayland, which is
+why M2 could not be shown there without this.
+
+## The lens wish follows coverage (#2247)
+
+A screen's DP is asked for the session's 2D/3D mode while the window covers that
+screen; a screen the window has been **wholly off for 0.5 s** is asked for 2D (it shows
+the desktop there, not a woven window), and gets the session's mode back **at once** when
+the window returns. Coverage is `comp_segments_screen_covered(table, screen)` (pure); the
+dead band is `comp_segments_cover_dwell`, one per manager, advanced on every update next to
+the hand-off hysteresis and with the same dwell (`COMP_SEGMENTS_DEFAULT_HANDOFF_HOLD_NS`;
+coverage is binary, so the hand-off's majority margin does not apply). A lens switch is a
+physical toggle, so a drag across a seam must not flap it. Both are unit-tested; an empty
+table (the window on no screen) carries no coverage and leaves the session's mode
+everywhere.
+
+- **Segment DPs** — every manager's `*_set_display_mode()` applies it per screen, so a DP
+  kept alive after its segment went away (the lifecycle's ~0.5 s hysteresis, or the DP
+  holding the window handle before the hand-back) is sent 2D. One WARN per coverage edge:
+  `segments: screen 0x… ('…') uncovered for 0.5 s — lens wish 2D (#2247)` / `covered again`.
+- **The session's own DP** (the primary screen's) — the compositor asks the manager
+  `*_primary_covered()` on every weave and, on an edge, sends `session_3d && covered`
+  (`segments: the window has been off the primary screen for 0.5 s — its lens wish 2D (#2247)`);
+  its `request_display_mode` entry point and the `swap_primary` hook (a windowless primary
+  DP made by the hand-off) apply the same gate, so the re-created weaver never replays a 3D
+  wish for a screen the window left. In-process D3D11, D3D12, Vulkan and OpenGL, and the
+  #918 Vulkan/D3D12 split. On desktop Linux the NOT_1TO1 hold wins while it is held.
+- **Not yet:** the service's panel DP (shared between clients — the right rule there is
+  "no 3D client covers this screen", the union over the service's clients) and the macOS
+  Metal session DP. Their segment DPs already follow the rule.
+
+## Lifecycle
+
+Segment DPs follow the table with hysteresis (`comp_segments_lifecycle`): created
+once a segment has existed for 2 consecutive metric updates, destroyed once it has
+been gone for 30 (~0.5 s at 60 Hz), so a drag back and forth across a seam never
+rebuilds DPs. A failed create is not retried until the segment goes away. Until a
+DP exists the segment is flat 2D. A table change is logged once at INFO
+(`segments: window … -> N segment(s); [i] screen … canvas … origin …`); a DP create
+or destroy is one WARN.
+
+## Scope and switches
+
+- In-process Vulkan compositor, desktop Linux, **X11/XWayland**: root coordinates
+  are desktop-absolute, the same space as the registry's RandR rects. Native Wayland
+  stays primary-only — the geometry payload does not describe the other monitors
+  (`docs/specs/runtime/wayland-window-geometry.md` §5). On **Windows** the same
+  compositor segments too — see *Windows / Vulkan (M6)* below.
+- **Mixed vendors** (M3): a Leia DS1 next to a sim_display laptop panel is
+  segmented like any other layout; each segment DP comes from its own screen's plug-in
+  and the table logs one INFO line naming the vendors. A plug-in whose VK factory was
+  refused at load (vk_bundle ABI, #1243) gets no segment DP: that segment is flat 2D.
+- Not segmented: zero-copy frames, a self-submitting DP or one without a render
+  pass, a session pinned with `XrSessionDisplayBindingDXR`, the shared-texture path.
+- `DXR_SEGMENTS=0` turns it off (and keeps `PRIMARY_MULTIVIEW_DXR` at the pre-M3 view count).
+- Capture: with the window split, the post-compose atlas capture also writes each
+  segment's DP input as `<stem>.seg<i>.png`.
+
+## Windows / D3D11 (M6)
+
+The in-process D3D11 compositor carries the same model in `d3d11/comp_d3d11_segments.{h,cpp}`,
+a line-for-line twin of the Vulkan manager with the GPU work in D3D11 terms
+(`CopySubresourceRegion` crops, `ClearRenderTargetView`, a renderer rect blit for flat 2D, no
+deferred-release list because the immediate context executes in order). What differs on Windows:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_d3d11_for_screen`
+  (the D3D11 twin of the Vulkan per-screen factory) and `xrt_display_processor_d3d11::set_present_origin`.
+  A plug-in without them gets flat 2D on its other screens, exactly like Vulkan.
+- **The window.** The real HWND, and so the vendor's drag phase-snap, belongs to the DP of the
+  screen holding the majority of the window (ADR-047 Amendment 2); every other screen's DP is
+  windowless and phases from `set_present_origin` + the canvas offset. It starts on the primary DP.
+  `comp_segments_owner_update` (pure, unit-tested) calls a hand-off when another screen beats the
+  owner by ≥ 20 % of the on-screen area for 0.5 s; `hwnd_handoff` then makes a windowless
+  replacement for the old owner (the primary is swapped through the compositor's `swap_primary`
+  hook, which re-sends transparency / mode / eye-tracking mode and guards the exchange with
+  `dp_swap_mutex`), destroys the old owner's DP, and makes the new owner's with the HWND — rolling
+  back on failure — between two weaves. While the primary is windowless the split path runs even
+  for a window back on the primary alone (it needs its present origin) until the hand-back. One
+  WARN per flip: `segments: window handle handed from '<dev>' to '<dev>' …` (or `… FAILED …`).
+  Only sessions with a real window hand off (not the shared-texture path). The vendor weaver reads
+  the current D3D11 viewport **and scissor** and writes only inside them, so the segment path sets
+  both to the segment before every `process_atlas`, and the back buffer is re-bound before every DP.
+- **Units.** The window rect comes from `ClientToScreen` in a per-monitor-DPI-aware process, i.e.
+  device px — the same space as the registry's monitor rects. A DPI-virtualised origin would weave on
+  the wrong lattice and look plausible (`docs/reference/dpi-awareness.md`).
+- **The untracked screen.** The SR tracker follows the runtime's active display only, so a weaver
+  bound to any other display sees no face and would fall back to 2D. The Leia plug-in pins that
+  weaver to its nominal viewer and leaves the lens to the active panel (David, 2026-10-07; SR D3/D4
+  move both per device later). The runtime does nothing special: the DP owns it.
+- **Under the #918 weave-on-scanout split** (ADR-039 — the default on hybrid boxes, and engaged even
+  on one adapter) the window is segmented the same way, on the device that presents: the segment
+  manager, its DPs and its crop textures live on the OUTPUT device (`d3d11_out_device()` /
+  `d3d11_out_context()`, which off the split are the app's), the DPs' input is the egress slot being
+  woven (the output-side copy of the composed atlas, already cropped to the box that slot was painted
+  at), and the flat-2D fill draws through the output composite unit (`comp_d3d11_outcomp_blit_rect`,
+  the renderer's blit re-made on that device). Same function, same table, same per-segment viewport /
+  scissor / present origin, same #1863 routing (the mosaic is painted on the app device and crosses the
+  bridge like any atlas). A slot one frame behind a resizing window is cropped at its own view size
+  against the live canvas — the single-DP split weave's one-frame lag, no more; a routed slot is
+  cropped at the partition it was painted with (#1883, *Per-segment views* below). A split session logs
+  one WARN when its segment manager is made (`segments: under the #918 output-device split …`).
+- **Not segmented on Windows:** zero-copy frames, a zones / Local2D frame (any non-whole-window
+  canvas), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
+  The service has its own section below (*Service / IPC path*).
+- **sim_display** implements both slots on D3D11 too, so a two-monitor Windows box with no vendor
+  hardware exercises the split path (anaglyph on both halves).
+- **Per-segment views (M3) on Windows** ride the same state-tracker path as Linux: `oxr_system` counts
+  the registry's D3D11 factories for the view-set capacity, `xrLocateViews` reads
+  `comp_d3d11_compositor_get_segment_metrics` (the last weave's table + each segment's eyes, the
+  secondary screen's from its own DP — on a Leia panel the pinned nominal viewer), `xrEndFrame` hands
+  the routing to `comp_d3d11_compositor_set_view_routing`, and the renderer paints each segment's
+  views at that segment's rect inside every tile (the mosaic; quads and equirect2 once per segment
+  with that segment's camera). A routed frame is never zero-copy. This is what makes an untracked
+  second panel render from its own viewer instead of the tracked panel's.
+
+## Windows / Vulkan (M6)
+
+The in-process Vulkan compositor (`cube_handle_vk_win`, the Vulkan `displayxr-demo-*` apps)
+segments a spanning window on Windows as well (ADR-047 Amendment 6). Which manager weaves depends
+on where the weave runs, which the Vulkan #918 output-device split (#1178) decides:
+
+- **Off the split** — the Vulkan manager above (`comp_vk_native_segments`), unchanged from Linux
+  except for the window:
+  - **Units.** The window rect is the HWND's client area from `ClientToScreen`, cached by the
+    same `vk_get_window_metrics` read the present origin uses — device px in a per-monitor-DPI-aware
+    process (every DisplayXR executable embeds the manifest, #1201), the registry's monitor space.
+  - **The window follows the majority screen** (ADR-047 Amendment 2), the D3D11 policy in Vulkan
+    terms: `comp_vk_native_segments_hwnd_hooks` (set only on Windows, only for a session with a
+    real window, never the shared-texture path), `comp_segments_owner_*` hysteresis, a windowless
+    replacement first (`comp_segments_owner_needs_windowless_replacement`), rollback on failure,
+    the HWND-holding DP made through `create_dp_vk_for_screen` with the window. The compositor's
+    `swap_primary` installs the new primary under `dp_swap_mutex` (the app-thread readers — eyes,
+    panel geometry, 2D/3D, eye-tracking mode, the snap — take it too) and re-sends transparency,
+    shared-texture present, the 2D/3D mode and the eye-tracking mode; the weave site replays that
+    weave's per-frame inputs (target view, backdrop, frame timing, atlas encoding) to the new DP.
+    The snap (`xrWeaveSnapWindowRectDXR`) asks the DP holding the window.
+  - **Retire, never destroy, on a hand-off.** A repaint parked on its fence with the lock released
+    (#1264 S1) may still execute a command buffer that references the old DP, so a replaced DP goes
+    on the retire list like every other segment resource. The list is drained before the new owner
+    is made whenever the update is release-safe (no parked repaint) — a vendor weaver is one per
+    window and only a destroyed one lets go of it. In the rare unsafe case the new owner's create
+    may be refused; the hand-off then rolls back and is retried only after the majority leaves.
+  - One WARN per flip: `segments: window handle handed from '<dev>' to '<dev>' … (Vulkan)`.
+- **Under the split** — the weave is the D3D11 one on the scanout adapter, so the window is
+  segmented by the **D3D11** manager (`comp_d3d11_segments`, linked into the Vulkan compositor from
+  `comp_d3d11_segs`) exactly as § *Windows / D3D11* describes for the D3D11 compositor's own split:
+  made on the output device, DPs from `create_dp_d3d11_for_screen`, the egress slot cropped per
+  segment, flat 2D through the split's output composite unit, the hand-off swapping the split's
+  own DP (`split_seg_swap_primary_cb`, guarded by the split's `dp_mutex`). It runs in
+  `comp_hub_d3d11_weave_and_present` right after the swapchain image is acquired and before any
+  per-frame DP input, so a hand-off's new DP gets them all. One WARN when the manager is made:
+  `segments: under the VK #918 output-device split — segment DPs are created on the OUTPUT device …`.
+  `comp_vk_native_compositor_set_screens` forwards the list to the split; a split that retires
+  mid-session leaves the Vulkan manager to take over on the next weave.
+- **Per-segment views (M3)** work on both arms: `oxr_system` counts a registry Vulkan factory
+  toward the view-set capacity on Windows (alongside D3D11 / D3D12), `xrLocateViews` reads
+  `comp_vk_native_compositor_get_segment_metrics` (which asks the split when it is up), and the
+  Vulkan renderer paints the mosaic on the app device — under the split it crosses the bridge
+  like any atlas.
+- **Not segmented on Windows / Vulkan:** zero-copy frames, a self-submitting DP or one without a
+  render pass (off the split), the shared-texture path, a pinned session, `DXR_SEGMENTS=0`.
+- **Vendor side.** The Leia plug-in's Vulkan per-screen DP is SR v2 only (routing, binding, present
+  origin and the simulated viewer exist only on the v2 C API); a process on the bundled v1 Vulkan
+  weavers gets flat 2D on its other screens. Under the split the plug-in's D3D11 per-screen DP is
+  what weaves, so no Vulkan slot is involved there.
+- **#1883 on both arms:** each segment's views are cropped where the frame PAINTED them, never at
+  the live seam. Off the split the partition is set with `eff_layout`'s routing
+  (`comp_vk_native_compositor::seg_content`, so a repaint replays it with its atlas) and handed to
+  `comp_vk_native_segments_frame::content` — which also fixes the Linux M2/M3 path, the same
+  module; under the split the compositor stages it before every `comp_hub_d3d11_submit_atlas`
+  (`comp_hub_d3d11_stage_segment_content`), the split records it under the bridge sequence and the
+  weave looks up the woven slot's own partition (`comp_xbridge_slot_seq`), exactly the D3D11
+  split's ring.
+
+## macOS / Metal
+
+The in-process Metal compositor carries the same model in `metal/comp_metal_segments.{h,m}`, a twin
+of the D3D11 manager with the GPU work in Metal terms (a clear pass, blit-encoder crops, a small
+sub-rect blit pipeline for flat 2D; every DP encodes its own render pass on the frame's one command
+buffer, in order). What differs on macOS:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_metal_for_screen`
+  and `xrt_display_processor_metal::set_present_origin`. A plug-in without them gets flat 2D on its
+  other displays. What a plug-in implements is spelled out in `docs/reference/xrt_plugin_iface.md`.
+- **Units — the macOS-specific part.** The registry holds each display's `CGDisplayBounds` in
+  top-down **points** plus its native backing px, and the window's content view is read in the same
+  points (AppKit's bottom-up frame flipped against the main display). The table is cut in points,
+  so a seam is exact whatever the scales, then converted per segment:
+  - the **canvas** (`window_rect`) → the drawable's px (points × the drawable's scale, edges rounded
+    independently so neighbours share the seam column);
+  - the **present origin** → that display's own backing px relative to its `CGDisplayBounds`
+    origin, chosen so `origin + canvas offset` = the segment's top-left on the panel even when the
+    window's backing scale differs from the display's. That is exactly what the Leia SR Metal
+    weaver's `srWeaverSetPresentOrigin` takes, so a per-screen DP forwards it and never recomputes
+    it from a window;
+  - **1:1** → the display's backing scale equals the drawable's AND its points × scale equal its
+    native mode. A "looks like" scaled mode (the WindowServer downsamples the 2x backing) or a
+    window straddling a 1x and a 2x display (the window has ONE backing scale; the other display
+    gets it resampled) is not 1:1, and a lenticular weave is refused there (flat 2D);
+  - the **published M3 metrics** → points × the drawable's scale throughout: a window pixel on
+    display *i* covers 1/scale points of it, so the per-pixel physical pitch the view math uses is
+    right on every display.
+- **The window.** The session's DP keeps the app's NSView (it is the system-default display's DP).
+  Every other display's DP is windowless.
+- **The drawable follows the APPLIED window, never the requested one.** AppKit constrains a shown
+  window to the screen's `visibleFrame` (and clamps `setFrame:` to min / max sizes), so the segment
+  table, the canvas and the drawable are all derived from the content rect read back after the
+  window was shown / moved, re-read every frame before `nextDrawable`. A drawable sized from the
+  request would be woven at one size and scaled into another — a broken lens phase on every
+  segment. The runtime-owned placement (ADR-050) also shows the frame-resize cursor over its
+  resize zones, since AppKit no longer sees those mouse-downs.
+- **Not segmented on macOS:** the shared-IOSurface (`_texture`) path, a zones / Local2D / mask frame
+  or an output rect (any non-whole-window canvas), a session with no DP, a pinned session,
+  `DXR_SEGMENTS=0`, the service / IPC path. Unlike D3D11, a zero-copy frame IS segmented (the crop
+  reads the app's swapchain at the same tile stride); a routed (M3) frame is never zero-copy.
+- **Per-segment views (M3)** ride the same state-tracker path: `oxr_system` counts the registry's
+  Metal factories for the view-set capacity, `xrLocateViews` reads
+  `comp_metal_compositor_get_segment_metrics`, `xrEndFrame` hands the routing to
+  `comp_metal_compositor_set_view_routing`, and the projection pass paints each segment's views at
+  its rect inside every tile. Quads and equirect layers are NOT routed on Metal yet (drawn once per
+  tile with the tile's camera, as unsegmented).
+- **sim_display** implements both slots on Metal (a bound DP loads the target and scissors to its
+  canvas; every Metal sim output tolerates a resample, since INTERLACED falls back to anaglyph on
+  this backend, #817), so a two-display Mac with no vendor hardware exercises the split path.
+- **"Displays have separate Spaces" clips a straddling window.** With that macOS setting ON (the
+  default: `com.apple.spaces` `spans-displays` absent or false) the WindowServer shows a window
+  spanning displays only on the display holding most of it; the other segments are rendered and
+  woven but never reach their panel. The runtime logs a one-shot WARN the first time a window
+  resolves to ≥ 2 segments under it (no behaviour change); turn it off in System Settings → Desktop
+  & Dock → Mission Control (requires logout). `DXR_TEST_SEPARATE_SPACES=0|1` overrides the read.
+- Test knob: `cube_handle_metal_macos` honours `DXR_TEST_WINDOW_RECT=x,y,w,h` (content rect, top-down
+  points) and, once at frame `DXR_TEST_WINDOW_MOVE_FRAME` (default 300), `DXR_TEST_WINDOW_RECT2`.
+
+## Display hotplug (ADR-047 Amendment 8)
+
+The screen table a compositor segments against is no longer fixed at session create. A worker
+thread (`targets/common/target_display_hotplug`) re-runs the per-monitor claim sweep when the OS
+reports a display reconfiguration, when a 500 ms poll of the monitor list sees a change, or when a
+plug-in calls `xrt_plugin_host_iface::request_display_rescan`; it loads the plug-ins that are not
+claim sources yet (one that declined at instance create is probed again), re-resolves, and
+publishes a new list with a bumped generation only when the list changed. Each session reads the
+generation in `xrBeginFrame` and re-pushes one consistent snapshot (`get_display_snapshot`: list +
+registry) through the compositor's ordinary `set_screens`.
+
+What a compositor does with it (Metal today; the other managers already rebuild on `set_screens`):
+
+- **The session DP's screen** is the monitor the session DP was made for, while the plug-in that
+  won it at session create still wins it with the same vendor serial, at the same desktop rect,
+  under the same OS output handle (macOS: `CGDirectDisplayID`) (`comp_segments_session_dp`). Not
+  "whatever is the system default now": the system default can move, and the session DP can only
+  ever weave the panel it was built for. A panel replugged unchanged is handed back (the weaver is
+  kept and re-sent the display mode); one that came back changed is woven by a fresh segment DP.
+- **Every other screen** is woven by a segment DP from its own claimant. When the session DP owns
+  no listed screen (its monitor was unplugged, or re-claimed — sim-display -> leia-sr once the
+  panel's vendor service is up), a single screen is segmented too: the window takes the split path
+  with one segment, never the session DP.
+- **Re-tabling in place.** A segment DP whose screen is listed again with the same
+  `xrt_screen_binding`, by the same plug-in instance, survives the new table
+  (`comp_segments_lifecycle_adopt`); every other one is destroyed on the commit thread between
+  weaves (one WARN, `segments: retiring the segment DP for screen …`). An unplugged panel's DP goes
+  this way.
+- **Logs to read a hotplug by**: `display hotplug: screen table generation N — …` (the diff, then
+  one line per screen with its claimant), `display hotplug: session takes display topology
+  generation A -> B`, `OXR EVENT: Displays changed`, then the usual `segments:` table and
+  `created a segment DP` lines.
+
+- **Present, not ready.** A screen whose winning claim is `XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`
+  (its plug-in owns the panel but cannot drive it yet — a 3D panel not yet authenticated after a
+  hotplug) has no DP factory in the registry: it is segmented like any screen and shown flat 2D,
+  never woven by a fallback DP or by the session DP. `DXR_TEST_SCREEN_NOT_READY=<name|id>` forces
+  it.
+
+- **D3D11 / D3D12 / OpenGL / Vulkan (Windows, desktop Linux — #2305).** These managers read
+  "the session DP's screen" off the list's `SYSTEM_DEFAULT` flag and rebuild every segment DP on
+  `set_screens`. So the session re-anchors each hotplug re-push on its **home screen** first
+  (`util/u_screen_home`, called from `oxr_session_push_screens`): the flag stays on the screen the
+  session DP was made for while the same plug-in wins it, and when that screen is gone or
+  re-claimed no screen carries the flag — the managers then take their single-DP path ("does not
+  know the system-default screen — no segmentation") and no second weaver is built for its panel.
+  A WARN per outcome change: `display hotplug: the session's own display processor stays on screen
+  0x… — in place | re-anchored | gone | re-claimed`.
+- **Home gone: a bounded wait, then a ready screen (ADR-047 Amendment 8 addendum, #2305).** While
+  the home panel is merely unplugged (its plug-in wins no screen, the compositor's last list still
+  has it, every monitor left is unmoved) the session leaves the compositor on its last list for up
+  to 60 s (`u_screen_home_keep_decide`, `U_SCREEN_HOME_KEEP_BOUND_NS` — the #266 move-back
+  window), so a re-seat comes back with no rebuild; the bound is checked every frame. After it,
+  or as soon as the list changes in another way, the list goes through. Before that rebuild a
+  manager that can move the window handle (D3D11 and the #918 hub, GL, Vulkan on Windows) gives
+  the window to a listed screen whose DP is ready (`comp_segments_handback_decide`: it reports
+  pixel and physical size; the DP already holding the window first) and moves that DP into the
+  session's primary slot — never a new DP for the departed screen, whose DP never becomes ready
+  (flat view 0, no geometry: the laptop showed one eye of a whole-panel frustum). If that DP
+  cannot be made, the window stays with its holder (or none). Only when the home is unplugged
+  (its id gone and its plug-in winning no screen): a re-claimed or re-identified panel keeps the
+  hand-back to its own DP. The compositor keeps the slot's screen (and the plug-ins) in its away
+  record (`struct comp_segments_away`); when the
+  home is back, the first update moves that DP to its own segment slot and gives the home a
+  windowless DP (the home alone in the list: the home's window-holding DP takes the slot back).
+  While the home stays gone, a list in which its plug-in wins a screen again (the panel alone at
+  (0, 0) under a position-derived id), or without the slot's screen, gets a stand-in primary
+  (`comp_segments_away_decide`) that is re-homed the same way; the record then names the stand-in,
+  so the home's own DP is made when it returns. A re-home from the primary's own plug-in's DP frees
+  the window before the window-holding DP is made (one weaver per window).
+  Logs: `the compositor keeps its
+  last screen list for up to 60 s`, `the kept screen list ends after N s — …` or `has been gone
+  for N s (bound 60 s) — the compositor takes the list without it now`, then `segments: home
+  screen 0x… is gone — the window stays with '…' (screen 0x…, its DP is ready), whose DP is the
+  session DP now` and, at the replug, `segments: home screen 0x… is back — '…' keeps the window
+  handle as its segment DP …`. Linux Vulkan and D3D12 without the hub have no handle hand-off: after
+  the bound their session DP keeps weaving the window.
+
+Test hook (macOS): `DXR_TEST_FAKE_MONITOR_FILE=<path>`. While the file holds a number S, the main
+display enumerates as two monitors cut at S points (the window can straddle the cut, since the
+WindowServer still shows one display); holding `reid`, the main display gets another identity.
+Creating / deleting the file is a monitor appearing / disappearing for the registry, the desktop
+resolver and the poll.
+
+## Windows / D3D12 (M6)
+
+Status: the in-process D3D12 compositor (the Unity display provider's path) carries the same
+model in `d3d12/comp_d3d12_segments.{h,cpp}`, behaving like the pre-split D3D11 path: two more
+appended slots, no ABI bump (`xrt_plugin_iface::create_dp_d3d12_for_screen`,
+`xrt_display_processor_d3d12::set_present_origin`), every segment recorded onto the one weave
+command list (crop per screen, each crop with its own SRV descriptor, the DP sets viewport +
+scissor from the canvas itself), the same non-segmented cases (plus the #1264 reroute and a back
+buffer that does not match the client area), M3 per-segment views through
+`comp_d3d12_compositor_get_segment_metrics` / `set_view_routing` and a mosaic in the D3D12
+renderer, and `oxr_system` counting a D3D11 **or** D3D12 factory toward the view-set capacity.
+sim_display implements both D3D12 slots. Not yet run on hardware.
+
+## Windows / OpenGL (M6)
+
+The in-process OpenGL compositor carries the same model in `gl/comp_gl_segments.{h,cpp}`, a twin of
+the D3D11 manager — screen-table join, lifecycle, the window handle following the majority screen
+(ADR-047 Amendment 2, through a `swap_primary` hook that re-sends transparency / shared-texture /
+mode / eye-tracking mode and swaps under the compositor's `dp_swap_mutex`), decide loop,
+primary-first weave order, flat-2D fill — with the GPU work in GL terms. What differs:
+
+- **Two appended ABI slots, no version bump** (ADR-020): `xrt_plugin_iface::create_dp_gl_for_screen`
+  and `xrt_display_processor_gl::set_present_origin` (`XRT_DP_GL_HAS_PRESENT_ORIGIN`).
+- **Coordinates.** Everything in `comp_segments` is top-left; every GL target is bottom-left, and
+  the GL atlas flips its tile rows (#1625). The three conversions live in
+  `util/comp_segments_gl.h` (`comp_segments_gl_flip`, `_atlas_rect`, `_crop_rect`) and the crop,
+  the per-segment weave viewport, the flat fill and the M3 routed viewport all go through them
+  (host-tested in `tests_comp_segments`).
+- **The frame.** Clear the bound target; crop each woven segment's tiles out of the atlas into its
+  own `GL_RGBA8` texture with `glBlitFramebuffer` (same tile grid and row order, so a DP reads it
+  like a whole-canvas atlas); for each DP re-bind the target and set `glViewport` **and**
+  `glScissor` to the segment (bottom-left), then `process_atlas` with `canvas = the segment`
+  (top-left); the flat 2D fill is a scissor-off `glBlitFramebuffer` of the middle view. The target
+  is whatever the window present bound — the window's default framebuffer, or the transparent
+  path's DComp transit / readback FBO — so transparency segments too.
+- **One context.** DPs are created, used and destroyed on the compositor's one GL context, current
+  on the weave thread (the app thread's commit or the #868 repaint, both under `c->mutex`). GL runs
+  in order on it: no deferred-release list.
+- **The primary's plug-in must have the slot** (ADR-047 Amendment 5): a pre-M6 GL DP re-states a
+  whole-target viewport in `process_atlas`, so with it the window keeps the single-DP path (one
+  WARN at set-up names the plug-in).
+- **No #918 split** on GL (ADR-037 §5), so nothing like Amendment 1.
+- **Not segmented on GL:** zero-copy frames (the atlas is the app's texture), the shared-texture
+  (`_texture`) path, a Local2D / zones / mask frame (the composite path), a present target whose
+  size differs from the client area (the DComp transit is fixed-size), a pinned session,
+  `DXR_SEGMENTS=0`, macOS.
+- **sim_display** implements both GL slots: a bound DP describes its screen, confines viewport +
+  scissor to the canvas, and phases the interlaced mode from `set_present_origin`. Its unbound DP
+  now honours a non-empty canvas too (identical whenever the canvas is empty — every GL call site
+  but the segment path).
+- **Per-segment views (M3).** `oxr_system` counts a registry GL factory toward the Windows
+  view-set capacity (`oxr_segment_views_win_entry_has_gl_dp`), `xrLocateViews` reads
+  `comp_gl_compositor_get_segment_metrics`, `xrEndFrame` hands the routing to
+  `comp_gl_compositor_set_view_routing`, and the projection pass paints each submitted view at its
+  segment's rect inside its tile (`comp_segments_route_place`, the service's mapping), with each
+  tile's blend mode decided once. The segment crop and the flat fill read the partition the atlas
+  was painted with (#1883: `comp_segments_source_rect`, the content kept with the repaint
+  snapshot), never the live seam. A routed frame is never zero-copy. Quads and equirect2 layers
+  are NOT routed on GL yet (drawn once per tile with the tile's camera, as unsegmented — Metal's
+  current state).
+- **Leia** (`displayxr-leia-plugin`): the GL DP gets `create_dp_gl_for_screen` (EXTERNAL routing +
+  display binding, KEEP_DRAG_SNAP with the real HWND, simulated viewer only without a tracker of
+  its own, bound lens with SR D3) and honours a non-empty canvas on every GL DP. Not yet run on
+  hardware.
+
+## Per-segment views (M3)
+
+Under `PRIMARY_MULTIVIEW_DXR` each segment gets its **own** views instead of a crop of
+one shared set (contract: `docs/reference/view-configuration-model.md` § *Per-segment
+views*; API: `XrViewDisplayBindingsDXR` in `XR_DXR_display_info` v22).
+
+1. **Publish.** Each weave that takes the split path publishes its table as
+   `xrt_segment_metrics` (`comp_vk_native_compositor_get_segment_metrics`): per segment
+   the screen id, rect in window and screen px, the screen's desktop rect, physical
+   size and nominal viewer, and whether it is woven. Eyes are predicted at query time
+   — the primary from the session DP, the others from their segment DPs
+   (`comp_vk_native_segments_get_eyes`, guarded against the weave destroying them).
+   Nothing is published while the session is collapsed to flat 2D (#1595/#1831), for
+   zero-copy frames or when the window is on the primary screen only.
+2. **Locate.** `oxr_session_locate_views` locates one view set per segment and records
+   which views went where (`xrt_segment_view_routing`); `xrEndFrame` hands it to the
+   compositor (`comp_vk_native_compositor_set_view_routing`) with the frame.
+3. **Route — one atlas, per-segment tile ranges, as a mosaic.** The atlas layout does
+   not change: `cols × rows` tiles of `canvas × scale`, so `u_tiling` and the
+   worst-case sizing stay honest and a single-segment frame is byte-for-byte the old
+   one. What changes is what a tile holds: local view `j` of segment `k` is placed at
+   segment `k`'s rect inside tile `j` (`comp_vk_native_eff_layout::route`, both the
+   blit and the compose paths). The rect comes from `comp_segments_tile_rect`, the
+   mapping the crop (step 2 of *The frame*) reads with, so cropping segment `k` out of
+   every tile yields exactly its own views — the M2 split path runs unchanged and each
+   DP weaves its own frustum. A routed frame never zero-copies (the mosaic is built by
+   the renderer, not by the app). Chosen over per-segment sub-atlases because it keeps
+   one atlas, one crop path, one capture path.
+
+   **The partition travels with the pixels (#1883).** The routing comes from the table
+   the frame was *located* against; the weave cuts its table from the window *now*.
+   During a drag those differ by the window's motion since the locate (one frame
+   in-process, two under the #918 split, whose egress slot lags), so cropping the mosaic
+   at the live seam handed each DP a sliver of its neighbour's views — a few px of one
+   panel's content on the other panel's side, gone at rest. So the routed frame's
+   partition (`comp_segments_content`: each screen's rect + the canvas, from the routing)
+   is recorded with the atlas — the renderer atlas (and the repaint that replays it), the
+   egress slot (a `comp_segments_content_ring` keyed by the bridge `seq`,
+   `comp_xbridge_slot_seq`), the service client's atlas (held with the #1140 recipe) —
+   and the crop reads each segment's views where they were painted
+   (`comp_segments_source_rect`). The live table still owns *placement*: each DP's canvas,
+   viewport/scissor and present origin are where the window is, because that is where
+   the back buffer lands on the panels; the DP stretches its views over its live segment
+   (a sub-percent scale for one frame of a drag). Partitioning the placement with the old
+   table instead would weave the strip between the two seams with the wrong screen's DP
+   onto the other panel — the same sliver, from the other side. An unrouted frame (one
+   view set) has no partition of its own and keeps the live crop, which is exact for it.
+   D3D11 in-process (split and not), the D3D11 service and D3D12 carry it; the Vulkan
+   and Metal twins do not yet.
+4. **Capture.** `displayxr_atlas.seg<i>.png` is each segment's DP input, i.e. that
+   segment's own views.
+
+What stays one view set (cropped per segment, as in M2): `PRIMARY_STEREO`/`MONO`
+sessions (framed from the screen holding most of the window), camera-rig and
+zone-scoped locates, a window covering more than `XRT_MAX_SEGMENTS` (2) screens. A
+frame whose routing no longer matches (the mode changed between the locate and the
+commit) is drawn unrouted for that frame. Under per-segment views, canvas that lies on
+no screen is not covered by any view set and stays black (M2 painted it from the shared
+set). Quads and equirect2 layers are drawn once per segment in each tile, with that
+segment's view camera, viewport and scissor confined to the segment's rect (the compose
+pass; the blit fallback draws no quads at all).
+
+**IPC.** See *Service / IPC path* below: the D3D11 service publishes the same table for
+a direct client, and the client frames per-segment views from it exactly as above.
+
+## Service / IPC path (Windows, ADR-047 Amendment 3)
+
+An `_ipc` client (`XRT_FORCE_MODE=ipc`, or any app under a running service) is composited by
+`displayxr-service`. The same segment manager weaves its window there:
+
+- **Opt-in.** At session create the client sends `compositor_segments_enable(pin)` — only when
+  its system's set capacity is above 1, i.e. the service's registry has two screens with a
+  D3D11 DP factory (`oxr_system` counts the by-value copy of the service's registry; the
+  pointers are only NULL-tested). The service answers with its OWN screen list (its instance,
+  the one `xrEnumerateDisplaysDXR` reports) and keeps a heap copy per client. A single-screen
+  box never sends it; a client that did not send it is never segmented.
+- **Where it weaves.** Only the direct single-client pipeline (`pipeline_default_policy_render`)
+  for an `APP_HWND` presenter — the app's own window, the only kind that can sit across a seam.
+  `pipeline_segments_weave` replaces that frame's single `process_atlas`: the client's manager
+  (`comp_d3d11_segments`, linked from the `comp_d3d11_segs` library), made on `svc_out_device`
+  (the output device under the #918 split), with the panel DP — bound to the app's HWND — as
+  the primary and the client's crop (or the egress slot) as the atlas. The window rect is the
+  app HWND's client area from `ClientToScreen` in the per-monitor-DPI-aware service, i.e.
+  device px. One client's segment DPs exist at a time: a focus change releases the outgoing
+  presenter's, and a table older than 250 ms (the client no longer weaves directly — focus
+  moved, the workspace took over) is not handed out, so that client locates one view set. A hosted client presents into the service's window on the panel, a
+  client-texture client weaves on its own and a zones frame keeps the single DP: none is
+  segmented here. A present-owner weaves on its own thread and is segmented there (next
+  section).
+- **Compose / shell mode** (`multi_compositor_render`) never runs this manager. ADR-052
+  gives the workspace one presenter per 3D screen, and its Amendment 1 frames a placed
+  tile's views from the screen it is on:
+  - **Wholly on one presenter.** The server-side view-pose path frames the window from that
+    presenter's eyes and display space.
+  - **Straddling.** `compositor_get_segment_metrics` hands out a table cut from the tile's
+    footprint: one segment per presenter part, with eyes from the panel DP for the primary
+    part and from the presenter DPs for the others. The table carries the tile's depth in
+    `window_depth_m`. The per-segment views, the routing and the mosaic below then apply
+    unchanged.
+
+  The direct pipeline's table never applies to a tile.
+- **Per-segment views.** `xrLocateViews` fetches the table with `compositor_get_segment_metrics`
+  (a round trip per locate, only for an opted-in session): the service fills each segment's
+  eyes at query time — the primary from the panel DP, the others from their segment DPs. The
+  client then runs the in-process locate unchanged, with two IPC-only differences: the
+  segment's client-side Kooima FOVs are kept over the device's single-set answer, and a
+  segment locate never takes the server rig call (`locate_views_rig`), which knows one view
+  set. `xrEndFrame` sends the routing with `compositor_set_view_routing`, change-only (the
+  service keeps the last one). The service lays a routed frame into the client's atlas as the
+  mosaic (`comp_segments_route_place`, `util/comp_segments_route.h`, unit-tested by
+  `tests/tests_segments_ipc.cpp`); a routed frame never zero-copies.
+- **Not yet on the service path:** quads / equirect / cylinder layers in a routed frame are
+  drawn once per tile with that tile's camera (in-process draws them per segment), and a
+  second projection layer is routed only where the per-tile pass visits it (segment 0).
+
+## Present-owners on the weave service (Windows, ADR-047 Amendment 4)
+
+An `XR_DXR_weave` present-owner (the DisplayXR Browser, `weave_rpc_probe_d3d11_win`) never reaches
+the direct pipeline: it is `PRESENTER_SELF`, and `comp_d3d11_service_weave_submit` weaves its
+pixels into a handback texture on its own IPC thread. That submit is segmented by the same rules:
+
+- **Opt-in and manager.** The same `compositor_segments_enable` list, but a manager of the
+  present-owner's own (`weave_segs`, rebuilt on `weave_seg_rebuild` / a device change), made on
+  `sys->device` — the device the woven handback and the #1172 ingest DP live on. It never shares
+  the direct pipeline's manager: different device, different thread, and a focus change does not
+  release it. Released with the compositor (under `render_mutex`).
+- **Which submits.** v3 batch and v6 N-view: both weave the whole window as one canvas (the SBS
+  scratch at window size, or the content-sized atlas), which is what `comp_segments_compute` cuts.
+  `weave_seg_update` reads the bound HWND's client area (`svc_seg_window_rect`) and runs the table +
+  lifecycle; a client area that does not match the handback size (a resize in flight) is woven
+  whole that frame. Legacy single-rect submits (canvas = one element) are never segmented.
+- **The weave.** `weave_seg_record` replaces the single `process_atlas`: `comp_d3d11_segments_record`
+  crops each segment's views out of the canvas atlas, the session's weave DP weaves the primary
+  screen's segment, each other screen's windowless DP its own (present origin, viewport, scissor
+  = the segment), transparent background and `client_presents` declared to the segment DPs as to
+  the session DP (`comp_d3d11_segments_frame::client_presents`), flat 2D (one view) where nothing
+  can weave. The v4 overlay is told "none" for that frame and composited by the runtime's
+  post-weave blit over the whole handback instead.
+- **Eyes out.** After the fence, `weave_seg_publish` stores the table (`comp_segments_publish`:
+  the generation moves on geometry only) with each segment's eyes — the primary's are the
+  submit's own base eyes, the others predicted from their segment DPs.
+  `weave_get_segments` (appended to `proto.json`) hands it to the client, which fills
+  `XrWeaveOutputRectPartsDXR` and cuts the submitted rects at the seams with
+  `u_weave_rect_parts` (`auxiliary/util/u_weave_rect_parts.h`, unit-tested by
+  `tests/tests_weave_segments.cpp`). Fetched only when the caller chains the struct **and**
+  `weave_submit`'s reply (its trailing `segment_count`, from
+  `comp_d3d11_service_weave_segment_count`) says the submit was woven per screen
+  (`u_weave_segments_fetch_needed`), so a window on one screen costs no second round trip.
+- **Element views (Amendment 4 addendum).** A present-owner's zone-scoped locate (the browser's
+  per-element `xrLocateViews` + `XR_DXR_view_rig`) is framed server-side in
+  `ipc_try_get_sr_view_poses`. Before the zone rebase it asks
+  `comp_d3d11_service_get_zone_weave_screen`: the locating client's own fresh weave table, else
+  that of any present-owner whose `weave_hwnd` is the same window (the browser locates from its
+  browser process and weaves from its GPU process), then `u_weave_zone_screen_segment`. When the
+  element lies wholly on a non-primary segment, the window metrics become the whole window
+  relative to that screen (`u_weave_segment_window_metrics`), and the eyes (render pair and raw
+  channel) and nominal viewer become that screen's; the eyes are predicted at the locate from the
+  segment DP (`render_mutex`, taken only on this branch). Straddling elements, elements on the
+  primary and windows on one screen take the old path unchanged (`clients_mutex` only).
+- **Drag snap.** `comp_d3d11_service_weave_snap_window_rect` first asks
+  `comp_d3d11_segments_snap_dp` for the DP of the screen holding the majority of the window at the
+  proposed position (a separate `comp_segments_owner`, Amendment 2's margin and hold, no failure
+  latch since nothing is torn down), and falls back to the panel DP's snap.
+- **Not covered:** the v8 hardware wish is still published to the panel DP only (the primary
+  screen's lens); a window across more than `XRT_MAX_SEGMENTS` screens is woven per screen but
+  reported unsegmented (one eye set); a straddling element's views stay the primary's
+  (per-part views need a view set per part, displayxr-browser-pvt#272).
+
+## Present-owners on the desktop-Linux service (#2218 item 6)
+
+The Linux / macOS service runs `null_compositor` + `comp_multi`, so before #2218 every
+`XR_DXR_weave` present-owner there (the DisplayXR Browser on Linux, `weave_probe_vk_linux`) was woven
+by ONE display processor: the weave engine's own, from the active plug-in's scalar
+`dp_factory_vk`, phased against the system-default panel, with the rest of the window painted flat
+(#1654's off-panel rule) — a window wholly on another vendor's screen was never woven by that
+vendor. `comp_multi_weave_linux.c` now segments the same way as the Windows section above:
+
+- **Screens.** The IPC server hands the multi system compositor its screen list
+  (`xrt_instance_enumerate_displays`) plus the DP registry as it stands
+  (`comp_multi_system_set_screens`) at start-up and after every display re-probe — the DRM
+  hotplug feeder, a `dp use --screen` re-claim, the fallback timer. The generation moves only on a
+  real change (`comp_weave_screens_compare` / `_registry_changed`), so the 10 s fallback re-probe
+  never disturbs a live engine. Each engine snapshots the list when the generation moved and
+  rebuilds its manager then (hotplug, re-claim = rebuild; DPs are not carried over as the D3D11
+  service's Amendment 8 adoption does — a hotplug is rare enough).
+- **Manager.** The in-process Vulkan manager, unchanged: `comp_vk_native_segments`, now its own
+  library (`comp_vk_segs`) so `comp_multi` links it. One per present-owner, windowless (no hooks),
+  the engine's own DP (`mc->weave.dp`) as the primary. Per-screen DPs come from each screen's own
+  registry claimant through `create_dp_vk_for_screen` (a per-screen preference decides it, exactly
+  as on the other paths); the same lifecycle hysteresis, crop-before-DP and flat fill.
+- **The frame.** A present-owner publishes its window in the weave geometry frame (device px, the
+  window's monitor's logical origin × that monitor's factor), which on a mixed-scale Wayland
+  desktop is not one global grid: the laptop's and the panel's device rects overlap in it. So the
+  screens are re-projected into the WINDOW's own pixel frame every submit
+  (`util/comp_weave_screens.h`, `comp_weave_screens_project`): with the v12 logical origin, each
+  screen's stage rect from the single-panel phase rule (`u_weave_present_origin.h` rules 1 + 2)
+  scaled by the window's factor and anchored on the window, so `window − screen` is exactly the
+  rule-2 present origin for that screen; a screen whose factor differs from the window's shows the
+  window resampled (its "device mode" ≠ its rect there), so its segment is flat unless its DP
+  tolerates a resample — the refuse-rather-than-resample rule. Without the logical origin only a
+  pure X11 / Mutter PHYSICAL layout (every X11 rect IS its device rect) is placed; anything else is
+  ambiguous and keeps the single-DP weave. The projection reaches the manager through
+  `comp_vk_native_segments_set_screen_geometry` (segment math only: DPs, lifecycle and the
+  bindings the DPs were created with — the OS's own desktop rects — are untouched).
+- **Which submits.** v3 batch and v6 N-view whose output IS the window (v6 at viewScale 1): both
+  weave the whole window as one canvas. Never a legacy single-rect submit, mono-in-2D (v13) or a
+  self-submitting DP. A window wholly on the system-default screen is `!is_split`: the single-DP
+  weave, byte for byte; so is every one-screen system (the manager never enables).
+- **The weave.** `comp_vk_native_segments_record` replaces the one `process_atlas` (the engine's DP
+  weaves the default screen's segment, phased by `weave_feed_dp_geometry` as before; each other
+  screen's DP its own segment at its own present origin); the off-panel bands step aside (the
+  record's flat fill covers every part no DP weaves); the v4 overlay is not offered to a DP that
+  frame and is blended post-weave over the whole output (the Windows rule). The record leaves the
+  target in `PRESENT_SRC_KHR` (the DP contract); the engine transitions it back to
+  `COLOR_ATTACHMENT_OPTIMAL` and continues unchanged. 2D/3D: every per-screen DP follows the
+  session's confirmed hardware state.
+- **A window straddling a seam** is cut per screen (one segment per screen it covers) — the
+  Windows / in-process rule, not an owner-screen rule.
+- **Eyes out.** Linux does not report v19 `XrWeaveOutputRectPartsDXR` yet (`segmentCount` 0: the
+  dma-buf submit reply has no segment count), so the base eyes are the MAJORITY segment's DP's
+  (`comp_weave_screens_eye_screen`): a window wholly on another screen is framed for that screen's
+  viewer.
+- **Log.** One WARN per change of what the weave does per screen (split or not, which screens) —
+  `weave(#2218): window X,Y WxH woven per screen (logical frame) — [k] screen 0x… by '<plug-in>'
+  (the engine's own DP | a per-screen DP) canvas … present origin …` — plus the manager's own
+  `created a segment DP for screen 0x… ('<output>', plug-in '<id>')`.
+- **Not yet:** v19 rect parts + per-screen eyes on the wire; the drag snap
+  (`xrWeaveSnapWindowRectDXR`) still snaps on the engine's DP; status rows show the engine DP only;
+  the shared spatial surface (the Linux workspace) is unchanged — it is fullscreen on the
+  system-default screen, the workspace's primary presenter (the Windows "not a finding"), and
+  Linux has no secondary-screen workspace presenter (ADR-052) yet. The macOS weave backends do the
+  same (next section); Android keeps one DP (one panel).
+
+## Present-owners on the macOS service (#2218 item 6)
+
+The macOS twin of the section above. The macOS service's `XR_DXR_weave` engine
+(`comp_multi_weave_macos.c` over a `vk` (MoltenVK, `dp_factory_vk`) or `metal` (`dp_factory_metal`,
+the Leia macOS plug-in's only family) backend) used to weave every present-owner window with ONE
+display processor — the backend's own, from the active plug-in's scalar factory — phased against
+whichever panel the window's origin resolved to. A window wholly on another vendor's screen was
+never woven by that vendor, and a per-screen preference had no effect on it. Now:
+
+- **Screens.** The same feed as Linux (`comp_multi_system_set_screens`, gated
+  `XRT_OS_LINUX_DESKTOP || XRT_OS_MACOS`): at start-up, after every display re-probe (a
+  `dp use --screen` re-claim, the policy watch, the fallback timer), and — macOS only in practice —
+  whenever the display-topology generation moves. On macOS the service's displays change through
+  the in-process hotplug sweep (`target_display_hotplug`, ADR-047 Amendment 8, on by default there),
+  which publishes a new table by bumping `xrt_instance_get_display_generation`; the IPC main loop
+  polls that generation every tick (one mutex read) and refreshes the weave engines when it moved.
+- **EDID refinement is not a new table (#2097).** CoreGraphics lists a hot-plugged monitor's
+  physical size ~0.5–1 s before IOKit publishes the EDID blob (598x341 mm → 600x340 mm). The sweep
+  never bumps its generation for that, and `comp_weave_screens_compare` now classifies it as
+  `COMP_WEAVE_SCREENS_PHYSICAL_SIZE`: the system compositor keeps the refined list but does not
+  move its generation, so no engine rebuilds a vendor weaver (and re-acquires its eye tracker) for
+  it. This applies to Linux as well.
+- **The frame (CG).** The present-owner reports its window in global CoreGraphics space — top-left
+  of the main display, y DOWN (AppKit's y-up frame flipped by the caller, spec v7) — in BACKING px
+  of the display the window is on (points × that display's scale). The screen list holds each
+  display's `CGDisplayBounds` in points plus its backing scale and native mode. The engine already
+  resolves the window's panel (the reported `displayId`, else the containing display); that panel's
+  scale S is the window's. The whole desktop is placed in the window's own px frame at S
+  (`comp_weave_screens_project_cg`): a screen's rect is its point rect × S with each edge rounded
+  like the engine rounds a display's backing origin (`lround`, so neighbours share their seam), and
+  the window rect is the reported one verbatim. `window − screen` is then exactly the present
+  origin the single-DP weave already feeds (`origin − lround(panel points × scale)`) on every screen
+  whose own scale is S — the in-process Metal rule (`comp_metal_segments`: phase = origin + canvas
+  offset = the segment's top-left in that panel's backing px) and what `srWeaverSetPresentOrigin`
+  takes. A screen at another scale (a 1x external next to a 2x laptop), or whose points × scale is
+  not its native mode (a "looks like" scaled mode), resamples the window: flat unless its DP
+  tolerates a resample. Displays left of / above the main display have negative point origins and
+  stay negative (this box's 3D panel at −1920,0).
+- **Managers.** `vk` backend: `comp_vk_native_segments` (`comp_vk_segs`, as on Linux), fed the CG
+  projection through `set_screen_geometry`, per-screen DPs via `create_dp_vk_for_screen`, rebuilt on
+  a generation change. `metal` backend: `comp_metal_segments`, now its own library
+  (`comp_metal_segs`) so `comp_multi` links it, per-screen DPs via `create_dp_metal_for_screen`. Its
+  window is handed in its backing-px mode (`comp_metal_seg_window::px_per_pt` = S: the table is cut
+  in backing px from the screens' points × S, so a window at a half-point position keeps an exact
+  phase); a generation change re-tables the live manager, which keeps every segment DP whose screen
+  is still listed the same way (`comp_segments_dp_key_keeps`).
+- **Which submits.** v3 batch and v6 whose output IS the window — v6 on the `metal` backend with a
+  non-resample-tolerant DP (output sized to the window), or any v6 whose content view equals the
+  window; the `vk` backend sizes v6 to one content view, so it segments a v6 submit only at
+  viewScale 1. Never a legacy single-rect submit, a self-submitting VK DP, or a window whose panel
+  (and so scale) has not been resolved. A window wholly on the system-default screen, and every
+  one-screen system, is the single-DP weave, byte for byte (the `metal` backend keeps feeding the
+  front end's present origin there; the `vk` backend still feeds none).
+- **The weave.** The manager's `record` replaces the one `process_atlas`: the backend's own DP weaves
+  the default screen's segment (the `metal` backend phases it with its segment's origin relative to
+  the default screen — `primary_present_origin`), each other screen's DP its own segment at its own
+  present origin; the flat fill covers the rest. The `vk` path transitions the target back from
+  `PRESENT_SRC_KHR` and continues (v4 overlay blend, `GENERAL` for the caller) unchanged; the
+  `metal` path's post-weave alpha pass and v4 overlay pass run unchanged over the woven output. Every
+  per-screen DP follows the session's confirmed 2D/3D state.
+- **Eyes out.** As on Linux: macOS reports no v19 parts (`segmentCount` 0), so the base eyes are the
+  majority segment's DP's when that is not the default screen.
+- **Log.** `weave(#2218): present-owner screen table generation N (K screen(s), <vk|metal> backend) —
+  …` once per table; `weave(#2218): window X,Y WxH woven per screen (CG frame, scale S, <backend>
+  backend) — [k] screen 0x… by '<plug-in>' (the engine's own DP | a per-screen DP) canvas … present
+  origin …` once per change of the screens a window covers; `… is wholly on the default screen
+  again — single-DP weave` on leaving; plus the managers' own `segments: created a segment DP for
+  screen 0x… … via create_dp_{vk,metal}_for_screen`.
+- **Not yet:** v19 parts on the wire; the drag snap (`xrWeaveSnapWindowRectDXR`, the `metal`
+  backend's `snap_window_rect`) still snaps on the engine's DP; status rows show the engine DP only;
+  the macOS shared spatial surface (the workspace) is unchanged; no session identity is recorded for
+  the engine's DP (`comp_segments_session_dp`), so after a hotplug that moves the system default
+  the engine's DP weaves whatever screen is now the default (the in-process rule keeps it on its own
+  panel) — the engine is per present-owner and short-lived next to a session, so this is left for a
+  follow-up.

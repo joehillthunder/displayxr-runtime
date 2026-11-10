@@ -20,6 +20,12 @@
  * macOS / Android engines. The snap and the phase feed therefore go through
  * this engine's DP, not through any compositor's.
  *
+ * Multi-screen (#2218 item 6): that DP weaves the system-default screen. A
+ * window not wholly on it is woven per screen — each other screen's part by a
+ * windowless per-screen DP from THAT screen's registry claimant
+ * (comp_vk_native_segments, the in-process Vulkan compositor's manager), see
+ * "Per-screen display processors" below and docs/architecture/comp-segments.md.
+ *
  * Linux platform mapping (vs the Android original):
  *
  *  - Handles are fds (XRT_GRAPHICS_BUFFER_HANDLE_IS_FD,
@@ -42,6 +48,18 @@
  *    (vk_create_exportable_dmabuf_image; driver-picked modifier, or LINEAR
  *    with DXR_WEAVE_OUTPUT_LINEAR=1), described by
  *    comp_multi_weave_export_output_dmabuf.
+ *  - Stage B sync_file fences are switchable: DXR_LINUX_WEAVE_SYNC_FD (tri-state)
+ *    decides whether acquire_sem / release_sem exist at all. Unset = ON, except
+ *    on an NVIDIA service device (vendor 0x10de), where it defaults OFF and stage
+ *    B runs the fallback the engine already has for a device without SYNC_FD
+ *    (acquire fence CPU-polled, synchronous completion, release fd -1). Reason:
+ *    on an RTX 4080 Laptop (driver 595.91.07, GNOME Wayland) the browser's
+ *    inline-3D path ran at ~2 fps with the GPU-process main thread spinning in
+ *    libnvidia-eglcore, and the raw-EGL-fence page path hit VK_ERROR_DEVICE_LOST
+ *    on the first submit; the suspect is the EGL native fence <-> Vulkan
+ *    SYNC_FD hand-off on that driver pair. Mesa (Intel) keeps the fences. `1`
+ *    forces them on (the A/B), `0` forces them off anywhere. The init WARN names
+ *    the path and the reason.
  *  - Output kind: one allocation, one kind. The first submit's path picks it
  *    (dma-buf submit -> dma-buf output, plain -> OPAQUE_FD); an export call of
  *    the other kind records the request, answers "nothing yet" and the next
@@ -92,12 +110,18 @@
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
+#include "xrt/xrt_session.h"
 #include "xrt/xrt_weave_dmabuf.h"
+
+#include "os/os_time.h"
 
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_handles.h"
 #include "util/u_debug.h"
+#include "util/u_weave_span2d.h"
+#include "util/u_weave_present_origin.h"
+#include "util/u_weave_flat.h"
 
 #include "vk/vk_helpers.h"
 #include "vk/vk_dmabuf.h"
@@ -105,6 +129,11 @@
 #include "vk/vk_local2d_composite.h"
 
 #include "comp_multi_private.h"
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+#include "vk_native/comp_vk_native_segments.h" // #2218 item 6: per-screen DPs
+#include "util/comp_weave_screens.h"
+#endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
 
@@ -114,6 +143,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -128,6 +158,14 @@ DEBUG_GET_ONCE_BOOL_OPTION(dxr_linux_weave_split, "DXR_LINUX_WEAVE_SPLIT", true)
 // {DRM_FORMAT_MOD_LINEAR}: the one layout every importer (EGL on another GPU,
 // the CPU) can read, at the cost of bandwidth on a tiled/compressed-capable GPU.
 DEBUG_GET_ONCE_BOOL_OPTION(dxr_weave_output_linear, "DXR_WEAVE_OUTPUT_LINEAR", false)
+
+// Stage B sync_file fences (tri-state). AUTO (unset) = SYNC_FD semaphores ON,
+// except on an NVIDIA service device (vendor 0x10de), where they are OFF and
+// stage B runs the CPU-poll + synchronous fallback; 1 forces them ON, 0 OFF.
+// See the file header (stage B sync_file fences) for why NVIDIA defaults off.
+DEBUG_GET_ONCE_TRISTATE_OPTION(dxr_linux_weave_sync_fd, "DXR_LINUX_WEAVE_SYNC_FD")
+
+#define WEAVE_VENDOR_ID_NVIDIA 0x10de
 
 /*
  *
@@ -451,6 +489,178 @@ weave_slot_release(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slo
 	U_ZERO(slot);
 }
 
+/*!
+ * A submit chained an overlay that could not be imported: it is REFUSED, and
+ * the caller (holding the weave mutex, before anything is recorded) breaks out
+ * of its submit with the woven output exactly as the previous accepted submit
+ * left it. Parity with the D3D11 service, which refuses a submit whose
+ * overlay it cannot open or acquire before it clears the output. A caller that
+ * hands the whole of its 2D over as the overlay (a browser's whole-page
+ * overlay) reads "accepted" as "composited", so an accepted submit that
+ * silently dropped the overlay would show a frame with its 2D missing.
+ *
+ * Logged on the first refusal and then 1 in 300: the import helper already
+ * names the cause (fourcc / modifier / import error) once per slot.
+ */
+static void
+weave_overlay_refused(struct multi_compositor *mc)
+{
+	const uint32_t n = mc->weave.overlay_refusals++;
+	if (n == 0 || (n % 300) == 0) {
+		U_LOG_W("weave: overlay import failed — submit REFUSED, woven output untouched (refusals=%u)", n + 1);
+	}
+}
+
+/*!
+ * The size a v4 overlay must have for this submit: the WINDOW the caller
+ * presents, which the overlay is defined to cover 1:1 (XR_DXR_weave v4,
+ * "window-sized premultiplied").
+ *
+ *  - batch (rect_count > 0): the input, whose extent IS the window client
+ *    (and the woven output's) — @p in_w x @p in_h.
+ *  - legacy single rect: the bound geometry's client size, else the rect's
+ *    offset + extent (stage A infers the input the same way).
+ *  - v6 N-view: the bound geometry's client size. The output is one content
+ *    view there (window x the mode's view scale), so it is not a reference;
+ *    without geometry there is none and the overlay is not checked.
+ *
+ * Returns false when there is no reference.
+ */
+static bool
+weave_overlay_expected_dims(const struct multi_compositor *mc,
+                            const struct xrt_weave_atlas_layout *layout,
+                            uint32_t rect_count,
+                            uint32_t in_w,
+                            uint32_t in_h,
+                            int32_t rect_x,
+                            int32_t rect_y,
+                            uint32_t rect_w,
+                            uint32_t rect_h,
+                            uint32_t *out_w,
+                            uint32_t *out_h)
+{
+	*out_w = 0;
+	*out_h = 0;
+	if (layout == NULL || layout->view_count == 0) {
+		if (rect_count > 0) {
+			*out_w = in_w;
+			*out_h = in_h;
+		} else if (mc->weave.have_geometry) {
+			*out_w = mc->weave.win_w;
+			*out_h = mc->weave.win_h;
+		} else if (rect_x >= 0 && rect_y >= 0) {
+			*out_w = (uint32_t)rect_x + rect_w;
+			*out_h = (uint32_t)rect_y + rect_h;
+		}
+	} else if (mc->weave.have_geometry) {
+		*out_w = mc->weave.win_w;
+		*out_h = mc->weave.win_h;
+	}
+	return *out_w != 0 && *out_h != 0;
+}
+
+/*!
+ * Resize race: decide whether this submit's overlay is used. A producer that
+ * resized its window keeps handing its old overlay buffer until it has
+ * reallocated it; that buffer is the OLD window's size. Composited as if it
+ * were window-sized it leaves a black margin and misplaced 2D (the runtime's
+ * post-weave blend stretches it; the DP never sees it, its slot requires the
+ * exact output size), and imported at the window's size it reads the wrong
+ * memory layout. So a mismatched overlay is treated as ABSENT for the frame:
+ * no DP offer, no post-weave blend, no off-panel / flat-region redraw — the
+ * content is woven as if no overlay had been chained. The submit is NOT
+ * refused (that would hold frames through every resize = stutter); refusal
+ * stays reserved for an overlay that cannot be imported at all (#1825).
+ *
+ * @p stale: the caller's size test failed. @p ov_w / @p ov_h: the overlay's
+ * real size, 0 x 0 when only its allocation is known (@p ov_bytes, stage A).
+ * One WARN on entering the stale state and one on leaving it. Returns true
+ * when the overlay is used.
+ */
+static bool
+weave_overlay_gate(struct multi_compositor *mc,
+                   bool stale,
+                   uint32_t ov_w,
+                   uint32_t ov_h,
+                   uint64_t ov_bytes,
+                   uint32_t exp_w,
+                   uint32_t exp_h)
+{
+	if (stale) {
+		if (!mc->weave.overlay_stale) {
+			mc->weave.overlay_stale = true;
+			mc->weave.overlay_stale_frames = 0;
+			if (ov_w != 0 && ov_h != 0) {
+				U_LOG_W("weave: stale overlay %ux%u vs output %ux%u — ignored until it matches", ov_w,
+				        ov_h, exp_w, exp_h);
+			} else {
+				U_LOG_W("weave: stale overlay (allocation %" PRIu64
+				        " B, smaller than any %ux%u image) vs output %ux%u — ignored until it matches",
+				        ov_bytes, exp_w, exp_h, exp_w, exp_h);
+			}
+		}
+		mc->weave.overlay_stale_frames++;
+		// The DP's cached layer (v14) predates the ignored frames.
+		mc->weave.overlay_force_changed = true;
+		return false;
+	}
+	if (mc->weave.overlay_stale) {
+		mc->weave.overlay_stale = false;
+		U_LOG_W("weave: overlay %ux%u matches the output again — composited (%u frame(s) ignored)", exp_w,
+		        exp_h, mc->weave.overlay_stale_frames);
+	}
+	return true;
+}
+
+/*!
+ * Stage A: the real size of an OPAQUE_FD overlay. The plain-handle transport
+ * carries no dimensions (the app-facing XrWeaveSubmitOverlaysDXR has none,
+ * the fd has none), so its import size is INFERRED from the bound window —
+ * which is exactly what goes wrong in a resize race. Two facts recover it:
+ *
+ *  - Identity: stage-A slots are keyed by the fd's inode, and our cached
+ *    import keeps the allocation alive, so an inode already cached at W1 x H1
+ *    IS a W1 x H1 buffer — an allocation never changes size. Exact, for every
+ *    buffer the engine has seen.
+ *  - Allocation size (unseen buffer): an fd smaller than @p exp_w x @p exp_h
+ *    x 4 bytes cannot hold a window-sized BGRA8 image in any tiling.
+ *
+ * Returns true and @p out_w / @p out_h (0 x 0 = size unknown, only too
+ * small: @p out_bytes) when the overlay is known NOT to be window-sized.
+ */
+static bool
+weave_stage_a_overlay_stale(const struct comp_multi_weave_linux_slot *slots,
+                            int fd,
+                            uint32_t exp_w,
+                            uint32_t exp_h,
+                            uint32_t *out_w,
+                            uint32_t *out_h,
+                            uint64_t *out_bytes)
+{
+	*out_w = 0;
+	*out_h = 0;
+	*out_bytes = 0;
+	struct stat st;
+	if (fstat(fd, &st) != 0) {
+		return false; // the import reports it
+	}
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_LINUX_SLOTS; i++) {
+		const struct comp_multi_weave_linux_slot *s = &slots[i];
+		if (s->used && s->buffer_id == 0 && s->dev == (uint64_t)st.st_dev && s->ino == (uint64_t)st.st_ino) {
+			*out_w = s->w;
+			*out_h = s->h;
+			return s->w != exp_w || s->h != exp_h;
+		}
+	}
+	const off_t end = lseek(fd, 0, SEEK_END);
+	if (end <= 0) {
+		return false; // cannot be sized: the import decides
+	}
+	(void)lseek(fd, 0, SEEK_SET); // the offset is shared with the producer
+	*out_bytes = (uint64_t)end;
+	return (uint64_t)end < (uint64_t)exp_w * exp_h * 4u;
+}
+
 static void
 weave_slots_release_all(struct vk_bundle *vk, struct comp_multi_weave_linux_slot *slots)
 {
@@ -643,9 +853,13 @@ weave_create_local(
     struct vk_bundle *vk, uint32_t w, uint32_t h, VkImage *out_image, VkDeviceMemory *out_memory, VkImageView *out_view)
 {
 	VkExtent2D extent = {.width = w, .height = h};
-	VkResult ret =
-	    vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
-	                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, out_memory, out_image);
+	// TRANSFER_SRC: a window woven per screen (#2218 item 6) crops each
+	// segment's views OUT of this atlas and flat-blits from it, and the
+	// #2207 capture reads the atlas back.
+	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
+	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	                                          VK_IMAGE_USAGE_SAMPLED_BIT,
+	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1699): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
 		return false;
@@ -681,9 +895,92 @@ weave_release_local(struct vk_bundle *vk, VkImage *image, VkDeviceMemory *memory
 	}
 }
 
+/*!
+ * Per-eye un-squeeze staging (struct comp_multi_weave_eye_stage): free one
+ * slot's image. The caller guarantees no in-flight GPU work still reads it.
+ */
+static void
+weave_eye_stage_release(struct vk_bundle *vk, struct comp_multi_weave_eye_stage *s)
+{
+	if (s->image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, s->image, NULL);
+		s->image = VK_NULL_HANDLE;
+	}
+	if (s->memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, s->memory, NULL);
+		s->memory = VK_NULL_HANDLE;
+	}
+	s->w = 0;
+	s->h = 0;
+	s->format = VK_FORMAT_UNDEFINED;
+}
+
+static void
+weave_eye_stage_release_all(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; i++) {
+		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][0]);
+		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][1]);
+	}
+}
+
+/*!
+ * The staging image of rect @p slot / @p eye, EXACTLY @p w x @p h in @p format,
+ * (re)allocated only when one of those changes (rects are stable frame to frame,
+ * so steady state allocates nothing). VK_NULL_HANDLE on failure: the caller then
+ * stretches straight out of the input (the pre-fix, edge-bleeding path) rather
+ * than drop the rect. Called while recording, before this frame's first use.
+ */
+static VkImage
+weave_eye_stage_get(struct vk_bundle *vk,
+                    struct multi_compositor *mc,
+                    uint32_t slot,
+                    uint32_t eye,
+                    uint32_t w,
+                    uint32_t h,
+                    VkFormat format)
+{
+	if (slot >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS || eye > 1 || w == 0 || h == 0) {
+		return VK_NULL_HANDLE;
+	}
+	struct comp_multi_weave_eye_stage *s = &mc->weave.eye_stage[slot][eye];
+	if (s->image != VK_NULL_HANDLE && s->w == w && s->h == h && s->format == format) {
+		return s->image;
+	}
+	if (s->image != VK_NULL_HANDLE) {
+		// A resized rect (rare): an earlier submit whose fence wait timed out may
+		// still read the old image — never free it under the GPU.
+		weave_queue_wait_idle(vk);
+		weave_eye_stage_release(vk, s);
+	}
+
+	VkExtent2D extent = {.width = w, .height = h};
+	VkResult ret = vk_create_image_simple(vk, extent, format,
+	                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                                      &s->memory, &s->image);
+	if (ret != VK_SUCCESS) {
+		s->image = VK_NULL_HANDLE;
+		s->memory = VK_NULL_HANDLE;
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_E(
+			    "weave(#1699): eye staging vk_create_image_simple(%ux%u) failed: %s — "
+			    "stretching from the input (edge bleed)",
+			    w, h, vk_result_string(ret));
+		}
+		return VK_NULL_HANDLE;
+	}
+	s->w = w;
+	s->h = h;
+	s->format = format;
+	return s->image;
+}
+
 static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
+	weave_eye_stage_release_all(vk, mc);
 	weave_release_local(vk, &mc->weave.sbs_image, &mc->weave.sbs_memory, &mc->weave.sbs_view);
 	mc->weave.sbs_w = 0;
 	mc->weave.sbs_h = 0;
@@ -895,6 +1192,85 @@ weave_reset_acquire_sem(struct vk_bundle *vk, struct multi_compositor *mc)
  * in the Linux DP contract ties its creation to a thread, so the factory runs on
  * the IPC handler thread.
  */
+/*!
+ * Apply a HARDWARE 2D/3D request to the engine's own DP and, once the DP
+ * confirmed a CHANGE, tell this client's session (#961: the event follows the
+ * DP, never the bookkeeping). Call with mc->weave.mutex held and mc->weave.dp
+ * non-NULL. The vendor call is one lens-hint call (Leia: srLensDisable /
+ * srLensEnable under the plug-in's own context lock), so it is cheap enough
+ * for the IPC thread; the lock order weave.mutex -> vendor lock is the same one
+ * every submit already takes (process_atlas runs under weave.mutex).
+ *
+ * A DP without a request_display_mode slot is mode-neutral (sim_display by
+ * default): the request counts as accepted, as in the D3D11 service's
+ * dp_request_display_mode_confirmed. A DP that HAS the slot and returns false
+ * rejected it — nothing is recorded or reported, so the session never believes
+ * in a panel state the hardware did not reach.
+ *
+ * The event carries the REQUESTED state once the DP accepted it (#961), never
+ * a read-back: a vendor lens may switch asynchronously (Leia SR flips it via
+ * its own LENS_ON/OFF events), so get_hardware_3d_state right after the
+ * request can still report the old state. The read-back is logged as
+ * information only. The DP call is timed, because it runs on the IPC thread
+ * under weave.mutex (a slow vendor service stalls this client's submits).
+ */
+static bool
+weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
+{
+	struct xrt_display_processor *dp = mc->weave.dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const int64_t t0_ns = os_monotonic_get_ns();
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	const double dp_ms = (double)(os_monotonic_get_ns() - t0_ns) / 1e6;
+	const char *slow = dp_ms > 50.0 ? " (slow)" : "";
+	if (!accepted) {
+		U_LOG_W(
+		    "weave(#1699): the display processor REJECTED hardware %s (%s) in %.1f ms%s — panel state "
+		    "unchanged, no event sent",
+		    want_3d ? "3D" : "2D", why, dp_ms, slow);
+		return false;
+	}
+
+	const bool prev_3d = !mc->weave.hw_2d_confirmed;
+	mc->weave.hw_2d_confirmed = !want_3d;
+	if (prev_3d == want_3d) {
+		// Already there as far as THIS client knows. The bring-up re-assert is
+		// the one case where the panel may disagree (another client's 2D took
+		// the lens), so it is logged once; every other re-assert stays silent.
+		if (why != NULL && strstr(why, "bring-up") != NULL) {
+			U_LOG_W("weave(#1699): hardware %s re-asserted (%s) on the weave engine's display processor (%s) in "
+			        "%.1f ms%s",
+			        want_3d ? "3D" : "2D", why,
+			        has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch", dp_ms,
+			        slow);
+		}
+		return true;
+	}
+
+	// One WARN per transition (a human-rate event: a tab switch, a page's mode
+	// choice), so a hardware run can be read from the journal alone. The
+	// read-back is informational only (see above): it may lag the request.
+	bool panel_3d = false;
+	const bool have_readback = xrt_display_processor_get_hardware_3d_state(dp, &panel_3d);
+	U_LOG_W(
+	    "weave(#1699): hardware %s -> %s (%s) on the weave engine's display processor (%s) in %.1f ms%s; "
+	    "DP readback: %s",
+	    prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why,
+	    has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch", dp_ms, slow,
+	    have_readback ? (panel_3d ? "3D (may lag — the lens switches asynchronously)"
+	                              : "2D (may lag — the lens switches asynchronously)")
+	                  : "none (the DP has no get_hardware_3d_state)");
+
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	const xrt_result_t xret = multi_compositor_push_event(mc, &xse);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("weave(#1699): could not push the hardware-state event to the session: %d", xret);
+	}
+	return true;
+}
+
 static bool
 weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 {
@@ -981,13 +1357,27 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	// Stage B sync_file semaphores (vk_dmabuf.h). Optional: without them the
 	// acquire fence is CPU-polled and completion stays synchronous, so a
 	// failure here is not a failed bring-up.
+	// DXR_LINUX_WEAVE_SYNC_FD gates them: AUTO = off on NVIDIA (file header).
 	const bool sync_fd = vk_dmabuf_sync_fd_supported(vk);
-	if (sync_fd) {
+	const enum debug_tristate_option sync_fd_opt = debug_get_tristate_option_dxr_linux_weave_sync_fd();
+	VkPhysicalDeviceProperties pdp = {0};
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &pdp);
+	const bool is_nvidia = pdp.vendorID == WEAVE_VENDOR_ID_NVIDIA;
+	const char *no_fence_reason = NULL;
+	if (!sync_fd) {
+		no_fence_reason = "none (device lacks SYNC_FD)";
+	} else if (sync_fd_opt == DEBUG_TRISTATE_OFF) {
+		no_fence_reason = "none (CPU poll + synchronous: DXR_LINUX_WEAVE_SYNC_FD=0)";
+	} else if (sync_fd_opt == DEBUG_TRISTATE_AUTO && is_nvidia) {
+		no_fence_reason = "none (CPU poll + synchronous: NVIDIA auto; DXR_LINUX_WEAVE_SYNC_FD=1 forces fences)";
+	}
+	if (no_fence_reason == NULL) {
 		VkSemaphoreCreateInfo sem_ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
 		if (vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &mc->weave.acquire_sem) != VK_SUCCESS ||
 		    vk_create_exportable_sync_fd_semaphore(vk, &mc->weave.release_sem) != VK_SUCCESS) {
 			U_LOG_W("weave(#1699): sync_file semaphores could not be created — stage B stays synchronous");
 			weave_destroy_sync_semaphores(vk, mc);
+			no_fence_reason = "none (CPU poll + synchronous: semaphore creation failed)";
 		}
 	}
 
@@ -997,8 +1387,27 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	    "weave(#1699): desktop-Linux weave engine initialized (BGRA8 output; OPAQUE_FD stage A: yes; dma-buf "
 	    "stage B: %s; sync_file fences: %s; DP self-submitting=%d)",
 	    vk_dmabuf_supported(vk) ? "yes" : "NO (device lacks dma-buf / DRM modifier / foreign queue)",
-	    mc->weave.release_sem != VK_NULL_HANDLE ? "GPU (SYNC_FD semaphores)" : "none (CPU poll + synchronous)",
+	    mc->weave.release_sem != VK_NULL_HANDLE
+	        ? (sync_fd_opt == DEBUG_TRISTATE_ON ? "GPU (SYNC_FD semaphores: DXR_LINUX_WEAVE_SYNC_FD=1)"
+	                                            : "GPU (SYNC_FD semaphores)")
+	        : (no_fence_reason != NULL ? no_fence_reason : "none (CPU poll + synchronous)"),
 	    (int)xrt_display_processor_is_self_submitting(mc->weave.dp));
+
+	// Apply the client's standing wish now that the DP exists — BOTH ways.
+	// "3D is the default" only holds while the vendor's weaver still owns the
+	// lens. The service's display processor outlives every client (one SR
+	// context for the process), and the first 2D request any client sent made
+	// DisplayXR the owner of the lens preference (LeiaSR #266): from then on
+	// nobody turns the lens back on unless we ask. A new present owner whose
+	// 3D request arrived before its engine came up therefore found a 2D panel
+	// and stayed there until a service restart (Show unit on 2.43.4, 2026-10-14:
+	// close a browser -> "lens OFF", open the next -> "panel hardware -> 3D"
+	// in the browser, nothing in the service, lens off). The DP decides what
+	// the request means: a 3D wish on a weaver-owned lens is a no-op there
+	// (leia_lens_owner_on_request), on an app-owned one it is srLensEnable.
+	(void)weave_apply_display_mode_locked(mc, mc->hardware_display_3d,
+	                                      mc->hardware_display_3d ? "standing 3D wish, re-asserted at engine bring-up"
+	                                                              : "deferred request, applied at engine bring-up");
 	return true;
 }
 
@@ -1122,6 +1531,9 @@ weave_wait_prev_frame(struct vk_bundle *vk, struct multi_compositor *mc)
 	}
 	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
 	mc->weave.fence_pending = false;
+	// XR_DXR_lift §6: that weave's lifted rects are done -- snapshots go to
+	// their streams, profiles are read, pins drop (no-op without lifted rects).
+	comp_multi_weave_lift_complete(&mc->weave.lift);
 	return true;
 }
 
@@ -1168,11 +1580,62 @@ weave_take_acquire_fence(struct vk_bundle *vk, struct multi_compositor *mc, int 
 }
 
 /*!
+ * The present-owner's client origin on the panel, panel-relative DEVICE px —
+ * the ONE origin both the DP phase slot (weave_feed_dp_geometry) and the
+ * off-panel bands (weave_offpanel_bands) use, so the two never disagree.
+ *
+ * Not `win_x - display_screen_left`: the panel origin is in the X11
+ * window-placement space, which under XWayland is the logical layout times
+ * the X root's global scale, while the bound geometry is device px. The two
+ * agree only when the X root scale equals the panel's scale (a 200 % panel on
+ * a 2x root); at 125/150/175 % the difference fed the DP a phase hundreds of
+ * px off — inverted eyes. u_weave_present_origin.h has the rule and
+ * tests_aux_weave_present_origin pins it.
+ */
+static struct u_weave_panel_frame
+weave_panel_frame(const struct multi_compositor *mc)
+{
+	// Read live, every submit: the service re-resolves this info when the
+	// desktop layout changes (a hotplug, a live display-scale or arrangement
+	// change, #2251), so a bound window follows without re-binding.
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+	const struct u_weave_panel_frame panel = {
+	    .screen_left = info->display_screen_left,
+	    .screen_top = info->display_screen_top,
+	    .desktop_w = info->display_desktop_width,
+	    .desktop_h = info->display_desktop_height,
+	    .native_w = info->display_desktop_native_width,
+	    .native_h = info->display_desktop_native_height,
+	    .scale = (double)info->display_desktop_scale,
+	};
+	return panel;
+}
+
+static enum u_weave_origin_source
+weave_panel_relative_origin_in(const struct multi_compositor *mc,
+                               const struct u_weave_panel_frame *panel,
+                               int32_t *out_x,
+                               int32_t *out_y)
+{
+	const struct xrt_weave_logical_origin *lo = &mc->weave.win_logical;
+	return u_weave_panel_relative_origin(panel, mc->weave.win_x, mc->weave.win_y, lo->valid, lo->x, lo->y,
+	                                     lo->scale, out_x, out_y);
+}
+
+static enum u_weave_origin_source
+weave_panel_relative_origin(struct multi_compositor *mc, int32_t *out_x, int32_t *out_y)
+{
+	const struct u_weave_panel_frame panel = weave_panel_frame(mc);
+	return weave_panel_relative_origin_in(mc, &panel, out_x, out_y);
+}
+
+/*!
  * Per-window weave phase: hand the DP the present-owner's client origin on the
- * panel (`set_present_origin`, panel-relative; (0,0) = display-scoped) — the
- * slot the Linux vendor DP honours, and the same value the in-process vk_native
- * compositor feeds (window − display screen origin). Re-asserted every submit so
- * a moved window keeps its phase; no-op for a DP without the slot (sim_display).
+ * panel (`set_present_origin`, panel-relative device px; (0,0) =
+ * display-scoped) — the slot the Linux vendor DP honours, and the same value
+ * the in-process vk_native compositor feeds (wl_geom's monitor-relative device
+ * origin). Re-asserted every submit so a moved window keeps its phase; no-op
+ * for a DP without the slot (sim_display).
  */
 static void
 weave_feed_dp_geometry(struct multi_compositor *mc)
@@ -1180,18 +1643,241 @@ weave_feed_dp_geometry(struct multi_compositor *mc)
 	if (!mc->weave.have_geometry || mc->weave.dp == NULL) {
 		return;
 	}
-	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-	const int32_t ox = mc->weave.win_x - info->display_screen_left;
-	const int32_t oy = mc->weave.win_y - info->display_screen_top;
+	// One snapshot of the panel frame per submit: the value fed, the change
+	// test and the log line all describe the same frame.
+	const struct u_weave_panel_frame panel = weave_panel_frame(mc);
+	const bool panel_moved =
+	    mc->weave.have_panel_frame && !u_weave_panel_frame_equal(&mc->weave.panel_frame, &panel);
+	int32_t ox = 0, oy = 0;
+	const enum u_weave_origin_source src = weave_panel_relative_origin_in(mc, &panel, &ox, &oy);
 	const bool fed =
 	    xrt_display_processor_vk_set_present_origin((struct xrt_display_processor_vk *)mc->weave.dp, ox, oy);
-	if (mc->weave.geometry_dirty) {
+	if (mc->weave.geometry_dirty || panel_moved || !mc->weave.have_panel_frame) {
 		mc->weave.geometry_dirty = false;
-		U_LOG_W("weave(#1699): present origin (%d,%d) panel-relative %s the DP phase slot", ox, oy,
-		        fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)");
+		mc->weave.panel_frame = panel;
+		mc->weave.have_panel_frame = true;
+		U_LOG_W(
+		    "weave(#1699): present origin (%d,%d) panel-relative (from %s; window %d,%d, panel X11 origin "
+		    "(%d,%d) %ux%u, device %ux%u @ %.4f) %s the DP phase slot%s",
+		    ox, oy, u_weave_origin_source_str(src), mc->weave.win_x, mc->weave.win_y, panel.screen_left,
+		    panel.screen_top, panel.desktop_w, panel.desktop_h, panel.native_w, panel.native_h, panel.scale,
+		    fed ? "fed to" : "NOT accepted by (no set_present_origin slot — display-scoped weave)",
+		    panel_moved ? " — the panel's desktop geometry changed under the bound window (live display-scale "
+		                  "/ arrangement change, #2251)"
+		                : "");
 	}
 }
 
+
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+/*
+ *
+ * Per-screen display processors (#2218 item 6, ADR-047 D2 / Amendment 4 on
+ * desktop Linux).
+ *
+ * A bound window that is not wholly on the system-default screen is woven per
+ * screen, the rule the Windows service applies to the same present-owner
+ * (#1884) and the in-process compositors apply to their own windows: each
+ * screen's part (segment = window ∩ screen) by the display processor of THAT
+ * screen — a windowless per-screen DP (create_dp_vk_for_screen) from the
+ * screen's own registry claimant, so a per-screen preference (`dp use <id>
+ * --screen <key>`) decides it — with that screen's present origin, scissored
+ * into the one woven output; the default screen's part by this engine's own DP
+ * (mc->weave.dp), phased exactly as before. A segment no DP can weave (no
+ * claimant, no per-screen factory, or a DP needing 1:1 pixels on a screen that
+ * resamples the window) and the part of the window on no screen are painted
+ * flat — the #1654 off-panel rule, now per screen. The manager is the
+ * in-process Vulkan compositor's (comp_vk_native_segments): same table, same
+ * DP lifecycle hysteresis, same crop-before-DP, same flat fill.
+ *
+ */
+
+//! Destroy the manager (its DPs and crop images). Rare: a screen-table change
+//! or teardown — waits the queue idle first (the manager's destroy contract).
+static void
+weave_segs_release(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.segs != NULL) {
+		weave_queue_wait_idle(vk);
+		comp_vk_native_segments_destroy(&mc->weave.segs);
+	}
+	mc->weave.segs_split = false;
+	mc->weave.segs_logged_key = 0;
+}
+
+static void
+weave_segs_free(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	weave_segs_release(vk, mc);
+	free(mc->weave.segs_list);
+	free(mc->weave.segs_info);
+	free(mc->weave.segs_proj);
+	mc->weave.segs_list = NULL;
+	mc->weave.segs_info = NULL;
+	mc->weave.segs_proj = NULL;
+	mc->weave.segs_generation = 0;
+}
+
+/*!
+ * (Re)build the manager when the system's screen table moved (start-up, a
+ * hotplug, a re-claim, a per-screen preference). Built once per generation,
+ * successful or not, so a hopeless table is not retried every frame.
+ *
+ * @return true when the manager exists and segments (>= 2 placed screens and
+ *         a registry entry for the system-default screen).
+ */
+static bool
+weave_segs_sync(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.segs_list == NULL) {
+		mc->weave.segs_list = U_TYPED_CALLOC(struct xrt_screen_list);
+		mc->weave.segs_info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+		mc->weave.segs_proj = U_TYPED_CALLOC(struct xrt_screen_list);
+		mc->weave.segs_frame = -1;
+		if (mc->weave.segs_list == NULL || mc->weave.segs_info == NULL || mc->weave.segs_proj == NULL) {
+			weave_segs_free(vk, mc);
+			return false;
+		}
+	}
+	const uint64_t gen = multi_system_weave_screens_snapshot(mc->msc, mc->weave.segs_generation,
+	                                                         mc->weave.segs_list, mc->weave.segs_info);
+	if (gen == 0) {
+		return false; // never handed a screen table: the single-DP weave
+	}
+	if (gen != mc->weave.segs_generation) {
+		weave_segs_release(vk, mc);
+		mc->weave.segs_generation = gen;
+		memset(mc->weave.segs_proj, 0, sizeof(*mc->weave.segs_proj));
+		struct comp_vk_native_segments *segs =
+		    comp_vk_native_segments_create(vk, mc->weave.cmd_pool, VK_NULL_HANDLE /* the DPs see main_queue */);
+		if (segs != NULL) {
+			comp_vk_native_segments_set_screens(segs, mc->weave.segs_list, mc->weave.segs_info, 0);
+		}
+		mc->weave.segs = segs;
+		const bool on = segs != NULL && comp_vk_native_segments_enabled(segs);
+		// Lifecycle: once per screen-table generation, per present-owner.
+		U_LOG_W("weave(#2218): present-owner screen table generation %llu (%u screen(s)) — %s",
+		        (unsigned long long)gen, mc->weave.segs_list->count,
+		        on ? "a window not wholly on the default screen is woven by each screen's own DP"
+		           : "per-screen weaving off (fewer than two placed screens, no registry entry for the "
+		             "default screen, or DXR_SEGMENTS=0): single-DP weave");
+	}
+	return mc->weave.segs != NULL && comp_vk_native_segments_enabled(mc->weave.segs);
+}
+
+/*!
+ * One WARN when what the weave does per screen changes — split or not, and
+ * which screens — never per drag step (the geometry moves every frame of a
+ * drag; the screens a window covers change at a human rate).
+ */
+static void
+weave_segs_log(struct multi_compositor *mc, bool split)
+{
+	const struct comp_segment_table *t = comp_vk_native_segments_get_table(mc->weave.segs);
+	uint64_t key = split ? 1u : 0u;
+	if (split && t != NULL) {
+		key ^= (uint64_t)t->count << 1;
+		for (uint32_t k = 0; k < t->count; k++) {
+			key = key * 1099511628211ull ^ t->seg[k].screen_id;
+		}
+		key |= 1u;
+	}
+	if (key == mc->weave.segs_logged_key) {
+		return;
+	}
+	const bool was_split = (mc->weave.segs_logged_key & 1u) != 0;
+	mc->weave.segs_logged_key = key;
+	if (!split) {
+		if (was_split) {
+			U_LOG_W(
+			    "weave(#2218): window %d,%d %ux%u is wholly on the default screen again — single-DP weave",
+			    mc->weave.win_x, mc->weave.win_y, mc->weave.win_w, mc->weave.win_h);
+		}
+		return;
+	}
+	struct comp_weave_segment_owner own[COMP_SEGMENTS_MAX];
+	const uint32_t n = comp_weave_screens_owners(t, mc->weave.segs_list, own, COMP_SEGMENTS_MAX);
+	char buf[768];
+	size_t used = 0;
+	buf[0] = '\0';
+	for (uint32_t k = 0; k < n && used + 1 < sizeof(buf); k++) {
+		const int w = snprintf(buf + used, sizeof(buf) - used,
+		                       "%s[%u] screen 0x%016llx by '%s' (%s) canvas %d,%d %ux%u present origin %d,%d%s",
+		                       k > 0 ? "; " : "", k, (unsigned long long)own[k].screen_id,
+		                       own[k].plugin_id[0] != '\0' ? own[k].plugin_id : "(no claimant: flat 2D)",
+		                       own[k].session_dp ? "the engine's own DP" : "a per-screen DP",
+		                       own[k].window_rect.x, own[k].window_rect.y, own[k].window_rect.w,
+		                       own[k].window_rect.h, own[k].present_origin_x, own[k].present_origin_y,
+		                       own[k].one_to_one ? "" : " (resampled: flat unless the DP tolerates it)");
+		if (w < 0) {
+			break;
+		}
+		used += (size_t)w < sizeof(buf) - used ? (size_t)w : sizeof(buf) - used - 1;
+	}
+	U_LOG_W("weave(#2218): window %d,%d %ux%u woven per screen (%s frame) — %s", mc->weave.win_x, mc->weave.win_y,
+	        mc->weave.win_w, mc->weave.win_h, comp_weave_frame_str((enum comp_weave_frame)mc->weave.segs_frame),
+	        buf);
+}
+
+/*!
+ * One metric update of the per-screen weave: place the screens in the
+ * window's frame (comp_weave_screens_project), hand a moved projection to the
+ * manager without disturbing its DPs, recompute the table and run the DP
+ * lifecycle (hysteresis: a DP is created after 2 updates on its screen and
+ * retired ~30 updates after the window left it).
+ *
+ * Holding weave.mutex, the previous frame waited.
+ *
+ * @return true when this submit must be woven per screen.
+ */
+static bool
+weave_segs_update(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!weave_segs_sync(vk, mc)) {
+		return false;
+	}
+	const struct comp_weave_window win = {
+	    .x = mc->weave.win_x,
+	    .y = mc->weave.win_y,
+	    .w = mc->weave.win_w,
+	    .h = mc->weave.win_h,
+	    .logical_valid = mc->weave.win_logical.valid,
+	    .logical_x = mc->weave.win_logical.x,
+	    .logical_y = mc->weave.win_logical.y,
+	    .logical_scale = mc->weave.win_logical.scale,
+	};
+	struct xrt_screen_list proj;
+	struct comp_seg_rect wr;
+	const enum comp_weave_frame frame = comp_weave_screens_project(mc->weave.segs_list, &win, &proj, &wr);
+	if ((int)frame != mc->weave.segs_frame) {
+		mc->weave.segs_frame = (int)frame;
+		// Human-rate: changes with the bind's shape (v12 logical origin or not).
+		U_LOG_W("weave(#2218): window placed against the screens in the %s frame%s",
+		        comp_weave_frame_str(frame),
+		        frame == COMP_WEAVE_FRAME_NONE
+		            ? " — no v12 logical origin on a scaled desktop: the device frame is ambiguous, single-DP "
+		              "weave with the off-panel 2D rule"
+		            : "");
+	}
+	if (frame == COMP_WEAVE_FRAME_NONE) {
+		return false;
+	}
+	if (comp_weave_screens_compare(mc->weave.segs_proj, &proj) != COMP_WEAVE_SCREENS_SAME) {
+		if (!comp_vk_native_segments_set_screen_geometry(mc->weave.segs, &proj)) {
+			return false; // cannot happen (same list, same filter): stay single-DP
+		}
+		*mc->weave.segs_proj = proj;
+	}
+	const struct comp_seg_rect canvas = {0, 0, wr.w, wr.h};
+	const bool split = comp_vk_native_segments_update(mc->weave.segs, &wr, &canvas, (int32_t)WEAVE_VK_FORMAT,
+	                                                  !mc->weave.fence_pending, 0);
+	// Every per-screen DP follows this session's confirmed 2D/3D state, like
+	// the engine's own DP (a DP the update just created gets it here).
+	comp_vk_native_segments_set_display_mode(mc->weave.segs, !mc->weave.hw_2d_confirmed);
+	weave_segs_log(mc, split);
+	return split;
+}
+#endif // COMP_MULTI_WEAVE_HAVE_SEGMENTS
 
 /*!
  * Which output kind to (re)allocate. A client's explicit request (an export of
@@ -1208,6 +1894,321 @@ weave_want_dmabuf_output(struct vk_bundle *vk, struct multi_compositor *mc, bool
 	return mc->weave.out_kind_req == 2 && vk_dmabuf_supported(vk);
 }
 
+/*
+ *
+ * Off-panel 2D (#1654 on the service path).
+ *
+ */
+
+/*!
+ * DXR_SPAN_2D=0 (or the in-process name DXR_WAYLAND_SPAN_2D=0) turns the
+ * off-panel 2D off: the whole output is then woven, which shows the interlace
+ * on whatever monitor the rest of the window is on.
+ */
+static bool
+weave_span_2d_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_SPAN_2D");
+		if (e == NULL) {
+			e = getenv("DXR_WAYLAND_SPAN_2D");
+		}
+		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+/*!
+ * The part of the output that is NOT on the 3D panel, in OUTPUT pixels.
+ *
+ * The weave is only correct where the lens is. A present-owner window dragged
+ * partly (or wholly) onto an ordinary monitor is still one output, so its
+ * off-panel part would show the interlace as a double image; it gets flat 2D
+ * instead, exactly as the in-process Vulkan compositor does
+ * (vk_composite_offpanel_2d). Not a vendor concern: the DP weaves what it is
+ * given, and deciding where the panel is is the runtime's job.
+ *
+ * Platform-neutral on purpose: the window rect is the caller-published
+ * geometry (device px, desktop-absolute — Wayland or X11 alike), and the
+ * panel rect is the one the present origin is computed against
+ * (weave_feed_dp_geometry), so the bands and the weave phase never disagree.
+ *
+ * The bands come from u_wl_offpanel_bands (pure arithmetic, pinned by
+ * tests_aux_wayland_geom) in window pixels and are mapped to the output by
+ * u_wl_offpanel_bands_to_output (u_weave_span2d.h, tests_aux_weave_span2d):
+ * 1:1 for the batch / legacy layouts (the output IS the window client area,
+ * from its top-left), scaled by output/window for the v6 N-view layout (the
+ * output is one content view, the window at viewScale).
+ *
+ * @return the band count; 0 = entirely on the panel (the common case), or no
+ *         geometry, or turned off.
+ */
+static uint32_t
+weave_offpanel_bands(struct multi_compositor *mc, bool nview, struct u_wl_rect_px out[4], bool *out_whole)
+{
+	*out_whole = false;
+	if (!weave_span_2d_enabled() || !mc->weave.have_geometry || mc->weave.win_w == 0 || mc->weave.win_h == 0 ||
+	    mc->weave.out_w == 0 || mc->weave.out_h == 0) {
+		return 0;
+	}
+	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
+
+	// Panel size: the DP's own answer when it has one (what vk_native uses),
+	// else the plug-in's display info.
+	uint32_t panel_w = 0, panel_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (mc->weave.dp == NULL ||
+		    !xrt_display_processor_get_display_pixel_info(mc->weave.dp, &panel_w, &panel_h, &ignored_left,
+		                                                  &ignored_top) ||
+		    panel_w == 0 || panel_h == 0) {
+			panel_w = info->display_pixel_width;
+			panel_h = info->display_pixel_height;
+		}
+	}
+	// DXR_TEST_SPAN_2D_INSET=N (test hook, off by default): pretend the panel
+	// is N px narrower and shorter, so the band path is reachable without a
+	// second monitor. Diagnostics only — it paints 2D over real panel pixels.
+	{
+		static long inset = -1;
+		if (inset < 0) {
+			const char *e = getenv("DXR_TEST_SPAN_2D_INSET");
+			inset = e != NULL ? strtol(e, NULL, 10) : 0;
+			if (inset < 0) {
+				inset = 0;
+			}
+		}
+		if (inset > 0 && panel_w > (uint32_t)inset && panel_h > (uint32_t)inset) {
+			panel_w -= (uint32_t)inset;
+			panel_h -= (uint32_t)inset;
+		}
+	}
+
+	int32_t ox = 0, oy = 0;
+	(void)weave_panel_relative_origin(mc, &ox, &oy);
+	struct u_wl_rect_px win_bands[4];
+	const uint32_t win_count =
+	    u_wl_offpanel_bands(ox, oy, panel_w, panel_h, mc->weave.win_w, mc->weave.win_h, win_bands);
+
+	// Window px -> output px (pure arithmetic, pinned by tests_aux_weave_span2d).
+	bool whole = false;
+	const uint32_t n = u_wl_offpanel_bands_to_output(win_bands, win_count, mc->weave.win_w, mc->weave.win_h,
+	                                                 mc->weave.out_w, mc->weave.out_h, nview, out, &whole);
+
+	// Log on a change of state only (band count, or "entirely off"), never per
+	// frame and not per drag step.
+	const uint32_t state = n | (whole ? 0x100u : 0u);
+	if (state != mc->weave.last_offpanel_band_count) {
+		mc->weave.last_offpanel_band_count = state;
+		U_LOG_W(
+		    "weave(#1699) SPAN_2D: window at (%d, %d) %ux%u panel-relative on a %ux%u panel — %u off-panel "
+		    "band(s) painted flat 2D%s",
+		    ox, oy, mc->weave.win_w, mc->weave.win_h, panel_w, panel_h, n,
+		    whole ? " (entirely off the panel: weave skipped)" : "");
+	}
+	*out_whole = whole;
+	return n;
+}
+
+/*
+ *
+ * Flat regions (spec v8, browser#88, on desktop Linux).
+ *
+ */
+
+//! Wire caps (IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX / _SET_SCREEN_FLAT_RECTS_MAX,
+//! ipc_protocol.h — not included by the compositor).
+#define WEAVE_SUBMIT_FLAT_MAX 16
+#define WEAVE_SCREEN_FLAT_MAX 8
+//! Per-submit + sticky flat rects; also bounds one paint call.
+#define WEAVE_FLAT_MAX_RECTS (WEAVE_SUBMIT_FLAT_MAX + WEAVE_SCREEN_FLAT_MAX)
+#define WEAVE_PAINT_MAX_RECTS WEAVE_FLAT_MAX_RECTS
+
+/*!
+ * DXR_WEAVE_FLAT_2D=0 turns the flat-region paint off: the flat lists are then
+ * accepted and ignored, exactly as before (and as on macOS / Android).
+ */
+static bool
+weave_flat_2d_enabled(void)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WEAVE_FLAT_2D");
+		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	return enabled == 1;
+}
+
+/*!
+ * The caller's flat regions in OUTPUT pixels: union of this submit's
+ * window-relative @p flat_rects and the sticky screen-space latch
+ * (comp_multi_weave_set_screen_flat_regions), clipped to the window.
+ *
+ * Why painted, not wished. On Windows these rects are subtracted from a
+ * per-region hardware wish the DP turns into a local lens switch, and the
+ * woven pixels are untouched. No desktop-Linux DP has a per-region lens: the
+ * only vendor one (Leia, drv_leia_linux) takes the same publish_local_zone_mask
+ * slot but reduces it to one global on/off (zone_grid 1x1). So a flat region
+ * would stay woven — a browser popup over inline 3D shown through the
+ * interlace, split into two "eyes" of page pixels. Instead the runtime paints
+ * those rects flat, from the same source the pixels came from (the input page
+ * for a batch submit; the flat view otherwise), exactly as the off-panel
+ * bands are painted. The window geometry is needed for the sticky latch (it
+ * is screen-absolute) and for the v6 scale; without it only the per-submit
+ * rects apply, 1:1 on the output.
+ *
+ * @return the rect count (0 = nothing flat, the common case).
+ */
+static uint32_t
+weave_flat_rects(struct multi_compositor *mc,
+                 bool nview,
+                 uint32_t flat_rect_count,
+                 const struct xrt_rect *flat_rects,
+                 struct u_wl_rect_px out[WEAVE_FLAT_MAX_RECTS])
+{
+	uint32_t n = 0;
+	if (weave_flat_2d_enabled() && mc->weave.out_w != 0 && mc->weave.out_h != 0) {
+		struct u_wl_rect_px win_rects[WEAVE_SUBMIT_FLAT_MAX];
+		struct u_wl_rect_px scr_rects[WEAVE_SCREEN_FLAT_MAX];
+		uint32_t win_count = 0, scr_count = 0;
+		for (uint32_t i = 0; flat_rects != NULL && i < flat_rect_count && i < ARRAY_SIZE(win_rects); i++) {
+			// xrt_offset names its fields w/h; they hold x/y here.
+			win_rects[win_count++] = (struct u_wl_rect_px){flat_rects[i].offset.w, flat_rects[i].offset.h,
+			                                               flat_rects[i].extent.w, flat_rects[i].extent.h};
+		}
+		const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+		for (uint32_t i = 0; geo && i < mc->weave.screen_flat_rect_count && i < ARRAY_SIZE(scr_rects); i++) {
+			const struct xrt_rect *r = &mc->weave.screen_flat_rects[i];
+			scr_rects[scr_count++] =
+			    (struct u_wl_rect_px){r->offset.w, r->offset.h, r->extent.w, r->extent.h};
+		}
+		const uint32_t win_w = geo ? mc->weave.win_w : mc->weave.out_w;
+		const uint32_t win_h = geo ? mc->weave.win_h : mc->weave.out_h;
+		n = u_wl_flat_rects_to_output(win_rects, win_count, scr_rects, scr_count, mc->weave.win_x,
+		                              mc->weave.win_y, win_w, win_h, mc->weave.out_w, mc->weave.out_h,
+		                              nview && geo, out, WEAVE_FLAT_MAX_RECTS);
+	}
+
+	// Log on a change of the painted count only, never per frame.
+	if (n != mc->weave.last_flat_count) {
+		mc->weave.last_flat_count = n;
+		U_LOG_W("weave(#1699) FLAT_2D: %u flat region(s) painted flat in the %ux%u output (%u sticky latched)",
+		        n, mc->weave.out_w, mc->weave.out_h, mc->weave.screen_flat_rect_count);
+	}
+	return n;
+}
+
+//! One-time init of the premul-over pipeline (shared by the overlay and the
+//! off-panel bands) and ONE descriptor-pool reset per frame (the pool must not
+//! be reset between two draws recorded into the same frame).
+static bool
+weave_blend_begin(struct vk_bundle *vk, struct multi_compositor *mc, bool *begun)
+{
+	if (!mc->weave.overlay_blend_initialized) {
+		mc->weave.overlay_blend_initialized =
+		    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
+		if (mc->weave.overlay_blend_initialized) {
+			U_LOG_W("weave(#1699): premul-over blend pipeline ready");
+		} else {
+			U_LOG_E("weave(#1699): premul-over blend init failed");
+			return false;
+		}
+	}
+	if (!*begun) {
+		vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
+		*begun = true;
+	}
+	return true;
+}
+
+/*!
+ * Paint each rect of the output (an off-panel band, or a flat region — see
+ * weave_flat_rects) with flat 2D copied from @p src_view at the rect's own
+ * output coordinates offset by (@p tile_x, @p tile_y). For an off-panel band
+ * the source is one view of the
+ * pre-weave atlas the DP consumed — the centre tile, which for a stereo pair
+ * is the left eye. That tile is output-sized and in register with the window
+ * on every layout (batch: the SBS scratch's left tile, i.e. each rect's left
+ * half unsqueezed at the rect's own position; v6: one content view), so a band
+ * samples it 1:1 at its own output coordinates.
+ *
+ * The band is cleared to transparent first and the tile drawn premul-over onto
+ * that, i.e. a copy — outside the rects the scratch is transparent, exactly as
+ * the weave's output is there. Output in COLOR_ATTACHMENT_OPTIMAL on entry and
+ * exit; @p src_view in SHADER_READ_ONLY_OPTIMAL.
+ */
+static void
+weave_paint_offpanel(struct vk_bundle *vk,
+                     struct multi_compositor *mc,
+                     VkCommandBuffer cmd,
+                     const struct u_wl_rect_px *bands,
+                     uint32_t band_count,
+                     VkImageView src_view,
+                     uint32_t src_w,
+                     uint32_t src_h,
+                     uint32_t tile_x,
+                     uint32_t tile_y,
+                     bool *blend_begun)
+{
+	if (band_count == 0 || src_view == VK_NULL_HANDLE || src_w == 0 || src_h == 0 ||
+	    !weave_blend_begin(vk, mc, blend_begun)) {
+		return;
+	}
+
+	// Order after the weave's writes (or the UNDEFINED transition when the
+	// weave was skipped).
+	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	// Clear the bands inside a render pass: vkCmdClearAttachments needs no
+	// transfer usage or format feature on the (possibly DRM-modifier) output.
+	VkRenderPassBeginInfo rp_bi = {
+	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	    .renderPass = mc->weave.render_pass,
+	    .framebuffer = mc->weave.out_fb,
+	    .renderArea = {{0, 0}, {mc->weave.out_w, mc->weave.out_h}},
+	};
+	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
+	VkClearAttachment clear = {
+	    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	    .colorAttachment = 0,
+	    .clearValue = {.color = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}}},
+	};
+	VkClearRect clear_rects[WEAVE_PAINT_MAX_RECTS];
+	if (band_count > WEAVE_PAINT_MAX_RECTS) {
+		band_count = WEAVE_PAINT_MAX_RECTS;
+	}
+	for (uint32_t i = 0; i < band_count; i++) {
+		clear_rects[i] = (VkClearRect){
+		    .rect = {{bands[i].x, bands[i].y}, {(uint32_t)bands[i].w, (uint32_t)bands[i].h}},
+		    .baseArrayLayer = 0,
+		    .layerCount = 1,
+		};
+	}
+	vk->vkCmdClearAttachments(cmd, 1, &clear, band_count, clear_rects);
+	vk->vkCmdEndRenderPass(cmd);
+
+	weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+	for (uint32_t i = 0; i < band_count; i++) {
+		const struct u_wl_rect_px r = bands[i];
+		vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
+		                                  mc->weave.out_h, src_view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+		                                  (float)(tile_x + (uint32_t)r.x) / (float)src_w,
+		                                  (float)(tile_y + (uint32_t)r.y) / (float)src_h,
+		                                  (float)r.w / (float)src_w, (float)r.h / (float)src_h,
+		                                  /*unpremultiplied*/ false);
+	}
+}
+
 /*!
  * Record, submit and complete ONE weave of @p in (+ @p ov) into the output —
  * shared by the stage-A plain-handle submit and the stage-B dma-buf submit,
@@ -1218,6 +2219,140 @@ weave_want_dmabuf_output(struct vk_bundle *vk, struct multi_compositor *mc, bool
  * Called with the engine lock held, after weave_wait_prev_frame succeeded.
  * *out_release_fd is written only on the asynchronous path.
  */
+/*
+ *
+ * XR_DXR_lift §6: lifted weave rects (vk_conv_weave through comp_multi_weave_lift).
+ *
+ */
+
+//! This submit's lifted rects (taken at the top of the submit: valid for exactly one).
+struct weave_lift_set
+{
+	uint32_t count;
+	uint64_t owner;
+	struct xrt_lift_weave_rect rects[XRT_LIFT_WEAVE_RECTS_MAX];
+};
+
+static const struct xrt_lift_weave_rect *
+weave_lift_binding(const struct weave_lift_set *lift, uint32_t rect_index)
+{
+	for (uint32_t k = 0; k < lift->count; k++) {
+		if (lift->rects[k].rect_index == rect_index) {
+			return &lift->rects[k];
+		}
+	}
+	return NULL;
+}
+
+//! The window size the caller's rects are in (the bound geometry, else @p fb_w x @p fb_h).
+static void
+weave_lift_window(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h, uint32_t *out_w, uint32_t *out_h)
+{
+	const bool geo = mc->weave.have_geometry && mc->weave.win_w != 0 && mc->weave.win_h != 0;
+	*out_w = geo ? mc->weave.win_w : fb_w;
+	*out_h = geo ? mc->weave.win_h : fb_h;
+}
+
+/*!
+ * Batch layout: each lifted rect's 2D frame (the WHOLE rect of the input,
+ * GENERAL) is snapshotted into its stream, and the stream's latest pair -- or
+ * the 2D frame, flat -- lands in both tiles of the SBS scratch
+ * (TRANSFER_DST_OPTIMAL).
+ */
+static void
+weave_lift_record_batch(struct multi_compositor *mc,
+                        VkCommandBuffer cmd,
+                        const struct comp_multi_weave_linux_slot *in,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects,
+                        const struct weave_lift_set *lift)
+{
+	uint32_t win_w = 0, win_h = 0;
+	weave_lift_window(mc, mc->weave.out_w, mc->weave.out_h, &win_w, &win_h);
+	for (uint32_t k = 0; k < lift->count; k++) {
+		const struct xrt_lift_weave_rect *b = &lift->rects[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &rects[b->rect_index];
+		if (rr->extent.w <= 0 || rr->extent.h <= 0) {
+			continue;
+		}
+		struct vk_conv_weave_rect r;
+		memset(&r, 0, sizeof(r));
+		r.binding = b;
+		r.owner = lift->owner;
+		r.src = (struct vk_conv_weave_image){in->image, VK_IMAGE_LAYOUT_GENERAL, in->format, in->w, in->h};
+		r.x = rr->offset.w; // xrt_offset fields are named w/h
+		r.y = rr->offset.h;
+		r.w = (uint32_t)rr->extent.w;
+		r.h = (uint32_t)rr->extent.h;
+		r.dst = (struct vk_conv_weave_image){mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                                     WEAVE_VK_FORMAT, mc->weave.sbs_w, mc->weave.sbs_h};
+		r.views = 2;
+		r.tile_columns = 2;
+		r.tile_w = mc->weave.out_w;
+		r.tile_h = mc->weave.out_h;
+		r.batch = true;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
+	}
+}
+
+/*!
+ * v6 layout: tile 0's copy of each lifted rect (the crop, GENERAL) is
+ * snapshotted and view v of the stream's latest result overwrites the rect in
+ * tile v; until the first result the caller's flat tiles stay as drawn.
+ */
+static void
+weave_lift_record_nview(struct multi_compositor *mc,
+                        VkCommandBuffer cmd,
+                        const struct xrt_weave_atlas_layout *layout,
+                        uint32_t rect_count,
+                        const struct xrt_rect *rects,
+                        const struct weave_lift_set *lift)
+{
+	const uint32_t cvw = layout->content_view_w, cvh = layout->content_view_h;
+	uint32_t win_w = 0, win_h = 0;
+	weave_lift_window(mc, cvw, cvh, &win_w, &win_h);
+	const float sx = (float)cvw / (float)win_w, sy = (float)cvh / (float)win_h;
+	for (uint32_t k = 0; k < lift->count; k++) {
+		const struct xrt_lift_weave_rect *b = &lift->rects[k];
+		if (b->rect_index >= rect_count) {
+			continue;
+		}
+		const struct xrt_rect *rr = &rects[b->rect_index];
+		// Tile-0 region, clipped to tile 0.
+		float fx0 = (float)rr->offset.w * sx, fy0 = (float)rr->offset.h * sy;
+		float fx1 = fx0 + (float)rr->extent.w * sx, fy1 = fy0 + (float)rr->extent.h * sy;
+		fx0 = fx0 < 0.0f ? 0.0f : fx0;
+		fy0 = fy0 < 0.0f ? 0.0f : fy0;
+		fx1 = fx1 > (float)cvw ? (float)cvw : fx1;
+		fy1 = fy1 > (float)cvh ? (float)cvh : fy1;
+		if (fx1 - fx0 < 1.0f || fy1 - fy0 < 1.0f) {
+			continue;
+		}
+		struct vk_conv_weave_rect r;
+		memset(&r, 0, sizeof(r));
+		r.binding = b;
+		r.owner = lift->owner;
+		r.src = (struct vk_conv_weave_image){mc->weave.crop_image, VK_IMAGE_LAYOUT_GENERAL, WEAVE_VK_FORMAT,
+		                                     mc->weave.crop_w, mc->weave.crop_h};
+		r.x = (int32_t)fx0;
+		r.y = (int32_t)fy0;
+		r.w = (uint32_t)(fx1 - fx0);
+		r.h = (uint32_t)(fy1 - fy0);
+		r.dst = r.src;
+		r.views = layout->view_count;
+		r.tile_columns = layout->tile_columns;
+		r.tile_w = cvw;
+		r.tile_h = cvh;
+		r.batch = false;
+		comp_multi_weave_lift_rect_frame(mc, rr, win_w, win_h, (uint64_t)(uintptr_t)mc->weave.dp, &r.frame);
+		(void)comp_multi_weave_lift_record(&mc->weave.lift, cmd, &r);
+	}
+}
+
 static bool
 weave_run_frame(struct vk_bundle *vk,
                 struct multi_compositor *mc,
@@ -1231,6 +2366,9 @@ weave_run_frame(struct vk_bundle *vk,
                 const struct xrt_rect *rects,
                 bool weave_frame_first,
                 const struct xrt_weave_atlas_layout *layout,
+                uint32_t flat_rect_count,
+                const struct xrt_rect *flat_rects,
+                const struct weave_lift_set *lift,
                 bool want_dmabuf_out,
                 bool wait_acquire,
                 bool want_release_fd,
@@ -1238,7 +2376,8 @@ weave_run_frame(struct vk_bundle *vk,
                 uint32_t *out_width,
                 uint32_t *out_height,
                 uint64_t *out_fence_value,
-                struct xrt_eye_positions *out_eyes)
+                struct xrt_eye_positions *out_eyes,
+                struct xrt_weave_woven_origin *out_origin)
 {
 	// Spec-v6 N-view atlas (#774): tiles contiguous from the top-left at
 	// (content_view_w, content_view_h); crop the packed region if the atlas
@@ -1308,7 +2447,10 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// v6 crop staging: (re)create when the packed region is smaller than the
 	// input. Zero-copy (packed == input) samples the input directly.
-	const bool v6_zero_copy = nview && (packed_w == in->w && packed_h == in->h);
+	// A v6 frame carrying lifted rects never samples the caller's buffer in
+	// place: the lift writes into the crop copy (XR_DXR_lift §6).
+	const bool lift_requested = lift != NULL && lift->count > 0;
+	const bool v6_zero_copy = nview && !lift_requested && (packed_w == in->w && packed_h == in->h);
 	if (nview && !v6_zero_copy &&
 	    (mc->weave.crop_image == VK_NULL_HANDLE || mc->weave.crop_w != packed_w || mc->weave.crop_h != packed_h)) {
 		weave_queue_wait_idle(vk);
@@ -1321,6 +2463,11 @@ weave_run_frame(struct vk_bundle *vk,
 		mc->weave.crop_h = packed_h;
 		mc->weave.crop_first_use = true;
 	}
+
+	// #2207: file-trigger capture. One poll per submit; only a submit that
+	// consumed a trigger records readbacks (input / atlas / woven) below and
+	// writes the PNGs after its own completion.
+	const bool capturing = comp_multi_weave_capture_begin(&mc->weave.capture, vk);
 
 	// ---- Record ----
 	// Stage B: the caller's acquire sync_file, imported into acquire_sem, is
@@ -1340,6 +2487,8 @@ weave_run_frame(struct vk_bundle *vk,
 	if (vk->vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
 		return false;
 	}
+	// XR_DXR_lift §6: lift this submit's rects (false = weave them as drawn).
+	const bool lifting = lift_requested && comp_multi_weave_lift_begin(&mc->weave.lift, vk, lift->count);
 
 	VkImageSubresourceRange range = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
 
@@ -1352,6 +2501,11 @@ weave_run_frame(struct vk_bundle *vk,
 	const VkAccessFlags in_access = v6_zero_copy ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
 	weave_acquire_slot(vk, cmd, in, in_stage, in_access);
 	in->first_use = false;
+	if (capturing) {
+		// The caller's buffer exactly as received (GENERAL, just acquired).
+		comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_INPUT, in->image,
+		                                in->w, in->h, in->format, VK_IMAGE_LAYOUT_GENERAL, in_stage, in_access);
+	}
 
 	VkImage dp_src_image = mc->weave.sbs_image;
 	VkImageView dp_src_view = mc->weave.sbs_view;
@@ -1360,6 +2514,7 @@ weave_run_frame(struct vk_bundle *vk,
 	uint32_t grid_cols = 2, grid_rows = 1;
 	VkImageLayout in_layout = VK_IMAGE_LAYOUT_GENERAL; // where the input sits after the reads
 	VkFormat dp_src_format = WEAVE_VK_FORMAT;
+	uint32_t dp_src_w = mc->weave.sbs_w, dp_src_h = mc->weave.sbs_h;
 
 	if (nview) {
 		if (v6_zero_copy) {
@@ -1372,6 +2527,8 @@ weave_run_frame(struct vk_bundle *vk,
 			dp_src_image = in->image;
 			dp_src_view = in->view;
 			dp_src_format = in->format; // a stage-B RGBA input is sampled as RGBA
+			dp_src_w = in->w;
+			dp_src_h = in->h;
 		} else {
 			// Crop the top-left packed region: ONE box copy.
 			weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
@@ -1410,12 +2567,25 @@ weave_run_frame(struct vk_bundle *vk,
 				                   VK_FILTER_NEAREST);
 			}
 
-			weave_layout_barrier(vk, cmd, mc->weave.crop_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			VkImageLayout crop_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			if (lifting) {
+				// The lift reads tile 0 and writes every tile of the crop: GENERAL.
+				weave_layout_barrier(vk, cmd, mc->weave.crop_image,
+				                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_ACCESS_TRANSFER_WRITE_BIT,
+				                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+				                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+				weave_lift_record_nview(mc, cmd, layout, rect_count, rects, lift);
+				crop_layout = VK_IMAGE_LAYOUT_GENERAL;
+			}
+			weave_layout_barrier(vk, cmd, mc->weave.crop_image, crop_layout,
 			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
 			                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 			dp_src_image = mc->weave.crop_image;
 			dp_src_view = mc->weave.crop_view;
+			dp_src_w = mc->weave.crop_w;
+			dp_src_h = mc->weave.crop_h;
 		}
 		atlas_view_w = cvw;
 		atlas_view_h = cvh;
@@ -1448,15 +2618,34 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_TRANSFER_BIT);
 		}
 
-		// Blit each rect's squeezed-SBS halves into the two atlas tiles:
-		// left half -> left tile at the rect's window position (stretched to
-		// full rect width), right half -> right tile offset by out_w.
+		// Un-squeeze each rect's SBS halves into the two atlas tiles: left half ->
+		// left tile at the rect's window position (stretched to full rect width),
+		// right half -> right tile offset by out_w. A LINEAR blit clamps at the
+		// edge of the whole SOURCE IMAGE, not at srcOffsets, so stretching straight
+		// out of the input would read 25 % of the texel beyond each half-rect (the
+		// caller's never-cleared ring on the outer edges = a dark 1-px border; the
+		// other eye at the midline). Each half is therefore first copied 1:1 into
+		// an image of exactly its size and that WHOLE image is stretched: the edge
+		// clamp is then the half-rect's own outermost texel centres. Odd widths
+		// keep the split they always had: left = rw / 2, right = the rest.
 		struct xrt_rect legacy_rect = {
 		    .offset = {.w = 0, .h = 0},
 		    .extent = {.w = (int)want_w, .h = (int)want_h},
 		};
 		const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
 		uint32_t blit_count = rect_count > 0 ? rect_count : 1;
+		if (blit_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
+			blit_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
+		}
+
+		VkImageBlit eye_blits[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		VkImage eye_src[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2]; // VK_NULL_HANDLE = straight from the input.
+		VkImage stage_images[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		VkImageCopy stage_copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		VkImageMemoryBarrier stage_barriers[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+		uint32_t eye_count = 0;
+		uint32_t staged_count = 0;
+		const VkImageSubresourceLayers color_layer = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1};
 
 		for (uint32_t i = 0; i < blit_count; i++) {
 			// xrt_offset names its fields w/h; they hold x/y here.
@@ -1467,6 +2656,7 @@ weave_run_frame(struct vk_bundle *vk,
 			if (rw <= 0 || rh <= 0) {
 				continue;
 			}
+			// Clamp to the input.
 			if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > in->w || (uint32_t)(ry + rh) > in->h) {
 				continue;
 			}
@@ -1474,25 +2664,93 @@ weave_run_frame(struct vk_bundle *vk,
 			if (half <= 0) {
 				continue;
 			}
-			VkImageBlit blits[2] = {
-			    // Left eye: input rect's left half -> left tile, unsqueezed.
-			    {
-			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
-			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{rx, ry, 0}, {rx + rw, ry + rh, 1}},
-			    },
-			    // Right eye: input rect's right half -> right tile (+out_w).
-			    {
-			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
-			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{(int32_t)mc->weave.out_w + rx, ry, 0},
-			                       {(int32_t)mc->weave.out_w + rx + rw, ry + rh, 1}},
-			    },
-			};
-			vk->vkCmdBlitImage(cmd, in->image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
-			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits, VK_FILTER_LINEAR);
+			// XR_DXR_lift §6: a lifted rect holds 2D, not SBS (drawn below).
+			if (lifting && rect_count > 0 && weave_lift_binding(lift, i) != NULL) {
+				continue;
+			}
+
+			// Tile position = the rect's own window position (1:1 vertically).
+			const int32_t dx0 = rx;
+			const int32_t dy0 = ry;
+			const int32_t dx1 = rx + rw;
+			const int32_t dy1 = ry + rh;
+			const int32_t src_x[2] = {rx, rx + half};
+			const int32_t src_w[2] = {half, rw - half};
+			const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
+			for (uint32_t e = 0; e < 2; e++) {
+				VkImage stage =
+				    weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e], (uint32_t)rh, in->format);
+				eye_blits[eye_count] = (VkImageBlit){
+				    .srcSubresource = color_layer,
+				    .srcOffsets = {{src_x[e], ry, 0}, {src_x[e] + src_w[e], ry + rh, 1}},
+				    .dstSubresource = color_layer,
+				    .dstOffsets = {{tile_x[e] + dx0, dy0, 0}, {tile_x[e] + dx1, dy1, 1}},
+				};
+				if (stage != VK_NULL_HANDLE) {
+					// Stretch the WHOLE staged image instead of the input sub-rect.
+					eye_blits[eye_count].srcOffsets[0] = (VkOffset3D){0, 0, 0};
+					eye_blits[eye_count].srcOffsets[1] = (VkOffset3D){src_w[e], rh, 1};
+					stage_images[staged_count] = stage;
+					stage_copies[staged_count] = (VkImageCopy){
+					    .srcSubresource = color_layer,
+					    .srcOffset = {src_x[e], ry, 0},
+					    .dstSubresource = color_layer,
+					    .dstOffset = {0, 0, 0},
+					    .extent = {(uint32_t)src_w[e], (uint32_t)rh, 1},
+					};
+					// Fully overwritten by the copy: discard from UNDEFINED. The
+					// TRANSFER src scope orders it after an earlier submit's
+					// stretch read of the same image (WAR — execution only).
+					stage_barriers[staged_count] = (VkImageMemoryBarrier){
+					    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					    .srcAccessMask = 0,
+					    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+					    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+					    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					    .image = stage,
+					    .subresourceRange = range,
+					};
+					staged_count++;
+				}
+				eye_src[eye_count] = stage;
+				eye_count++;
+			}
+		}
+
+		if (staged_count > 0) {
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+			                         0, NULL, 0, NULL, staged_count, stage_barriers);
+			for (uint32_t k = 0; k < staged_count; k++) {
+				vk->vkCmdCopyImage(cmd, in->image, VK_IMAGE_LAYOUT_GENERAL, stage_images[k],
+				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &stage_copies[k]);
+			}
+			// Copy writes -> stretch reads.
+			for (uint32_t k = 0; k < staged_count; k++) {
+				stage_barriers[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+				stage_barriers[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+				stage_barriers[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+				stage_barriers[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+			}
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+			                         0, NULL, 0, NULL, staged_count, stage_barriers);
+		}
+
+		// Stretches, in rect order (a later rect still overwrites an overlapping
+		// earlier one).
+		for (uint32_t k = 0; k < eye_count; k++) {
+			const bool staged = eye_src[k] != VK_NULL_HANDLE;
+			VkImage src = staged ? eye_src[k] : in->image;
+			VkImageLayout src_layout =
+			    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+			vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
+			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k], VK_FILTER_LINEAR);
+		}
+
+		// XR_DXR_lift §6: the lifted rects, after the squeezed ones.
+		if (lifting && rect_count > 0) {
+			weave_lift_record_batch(mc, cmd, in, rect_count, rects, lift);
 		}
 
 		// Scratch -> SHADER_READ for the DP sample.
@@ -1510,6 +2768,130 @@ weave_run_frame(struct vk_bundle *vk,
 	                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
 	weave_feed_dp_geometry(mc);
+	// v12 (browser-pvt#180): THE origin this weave is phase-locked to — the
+	// geometry just fed to the DP, read under the engine lock that also
+	// serialises every bind. Snapshotted here, in the weave's own storage, and
+	// committed below only if the weave goes out: the same per-weave capture as
+	// the in-process compositor's comp_vk_native_wl_geom_last_rect.
+	const struct xrt_weave_woven_origin woven = {
+	    .valid = mc->weave.have_geometry,
+	    .x = mc->weave.have_geometry ? mc->weave.win_x : 0,
+	    .y = mc->weave.have_geometry ? mc->weave.win_y : 0,
+	    .logical_valid = mc->weave.have_geometry && mc->weave.win_logical.valid,
+	    .logical_x = mc->weave.win_logical.valid ? mc->weave.win_logical.x : 0,
+	    .logical_y = mc->weave.win_logical.valid ? mc->weave.win_logical.y : 0,
+	    .logical_scale = mc->weave.win_logical.valid ? mc->weave.win_logical.scale : 0.0f,
+	    .serial = 0, // assigned on success
+	};
+
+	// #2218 item 6: per-screen display processors. Batch / v6 only (both weave
+	// the WHOLE window as one canvas, which is what the segment table cuts) and
+	// only while the output IS the window (v6 at viewScale 1); never in mono 2D
+	// (one flat view, no weave) or with a self-submitting DP (its own submit
+	// could not be ordered after the per-segment crops). Every other frame —
+	// and every one-screen system, where the manager never enables — is the
+	// single-DP weave below, byte for byte.
+	bool seg_split = false;
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	{
+		const bool mono_frame = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
+		const bool whole_window = (nview || rect_count > 0) && mc->weave.have_geometry &&
+		                          mc->weave.out_w == mc->weave.win_w && mc->weave.out_h == mc->weave.win_h;
+		if (whole_window && !mono_frame && !xrt_display_processor_is_self_submitting(mc->weave.dp)) {
+			seg_split = weave_segs_update(vk, mc);
+		}
+		mc->weave.segs_split = seg_split;
+	}
+#endif
+
+	// Off-panel 2D (#1654): the bands of the output that are not on the panel.
+	// A window entirely off the panel is one band covering the whole output,
+	// and then the weave is skipped — nothing of it would be seen. A window
+	// woven per screen (above) takes the per-screen rule instead: its parts off
+	// every DP-backed screen are painted flat by the segment record.
+	struct u_wl_rect_px offpanel[4];
+	bool skip_weave = false;
+	uint32_t offpanel_count = seg_split ? 0u : weave_offpanel_bands(mc, nview, offpanel, &skip_weave);
+	bool blend_begun = false;
+
+	// Spec v13 (XrWeaveSubmitMonoIn2DDXR): mono while the hardware is 2D. The
+	// whole output becomes ONE flat band — exactly the "entirely off the panel"
+	// case above: no weave, the flat view (below: a stereo pair's LEFT view —
+	// each batch rect's left half unsqueezed; N > 2 views, the one nearest the
+	// display axis) painted in register with the window at full output
+	// resolution. Gated on the CONFIRMED hardware state, not on the caller's
+	// own request, so the content goes flat only while the lens is really
+	// dropped (a DP that rejected the 2D request keeps the weave); it ends on
+	// the first submit after the confirmed state is 3D again.
+	const bool mono = mc->weave.mono_in_2d && mc->weave.hw_2d_confirmed;
+	if (mono != mc->weave.mono_active) {
+		mc->weave.mono_active = mono;
+		U_LOG_W("weave(v13): %s",
+		        mono ? "MONO — hardware 2D and the caller asked for one view: the flat view (stereo: the left "
+		               "view) is painted over the whole output, no weave"
+		             : (mc->weave.mono_in_2d ? "weave resumed (the hardware is 3D again)"
+		                                     : "weave resumed (the caller no longer asks for mono)"));
+	}
+	if (mono) {
+		offpanel[0] = (struct u_wl_rect_px){0, 0, (int32_t)mc->weave.out_w, (int32_t)mc->weave.out_h};
+		offpanel_count = 1;
+		skip_weave = true;
+	}
+
+	// 2D under the lens (ADR-027 Amendment): offer the v4 overlay to the DP so
+	// it composites the layer INSIDE the weave and band-limits it for the lens,
+	// instead of the post-weave blend below (which aliases per eye wherever the
+	// lens is on). Only when this frame weaves and the layer is exactly the
+	// output (= the process_atlas target) size — the slot's contract. The layer
+	// is taken from the producer and put in SHADER_READ_ONLY here, BEFORE the
+	// self-submitting split below, so it is ready when the DP's reads execute
+	// whichever command buffer they land in. A DP that declines (no slot, no SR
+	// compose, transparency, 2D content, ...) leaves the post-weave blend to do
+	// exactly what it did before; the layer is then already acquired.
+	struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
+	bool ov_acquired = false; // ov taken from the producer and in SHADER_READ_ONLY_OPTIMAL
+	bool ov_in_dp = false;    // the DP composites ov in this frame's process_atlas
+	// Not while woven per screen: the layer is window-sized and a DP composites
+	// it over its whole target, which no segment DP covers — the post-weave
+	// blend composites it instead (the Windows #1884 rule).
+	if (ov != NULL && !skip_weave && !seg_split && ov->w == mc->weave.out_w && ov->h == mc->weave.out_h &&
+	    xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
+		weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
+		                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
+		                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+		ov->first_use = false;
+		ov_acquired = true;
+		// v15 strength first: the D3D11 order, and a DP may key its weave on both.
+		xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, mc->weave.overlay_filter_strength);
+		// v14 "unchanged" is the caller's claim against ITS previous submit.
+		// After a stale overlay was ignored (weave_overlay_gate) the DP's
+		// cached layer is older than that, so the first offer after it says
+		// "changed" whatever the caller claimed.
+		const bool unchanged = mc->weave.overlay_unchanged && !mc->weave.overlay_force_changed;
+		mc->weave.overlay_force_changed = false;
+		ov_in_dp = xrt_display_processor_vk_set_overlay_2d(dp_vk, ov->view, (VkFormat_XDP)ov->format, ov->w,
+		                                                   ov->h, XRT_ATLAS_ENCODING_ENCODED, unchanged);
+	}
+	if (ov != NULL) {
+		const uint8_t verdict = ov_in_dp ? 2u : 1u;
+		if (verdict != mc->weave.overlay_in_dp) {
+			mc->weave.overlay_in_dp = verdict;
+			U_LOG_W("weave: 2D overlay (%ux%u) %s", ov->w, ov->h,
+			        ov_in_dp ? "composited by the display processor INSIDE the weave (2D under the lens)"
+			                 : "blended post-weave by the runtime (the DP did not take it this frame)");
+		}
+	}
+
+	// #2207: the atlas the DP is about to consume (SBS scratch / v6 crop / the
+	// zero-copy input — all in SHADER_READ_ONLY here), lifted views included.
+	// Recorded before the self-submitting split, so it reads what the DP reads.
+	if (capturing) {
+		comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS,
+		                                dp_src_image, dp_src_w, dp_src_h, dp_src_format,
+		                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+	}
 
 	// SELF-SUBMITTING DP ORDERING (Android #1036's one-frame trail fix): a
 	// DP that submits its own batch during process_atlas would otherwise
@@ -1517,7 +2899,7 @@ weave_run_frame(struct vk_bundle *vk,
 	// the pre-weave batch first; same-queue submission order then puts the
 	// DP's batch after it. The final submit + fence below retire both.
 	const bool self_submits = xrt_display_processor_is_self_submitting(mc->weave.dp);
-	if (self_submits && debug_get_bool_option_dxr_linux_weave_split()) {
+	if (self_submits && !skip_weave && debug_get_bool_option_dxr_linux_weave_split()) {
 		if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 			U_LOG_E("weave(#1699): vkEndCommandBuffer (pre-weave) failed");
 			return false;
@@ -1563,17 +2945,125 @@ weave_run_frame(struct vk_bundle *vk,
 	// the window. v6: the caller's grid at content_view dims. A
 	// self-submitting DP gets VK_NULL_HANDLE (xrt_display_processor
 	// contract; it records into its own buffer).
-	xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
-	xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
-	                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
-	                                    atlas_view_w, atlas_view_h,                        //
-	                                    grid_cols, grid_rows,                              //
-	                                    (VkFormat_XDP)dp_src_format,                       //
-	                                    mc->weave.out_fb,                                  //
-	                                    (VkImage_XDP)mc->weave.out_image,                  //
-	                                    mc->weave.out_w, mc->weave.out_h,                  //
-	                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
-	                                    0, 0, 0, 0);
+	if (seg_split) {
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+		// #2218 item 6: crop each segment's views, weave each with its
+		// screen's DP over its canvas (the engine's DP first, for the default
+		// screen's part, phased by weave_feed_dp_geometry above), flat 2D
+		// where nothing can weave.
+		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+		const struct comp_vk_native_segments_frame sf = {
+		    .cmd = cmd,
+		    .is_repaint = false,
+		    .src_image = dp_src_image,
+		    .src_format = dp_src_format,
+		    .view_width = atlas_view_w,
+		    .view_height = atlas_view_h,
+		    .tile_columns = grid_cols,
+		    .tile_rows = grid_rows,
+		    .target_fb = mc->weave.out_fb,
+		    .target_image = mc->weave.out_image,
+		    .target_view = mc->weave.out_view,
+		    .target_width = mc->weave.out_w,
+		    .target_height = mc->weave.out_h,
+		    .target_format = WEAVE_VK_FORMAT,
+		    .canvas = {0, 0, mc->weave.out_w, mc->weave.out_h},
+		    .content = NULL,                 // one view set (no per-segment views on this path)
+		    .transparent_background = false, // the engine never declares transparency to its DP
+		    .atlas_encoding = -1,            // nor an atlas encoding
+		    .primary_dp = mc->weave.dp,
+		};
+		(void)comp_vk_native_segments_record(mc->weave.segs, &sf);
+		// The record leaves the target in PRESENT_SRC_KHR (the DP contract it
+		// shares with the in-process compositor); everything below continues
+		// from COLOR_ATTACHMENT_OPTIMAL.
+		weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+		                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+		                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+#endif
+	} else if (!skip_weave) {
+		xrt_display_processor_set_target_color_view(mc->weave.dp, mc->weave.out_view);
+		xrt_display_processor_process_atlas(mc->weave.dp, self_submits ? VK_NULL_HANDLE : cmd, //
+		                                    (VkImage_XDP)dp_src_image, dp_src_view,            //
+		                                    atlas_view_w, atlas_view_h,                        //
+		                                    grid_cols, grid_rows,                              //
+		                                    (VkFormat_XDP)dp_src_format,                       //
+		                                    mc->weave.out_fb,                                  //
+		                                    (VkImage_XDP)mc->weave.out_image,                  //
+		                                    mc->weave.out_w, mc->weave.out_h,                  //
+		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,                     //
+		                                    0, 0, 0, 0);
+	}
+
+	// THE flat view, shared by every flat path below (off-panel bands, mono in
+	// 2D, non-batch flat regions) so they are in register with each other:
+	// view 0 for 1-2 views (a stereo pair's LEFT view), else the view whose eye
+	// is nearest the display axis (u_weave_flat_view_index). Eye offsets are
+	// read only on an N > 2 grid (one DP query, the same one the reply makes).
+	uint32_t flat_view = 0;
+	{
+		const uint32_t tiles = grid_cols * grid_rows;
+		if (tiles > 2) {
+			struct xrt_eye_positions fe = {0};
+			float fx[ARRAY_SIZE(fe.eyes)];
+			uint32_t fn = 0;
+			if (xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, &fe) && fe.valid) {
+				fn = fe.count < ARRAY_SIZE(fe.eyes) ? fe.count : (uint32_t)ARRAY_SIZE(fe.eyes);
+				for (uint32_t i = 0; i < fn; i++) {
+					fx[i] = fe.eyes[i].x;
+				}
+			}
+			flat_view = u_weave_flat_view_index(tiles, fn > 0 ? fx : NULL, fn);
+		}
+	}
+
+	// Off-panel bands -> flat 2D, from the flat view of the atlas the DP
+	// consumed (for a stereo pair, the left view). After the weave and BEFORE
+	// the v4 overlay, as in-process (#1654): 2D overlays are composited over
+	// the bands too, so they stay readable on both sides of the seam. Here,
+	// while the input is still in the layout the weave sampled it in (the
+	// zero-copy v6 source IS the input).
+	if (offpanel_count > 0) {
+		weave_paint_offpanel(vk, mc, cmd, offpanel, offpanel_count, dp_src_view, dp_src_w, dp_src_h,
+		                     (flat_view % grid_cols) * atlas_view_w, (flat_view / grid_cols) * atlas_view_h,
+		                     &blend_begun);
+	}
+
+	// Flat regions (spec v8) -> flat 2D, AFTER the off-panel bands (a popup
+	// that is also off the panel must still show the popup) and before the v4
+	// overlay. Source: for a batch submit the input page itself, 1:1 — the
+	// flat region IS page content (a popup / menu / DOM over 3D), and the
+	// input is window-sized in register with the output; otherwise (v6 /
+	// legacy, where the input holds views, not a page) the flat view the
+	// off-panel bands use.
+	struct u_wl_rect_px flat[WEAVE_FLAT_MAX_RECTS];
+	const uint32_t flat_count = weave_flat_rects(mc, nview, flat_rect_count, flat_rects, flat);
+	{
+		if (flat_count > 0) {
+			const bool page_source = !nview && rect_count > 0;
+			if (page_source) {
+				// The batch input sat in GENERAL for the TRANSFER blits;
+				// sample it in SHADER_READ_ONLY and put it back.
+				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+				weave_paint_offpanel(vk, mc, cmd, flat, flat_count, in->view, in->w, in->h, 0, 0,
+				                     &blend_begun);
+				weave_layout_barrier(vk, cmd, in->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+			} else {
+				weave_paint_offpanel(vk, mc, cmd, flat, flat_count, dp_src_view, dp_src_w, dp_src_h,
+				                     (flat_view % grid_cols) * atlas_view_w,
+				                     (flat_view / grid_cols) * atlas_view_h, &blend_begun);
+			}
+		}
+	}
 
 	// Input back to GENERAL (if a v6 path moved it) and released to the
 	// producer's family, so its next writes land in a defined state.
@@ -1585,27 +3075,34 @@ weave_run_frame(struct vk_bundle *vk,
 
 	// v4 overlay atlas (browser#18): composite the caller's window-sized
 	// premultiplied 2D atlas OVER the woven output — not woven, drawn after
-	// process_atlas onto the same attachment.
+	// process_atlas onto the same attachment. When the DP already composited it
+	// inside the weave (ov_in_dp), only the off-panel bands and flat regions
+	// painted over the weave above need it again: those were cleared and
+	// re-painted flat, so the layer is redrawn there (and only there), keeping
+	// 2D readable on both sides of a seam exactly as before.
 	if (ov != NULL) {
-		bool blend_ready = mc->weave.overlay_blend_initialized;
-		if (!blend_ready) {
-			blend_ready =
-			    vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT);
-			mc->weave.overlay_blend_initialized = blend_ready;
-			if (blend_ready) {
-				U_LOG_W("weave(#1699) v4: premul-over blend pipeline ready");
-			} else {
-				U_LOG_E("weave(#1699) v4: premul-over blend init failed");
+		struct u_wl_rect_px redo[ARRAY_SIZE(offpanel) + WEAVE_FLAT_MAX_RECTS];
+		uint32_t redo_count = 0;
+		if (ov_in_dp) {
+			for (uint32_t i = 0; i < offpanel_count && redo_count < ARRAY_SIZE(redo); i++) {
+				redo[redo_count++] = offpanel[i];
+			}
+			for (uint32_t i = 0; i < flat_count && redo_count < ARRAY_SIZE(redo); i++) {
+				redo[redo_count++] = flat[i];
 			}
 		}
-		if (blend_ready) {
-			weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                   VK_ACCESS_SHADER_READ_BIT);
-			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
-			                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, VK_ACCESS_SHADER_READ_BIT,
-			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-			ov->first_use = false;
+		const bool draw = ov_in_dp ? redo_count > 0 : true;
+		if (draw && weave_blend_begin(vk, mc, &blend_begun)) {
+			if (!ov_acquired) {
+				weave_acquire_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                   VK_ACCESS_SHADER_READ_BIT);
+				weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_GENERAL,
+				                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0,
+				                     VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+				ov->first_use = false;
+				ov_acquired = true;
+			}
 
 			weave_layout_barrier(vk, cmd, mc->weave.out_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -1614,15 +3111,29 @@ weave_run_frame(struct vk_bundle *vk,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 			                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
 
-			vk_local2d_composite_begin_frame(&mc->weave.overlay_blend, vk);
-			vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
-			                                  mc->weave.out_w, mc->weave.out_h,
-			                                  ov->view, //
-			                                  0, 0, mc->weave.out_w,
-			                                  mc->weave.out_h,        // dst = full window
-			                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
-			                                  /*unpremultiplied*/ false);
-
+			if (!ov_in_dp) {
+				vk_local2d_composite_flatten_draw(&mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb,
+				                                  mc->weave.out_w, mc->weave.out_h,
+				                                  ov->view, //
+				                                  0, 0, mc->weave.out_w,
+				                                  mc->weave.out_h,        // dst = full window
+				                                  0.0f, 0.0f, 1.0f, 1.0f, // src = whole atlas
+				                                  /*unpremultiplied*/ false);
+			} else {
+				// The layer is output-sized (checked before it went to the DP),
+				// so each rect samples it 1:1 at its own position.
+				for (uint32_t i = 0; i < redo_count; i++) {
+					const struct u_wl_rect_px r = redo[i];
+					vk_local2d_composite_flatten_draw(
+					    &mc->weave.overlay_blend, vk, cmd, mc->weave.out_fb, mc->weave.out_w,
+					    mc->weave.out_h, ov->view, r.x, r.y, (uint32_t)r.w, (uint32_t)r.h,
+					    (float)r.x / (float)ov->w, (float)r.y / (float)ov->h,
+					    (float)r.w / (float)ov->w, (float)r.h / (float)ov->h,
+					    /*unpremultiplied*/ false);
+				}
+			}
+		}
+		if (ov_acquired) {
 			weave_layout_barrier(vk, cmd, ov->image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			                     VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT, 0,
 			                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -1630,6 +3141,14 @@ weave_run_frame(struct vk_bundle *vk,
 			weave_release_slot(vk, cmd, ov, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 			                   VK_ACCESS_SHADER_READ_BIT);
 		}
+	}
+
+	// #2207: the woven output, everything drawn (weave, flat bands, overlay).
+	if (capturing) {
+		comp_multi_weave_capture_record(
+		    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_WOVEN, mc->weave.out_image, mc->weave.out_w,
+		    mc->weave.out_h, WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 	}
 
 	// Output handed to the caller in GENERAL. A stage-B dma-buf goes to
@@ -1707,6 +3226,31 @@ weave_run_frame(struct vk_bundle *vk,
 
 	mc->weave.fence_value++;
 
+	// #2207: a capturing submit waits its OWN fence (stage B otherwise leaves
+	// it to the next submit) — without resetting it, so the next submit's
+	// weave_wait_prev_frame still retires it as usual — then encodes the PNGs.
+	// Diagnostic frames only; a timeout leaves the buffers to the next begin.
+	if (capturing) {
+		const bool done =
+		    !mc->weave.fence_pending ||
+		    vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, WEAVE_FENCE_TIMEOUT_NS) == VK_SUCCESS;
+		if (done) {
+			char what[160];
+			snprintf(what, sizeof(what), "client=%s %s layout, output %ux%u",
+			         mc->weave.capture.tag[0] != 0 ? mc->weave.capture.tag : "?",
+			         nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"), mc->weave.out_w,
+			         mc->weave.out_h);
+			comp_multi_weave_capture_finish(&mc->weave.capture, vk, what);
+		}
+	}
+
+	// v12: this output now exists, woven for `woven`.
+	mc->weave.woven_origin = woven;
+	mc->weave.woven_origin.serial = ++mc->weave.woven_serial;
+	if (out_origin != NULL) {
+		*out_origin = mc->weave.woven_origin;
+	}
+
 	*out_width = mc->weave.out_w;
 	*out_height = mc->weave.out_h;
 	*out_fence_value = mc->weave.fence_value;
@@ -1714,8 +3258,28 @@ weave_run_frame(struct vk_bundle *vk,
 	// Eyes flow OUT for the caller's next off-axis frame; the weave itself
 	// reads the tracker DP-internally.
 	U_ZERO(out_eyes);
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+	// #2218 item 6: woven per screen, the base eyes are the majority screen's
+	// DP's (desktop Linux reports v19 segmentCount 0, so the caller frames
+	// every rect from these) — a window wholly on another screen is rendered
+	// for THAT screen's viewer, not the default screen's.
+	if (seg_split) {
+		bool on_primary = true;
+		const uint64_t eye_screen =
+		    comp_weave_screens_eye_screen(comp_vk_native_segments_get_table(mc->weave.segs), &on_primary);
+		if (eye_screen != 0 && !on_primary &&
+		    comp_vk_native_segments_get_eyes(mc->weave.segs, eye_screen, out_eyes)) {
+			return true;
+		}
+		U_ZERO(out_eyes);
+	}
+#endif
 	if (!xrt_display_processor_get_predicted_eye_positions(mc->weave.dp, out_eyes)) {
 		U_ZERO(out_eyes);
+	} else {
+		// The conversion core's per-DP eyes (roadmap §5.2): a lifted rect's
+		// stream reads this DP's.
+		comp_multi_conv_eyes_publish((uint64_t)(uintptr_t)mc->weave.dp, out_eyes);
 	}
 
 	return true;
@@ -1739,9 +3303,19 @@ comp_multi_weave_bind_window(struct xrt_compositor *xc, uint64_t window_id)
 	// Recorded only: an XID (X11) or 0 (Wayland, where a client cannot name
 	// its window to another process). The service creates no window and never
 	// derives geometry from it — that arrives through set_window_geometry.
+	const bool first = !mc->weave.window_bound;
+	const bool changed = first || mc->weave.window_id != window_id;
+	mc->weave.window_bound = true;
 	mc->weave.window_id = window_id;
 	os_mutex_unlock(&mc->weave.mutex);
-	U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	// A present-owner re-binds on every move — every frame of a drag under v12
+	// move sync — so this must not be a per-frame WARN: one WARN for the
+	// session's first bind, INFO when the id changes, silence on a repeat.
+	if (first) {
+		U_LOG_W("weave(#1699): bound present-owner window id 0x%" PRIx64, window_id);
+	} else if (changed) {
+		U_LOG_I("weave(#1699): present-owner window id now 0x%" PRIx64, window_id);
+	}
 	return true;
 }
 
@@ -1753,21 +3327,41 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
                                      uint32_t client_h,
                                      int32_t display_id)
 {
+	return comp_multi_weave_set_window_geometry_logical(xc, origin_x, origin_y, client_w, client_h, display_id,
+	                                                    NULL);
+}
+
+bool
+comp_multi_weave_set_window_geometry_logical(struct xrt_compositor *xc,
+                                             int32_t origin_x,
+                                             int32_t origin_y,
+                                             uint32_t client_w,
+                                             uint32_t client_h,
+                                             int32_t display_id,
+                                             const struct xrt_weave_logical_origin *logical)
+{
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || mc->msc == NULL || client_w == 0 || client_h == 0) {
 		return false;
+	}
+	// v12 (browser-pvt#180): verbatim, or cleared — never derived.
+	struct xrt_weave_logical_origin lo = {0};
+	if (logical != NULL && logical->valid) {
+		lo = *logical;
 	}
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 	const bool changed = !mc->weave.have_geometry || mc->weave.win_x != origin_x || mc->weave.win_y != origin_y ||
 	                     mc->weave.win_w != client_w || mc->weave.win_h != client_h ||
 	                     mc->weave.win_display_id != display_id;
+	const bool logical_first = lo.valid && !mc->weave.win_logical.valid;
 	mc->weave.have_geometry = true;
 	mc->weave.win_x = origin_x;
 	mc->weave.win_y = origin_y;
 	mc->weave.win_w = client_w;
 	mc->weave.win_h = client_h;
 	mc->weave.win_display_id = display_id;
+	mc->weave.win_logical = lo;
 	mc->weave.geometry_dirty = mc->weave.geometry_dirty || changed;
 	os_mutex_unlock(&mc->weave.mutex);
 	if (changed) {
@@ -1775,6 +3369,14 @@ comp_multi_weave_set_window_geometry(struct xrt_compositor *xc,
 		// re-publish every frame, so log only on change.
 		U_LOG_W("weave(#1699): present-owner window %d,%d %ux%u on display %d", origin_x, origin_y, client_w,
 		        client_h, display_id);
+	}
+	if (logical_first) {
+		// One-off per transition (not per move): the caller now reports its
+		// logical origin, so outputs carry a move-sync-taggable origin.
+		U_LOG_W(
+		    "weave(v12): present-owner publishes its logical origin (%d,%d) @ scale %.4f — woven outputs "
+		    "report it for move-sync tagging",
+		    lo.x, lo.y, (double)lo.scale);
 	}
 	return true;
 }
@@ -1798,11 +3400,8 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
                         uint64_t *out_fence_value,
                         struct xrt_eye_positions *out_eyes)
 {
-	// v8 (browser#88): accepted and ignored, as on macOS / Android — the
-	// per-region hardware wish has no desktop-Linux channel yet. Conformant:
-	// the wish is advisory and hardware-only (ADR-027 D6), pixels are unaffected.
-	(void)flat_rect_count;
-	(void)flat_rects;
+	// v8 (browser#88): the flat regions are painted flat in the output
+	// (weave_flat_rects — no desktop-Linux DP has a per-region lens to wish).
 
 	// Every received fd is ours from here and is closed exactly once, at the
 	// bottom — hit, miss, refusal or error (file header, rule 1).
@@ -1820,6 +3419,11 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_lift §6: this submit's lifted rects, taken NOW so every exit path
+	// consumes them (a set is valid for exactly one submit).
+	struct weave_lift_set lift;
+	lift.count = comp_multi_weave_lift_take(&mc->weave.lift, &lift.owner, lift.rects);
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_engine(vk, mc) || !weave_wait_prev_frame(vk, mc)) {
@@ -1835,20 +3439,44 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		}
 
 		// v4 overlay: window-sized premul atlas, same import cache shape. A
-		// failed overlay import only drops the overlay (as on macOS / Android).
+		// chained overlay that cannot be imported REFUSES the submit, before
+		// the woven output is touched (the D3D11 service's rule, see
+		// weave_overlay_refused): the caller then still holds the last
+		// composed frame and decides itself whether to hold it or to paint its
+		// 2D on its own. Dropping the overlay and weaving anyway would hand
+		// back a "successful" frame with the caller's 2D missing.
+		//
+		// Resize race: an overlay known not to be window-sized is ignored
+		// for this frame, not imported at the window's size and not refused
+		// (weave_overlay_gate; weave_stage_a_overlay_stale says how its real
+		// size is known without a size on the wire).
 		struct comp_multi_weave_linux_slot *ov = NULL;
-		if (ov_fd >= 0) {
+		bool use_ov = ov_fd >= 0;
+		uint32_t exp_w = 0, exp_h = 0;
+		if (use_ov && weave_overlay_expected_dims(mc, layout, rect_count, in_w, in_h, rect_x, rect_y, rect_w,
+		                                          rect_h, &exp_w, &exp_h)) {
+			uint32_t real_w = 0, real_h = 0;
+			uint64_t real_bytes = 0;
+			const bool stale = weave_stage_a_overlay_stale(mc->weave.ov_slots, ov_fd, exp_w, exp_h, &real_w,
+			                                               &real_h, &real_bytes);
+			use_ov = weave_overlay_gate(mc, stale, real_w, real_h, real_bytes, exp_w, exp_h);
+		}
+		if (use_ov) {
 			uint32_t ov_w = mc->weave.have_geometry ? mc->weave.win_w : in_w;
 			uint32_t ov_h = mc->weave.have_geometry ? mc->weave.win_h : in_h;
 			ov = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, NULL, ov_w, ov_h, "overlay");
+			if (ov == NULL) {
+				weave_overlay_refused(mc);
+				break;
+			}
 		}
 
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, false);
 		int unused_release_fd = -1;
 		if (!weave_run_frame(vk, mc, in, ov, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, want_dmabuf_out, false /* no acquire sem */,
-		                     false /* synchronous */, &unused_release_fd, out_width, out_height,
-		                     out_fence_value, out_eyes)) {
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, &lift, want_dmabuf_out,
+		                     false /* no acquire sem */, false /* synchronous */, &unused_release_fd, out_width,
+		                     out_height, out_fence_value, out_eyes, NULL /* v12: dma-buf path only */)) {
 			break;
 		}
 		ok = true;
@@ -1935,12 +3563,14 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                uint64_t *out_fence_value,
-                               struct xrt_eye_positions *out_eyes)
+                               struct xrt_eye_positions *out_eyes,
+                               struct xrt_weave_woven_origin *out_origin)
 {
-	(void)flat_rect_count; // v8: accepted and ignored (see comp_multi_weave_submit)
-	(void)flat_rects;
 	if (out_release_fence_fd != NULL) {
 		*out_release_fence_fd = -1;
+	}
+	if (out_origin != NULL) {
+		memset(out_origin, 0, sizeof(*out_origin));
 	}
 
 	// Every fd handed in is the engine's from here (xrt_weave_dmabuf.h): the
@@ -1962,6 +3592,10 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
+
+	// XR_DXR_lift §6: this submit's lifted rects (valid for exactly one submit).
+	struct weave_lift_set lift;
+	lift.count = comp_multi_weave_lift_take(&mc->weave.lift, &lift.owner, lift.rects);
 
 	bool ok = false;
 	do {
@@ -1989,10 +3623,27 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		if (in_slot == NULL) {
 			break;
 		}
+		// Resize race: an overlay whose declared size is not the window's is
+		// ignored for this frame — not imported, not refused
+		// (weave_overlay_gate). Its fd still closes in the epilogue.
 		struct comp_multi_weave_linux_slot *ov_slot = NULL;
-		if (ov_fd >= 0) {
+		bool use_ov = ov_fd >= 0;
+		uint32_t exp_w = 0, exp_h = 0;
+		if (use_ov && weave_overlay_expected_dims(mc, layout, rect_count, in->width, in->height, rect_x, rect_y,
+		                                          rect_w, rect_h, &exp_w, &exp_h)) {
+			const bool stale = overlay->width != exp_w || overlay->height != exp_h;
+			use_ov = weave_overlay_gate(mc, stale, overlay->width, overlay->height, 0, exp_w, exp_h);
+		}
+		if (use_ov) {
 			ov_slot = weave_cache_acquire(vk, mc, mc->weave.ov_slots, ov_fd, overlay, overlay->width,
 			                              overlay->height, "overlay");
+			if (ov_slot == NULL) {
+				// Refused before the acquire fence is taken and before the
+				// woven output is touched (weave_overlay_refused). The fence
+				// closes in the epilogue below.
+				weave_overlay_refused(mc);
+				break;
+			}
 		}
 
 		// Last step before recording: the acquire fence (consumed here on
@@ -2007,9 +3658,9 @@ comp_multi_weave_submit_dmabuf(struct xrt_compositor *xc,
 		const bool want_dmabuf_out = weave_want_dmabuf_output(vk, mc, true);
 		int release_fd = -1;
 		if (!weave_run_frame(vk, mc, in_slot, ov_slot, rect_x, rect_y, rect_w, rect_h, rect_count, rects,
-		                     weave_frame_first, layout, want_dmabuf_out, wait_acquire,
-		                     true /* release sync_file */, &release_fd, out_width, out_height, out_fence_value,
-		                     out_eyes)) {
+		                     weave_frame_first, layout, flat_rect_count, flat_rects, &lift, want_dmabuf_out,
+		                     wait_acquire, true /* release sync_file */, &release_fd, out_width, out_height,
+		                     out_fence_value, out_eyes, out_origin)) {
 			if (wait_acquire) {
 				// The temporary payload may be unconsumed (nothing was
 				// submitted): replace acquire_sem so the next import starts
@@ -2069,6 +3720,35 @@ comp_multi_weave_export_output_dmabuf(struct xrt_compositor *xc, struct xrt_weav
 }
 
 bool
+comp_multi_weave_set_screen_flat_regions(struct xrt_compositor *xc,
+                                         uint32_t rect_count,
+                                         const struct xrt_rect *screen_rects)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL || rect_count > WEAVE_SCREEN_FLAT_MAX ||
+	    (rect_count > 0 && screen_rects == NULL)) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	// SET, not add: the latch is replaced wholesale, and count 0 clears it.
+	for (uint32_t i = 0; i < rect_count; i++) {
+		mc->weave.screen_flat_rects[i] = screen_rects[i];
+	}
+	const bool changed = rect_count != mc->weave.screen_flat_rect_count;
+	mc->weave.screen_flat_rect_count = rect_count;
+	os_mutex_unlock(&mc->weave.mutex);
+	if (changed) {
+		// A caller may re-latch the same furniture on every layout pass; log
+		// a change of count only.
+		U_LOG_W(
+		    "weave(#1699): sticky screen flat regions latched: %u rect(s) (painted flat from the next submit)",
+		    rect_count);
+	}
+	return true;
+}
+
+bool
 comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
                                   int32_t origin_x,
                                   int32_t origin_y,
@@ -2100,6 +3780,78 @@ comp_multi_weave_snap_window_rect(struct xrt_compositor *xc,
 	return snapped;
 }
 
+bool
+comp_multi_weave_linux_request_display_mode(struct multi_compositor *mc, bool enable_3d)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	// The standing wish: read again at engine bring-up if the DP is not there yet.
+	const bool had_pending_2d = mc->weave.dp == NULL && !mc->hardware_display_3d;
+	mc->hardware_display_3d = enable_3d;
+	bool ok = true;
+	if (mc->weave.dp != NULL) {
+		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else if (enable_3d && had_pending_2d) {
+		U_LOG_W(
+		    "weave(#1699): hardware 3D requested before the weave engine exists — the recorded 2D request is "
+		    "withdrawn; 3D is re-asserted at bring-up");
+	} else if (enable_3d) {
+		U_LOG_W("weave(#1699): hardware 3D requested before the weave engine exists — recorded, re-asserted "
+		        "when the engine comes up (the panel may be 2D from an earlier client)");
+	} else if (!enable_3d) {
+		U_LOG_W(
+		    "weave(#1699): hardware 2D requested before the weave engine exists — recorded, applied when "
+		    "the engine comes up");
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
+}
+
+void
+comp_multi_weave_linux_set_mono_in_2d(struct xrt_compositor *xc, bool mono_in_2d)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.mono_in_2d = mono_in_2d;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_linux_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.overlay_unchanged = overlay_unchanged;
+	// Out of range (incl. NaN) = not set by the app: the DP's own default.
+	mc->weave.overlay_filter_strength =
+	    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_linux_set_capture_tag(struct xrt_compositor *xc, const char *tag)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	snprintf(mc->weave.capture.tag, sizeof(mc->weave.capture.tag), "%s", tag != NULL ? tag : "");
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
 void
 comp_multi_weave_fini(struct multi_compositor *mc)
 {
@@ -2115,6 +3867,9 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			weave_queue_wait_idle(vk);
 			mc->weave.fence_pending = false;
 		}
+		// XR_DXR_lift §6: the lifted rects' state (pins, pending snapshots) -- idle above.
+		comp_multi_weave_lift_fini(&mc->weave.lift);
+		comp_multi_weave_capture_release(&mc->weave.capture, vk); // #2207 (idle above)
 		weave_slots_release_all(vk, mc->weave.in_slots);
 		weave_slots_release_all(vk, mc->weave.ov_slots);
 		weave_release_scratch(vk, mc);
@@ -2124,7 +3879,12 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 			mc->weave.overlay_blend_initialized = false;
 		}
+#ifdef COMP_MULTI_WEAVE_HAVE_SEGMENTS
+		// #2218 item 6: the per-screen DPs + crops (the queue is idle above).
+		weave_segs_free(vk, mc);
+#endif
 		if (mc->weave.dp != NULL) {
+			comp_multi_conv_eyes_retire((uint64_t)(uintptr_t)mc->weave.dp); // its eyes key (roadmap §5.2)
 			xrt_display_processor_destroy(&mc->weave.dp);
 		}
 		if (mc->weave.render_pass != VK_NULL_HANDLE) {

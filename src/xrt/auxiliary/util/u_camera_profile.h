@@ -9,7 +9,11 @@
 extern "C" {
 #endif
 
-//! Camera-rig tuning only: navigation/pose is never configuration data.
+//! Camera-rig tuning, plus where the camera starts. Navigation itself (the
+//! voluntary pose the user drives) is never configuration data; its starting
+//! framing is: many VR titles put their work area at arm's length and hand
+//! height, below and too close to a camera that starts level at eye height
+//! (pitchDegrees, pullbackMeters).
 struct u_camera_profile
 {
 	float ipd_factor;
@@ -17,10 +21,14 @@ struct u_camera_profile
 	float inv_convergence_distance;
 	float half_tan_vfov;
 	float m2v;
+	//! Initial camera pitch, radians, positive = up; also what Space resets to.
+	float pitch_rad;
+	//! Initial distance behind the default camera position along its starting view, metres.
+	float pullback_m;
 };
 
 //! The existing qwerty camera defaults (tan(18 degrees) is historically rounded).
-#define U_CAMERA_PROFILE_DEFAULT {1.0f, 1.0f, 0.5f, 0.3249f, 1.0f}
+#define U_CAMERA_PROFILE_DEFAULT {1.0f, 1.0f, 0.5f, 0.3249f, 1.0f, 0.0f, 0.0f}
 
 enum u_camera_profile_result
 {
@@ -32,8 +40,11 @@ enum u_camera_profile_result
 //! Parse a complete JSON object. Missing fields use the qwerty defaults.
 //! Scalar bounds match XrCameraRigDXR; geometry-dependent comfort is applied by
 //! the eligible instance. Only horizontalFovDeg needs a positive, finite canvas aspect.
-//! Unknown/duplicate keys, conflicting aliases and non-finite/non-number values
-//! are errors. On failure out is untouched. Optional error receives a reason.
+//! Duplicate keys, conflicting aliases, malformed JSON and non-finite/non-number
+//! values of known keys are errors: out is untouched and the optional error
+//! buffer receives a reason. Unknown keys are skipped whatever their value
+//! (#2450): on success the error buffer is empty, or names the skipped keys so
+//! the caller can warn once.
 bool
 u_camera_profile_parse(
     const char *json, float canvas_aspect, struct u_camera_profile *out, char *error, size_t error_size);
@@ -42,6 +53,7 @@ u_camera_profile_parse(
 //! <profile_dir>/<exe_basename>.json. An invalid override does not fall through
 //! to the per-title file. Missing per-title files return NONE; other failures
 //! return INVALID. Reads at most 64 KiB and never creates files/directories.
+//! On LOADED the error buffer holds the parse notice (skipped keys) or is empty.
 enum u_camera_profile_result
 u_camera_profile_load(const char *exe_basename,
                       const char *profile_dir,

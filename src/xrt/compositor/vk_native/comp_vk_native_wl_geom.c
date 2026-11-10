@@ -7,9 +7,11 @@
  * libdbus-1 client of the GNOME Shell extension `window-geometry@displayxr.org`
  * (contrib/gnome-shell/). One initial GetWindows snapshot at create, then a
  * non-blocking per-query pump of WindowsChanged signals. The publisher is
- * intermittent by design — GNOME disables user extensions whenever the screen
- * shield is up — so NameOwnerChanged is tracked too, and the cache is dropped
- * and re-taken across that gap. Single-threaded use from the compositor frame
+ * intermittent — a shell restart, a re-enable, and (before extension version
+ * 14, which declares the unlock-dialog session mode, #2071) every lock screen
+ * take the bus name away — so NameOwnerChanged is tracked too, and the cache is
+ * dropped and re-taken across that gap; each reappearance also bumps a
+ * generation the compositor uses to re-sync its own derived state. Single-threaded use from the compositor frame
  * loop — no locking.
  *
  * @ingroup comp_vk_native
@@ -19,11 +21,14 @@
 
 #include "util/u_logging.h"
 #include "util/u_wayland_geom.h"
+#include "util/u_wayland_layout.h"
 #include "util/u_json.h"
 #include "util/u_misc.h"
 #include "os/os_time.h"
 
 #include <dbus/dbus.h>
+
+#include <math.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +48,13 @@
 //! The publisher comes and goes (see wlg_pump), so we also watch who owns its
 //! well-known name. The daemon supports arg0 matching, so this delivers only
 //! transitions of OUR name — not every name change on the session bus.
+//! Mutter's monitor configuration (the layout-mode fallback, see
+//! wlg_query_mutter_layout_mode). MonitorsChanged marks the cached answer stale.
+#define MUTTER_DC_BUS_NAME "org.gnome.Mutter.DisplayConfig"
+#define MUTTER_DC_OBJ_PATH "/org/gnome/Mutter/DisplayConfig"
+#define MUTTER_DC_IFACE "org.gnome.Mutter.DisplayConfig"
+#define MUTTER_DC_MATCH_RULE "type='signal',interface='" MUTTER_DC_IFACE "',member='MonitorsChanged'"
+
 #define WLG_OWNER_MATCH_RULE                                                                                           \
 	"type='signal',sender='" DBUS_SERVICE_DBUS "',interface='" DBUS_INTERFACE_DBUS                                 \
 	"',"                                                                                                           \
@@ -59,7 +71,11 @@
 // One entry per published window we care about (own-PID filter is applied at
 // query time, not parse time, so the cache mirrors the full snapshot).
 //
-// EVERY geometry field here is LOGICAL — this is the wire payload, unconverted.
+// EVERY geometry field here is LOGICAL — this is the wire payload, unconverted
+// — except `buffer_device_*`, which the publisher sends already in device px.
+// "Logical" means Mutter's STAGE coordinates, which are device px in Mutter's
+// PHYSICAL layout mode: the factor that converts them is resolved per window
+// at the boundary (u_wl_stage_to_device_scale), never assumed to be mon_scale.
 // The `logical_` prefix is not decoration: the 2026-09-20 faults all came from
 // two coordinate spaces sharing one variable name, so the cache keeps the
 // payload's space in the name and the conversion happens at exactly one place
@@ -77,6 +93,10 @@ struct wlg_window
 	//! Mutter's FRACTIONAL monitor scale (Meta.Display.get_monitor_scale) —
 	//! 1.6667 on the measured box's laptop. Never an integer wl_output.scale.
 	float mon_scale;
+	//! Device px per stage px on that monitor, as the publisher states it
+	//! (extension v11+, `monitor.device_scale`: the scale of the stage view
+	//! painting it). 0 when not published — then the layout mode decides.
+	float mon_device_scale;
 	//! False when Mutter published no `monitor` object (window on no monitor).
 	bool have_monitor;
 	//! Buffer rect, LOGICAL px, same coordinates (Meta.Window.get_buffer_rect):
@@ -87,12 +107,22 @@ struct wlg_window
 	int32_t buffer_logical_x, buffer_logical_y;
 	int32_t buffer_logical_w, buffer_logical_h;
 	bool have_buffer;
+	//! Where the compositor PAINTS the main surface, DEVICE px relative to
+	//! the monitor's top-left (`buffer_device`, #1991). The one field here
+	//! that is not logical: the publisher has done the conversion, with the
+	//! compositor's own rounding. False when not published.
+	int32_t buffer_device_x, buffer_device_y;
+	int32_t buffer_device_w, buffer_device_h;
+	bool have_buffer_device;
 	//! An interactive grab is running on this window (publisher v3+).
 	bool moving;
 	bool have_moving;
 	//! The last drag ended on the drag lattice and the window has not moved
 	//! since (publisher v7+; false when absent).
 	bool lattice_drop;
+	//! The publisher runs move sync for this window's process (v9+; false
+	//! when absent).
+	bool move_sync;
 };
 
 #define WLG_MAX_WINDOWS 64
@@ -109,9 +139,33 @@ struct comp_vk_native_wl_geom
 	bool warned_schema;      //!< one-shot WARN guard (publisher schema too new)
 	bool warned_no_monitor;  //!< one-shot WARN guard (payload carried no monitor rect)
 	bool warned_no_placement; //!< one-shot WARN guard (publisher has no WindowPlacement1)
+	bool warned_layout;       //!< one-shot WARN guard (PHYSICAL layout / fallback source)
+
+	//! The snapshot's top-level `layout_mode` (extension v11+); UNKNOWN when
+	//! an older publisher omits it.
+	enum u_wl_layout_mode payload_layout_mode;
+	//! Mutter's own answer (DisplayConfig.GetCurrentState `layout-mode`),
+	//! asked only when the publisher states neither the device scale nor the
+	//! layout mode: an extension older than version 11, e.g. the one still
+	//! loaded in a session that has not logged out since the package upgrade.
+	enum u_wl_layout_mode mutter_layout_mode;
+	//! The cached Mutter answer must be (re)fetched: never asked, or
+	//! MonitorsChanged since.
+	bool mutter_layout_stale;
 	//! Last surface-vs-frame comparison logged (logical px), on change only.
 	int32_t logged_surface_w, logged_surface_h, logged_frame_w, logged_frame_h, logged_inset_y;
+	bool logged_buffer_device; //!< last logged rect source (INFO on change only)
 	int64_t next_retry_ns;   //!< earliest monotonic time for the next blocking GetWindows retry
+	//! The last rect get_window_rect returned (#1748, see last_rect).
+	struct comp_vk_native_wl_window_rect last_rect;
+	bool have_last_rect;
+	//! This process asked for move sync (#1748): ask again whenever the
+	//! publisher comes back (GNOME disables user extensions while the screen
+	//! shield is up, and a re-enabled extension has forgotten every caller).
+	bool move_sync_wanted;
+	//! #2071: NameOwnerChanged edges that GAVE the bus name an owner (see
+	//! comp_vk_native_wl_geom_publisher_generation).
+	uint32_t publisher_generation;
 };
 
 
@@ -150,6 +204,14 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		}
 		cJSON_Delete(root);
 		return;
+	}
+
+	// Extension v11+: which space the stage coordinates below are in. Absent
+	// from an older publisher (UNKNOWN), which then gets the Mutter fallback.
+	char layout_mode[16] = {0};
+	g->payload_layout_mode = U_WL_LAYOUT_MODE_UNKNOWN;
+	if (u_json_get_string_into_array(u_json_get(root, "layout_mode"), layout_mode, sizeof(layout_mode))) {
+		g->payload_layout_mode = u_wl_layout_mode_from_string(layout_mode);
 	}
 
 	const cJSON *windows = u_json_get(root, "windows");
@@ -193,6 +255,31 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 			out->have_buffer = out->buffer_logical_w > 0 && out->buffer_logical_h > 0;
 		}
 
+		// Additive, schema version unchanged (#1991). Device pixels are
+		// whole, so a non-integer or non-positive size is malformed and the
+		// field is ignored: the conversion of `buffer` still applies.
+		const cJSON *buffer_device = u_json_get(win, "buffer_device");
+		if (cJSON_IsArray(buffer_device) && cJSON_GetArraySize(buffer_device) == 4) {
+			int32_t v[4];
+			bool whole = true;
+			for (int i = 0; i < 4; i++) {
+				const cJSON *item = cJSON_GetArrayItem(buffer_device, i);
+				if (!cJSON_IsNumber(item) || item->valuedouble != floor(item->valuedouble) ||
+				    fabs(item->valuedouble) > (double)INT32_MAX) {
+					whole = false;
+					break;
+				}
+				v[i] = (int32_t)item->valuedouble;
+			}
+			if (whole && v[2] > 0 && v[3] > 0) {
+				out->buffer_device_x = v[0];
+				out->buffer_device_y = v[1];
+				out->buffer_device_w = v[2];
+				out->buffer_device_h = v[3];
+				out->have_buffer_device = true;
+			}
+		}
+
 		bool focus = false;
 		u_json_get_bool(u_json_get(win, "focus"), &focus);
 		out->focus = focus;
@@ -210,6 +297,11 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 		bool lattice_drop = false;
 		u_json_get_bool(u_json_get(win, "lattice_drop"), &lattice_drop);
 		out->lattice_drop = lattice_drop;
+
+		// Publisher v9+: move sync is live for this window's process (#1748).
+		bool move_sync = false;
+		u_json_get_bool(u_json_get(win, "move_sync"), &move_sync);
+		out->move_sync = move_sync;
 
 		// The monitor rect + scale are what make the logical payload
 		// convertible (#1596). Schema v1 has published them since #817; they
@@ -233,6 +325,11 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 			if (u_json_get_float(u_json_get(monitor, "scale"), &scale) && scale > 0.0f) {
 				out->mon_scale = scale;
 			}
+			float device_scale = 0.0f;
+			if (u_json_get_float(u_json_get(monitor, "device_scale"), &device_scale) &&
+			    device_scale > 0.0f) {
+				out->mon_device_scale = device_scale;
+			}
 		}
 
 		count++;
@@ -245,6 +342,9 @@ wlg_parse_snapshot(struct comp_vk_native_wl_geom *g, const char *json)
 
 static bool
 wlg_request_snapshot(struct comp_vk_native_wl_geom *g, int timeout_ms);
+
+static enum comp_vk_native_wl_move_sync_reply
+wlg_send_enable_move_sync(struct comp_vk_native_wl_geom *g, int timeout_ms);
 
 //! Forget the cached snapshot. Callers then report "no rect" and the weave
 //! falls back to display-scoped — the honest outcome once we can no longer
@@ -280,17 +380,84 @@ wlg_handle_owner_changed(struct comp_vk_native_wl_geom *g, DBusMessage *msg)
 	wlg_invalidate(g);
 
 	if (new_owner[0] != '\0') {
+		// #2071: the compositor re-syncs everything it derived from the
+		// previous publisher (see comp_vk_native_wl_geom_publisher_generation).
+		g->publisher_generation++;
 		return true;
 	}
 
 	U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME
-	        " went away (GNOME disables user extensions "
-	        "while the screen shield is up) — dropped the cached geometry rather than weave at an "
-	        "origin we can no longer vouch for; display-scoped until it returns.");
+	        " went away (a shell restart, the extension disabled, or the lock screen with an extension "
+	        "older than version 14) — dropped the cached geometry rather than weave at an origin we can "
+	        "no longer vouch for; display-scoped until it returns, then re-synced (#2071).");
 	// The name has no owner, so an immediate GetWindows buys only an error
 	// reply. Hand the wait back to the bounded retry path.
 	g->next_retry_ns = os_monotonic_get_ns() + WLG_RETRY_PERIOD_NS;
 	return false;
+}
+
+/*!
+ * Mutter's layout mode, straight from Mutter: the `layout-mode` property of
+ * org.gnome.Mutter.DisplayConfig.GetCurrentState
+ * `(u serial, a(...) monitors, a(...) logical_monitors, a{sv} properties)`.
+ *
+ * The fallback for a publisher that states neither `monitor.device_scale` nor
+ * `layout_mode` (extension version 10 and older). Bounded and blocking, so it
+ * runs once, and again only after MonitorsChanged — never per frame.
+ *
+ * @return UNKNOWN when Mutter does not answer (not GNOME, or a Mutter too old
+ *         to report the property); callers then keep the monitor scale.
+ */
+static enum u_wl_layout_mode
+wlg_query_mutter_layout_mode(struct comp_vk_native_wl_geom *g, int timeout_ms)
+{
+	DBusMessage *call =
+	    dbus_message_new_method_call(MUTTER_DC_BUS_NAME, MUTTER_DC_OBJ_PATH, MUTTER_DC_IFACE, "GetCurrentState");
+	if (call == NULL) {
+		return U_WL_LAYOUT_MODE_UNKNOWN;
+	}
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g->conn, call, timeout_ms, NULL);
+	dbus_message_unref(call);
+	if (reply == NULL) {
+		return U_WL_LAYOUT_MODE_UNKNOWN;
+	}
+
+	enum u_wl_layout_mode mode = U_WL_LAYOUT_MODE_UNKNOWN;
+	DBusMessageIter it;
+	if (dbus_message_iter_init(reply, &it)) {
+		// Skip serial, monitors and logical monitors to the properties dict.
+		int skipped = 0;
+		while (skipped < 3 && dbus_message_iter_next(&it)) {
+			skipped++;
+		}
+		if (skipped == 3 && dbus_message_iter_get_arg_type(&it) == DBUS_TYPE_ARRAY) {
+			DBusMessageIter dict;
+			dbus_message_iter_recurse(&it, &dict);
+			while (dbus_message_iter_get_arg_type(&dict) == DBUS_TYPE_DICT_ENTRY) {
+				DBusMessageIter entry, value;
+				const char *key = NULL;
+				dbus_message_iter_recurse(&dict, &entry);
+				if (dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_STRING) {
+					dbus_message_iter_get_basic(&entry, &key);
+				}
+				if (key != NULL && strcmp(key, "layout-mode") == 0 && dbus_message_iter_next(&entry) &&
+				    dbus_message_iter_get_arg_type(&entry) == DBUS_TYPE_VARIANT) {
+					dbus_message_iter_recurse(&entry, &value);
+					if (dbus_message_iter_get_arg_type(&value) == DBUS_TYPE_UINT32) {
+						dbus_uint32_t v = 0;
+						dbus_message_iter_get_basic(&value, &v);
+						mode = v == U_WL_LAYOUT_MODE_LOGICAL    ? U_WL_LAYOUT_MODE_LOGICAL
+						       : v == U_WL_LAYOUT_MODE_PHYSICAL ? U_WL_LAYOUT_MODE_PHYSICAL
+						                                        : U_WL_LAYOUT_MODE_UNKNOWN;
+					}
+					break;
+				}
+				dbus_message_iter_next(&dict);
+			}
+		}
+	}
+	dbus_message_unref(reply);
+	return mode;
 }
 
 //! Drain pending bus messages without blocking; keep the latest snapshot.
@@ -315,6 +482,9 @@ wlg_pump(struct comp_vk_native_wl_geom *g)
 			}
 		} else if (dbus_message_is_signal(msg, DBUS_INTERFACE_DBUS, "NameOwnerChanged")) {
 			owner_appeared |= wlg_handle_owner_changed(g, msg);
+		} else if (dbus_message_is_signal(msg, MUTTER_DC_IFACE, "MonitorsChanged")) {
+			// The layout mode can change with the monitor configuration.
+			g->mutter_layout_stale = true;
 		}
 		dbus_message_unref(msg);
 	}
@@ -329,6 +499,19 @@ wlg_pump(struct comp_vk_native_wl_geom *g)
 	// pre-invalidation, stale) until the user happened to move it again.
 	// Same bounded call the retry path already makes — the pump never blocks
 	// for anything else.
+	/*
+	 * A publisher that comes back has forgotten every move-sync caller (the
+	 * registration lives with its bus connection to US, and it was restarted).
+	 * Register again BEFORE re-snapshotting, so the snapshot already says
+	 * move_sync — until then the compositor treats the window as a lattice
+	 * window, which is correct for a publisher that does not sync it.
+	 */
+	if (g->move_sync_wanted) {
+		const enum comp_vk_native_wl_move_sync_reply r = wlg_send_enable_move_sync(g, 100);
+		U_LOG_W("wl_geom: geometry service " WLG_BUS_NAME " came back — move sync %s (#1748)",
+		        r == COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED ? "re-registered"
+		                                                  : "NOT re-registered; the drag lattice applies");
+	}
 	const bool ok = wlg_request_snapshot(g, 25);
 	// Whether or not that answered, don't let get_window_rect's lazy retry
 	// fire a second GetWindows in this same frame.
@@ -501,6 +684,14 @@ comp_vk_native_wl_geom_create(void)
 		    err.message);
 		dbus_error_free(&err);
 	}
+	// Only consulted for a publisher older than version 11 (see
+	// wlg_query_mutter_layout_mode); the signal is rare, so subscribe always.
+	g->mutter_layout_stale = true;
+	dbus_bus_add_match(g->conn, MUTTER_DC_MATCH_RULE, &err);
+	if (dbus_error_is_set(&err)) {
+		U_LOG_W("wl_geom: MonitorsChanged add_match failed (%s)", err.message);
+		dbus_error_free(&err);
+	}
 	dbus_connection_flush(g->conn);
 
 	if (!wlg_request_snapshot(g, 200)) {
@@ -589,12 +780,47 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		return false;
 	}
 
+	/*
+	 * WHICH factor. The payload is Mutter's stage coordinates, and the stage
+	 * is logical px only in Mutter's LOGICAL layout mode. In its PHYSICAL
+	 * mode (Ubuntu 24.04 / GNOME 46 at an integer scale, out of the box) the
+	 * stage IS device px and the monitor scale only says how big clients
+	 * draw: multiplying by it read a 3840x2160 panel at 200 % as 7680x4320,
+	 * so the window was "not on the panel" and never wove.
+	 */
+	enum u_wl_layout_mode layout = g->payload_layout_mode;
+	const char *layout_src = "the geometry service";
+	if (best->mon_device_scale <= 0.0f && layout == U_WL_LAYOUT_MODE_UNKNOWN) {
+		if (g->mutter_layout_stale) {
+			g->mutter_layout_stale = false;
+			g->mutter_layout_mode = wlg_query_mutter_layout_mode(g, 100);
+		}
+		layout = g->mutter_layout_mode;
+		layout_src = "Mutter DisplayConfig (the geometry service predates version 11)";
+	}
+	const double device_scale =
+	    u_wl_stage_to_device_scale((double)best->mon_scale, (double)best->mon_device_scale, layout);
+	if (!(device_scale > 0.0)) {
+		return false;
+	}
+
+	if (!g->warned_layout && (layout == U_WL_LAYOUT_MODE_PHYSICAL ||
+	                          (best->mon_device_scale > 0.0f && best->mon_device_scale != best->mon_scale))) {
+		g->warned_layout = true;
+		U_LOG_W(
+		    "wl_geom: Mutter is in its PHYSICAL layout mode (from %s): window geometry is already DEVICE "
+		    "px, so the monitor scale %.4f is not applied (factor %.4f).",
+		    best->mon_device_scale > 0.0f ? "the geometry service's device_scale" : layout_src,
+		    (double)best->mon_scale, device_scale);
+	}
+
 	const struct u_wl_monitor mon = {
 	    .logical_x = best->mon_logical_x,
 	    .logical_y = best->mon_logical_y,
 	    .logical_w = best->mon_logical_w,
 	    .logical_h = best->mon_logical_h,
-	    .scale = (double)best->mon_scale,
+	    // Device px per STAGE px — the monitor scale only in LOGICAL layout.
+	    .scale = device_scale,
 	    .mode_w = 0, // Mutter publishes the fractional scale, not the mode.
 	    .mode_h = 0,
 	};
@@ -615,12 +841,27 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	struct u_wl_rect_logical content_logical = frame_logical;
 	u_wl_window_content_rect(&frame_logical, best->have_buffer ? &buffer_logical : NULL, &content_logical);
 
+	/*
+	 * WHERE it is painted (#1991): the publisher's `buffer_device` when it
+	 * sent one — the compositor's own answer — else the conversion of the
+	 * content rect, which guesses the compositor's rounding.
+	 */
+	const struct u_wl_rect_px buffer_device = {best->buffer_device_x, best->buffer_device_y, best->buffer_device_w,
+	                                           best->buffer_device_h};
 	struct u_wl_rect_px win_px = {0, 0, 0, 0};
+	bool used_buffer_device = false;
 	int32_t mon_w_px = 0, mon_h_px = 0;
-	if (!u_wl_window_rect_px_on_monitor(&mon, content_logical.logical_x, content_logical.logical_y,
-	                                    content_logical.logical_w, content_logical.logical_h, &win_px) ||
+	if (!u_wl_window_device_rect(&mon, &content_logical, best->have_buffer_device ? &buffer_device : NULL, &win_px,
+	                             &used_buffer_device) ||
 	    !u_wl_monitor_size_px(&mon, &mon_w_px, &mon_h_px) || win_px.w <= 0 || win_px.h <= 0) {
 		return false;
+	}
+	if (used_buffer_device != g->logged_buffer_device) {
+		g->logged_buffer_device = used_buffer_device;
+		U_LOG_I("wl_geom: content device rect %s",
+		        used_buffer_device ? "is the publisher's buffer_device (where the compositor "
+		                             "paints it, #1991)"
+		                           : "is converted from the logical buffer rect");
 	}
 
 	if (!g->warned_scale) {
@@ -630,11 +871,15 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 		// a scaled desktop is now a supported configuration for the phase
 		// feed, not a degradation.
 		U_LOG_I(
-		    "wl_geom: monitor scale %.4f — window content logical %d,%d %dx%d on a %dx%d logical monitor "
-		    "converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
-		    (double)best->mon_scale, content_logical.logical_x, content_logical.logical_y,
-		    content_logical.logical_w, content_logical.logical_h, best->mon_logical_w, best->mon_logical_h,
-		    win_px.x, win_px.y, win_px.w, win_px.h, mon_w_px, mon_h_px);
+		    "wl_geom: monitor scale %.4f, %s layout, factor %.4f — window content stage %d,%d %dx%d on a "
+		    "%dx%d stage monitor converts to DEVICE %d,%d %dx%d on a %dx%d px monitor (#1596)",
+		    (double)best->mon_scale,
+		    layout == U_WL_LAYOUT_MODE_PHYSICAL  ? "PHYSICAL"
+		    : layout == U_WL_LAYOUT_MODE_LOGICAL ? "LOGICAL"
+		                                         : "unknown",
+		    device_scale, content_logical.logical_x, content_logical.logical_y, content_logical.logical_w,
+		    content_logical.logical_h, best->mon_logical_w, best->mon_logical_h, win_px.x, win_px.y, win_px.w,
+		    win_px.h, mon_w_px, mon_h_px);
 	}
 
 	out_rect->frame_logical_x = best->logical_x;
@@ -646,6 +891,7 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->moving = best->moving;
 	out_rect->have_moving = best->have_moving;
 	out_rect->lattice_drop = best->lattice_drop;
+	out_rect->move_sync = best->move_sync;
 
 	out_rect->left_px = win_px.x;
 	out_rect->top_px = win_px.y;
@@ -653,7 +899,9 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->height_px = (uint32_t)win_px.h;
 	out_rect->monitor_width_px = (uint32_t)mon_w_px;
 	out_rect->monitor_height_px = (uint32_t)mon_h_px;
-	out_rect->scale = best->mon_scale;
+	out_rect->scale = (float)device_scale;
+	out_rect->monitor_scale = best->mon_scale;
+	out_rect->from_buffer_device = used_buffer_device;
 
 	/*
 	 * The committed SURFACE vs the FRAME. Two different reasons they differ,
@@ -678,13 +926,17 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 	out_rect->surface_within_frame = true;
 	out_rect->frame_inset_top_px = 0;
 	if (best->have_buffer) {
-		out_rect->surface_width_px =
-		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, (double)best->mon_scale);
-		out_rect->surface_height_px =
-		    (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, (double)best->mon_scale);
+		// The painted size is the 1:1 test's destination (#1991); without
+		// it, the converted buffer size.
+		out_rect->surface_width_px = used_buffer_device
+		                                 ? (uint32_t)win_px.w
+		                                 : (uint32_t)u_wl_logical_to_px(best->buffer_logical_w, device_scale);
+		out_rect->surface_height_px = used_buffer_device
+		                                  ? (uint32_t)win_px.h
+		                                  : (uint32_t)u_wl_logical_to_px(best->buffer_logical_h, device_scale);
 		out_rect->surface_within_frame = u_wl_surface_within_frame(&frame_logical, &buffer_logical);
 		const int32_t inset_y = best->buffer_logical_y - best->logical_y;
-		out_rect->frame_inset_top_px = u_wl_logical_to_px(inset_y, (double)best->mon_scale);
+		out_rect->frame_inset_top_px = u_wl_logical_to_px(inset_y, device_scale);
 		if (best->buffer_logical_w != g->logged_surface_w || best->buffer_logical_h != g->logged_surface_h ||
 		    best->logical_w != g->logged_frame_w || best->logical_h != g->logged_frame_h ||
 		    inset_y != g->logged_inset_y) {
@@ -717,7 +969,82 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g, struct 
 			}
 		}
 	}
+	g->last_rect = *out_rect;
+	g->have_last_rect = true;
 	return true;
+}
+
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect)
+{
+	if (g == NULL || out_rect == NULL || !g->have_last_rect) {
+		return false;
+	}
+	*out_rect = g->last_rect;
+	return true;
+}
+
+static enum comp_vk_native_wl_move_sync_reply
+wlg_send_enable_move_sync(struct comp_vk_native_wl_geom *g, int timeout_ms)
+{
+	DBusMessage *call =
+	    dbus_message_new_method_call(WLG_BUS_NAME, WLG_PLACEMENT_PATH, WLG_PLACEMENT_IFACE, "EnableMoveSync");
+	if (call == NULL) {
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	dbus_uint32_t pid = 0; // 0 = the caller
+	if (!dbus_message_append_args(call, DBUS_TYPE_UINT32, &pid, DBUS_TYPE_INVALID)) {
+		dbus_message_unref(call);
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	DBusError err;
+	dbus_error_init(&err);
+	DBusMessage *reply = dbus_connection_send_with_reply_and_block(g->conn, call, timeout_ms, &err);
+	dbus_message_unref(call);
+	if (reply == NULL) {
+		// No such method / object / interface: a publisher older than
+		// version 9, which never will sync. Anything else (no owner yet, a
+		// timeout) may still resolve when the publisher (re)appears.
+		const bool unsupported =
+		    dbus_error_is_set(&err) && (dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_METHOD) ||
+		                                dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_OBJECT) ||
+		                                dbus_error_has_name(&err, DBUS_ERROR_UNKNOWN_INTERFACE));
+		U_LOG_W("wl_geom: EnableMoveSync: %s (%s)",
+		        unsupported ? "the window-geometry extension predates move sync (version < 9) - the drag "
+		                      "lattice applies; update the extension for move-synchronised drags"
+		                    : "no answer from the window-geometry extension yet - will register when it "
+		                      "appears",
+		        dbus_error_is_set(&err) ? err.message : "no reply");
+		dbus_error_free(&err);
+		return unsupported ? COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED : COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE;
+	}
+	dbus_bool_t ok = FALSE;
+	if (!dbus_message_get_args(reply, NULL, DBUS_TYPE_BOOLEAN, &ok, DBUS_TYPE_INVALID)) {
+		ok = FALSE;
+	}
+	dbus_message_unref(reply);
+	return ok == TRUE ? COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED : COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED;
+}
+
+enum comp_vk_native_wl_move_sync_reply
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g)
+{
+	if (g == NULL || g->conn == NULL) {
+		return COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED;
+	}
+	const enum comp_vk_native_wl_move_sync_reply r = wlg_send_enable_move_sync(g, 200);
+	g->move_sync_wanted = (r != COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED);
+	return r;
+}
+
+uint32_t
+comp_vk_native_wl_geom_publisher_generation(struct comp_vk_native_wl_geom *g)
+{
+	if (g == NULL) {
+		return 0;
+	}
+	wlg_pump(g);
+	return g->publisher_generation;
 }
 
 bool

@@ -78,6 +78,8 @@ older runtime sees a zeroed slot.
 | `get_android_class_host_context` | Android | A `Context` whose `getClassLoader()` can resolve classes shipped in the **runtime's** APK. **Class loading only.** See below. |
 
 ### `get_android_class_host_context` (ADR-036 D2, #1037)
+| `request_display_rescan` | all | "My displays may have changed": the runtime re-runs the per-monitor claim sweep (ADR-047 Amendment 8) — re-enumerates the monitors, probes every plug-in that is not a claim source yet (so one whose `probe()` declined is asked again), calls `probe_displays` on every source and publishes the new screen table to live sessions. Debounced, served on a runtime thread, returns at once; callable from any thread (a vendor SDK's event thread, under the plug-in's own locks) and after `probe()` declined — copy the pointer at negotiate time. Call it when the vendor backend recognises or loses a panel (Leia SR: `SR_EVENT_TYPE_DISPLAY_TOPOLOGY_CHANGED`). `XRT_PLUGIN_HOST_HAS_DISPLAY_RESCAN`. |
+| `get_setting` | all | The one options contract (ADR-054 decision 7, N3c): `get_setting(iface->id, "KEY", buf, cap)` resolves the plug-in's own setting through the runtime's chain — `DXR_DP_<ID>_<KEY>` in the hosting process's environment (always wins) → the per-user store (HKCU `…\DisplayProcessors\<id>\Settings\<KEY>` / POSIX `<id>.settings.json`) → the row's HKLM `Settings\<KEY>` / manifest `settings` → false (keep your compiled default). Strings; you parse. The ONLY way a plug-in reads a knob — never `getenv`. Process-lifetime pointer (copy it at negotiate); read at init and cache. `xrt/xrt_component_settings.h`; `XRT_PLUGIN_HOST_HAS_GET_SETTING`. Pair it with the optional `describe_settings` vtable slot below so `displayxr-cli dp options <id>` can list the keys. |
 
 ```c
 void *(*get_android_class_host_context)(void);   /* jobject, or NULL */
@@ -225,9 +227,11 @@ Fields to populate:
 | `nominal_viewer_x_m`, `nominal_viewer_y_m`, `nominal_viewer_z_m` | meters (float) | Default viewer position relative to display center. Drives Kooima projection defaults when the app has no head tracking. |
 | `display_pixel_width`, `display_pixel_height` | pixels (uint32) | Native panel resolution |
 | `recommended_view_scale_x`, `recommended_view_scale_y` | float, 1.0 = native | Vendor-recommended per-view scaling. <1.0 means downscale. **Baseline hint only** — see the rule below. |
-| `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference / display origin == desktop origin" (sim-display picks this). |
+| `display_screen_left`, `display_screen_top` | virtual-screen coords (int32) | Display top-left in Windows-style virtual-screen pixels. Used to position workspace windows. Both 0 = "no preference" (sim-display picks this) unless `display_flags` carries `XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID`. |
 | `supported_eye_tracking_modes` | bitmask | bit 0 = MANAGED, bit 1 = MANUAL, `0` = no eye tracking. A typical hardware DP is MANAGED-only; the reference simulator (sim_display) declares `0` — its positions are nominal, not tracked (`SIM_DISPLAY_FAKE_TRACKING=1` dev toggle re-enables MANUAL for testing). Must be non-zero iff at least one `xrt_rendering_mode` sets `XRT_RENDERING_MODE_FLAG_HAS_TRACKING` in `mode_flags` (ABI v3, #441). |
 | `default_eye_tracking_mode` | enum | 0 = MANAGED, 1 = MANUAL. |
+| `refresh_mhz` | milli-Hz (uint32) | Panel refresh rate; `0` = unknown. |
+| `display_flags` | bitmask (uint32) | `XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID` (bit 0): `display_screen_left/top` is a real position **even when it is (0, 0)** — set it whenever the origin came from an identified monitor. Without it (0, 0) reads as "no preference" and the runtime picks the panel's monitor by claim / size heuristics, which with two panels of one vendor and the primary at the desktop origin chose the wrong one (#2577). `#ifdef XRT_PLUGIN_HAS_DISPLAY_ORIGIN_VALID`. |
 
 **The view-scale rule — one derivation, never two.**
 `xrt_rendering_mode::view_scale_x/y` (your device's mode table) is the **single
@@ -260,6 +264,253 @@ a disagreeing value does not survive the first mode switch anyway.
 
 **Called again after startup — keep it cheap.** A long-lived service can start before the vendor backend has identified the panel (an unattended reboot with the panel asleep; even a healthy boot needs a few seconds after the vendor platform service is up). The runtime therefore calls `get_display_info` not only at instance create but again on every client connect / per-client compositor create (`xrt_system_compositor_info::refresh_display_processors`), and — while the answer is still unknown — about once a second from the service's main loop (#1721), so identification is picked up even when no client connects afterwards; it re-applies the answer whenever the reported geometry (physical size, pixel size, nominal viewer, screen origin) differs from what it last applied — logging one `display info refreshed from plug-in after startup` WARN. IPC clients that connected *before* the first real answer keep the startup snapshot of the head's mode table (`rendering_modes[]` tiling, per-view pixel dims) they were created with — the client copies it out of shared memory once at device create — until they reconnect; their head poses/geometry are already right because you update your own `xrt_device` in place. The contract for the repeat calls: return `false` **fast** while the panel is still unknown (no blocking retry — spend any startup budget once, in `create_device`), and `true` with the real numbers once it is; keep your own head `xrt_device` (views, FOV, `hmd->views[].display`) correct in place, because the runtime re-derives only its own tiling / atlas / `xsysc->info` from the struct. Return values must be stable between calls for the same panel so the refresh stays a no-op.
 
+### `get_display_info_for_monitor` (multi-screen M1)
+
+```c
+bool (*get_display_info_for_monitor)(struct xrt_plugin_instance *inst,
+                                     const struct xrt_display_descriptor *display,
+                                     const struct xrt_display_physical *physical,
+                                     struct xrt_plugin_display_info *out_info);
+```
+
+The per-monitor twin of `get_display_info`: describe ONE monitor your plug-in won in the
+per-monitor registry (your `probe_displays` claim beat everyone else's). Same out struct,
+same field meanings — physical size, nominal viewer (display-centred, metres), native
+pixels, recommended view scale (`0` = let the runtime decide), desktop origin, eye-tracking
+modes supported/default — but keyed by the monitor, with no head device. It feeds
+`XR_DXR_display_info` v22 `xrEnumerateDisplaysDXR` (`docs/specs/extensions/XR_DXR_display_info.md`)
+and `displayxr-cli info`'s `:: Displays` block.
+
+- `display` is the descriptor `probe_displays` saw for the monitor. `physical` carries what the
+  descriptor does not — EDID millimetres and the connector's device mode — and may be NULL;
+  its fields are 0 when unknown. Clamp reads to `physical->struct_size`.
+- The runtime sets `out_info->struct_size` and zero-fills the rest; never write past it.
+- Cheap, non-blocking, any thread: it runs on every `xrEnumerateDisplaysDXR` and in diagnostics.
+- Return `false` for a monitor you cannot describe.
+
+**Which monitor gets which source.** The system-default monitor (the one the scalar
+`get_display_info` describes, i.e. `XrSystemProperties`) always reports the system info, so
+the two can never disagree — this slot is asked only about your *other* monitors. With the
+slot absent (NULL, or a `struct_size` that predates it) those monitors get runtime defaults
+from EDID: physical size from the millimetres, view scale 1, no eye tracking, nominal viewer
+centred at the distance that matches the system panel's vertical FOV.
+
+**ABI.** Appended after `stereo_camera_close` per ADR-020 (append-only, `struct_size`-gated,
+no `XRT_PLUGIN_API_VERSION_CURRENT` bump). Guard an implementation with
+`#ifdef XRT_PLUGIN_IFACE_HAS_DISPLAY_INFO_FOR_MONITOR` to keep building against older
+headers. `xrt_display_physical` is a separate struct passed by pointer **on purpose**:
+`probe_displays` receives descriptors as an array, so appending to `xrt_display_descriptor`
+would change the array stride under every existing plug-in — a layout break, not a free
+append. Reference implementation: `sim_display_plugin.c` (EDID mm, else its
+`SIM_DISPLAY_WIDTH_M/HEIGHT_M` defaults; its usual nominal viewer; `SIM_DISPLAY_FAKE_TRACKING`
+semantics unchanged).
+
+**Where claims surface.** `displayxr-cli displays --claims --json` publishes each winning claim (plug-in id, confidence, your claim's `serial` verbatim, EDID mm) and is polled by vendor dashboards, so its shape is a contract versioned by a top-level `"schema"` (keys only ever added; ADR-051).
+
+### `create_dp_vk_for_screen` (multi-screen M2)
+
+```c
+xrt_result_t (*create_dp_vk_for_screen)(struct xrt_plugin_instance *inst,
+                                        void *vk_bundle,
+                                        void *vk_cmd_pool,
+                                        void *window_handle,
+                                        int32_t target_format,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor **out_xdp);
+```
+
+Make a Vulkan DP for ONE screen your plug-in won. A window that spans screens is woven per
+**segment** (canvas ∩ screen, [`comp-segments.md`](../architecture/comp-segments.md)); the
+session's own DP keeps the system-default screen's segment and this slot makes the DP for each
+other screen. Same contract as `create_dp_vk`, plus:
+
+- `binding` names the screen: monitor id, desktop rect, native (device-mode) pixels, EDID mm,
+  desktop scale, your claim's serial, a vendor display id (0 until SR-P1/P2 supply one), the
+  output name. Clamp reads to `binding->struct_size`. Answer `get_display_dimensions` /
+  `get_display_pixel_info` for THAT screen, with the screen origin = the binding's desktop
+  origin.
+- `window_handle` is NULL on desktop Linux: a segment DP is windowless, its phase comes from
+  `set_present_origin` (ADR-033) — the window's origin relative to THIS screen, to which you add
+  the canvas offset. On **Windows** (multi-screen M6, ADR-047 Amendments 2 + 5) it is the
+  session's real HWND for the DP of the screen holding the MAJORITY of the window (it keeps your
+  drag phase-snap; phase from the window) and NULL for every other screen's DP — the same rule as
+  `create_dp_d3d11_for_screen`. The runtime may also ask this slot for a windowless DP for the
+  system-default screen while another screen holds the window.
+- Each `process_atlas` hands you `canvas = the segment` (a sub-rect of the target) and an atlas
+  that holds exactly that segment's views (the runtime crops per segment — crop before the DP is
+  the law). **Confine render area, viewport AND scissor to the canvas** (a windowless weaver's
+  default scissor is its panel rect — multi-screen plan risk 7), and **do not assume you are the
+  first writer** to the target this frame: the target arrives in `COLOR_ATTACHMENT_OPTIMAL`
+  holding other segments' pixels; leave it in `PRESENT_SRC_KHR` like any VK DP.
+- Several instances coexist in one process, one per screen.
+
+NULL (or an older `struct_size`) → your screens other than the session's primary one get a
+flat 2D view. There is deliberately no fallback to `create_dp_vk`: that DP describes your one
+panel, not the screen, and nothing binds it to the canvas / not-first-writer contract above, so
+it could clear the segment the primary DP just wove.
+Appended after `get_display_info_for_monitor` per ADR-020 (`struct_size`-gated, no
+`XRT_PLUGIN_API_VERSION_CURRENT` bump; ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_FOR_SCREEN`. M2 only segments a window whose screens all
+belong to the ACTIVE plug-in; mixed vendors are M4. Reference implementation:
+`sim_display_dp_factory_vk_for_screen` (`drivers/sim_display/sim_display_processor.c`).
+
+### `create_dp_d3d11_for_screen` / `create_dp_d3d12_for_screen` (multi-screen M6, Windows)
+
+```c
+xrt_result_t (*create_dp_d3d11_for_screen)(struct xrt_plugin_instance *inst, void *d3d11_device,
+                                           void *d3d11_context, void *window_handle,
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_d3d11 **out_xdp);
+xrt_result_t (*create_dp_d3d12_for_screen)(struct xrt_plugin_instance *inst, void *d3d12_device,
+                                           void *d3d12_command_queue, void *window_handle,
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_d3d12 **out_xdp);
+```
+
+The Windows twins of `create_dp_vk_for_screen`, for the in-process D3D11 and D3D12 compositors.
+Same `binding` rules; `window_handle` is the session's real HWND only for the DP that keeps the
+vendor's drag phase-snap and NULL for every other screen's DP, whose phase comes from the
+appended per-API `set_present_origin` slot (`xrt_display_processor_d3d11::set_present_origin`,
+`xrt_display_processor_d3d12::set_present_origin`, both `struct_size`-gated, announced by
+`XRT_DP_D3D11_HAS_PRESENT_ORIGIN` / `XRT_DP_D3D12_HAS_PRESENT_ORIGIN`), called before every weave,
+plus the canvas offset. `process_atlas` gets `canvas = the segment` and a pre-cropped atlas
+holding exactly that segment's views; confine viewport AND scissor to the canvas and do not
+assume you are the first writer. On D3D12 every segment records onto ONE command list, which
+carries no viewport/scissor a DP could inherit — the DP sets both itself from the canvas; the
+atlas arrives as a plain 2D texture in `COMMON` with its own SRV descriptor. Appended after
+`create_dp_vk_for_screen` (D3D11) and `create_dp_metal_for_screen` (D3D12) per ADR-020 (ABI stays
+5); guard with `#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D11_FOR_SCREEN` /
+`XRT_PLUGIN_IFACE_HAS_CREATE_DP_D3D12_FOR_SCREEN`. Reference implementations:
+`sim_display_dp_factory_d3d11_for_screen` / `sim_display_dp_factory_d3d12_for_screen`.
+
+### `create_dp_gl_for_screen` (multi-screen M6, Windows OpenGL)
+
+```c
+xrt_result_t (*create_dp_gl_for_screen)(struct xrt_plugin_instance *inst, void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_gl **out_xdp);
+```
+
+The OpenGL twin, for the in-process GL compositor (`cube_handle_gl_win`, GL demos). Same `binding`
+and `window_handle` rules as the D3D11 slot, plus the GL factory's own: the compositor's GL context
+is current on the calling thread, every later call into the DP happens on that one context, and
+several per-screen DPs share it (load your own GLAD table — the per-DLL trap the plain factory
+already has). Phase from the appended `xrt_display_processor_gl::set_present_origin`
+(`struct_size`-gated, `XRT_DP_GL_HAS_PRESENT_ORIGIN`) plus the canvas offset. What is GL-specific:
+
+- `process_atlas` draws into the bound framebuffer (the window, or the transparent path's
+  transit FBO), and the runtime has set `glViewport` **and** `glScissor` (`GL_SCISSOR_TEST` on) to
+  the segment. The canvas you are handed is top-left origin like every backend's; in GL's
+  bottom-left framebuffer coordinates the segment is
+  `(canvas_x, target_height − canvas_y − canvas_height, canvas_width, canvas_height)`. Do not
+  re-state a whole-target viewport and do not disable the scissor.
+- The atlas is a `GL_TEXTURE_2D` holding exactly the segment's views in the usual GL tile order
+  (view 0 in the top row of `v`, #1625).
+- **The session's own DP (from the plain `create_dp_gl`) weaves the primary screen's segment the
+  same way**, so a plug-in that implements this slot must also honour a non-empty canvas on its
+  plain GL DP. The GL compositor therefore segments a window only when the primary screen's
+  plug-in implements this slot: a pre-M6 GL DP re-states a whole-target viewport inside
+  `process_atlas` (the old GL contract said "the caller sets the viewport", and DPs re-stated it),
+  which would weave the primary segment's crop across the whole window.
+
+Appended after `get_screen_status` per ADR-020 (ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_GL_FOR_SCREEN`, test with
+`xrt_plugin_iface_has_create_dp_gl_for_screen()`. Reference implementation:
+`sim_display_dp_factory_gl_for_screen` (`drivers/sim_display/sim_display_processor_gl.c`).
+
+**The 1:1 capability.** Report through the existing `get_scanout_caps` slot whether your output
+survives a display-server resample: `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` in
+`xrt_dp_scanout_caps::flags` (carved from the former `reserved[0]`, so an older plug-in reads
+as "needs 1:1"). A lenticular weave leaves it clear; the runtime then paints flat 2D on a
+segment whose screen is resampled, and the #1595 / #1831 session gates degrade as before.
+sim_display sets it for every output but INTERLACED.
+
+### `create_dp_metal_for_screen` (multi-screen on macOS)
+
+```c
+xrt_result_t (*create_dp_metal_for_screen)(struct xrt_plugin_instance *inst,
+                                           void *metal_device,     // id<MTLDevice>
+                                           void *command_queue,    // id<MTLCommandQueue>
+                                           void *window_handle,    // NSView*, NULL today
+                                           const struct xrt_screen_binding *binding,
+                                           struct xrt_display_processor_metal **out_xdp);
+```
+
+The Metal twin of `create_dp_vk_for_screen` / `create_dp_d3d11_for_screen`, used by the
+in-process Metal compositor (`compositor/metal/comp_metal_segments.m`). Appended after
+`create_dp_d3d11_for_screen` (`struct_size`-gated, no ABI bump); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_CREATE_DP_METAL_FOR_SCREEN`. **Exactly what a plug-in implements:**
+
+1. **The factory.** Same as `create_dp_metal`, plus `binding`: on macOS `desktop_*` is the
+   display's `CGDisplayBounds` in top-down **points**, `native_pixel_*` its current mode in
+   backing px, `desktop_scale` its backing scale, `device_name` the CoreGraphics display UUID,
+   `serial` your claim's serial. Resolve it to your SDK's display (`binding->display_id`, else
+   your per-monitor claim) and bind the weaver to THAT display. Answer
+   `get_display_dimensions` / `get_display_pixel_info` for it. `window_handle` is NULL: the DP
+   is windowless and must weave without a view.
+2. **`xrt_display_processor_metal::set_present_origin`** (new Metal DP slot, appended after
+   `get_background_preview`; guard with `#ifdef XRT_DP_METAL_HAS_PRESENT_ORIGIN`). The runtime
+   calls it every frame before `process_atlas` with the window content view's top-left in
+   **backing pixels of that display, relative to its `CGDisplayBounds` origin** (top-down) —
+   exactly what the Leia SR Metal weaver's `srWeaverSetPresentOrigin` takes. Forward it; do NOT
+   recompute it from a window (you were not given one). Phase = origin + `canvas_offset`; the
+   runtime guarantees that sum is the segment's top-left on the panel even when the window's
+   backing scale differs from the display's (the origin absorbs the difference). It is sent
+   only where the window's pixels reach the panel 1:1.
+3. **`process_atlas` with `canvas = the segment`** (drawable px) and a pre-cropped atlas
+   holding exactly that segment's views, on the frame's shared command buffer. You encode your
+   own render pass, so: **`MTLLoadActionLoad` on the target, never `Clear`** (other segments are
+   already there), and **viewport AND scissor rect = the canvas**.
+4. **`get_scanout_caps`**: set `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE` only if the output
+   survives a WindowServer resample (a lenticular weave does not). The runtime counts a display
+   as 1:1 when its backing scale equals the window's and points × scale equal its native mode.
+5. `request_display_mode` follows the session; `set_background_2d(NULL)` is sent once.
+
+The session's own DP (from `create_dp_metal`, with the app's NSView) keeps weaving the
+system-default display's segment; it runs FIRST each split frame, so it may still clear. A
+plug-in without this slot gets flat 2D on its other displays. Reference implementation:
+`sim_display_dp_factory_metal_for_screen` (`drivers/sim_display/sim_display_processor_metal.m`).
+
+### `get_screen_status` (display dashboard, ADR-051 D2)
+
+```c
+xrt_result_t (*get_screen_status)(struct xrt_plugin_instance *inst, uint64_t monitor_id,
+                                  struct xrt_plugin_screen_status *out);
+```
+
+The vendor summary cell for ONE screen the plug-in claimed (`monitor_id` is a
+`xrt_display_descriptor::monitor_id` it returned a claim for). The dashboard (`displayxr-cli
+status`, the DisplayXR Dashboard's Displays page) shows the values and strings; the runtime never
+learns what they mean for a vendor. `struct xrt_plugin_screen_status` (caller sets `struct_size`
+and zero-fills; the plug-in sets `version = 1` and never writes past `struct_size`):
+
+| Field | Meaning |
+|---|---|
+| `change_counter` | Moves whenever anything below may have changed; a poller skips a screen whose counter did not move. |
+| `ready` / `verified` / `calibrated` | Platform up for this screen / positively identified as the vendor's hardware / a valid calibration exists (vendor-defined). |
+| `tracker` | `XRT_PLUGIN_TRACKER_STATE_{NONE, OFF, STARTING, RUNNING, DOWN, UNSUPPORTED}`. |
+| `lens` | `XRT_PLUGIN_LENS_STATE_{2D, 3D, UNKNOWN}`. |
+| `model[32]` / `serial[32]` | UTF-8, `""` = unknown. |
+| `warning_count` + `warnings[8]` | `{code[32], level (INFO/WARN/CRITICAL), text[96]}`, shown verbatim, never parsed. |
+| `dashboard_command[160]` | Command line opening the vendor's dashboard on this screen, with `{serial}` / `{monitor_id}` placeholders; `""` = none. Launched on request, never parsed. |
+
+**The call must be PASSIVE** — the vendor dashboard learned these the hard way:
+
+- no tracker, lens, display or weaver handle (a tracker handle wakes the screen's camera; a lens
+  enable is a shared vote that `destroy` does not withdraw);
+- no per-call vendor instance — keep the one long-lived instance you already have;
+- return in < 20 ms; expect to be polled every 2 s by the service and by diagnostic processes;
+- bump `change_counter` on your own device / topology events, never by polling hardware.
+
+NULL (or a `struct_size` that predates the slot) reads as "no vendor status", never an error;
+so does an error return for one screen. Appended after `create_dp_d3d12_for_screen` per ADR-020
+(`struct_size`-gated, no `XRT_PLUGIN_API_VERSION_CURRENT` bump; ABI stays 5); guard with
+`#ifdef XRT_PLUGIN_IFACE_HAS_GET_SCREEN_STATUS`, test with
+`xrt_plugin_iface_has_get_screen_status()`. Reference implementation:
+`sim_display_plugin_get_screen_status` (`drivers/sim_display/sim_display_plugin.c`), whose
+`tracker` follows `SIM_DISPLAY_FAKE_TRACKING` / `_PERIOD_MS` so the live UI is testable with no
+hardware.
+
 ### `set_pose_source`
 
 ```c
@@ -287,6 +538,59 @@ my_plugin_set_pose_source(struct xrt_plugin_instance *inst,
     m->external_pose_source = source;
 }
 ```
+
+### `describe_settings` (the one options contract, ADR-054 decision 7 / N3c)
+
+```c
+uint32_t (*describe_settings)(const struct xrt_component_setting_desc **out_descs);
+```
+
+Declare the keys your plug-in reads through the host's `get_setting` so `displayxr-cli dp options <id>` can list them with type, default, help, the effective value and where it came from. Write the address of a plug-in-owned `static const struct xrt_component_setting_desc[]` (`{key, type, default_value, help}`, every string valid for the plug-in's lifetime; `xrt/xrt_component_settings.h`) to `*out_descs` and return its length. Pure, callable from any thread, with no instance: it runs on a negotiated-only plug-in.
+
+**NULL is allowed** — the store's keys are still listed, just undeclared. Appended per ADR-020 after `create_dp_gl_for_screen` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`, test with `xrt_plugin_iface_has_describe_settings()`. Reference implementation: `sim_display_describe_settings` (`drivers/sim_display/sim_display_settings.c`, 36 keys — the same table the shim resolves them from).
+
+### `get_claimed_cameras` (tracker-camera denylist, ADR-043 Amendment 5)
+
+```c
+uint32_t (*get_claimed_cameras)(struct xrt_plugin_instance *inst, uint32_t capacity,
+                                char (*out_ids)[XRT_PLUGIN_CLAIMED_CAMERA_ID_MAX]);
+```
+
+Declare the capture devices your display owns — above all the camera your eye tracker reads — so the service's own UVC side-by-side stereo webcam source (ADR-043 Amendment 4) never claims or opens them. The denylist wins over every `stereo-cameras.json` entry, an explicit `vid_pid` included; a refused match logs one WARN naming the device. Fill up to `capacity` NUL-terminated ids (≤ 256 bytes) and return how many you claim; each is a USB `"vvvv:pppp"` (preferred: it names every unit of the model, needs no enumeration) or the OS device id (Windows device interface / MF symbolic link, Linux `/dev/videoN`) — the same forms as `platform_device_hint`. It is a **declaration**, not a resolution: list every camera the tracker may use, attached or not, running or not; no ambiguity rule. Pure, cheap (called on every camera rescan, ~2 s while a client listens), any thread, `inst` may be NULL, and it **must not open any capture device**.
+
+**NULL is allowed** (declares nothing). The runtime still refuses every plug-in camera's `platform_device_hint` and its own small built-in list (`u_stereo_uvc_builtin_tracker_refusal`: a few VID:PIDs plug-ins already reported as tracker cameras, and the generic names "tracking camera" / "eye track"), so an older plug-in is covered conservatively. Appended per ADR-020 after `describe_settings` (gated by `struct_size`, no API bump): `#ifdef XRT_PLUGIN_IFACE_HAS_CLAIMED_CAMERAS`, test with `xrt_plugin_iface_has_claimed_cameras()`. Reference implementation: sim_display returns the webcam its opt-in eye tracker would read (`sim_display_webcam_claimed_cameras`). Today the service asks the **active** plug-in only.
+
+### `get_viewer_policy` (may the views follow an external viewer? ADR-054 N6 Part 2)
+
+```c
+uint32_t (*get_viewer_policy)(struct xrt_plugin_instance *inst, const struct xrt_display_descriptor *display);
+```
+
+Say whether the views on your display may follow a viewer measured by someone else — a
+viewer-tracking provider (`xrt/xrt_tracking_plugin.h`, the fourth component class) — when your
+display does **not** track the viewer itself. Return one of `enum xrt_plugin_viewer_policy`:
+
+| Value | Meaning |
+|---|---|
+| `XRT_PLUGIN_VIEWER_POLICY_OWN` (1) | The display owns the viewer; a provider is never used on it. |
+| `XRT_PLUGIN_VIEWER_POLICY_EXTERNAL_OK` (2) | When you report no eye tracking, the trunk may drive your views from the best enabled provider, and composes the `XR_DXR_display_info` tracking advertisement for you (MANAGED\|MANUAL + `HAS_TRACKING` on your 3D modes). |
+| `XRT_PLUGIN_VIEWER_POLICY_FIXED` (3) | Never viewer-coupled (an N-view panel whose optics supply the parallax): views stay nominal whatever providers are installed. |
+
+A display that **tracks** (`supported_eye_tracking_modes != 0`) always wins on its own screen,
+whatever this returns: the trunk never splices a second eye source into a screen whose weave uses
+tracked eyes, and it never pushes eyes into your DP. Keep reporting only what **your** display does
+in `get_display_info` — honest zero when you have no tracker.
+
+`display` is a runtime-built descriptor (as for `get_display_info_for_monitor`), or NULL for your
+active panel; answer per screen when you drive several. Pure, cheap, any thread, `inst` may be NULL.
+
+**NULL is allowed** and, like a `struct_size` that predates the slot, 0 or any unknown value, reads
+as **FIXED** — so no installed display changes behaviour. Appended per ADR-020 after
+`get_claimed_cameras` (gated by `struct_size`, no API bump): `#ifdef
+XRT_PLUGIN_IFACE_HAS_VIEWER_POLICY`, read it with `xrt_plugin_iface_viewer_policy()` (the rule
+above, applied). Reference implementation: sim_display returns `EXTERNAL_OK`
+(`sim_display_plugin_get_viewer_policy`). Contract:
+[tracking-provider-discovery.md](../specs/runtime/tracking-provider-discovery.md) §4–5.
 
 ## Forward-compatibility rules
 
@@ -392,6 +696,120 @@ bool (*get_background_preview)(struct xrt_display_processor_d3d11 *xdp,
   four floats zeroed is read as the documented normal case, `0,0,1,1`.
 - **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
 
+## Turning 2D into 3D: the lift slots (ADR-042, `XR_DXR_lift`)
+
+A vendor may ship a **2D→3D conversion module** — monocular depth, stereo or N-view synthesis,
+photo → Gaussian splats. The runtime exposes it to apps generically as
+[`XR_DXR_lift`](../specs/extensions/XR_DXR_lift.md), and, per
+[ADR-042](../adr/ADR-042-vendor-2d3d-conversion-supersedes-default.md), a READY vendor module
+supersedes the open default a browser or the web SDK would otherwise run. The plug-in side is
+five optional slots appended to `xrt_display_processor_d3d11` and one optional factory appended
+to `xrt_plugin_iface`, all announced by `XRT_DP_D3D11_HAS_LIFT` /
+`XRT_PLUGIN_IFACE_HAS_D3D11_LIFT_FACTORY`:
+
+```c
+/* xrt_dp_lift.h */
+struct xrt_dp_lift_caps { uint32_t struct_size; uint32_t modes; /* 1 DEPTH, 2 SBS, 4 NVIEW, 8 GAUSSIANS */
+                          uint32_t max_streams; uint32_t max_views;
+                          uint32_t depth_semantics; /* 0 relative, 1 metric */
+                          uint32_t state;           /* 0 unavailable, 1 activating, 2 ready */
+                          uint64_t typical_latency_ns; char backend[32]; };
+struct xrt_dp_lift_stream_info { uint32_t struct_size; uint32_t mode; uint32_t content_hint; /* 0 video, 1 photo */
+                                 float input_scale; };
+struct xrt_dp_lift_params { uint32_t struct_size; float convergence; /* [0,1] relative depth at the glass; <0 AUTO */
+                            float strength; uint32_t inpaint; uint32_t view_count;
+                            float focal_px; /* appended: input focal length in px; <=0 unknown (GAUSSIANS) */
+                            /* appended, XRT_DP_LIFT_HAS_VIEWPOINT_POLICY (ADR-048): */
+                            float rect_width_m, rect_height_m; /* lifted region size; 0 unknown */
+                            float baseline_m;      /* first-to-last viewpoint distance; 0 = none */
+                            uint32_t axis_mode;    /* 1 X, 2 XY, 3 XYZ: components that follow the viewer */
+                            float max_offset_m;    /* x/y clamp the runtime applied; 0 none */
+                            uint32_t viewpoint_frame; /* 0 DISPLAY (panel centre), 1 RECT (lifted rect centre) */
+                            /* appended, XRT_DP_LIFT_HAS_APP_RIG (ADR-048 Addendum A): */
+                            uint32_t viewpoint_source; /* 0 TRACKED, 1 EXPLICIT, 2 DISPLAY_RIG, 3 CAMERA_RIG */
+                            float nominal_z_m; };
+/* appended to caps / stream_info, XRT_DP_LIFT_HAS_AUX_DEPTH: caps.aux_outputs + aux_depth_semantics,
+   stream_info.aux_outputs (XRT_DP_LIFT_AUX_DEPTH) + aux_depth_format (DXGI hint) */
+struct xrt_dp_lift_depth { uint32_t struct_size; uint32_t format; /* R32_FLOAT / R16_FLOAT */
+                           void *resource; /* DP-owned, valid until the next lift_convert on the stream */
+                           uint32_t width, height, units /* 0 relative, 1 metric */, encoding /* 0 linear, 1 inverse */;
+                           float value_scale, value_offset; /* d = scale * sample + offset */
+                           uint32_t source_width, source_height;
+                           float focal_x_px, focal_y_px, principal_x_px, principal_y_px; /* depth-map px */
+                           float near_depth, far_depth, convergence_depth; /* decoded units; <=0 unknown */
+                           uint32_t same_inference; uint64_t vendor_frame_id; };
+
+/* xrt_display_processor_d3d11, slots 25..29 */
+bool (*lift_get_caps)(xdp, struct xrt_dp_lift_caps *out);
+bool (*lift_stream_create)(xdp, const struct xrt_dp_lift_stream_info *info, uint64_t *out_id);
+void (*lift_stream_destroy)(xdp, uint64_t id);
+bool (*lift_convert)(xdp, uint64_t id, void *d3d11_context, void *input_resource /* RGBA8, w x h */,
+                     uint32_t w, uint32_t h, const struct xrt_dp_lift_params *p,
+                     const float *viewpoints_xyz, uint32_t viewpoint_floats,
+                     void **out_resource /* valid until the next call on this stream */,
+                     uint32_t *out_w, uint32_t *out_h, uint32_t *out_format /* DXGI_FORMAT */);
+bool (*lift_convert_blob)(xdp, uint64_t id, void *d3d11_context, void *input_resource, uint32_t w, uint32_t h,
+                          const struct xrt_dp_lift_params *p, uint32_t *out_format /* 1 PLY_3DGS, 2 SOG */,
+                          const void **out_bytes /* valid until the next call */, size_t *out_size);
+/* slot 33, XRT_DP_D3D11_HAS_LIFT_DEPTH: the depth of the conversion lift_convert just returned */
+bool (*lift_get_depth)(xdp, uint64_t id, void *d3d11_context, struct xrt_dp_lift_depth *out);
+
+/* xrt_plugin_iface, appended */
+xrt_dp_factory_d3d11_fn_t create_dp_d3d11_lift; /* a DP that serves ONLY the lift slots */
+```
+
+- **Who calls, from where.** Exactly one runtime thread — the D3D11 service's *lift thread* —
+  on exactly one DP instance per service process, created through **`create_dp_d3d11_lift`**
+  on a **dedicated device** on the service's adapter (its immediate context has
+  `ID3D11Multithread` protection on, so a module may flush / signal it from its own worker).
+  Window handle NULL, never `process_atlas`, never a mode request. **That DP must build no
+  weaver and open no tracker session.** Without the lift-only factory the runtime falls back to
+  `create_dp_d3d11` with a NULL window, and destroys the instance at once if it has no lift
+  slots — which is why a plug-in with a module should provide the explicit factory.
+- **Why not the weaving DP.** A conversion blocks for tens of milliseconds (seconds for
+  GAUSSIANS); the weaving DP is driven on the service's single shared immediate context under
+  the render lock and is recreated on presenter/focus changes. Sharing it would stall every
+  weave for the length of a conversion.
+- **Synchronous, stateless in time.** One call converts one frame. The plug-in never queues,
+  drops, timestamps or schedules: the runtime owns the latest-wins mailbox, the output ring
+  (it copies `out_resource` / `out_bytes` before the next call), fences, per-stream priority
+  (`XrLiftPriorityDXR`) and timestamps. A `false` return means "no output this frame"; the
+  runtime keeps the previous result.
+- **Viewpoints are always explicit.** For SBS/N-view the runtime passes `viewpoints_xyz` —
+  the app's EXPLICIT viewpoints, else the panel DP's predicted tracked eye pair (metres). Give
+  them precedence over any tracker of your own; the lift DP has none. NULL/0 only while no eyes
+  are known.
+- **Viewpoints are rect-relative and already shaped (ADR-048).** With
+  `viewpoint_frame == RECT` (every runtime that fills the field) they are relative to the
+  lifted rect's centre, and the runtime has already applied the viewpoint policy — ipd /
+  parallax factors, axis mask, ease-back, clamp. Translate units only: normalise by
+  `baseline_m` (not a fixed eye distance), honour every component you are sent (`axis_mode`
+  says which ones are live), and use `max_offset_m` + the rect size to map onto your module's
+  range. A `struct_size` that stops before these fields means panel-centred viewpoints (an
+  older runtime).
+- **App-rig viewpoints (ADR-048 Addendum A).** With `viewpoint_source` DISPLAY_RIG /
+  CAMERA_RIG the viewpoints are the app's own rig eyes (the `xrLocateViews` math, the rect as the
+  screen) — the eyes the app renders its 3D from. Reproduce them as given: no extra view gain.
+- **Auxiliary depth (ADR-048 Addendum A).** A stream whose `stream_info.aux_outputs` has
+  `XRT_DP_LIFT_AUX_DEPTH` gets a `lift_get_depth` call right after each successful
+  `lift_convert`. Return that conversion's depth — ideally from the same inference
+  (`same_inference`) — as an R32F / R16F texture you own until the next convert, with its
+  encoding, units, intrinsics and `convergence_depth` (the decoded depth you put at zero
+  disparity). The runtime copies it out and derives the display transform itself; report, don't
+  align. Advertise it in `caps.aux_outputs` / `aux_depth_semantics`. No slot ⟹ no depth.
+- **Output layout.** SBS = two views side by side; NVIEW = `view_count` views in one row, view 0
+  leftmost; DEPTH = one channel (any single-channel or RGBA format — say which in
+  `out_format`). The runtime weaves SBS/NVIEW results itself on the ordinary weave path
+  (ADR-007) — the plug-in never weaves a lift result.
+- **Caps are polled.** `lift_get_caps` at DP creation, then ≤ 1 Hz while not READY, so an
+  ACTIVATING module (licence check, model load) shows up as READY without an app restart.
+  Modes 0 / a NULL slot / an older `struct_size` all read as "no module".
+- **Knobs live in the SERVICE's environment.** A vendor module that reads env vars (backend
+  choice, gains) reads them in `displayxr-service.exe`'s process, not the app's.
+- **sim_display** fills the slots only under `SIM_DISPLAY_FAKE_LIFT=1` (shifted SBS/N-view,
+  gradient depth, a two-layer 3DGS PLY) so the whole path runs hardware-free.
+- **Purely additive**, so no `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020).
+
 ## Where the window may LAND: `snap_window_rect`
 
 A windowed weave takes its interlace phase from the window's absolute position on the panel.
@@ -444,6 +862,25 @@ bool (*snap_window_rect)(struct xrt_display_processor_vk *xdp, /* or _d3d11 */
   runtime-owned window, the D3D11 service for a cross-process present owner, and — on
   desktop Linux, where a client cannot hook the window manager's drag — the **app**, through
   `xrWeaveSnapWindowRectDXR`. Always *before* the window moves.
+- **macOS / Metal (ADR-050): the runtime is the window owner.** Appended after
+  `set_present_origin` on `xrt_display_processor_metal` with the identical signature
+  (`XRT_DP_METAL_HAS_SNAP_WINDOW_RECT`). The in-process Metal compositor owns every eligible
+  window's drag and resize: it calls the slot once per drag step with the content origin at
+  **gesture start** and the proposed content origin, in **backing (device) px**, top-down, and
+  moves the window to the answer in the same Core Animation transaction that presents the frame
+  woven for it. On an edge resize by the left / top edge the far edges stay put and the size
+  absorbs your correction; a right / bottom-only resize never calls you. On Retina the runtime
+  only offers you reachable positions (`origin + scale·Z`) and keeps your answer only if it is
+  one. With multiple 3D screens it asks the DP of the screen holding the content origin.
+  **What a Leia Metal DP implements:** `srWeaverSnapToPhase(weaver, origin_x, origin_y,
+  target_x, target_y, &x, &y)` — `SR_SUCCESS` → write `x, y`, return true; `SR_DECLINED` (no
+  viewer tracked yet) or any other result → return false (the runtime keeps the target and the
+  move stays atomic, just unsnapped).
+  **And `set_present_origin` wins:** for a runtime-placed window the compositor calls
+  `set_present_origin` every frame with the origin the window was actually moved to *for this
+  frame*. A DP that also derives its origin from its NSView (polling the view's frame) must use
+  the runtime's value for that frame — the view still reports the pre-move position until the
+  transaction commits.
 
   **The runtime feeds the weaver the window's TRUE origin and never quantises it.** This is
   a rule hardware established, not a style preference. A Vulkan build briefly re-snapped the
@@ -499,6 +936,80 @@ void (*set_transparency_active)(struct xrt_display_processor_vk *xdp, bool activ
   logging test double (`SIM TRANSPARENCY ACTIVE/IDLE`), which is how the runtime half
   is verified without vendor hardware.
 
+## Joining the runtime's GPU chain: `set_weave_sync` (Vulkan slot 17)
+
+```c
+bool (*set_weave_sync)(struct xrt_display_processor_vk *xdp,
+                       VkSemaphore_XDP wait_sem, uint64_t wait_value,
+                       VkSemaphore_XDP signal_sem, uint64_t signal_value);
+```
+
+For a **self-submitting** Vulkan DP (`is_self_submitting` true: `process_atlas` submits its own
+batches rather than recording into the given command buffer — the Leia CNSDK weaver). Without it
+the runtime cannot hand such a DP a wait or a signal, so it must CPU-wait the whole frame before
+it can tell anyone the target is complete. First consumer: the Android XR_DXR_weave engine, so the
+browser's inline-3D weave can return a release `sync_file` instead of blocking (XR_DXR_weave v20).
+
+- **Per call.** Called before the `process_atlas` it applies to (only `set_target_color_view` may
+  come between), for that call only. A runtime that armed the pair and could not reach
+  `process_atlas` clears it with a NULL/NULL call.
+- **true** = for that `process_atlas` the DP waits `wait_sem` on the GPU before its first read of
+  the atlas (or the `set_overlay_2d` layer) — with a `dstStageMask` that covers the stage that
+  reads it, not only `COLOR_ATTACHMENT_OUTPUT` — and signals `signal_sem` after its last target
+  write. Either handle may be `VK_NULL_HANDLE`. **false** / absent slot = the runtime keeps its
+  CPU waits for that frame.
+- **Values**: 0 = binary semaphores (the only form used today). Non-zero is reserved for
+  timeline semaphores; return false for a value you do not support.
+- **Drops**: after returning true, wait and signal even on a dropped frame (an early return, a
+  failed vendor submit — LeiaInc/CNSDK#734: a failed `vkQueueSubmit` never signals), e.g. with an
+  empty submit. The runtime still treats `get_last_frame_dropped` == true as "signal not
+  guaranteed": no GPU wait on `signal_sem` that frame, CPU completion, queue drained, and BOTH
+  semaphores destroyed and recreated before any later `process_atlas` — so a DP that cannot tell
+  whether its vendor weaver consumed `wait_sem` on the drop must not wait it a second time.
+- Appended after `set_overlay_2d_filter_strength`, `XRT_DP_VK_HAS_WEAVE_SYNC`, wrapper
+  `xrt_display_processor_vk_set_weave_sync`. **Purely additive** — no
+  `XRT_PLUGIN_API_VERSION_CURRENT` bump (ADR-020). `sim_display` records into the command buffer
+  and leaves it NULL.
+
+## Eyes at a target time: `get_eye_positions_at` (ADR-054 §4.1 / N6 Part 1)
+
+`bool (*get_eye_positions_at)(xdp, int64_t target_ns, struct xrt_eye_positions *out)` — an
+optional slot appended (ADR-020; ABI unchanged) to **every** per-API vtable: D3D11 after
+`lift_get_depth`, D3D12 and GL after `set_present_origin`, Metal after `snap_window_rect`, and
+Vulkan on `xrt_display_processor_vk` after `set_weave_sync` (the variant embeds the base by value,
+so appending to the base would have moved every variant slot). Each header defines
+`XRT_DP_<API>_HAS_EYE_POSITIONS_AT` for `#ifdef`-guarding, and
+`xrt_display_processor_<api>_has_eye_positions_at()` / `_get_eye_positions_at()` helpers (the
+latter falls back to `get_predicted_eye_positions` when the slot is absent or NULL).
+
+`target_ns` is when the caller's pixels will be **seen**, on the `os_monotonic_get_ns()` clock —
+`xrLocateViews` passes the frame's `displayTime`. Fill `out` exactly as
+`get_predicted_eye_positions` does; set `out->timestamp_ns` to the tracker sample the answer is
+based on. The old slot keeps meaning "now + your default horizon". A DP without the slot keeps
+today's latest-answer behaviour — every path returns its `get_predicted_eye_positions` answer
+unchanged; implementing the slot opts in to display-time sampling. Full contract: [eye-tracking-modes.md § Target-time query](../specs/vendor/eye-tracking-modes.md#target-time-query-adr-054-41--n6-part-1-2144).
+
+## PQ atlases: `accepts_atlas_encoding` (D3D11 #2273, Vulkan #2340)
+
+`bool (*accepts_atlas_encoding)(xdp, enum xrt_atlas_encoding encoding)` — an optional slot appended to
+the D3D11 vtable after `get_eye_positions_at` (ADR-020, ABI unchanged, `#ifdef
+XRT_DP_D3D11_HAS_ATLAS_ENCODING_QUERY`; helper `xrt_display_processor_d3d11_accepts_atlas_encoding()`,
+false for an absent slot or NULL). The runtime asks it before it sends any encoding beyond the
+ENCODED/LINEAR pair that `get_color_capability` negotiates; today that is `XRT_ATLAS_ENCODING_PQ` (SMPTE
+ST 2084 code values, 1.0 linear = 203 cd/m², primaries passed through), under the experimental
+`DXR_ATLAS_ENCODING=pq` + `DXR_ATLAS_FORMAT=rgb10a2` knobs. Keep reporting `get_color_capability` as
+before: the runtime compares it with `== XRT_DP_COLOR_EITHER`, which is why PQ is a query and not a
+new capability value.
+
+**Vulkan (#2340).** The same slot, same signature (taking `struct xrt_display_processor_vk *`), appended
+to the **`xrt_display_processor_vk` variant** after its `get_eye_positions_at` — not to the embedded base,
+whose growth would move every variant slot (ADR-020, ABI unchanged, `#ifdef
+XRT_DP_VK_HAS_ATLAS_ENCODING_QUERY`; helper `xrt_display_processor_vk_accepts_atlas_encoding()`, false for
+an absent slot per `base.struct_size`, or NULL). A DP that answers true for `XRT_ATLAS_ENCODING_PQ` then
+receives PQ through the base's existing `set_atlas_encoding` (slot 14) before `process_atlas`. Under the
+Windows weave-on-scanout split the Vulkan atlas is woven by the D3D11 DP on the output adapter, so there
+the D3D11 slot above is the one asked.
+
 ## Frame-timing inputs are an offer, never a requirement
 
 The runtime does a lot of work to make each frame reach the panel as late and
@@ -514,6 +1025,7 @@ Concretely, and verified rather than assumed:
 | Measured weave→scanout residual and panel period | `set_frame_timing`, an **optional appended slot** on each per-API vtable | Guarded by both `XRT_DP_HAS_SLOT` (a `struct_size` read-clamp, so a plug-in compiled against older headers is safe) and a NULL check. The runtime skips the call. |
 | Presentation paced to the previous frame's real scanout | Nothing — the runtime simply presents later | The plug-in sees an ordinary `process_atlas` call. Pacing changes *when* it is called, never *what* it must do. |
 | Fresh viewer position at weave time | The plug-in's own `get_predicted_eye_positions`, if it chooses to re-predict | A plug-in that samples once, or not at all, produces a correct frame with a staler viewer position. No runtime path requires re-prediction. |
+| The display time the eyes are wanted for | `get_eye_positions_at(target_ns)`, an **optional appended slot** on each per-API vtable (N6 Part 1) | The runtime uses `get_predicted_eye_positions` unchanged — exactly the pre-slot behaviour. |
 
 The corollary matters for anyone writing a plug-in: **do not treat late
 presentation as a contract that you will be called at a particular time.** The
@@ -530,6 +1042,53 @@ driver reports support and proceeds without them when it does not. Under
 the runtime logs one warning and runs unpaced. Either way nothing fails — the
 difference is accuracy, not correctness. Application-side guidance:
 [INV-5.9](../guides/displayxr-app-rules.md).
+
+## A stereo camera: the `stereo_camera_*` slots (ADR-043)
+
+Optional, appended per ADR-020, announced by `XRT_PLUGIN_IFACE_HAS_STEREO_CAMERA`; the runtime
+uses them only when `struct_size` covers `stereo_camera_close` **and** all six are non-NULL
+(`xrt_plugin_iface_has_stereo_camera()`). They let a plug-in expose the display's own stereo
+camera — usually the one its eye tracker looks through — as a runtime source
+([`XR_DXR_stereo_camera`](../specs/extensions/XR_DXR_stereo_camera.md)). The service opens each
+camera once and fans frames out to every authorised client; the plug-in only produces frames.
+
+```c
+uint32_t     (*stereo_camera_enumerate)(inst, capacity, struct xrt_plugin_stereo_camera_info *out);
+xrt_result_t (*stereo_camera_get_calibration)(inst, index, struct xrt_plugin_stereo_camera_calibration *out);
+xrt_result_t (*stereo_camera_open)(inst, index, struct xrt_plugin_stereo_camera **out_cam);
+uint32_t     (*stereo_camera_wait_frame)(cam, int64_t timeout_ns, struct xrt_plugin_stereo_camera_frame *out);
+void         (*stereo_camera_release_frame)(cam);
+void         (*stereo_camera_close)(cam);
+```
+
+| Rule | Why |
+|---|---|
+| **Never take the device from the tracker.** Read the frames the tracker already publishes (shared memory, a vendor camera service); never open, reconfigure or re-time the device. | The whole point: while tracking runs the device is exclusive (Windows `NotReadableError`), and on Android opening the front pair evicts the tracker (roadmap §C) |
+| `stereo_camera_open` is a **tracker keep-alive**: while any camera is open, keep the tracker running. | Frames only exist while tracking runs |
+| `wait_frame` is called from **one runtime-owned thread per open camera**, may block up to `timeout_ns`, and returns an `enum xrt_plugin_stereo_camera_wait` (`OK` / `TIMEOUT` / `SUSPENDED` / `ERROR`). Planes stay valid until `release_frame`. | The service maps `TIMEOUT` → `WAITING` (then `SUSPENDED` after 1 s without frames), `SUSPENDED` → `SUSPENDED`, `ERROR` → close + retry in 1 s |
+| **Never wait on a wake object shared with other readers** of the vendor channel — poll it. | An auto-reset event wakes exactly one waiter: two readers steal each other's frames (ADR-043) |
+| Decode your transport (JPEG, YUY2, …) to `GRAY8`, `NV12` or `BGRA8` yourself; always deliver **one side-by-side image**, `2·eye_width × eye_height`, left eye left, unmirrored, even extents. | The runtime owns format conversion, decimation, rectification (R2) and transport; one SBS layout for every vendor |
+| Calibration is **per camera index**: the device behind that camera (one camera per device; several devices = several cameras), keyed by its own identity (serial). RAW, OpenCV convention: `k[eye] = fx fy cx cy`, `distortion_model` + coefficients, and `R`, `T` with **`x_R = R·x_L + T`** (T in mm; a right camera at +x of the left has `T = (−B, 0, 0)`). The runtime converts it to the client's pose-of-the-right-camera form. Return `XRT_ERROR_FEATURE_NOT_SUPPORTED` and do **not** set `CALIBRATED` if you cannot resolve it. `image_width/height` = the size the intrinsics were calibrated at; the service rescales them to the frame's eye size when the two differ. Unless you set `NATIVELY_RECTIFIED`, the service rectifies from exactly these numbers (R2, `u_stereo_rectify`), so a wrong calibration shows up as misaligned rows in `displayxr-cli camera probe --rectified`. | One test box carried eleven calibration folders; "the first one" is the wrong camera |
+| `device_identity` is private: the service hashes it per consumer (`persistentId`) and never exports it. | Fingerprinting (spec §7.5) |
+| `enumerate` is called **again** during your life — on a client's enumerate (≤ 1/s) and every ~2 s while a client listens — so keep it cheap and log only when the set changes. Keep an index on the same device while it is listed; append new devices; a gone device may be dropped (the service reports it `UNAVAILABLE`, never opens its index) or kept at its index. | The service keys cameras by `device_identity` to keep client ids stable and raise `XrEventDataStereoCamerasChangedDXR` (spec v4, #1961) — no change-counter slot needed |
+| Nothing throws across the boundary. | C ABI |
+| `info.frame_orientation` (appended, spec v7, `XRT_PLUGIN_STEREO_CAMERA_INFO_HAS_FRAME_ORIENTATION`; write it only when `struct_size` covers it): the clockwise turn that makes the frame you deliver upright in the device's **natural** orientation, after any turn you applied yourself — `XRT_PLUGIN_STEREO_CAMERA_FRAME_ORIENTATION_0/_90/_180/_270`, or leave it 0 (`UNKNOWN`). E.g. unturned frames from a sensor mounted at `SENSOR_ORIENTATION` 270 → `_270`; eyes you already turned by that 270 → `_0`. | Apps see it as `XrStereoCameraOrientationDXR::frameOrientationDegrees` (0 is offset on purpose: a plug-in that predates the field reads as unknown, and the consumer keeps its fallback) |
+
+Flags (`XRT_PLUGIN_STEREO_CAMERA_*`) mirror the XR bits: `SHARED_WITH_EYE_TRACKING`,
+`USER_FACING`, `CALIBRATED`, `NATIVELY_RECTIFIED`, `MONOCHROME`. The reference implementation is
+`sim_display`'s fake (`drivers/sim_display/sim_display_stereo_camera.c`, enabled with
+`SIM_DISPLAY_FAKE_STEREO_CAMERA=1` in the **service** environment).
+
+**Slot order.** The six slots are the LAST members of the iface, appended (ADR-020) after
+everything that was on `main` before them: `… vk_bundle_fn_table_offset` → `create_dp_d3d11_lift`
+(ADR-042) → `get_platform_state` (ADR-045) → `stereo_camera_enumerate … stereo_camera_close`
+→ `get_display_info_for_monitor` (multi-screen M1) → `create_dp_vk_for_screen` (multi-screen M2)
+→ `create_dp_d3d11_for_screen` (M6, D3D11) → `create_dp_metal_for_screen` (macOS) →
+`create_dp_d3d12_for_screen` (M6, D3D12) → `get_screen_status` (ADR-051 dashboard) →
+`create_dp_gl_for_screen` (M6, OpenGL, now the last member).
+`tests_stereo_camera` pins that order (lift right after the vk fingerprint, platform-state right
+after lift, the camera block right after platform-state and ending the struct), so a reorder or a
+slot squeezed in between fails on the host, not on a vendor box.
 
 ## Aux surface — separate from the iface
 

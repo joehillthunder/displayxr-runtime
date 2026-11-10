@@ -13,6 +13,7 @@
 // #1580: the canvas metres branch (b) of the per-view camera resolver needs.
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_limits.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@
 struct comp_d3d11_renderer;
 struct comp_d3d11_compositor;
 struct comp_layer_accum;
+struct xrt_swapchain;
+struct comp_cursor_look;
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,6 +45,26 @@ struct comp_d3d11_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3 (Windows): per-segment views. 0 = one view set fills
+	 * every tile (the only case before M3). Otherwise the projection layer
+	 * carries one view set per window segment and each tile is a MOSAIC:
+	 * local view j of segment k is placed at that segment's rect inside tile
+	 * j, so cropping a segment's rect out of every tile
+	 * (comp_d3d11_segments) yields exactly that segment's own views. Quads
+	 * and equirect2 layers are drawn once per segment with that segment's
+	 * camera; zones are not routed. Filled by the compositor after
+	 * comp_d3d11_renderer_compute_effective_layout (which zeroes it).
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (<= @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!
@@ -96,6 +119,17 @@ comp_d3d11_renderer_create(struct comp_d3d11_compositor *c,
  */
 void *
 comp_d3d11_renderer_get_atlas_shared_handle(struct comp_d3d11_renderer *renderer);
+
+/*!
+ * The DXGI format every atlas this process creates will have:
+ * `DXGI_FORMAT_R8G8B8A8_UNORM` unless `DXR_ATLAS_FORMAT` asks for a deeper one
+ * (#2273). Needs no renderer, so the compositor can ask before Stage A whether
+ * the #918 bridge (8-bit only) can carry the atlas at all.
+ *
+ * @ingroup comp_d3d11
+ */
+uint32_t
+comp_d3d11_renderer_requested_atlas_format(void);
 
 /*!
  * #918: monotonic atlas generation. Bumped ONLY on a genuine (re)allocation —
@@ -184,6 +218,70 @@ comp_d3d11_renderer_draw_window_space_pass(struct comp_d3d11_renderer *renderer,
                                             uint32_t target_width,
                                             uint32_t target_height,
                                             const struct comp_d3d11_eff_layout *layout);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor - where the sprite lands in each view
+ * tile and what it samples.
+ *
+ * Drawn LAST by @ref comp_d3d11_renderer_draw_window_space_pass - over the
+ * projection, quad and window-space layers, never occluded, before the
+ * display processor - one straight-alpha quad per tile, depth off, scissored
+ * to the tile. The colour treatment is the frame's (ADR-044): through the
+ * private `_SRGB` compose target when the frame composes, with the source's
+ * format-honest view; else straight into the atlas through non-decoding
+ * views. A sprite that is not `_SRGB` (scene-linear, owes the encode) makes
+ * the frame compose.
+ */
+struct u_cursor_draw_request;
+
+struct comp_d3d11_cursor_quads
+{
+	//! Tiles to draw (view i -> tile i); 0 = no cursor this frame.
+	uint32_t count;
+	//! Per tile, the quad's corners in tile-normalised coordinates (origin
+	//! top-left, y down) in u_cursor_draw_corners() order.
+	float corners[XRT_MAX_VIEWS][4][2];
+	//! The draw's clip in every tile, tile-normalised (x, y, w, h; origin
+	//! top-left): the whole tile {0, 0, 1, 1}, or a display zone's sub-rect
+	//! (u_cursor_draw_into_zone, #1949). The scissor is tile box ∩ clip.
+	float clip[4];
+	//! The app's sprite swapchain (sampled at @ref image_index), or NULL for
+	//! @ref look.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The default look (compositor-owned, outlives the frame).
+	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
+	//! STRAIGHT (the spec). The renderer blends each accordingly.
+	const struct comp_cursor_look *look;
+	//! #1952: the state tracker's request, for the renderer to report what
+	//! it did (u_cursor_draw_report_drew / _refused). Must outlive the
+	//! window-space pass; only its report fields are used here.
+	const struct u_cursor_draw_request *req;
+	//! #1952: run every check, draw nothing (the request is report-only).
+	bool report_only;
+	/*!
+	 * ADR-046 Amendment 2 B.7: crosstalk softening of the lifted cursor.
+	 * False = the crisp draw (corners as above, uv 0..1). True: the corners
+	 * above are already padded by the blur radius (u_cursor_draw_soften_quad),
+	 * @ref uv holds the matching texture coordinates per tile, and
+	 * @ref soften per tile = (blur radius u, v in sprite uv, opacity, unused).
+	 */
+	bool soft;
+	float uv[XRT_MAX_VIEWS][4][2];
+	float soften[XRT_MAX_VIEWS][4];
+};
+
+/*!
+ * Hand the renderer this frame's cursor (NULL or count 0 = none). Call before
+ * @ref comp_d3d11_renderer_draw_projection_pass (the sprite's colour encoding
+ * takes part in the frame's compose decision) and clear it after the
+ * window-space pass. A renderer never handed a cursor builds nothing for it.
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_cursor(struct comp_d3d11_renderer *renderer, const struct comp_d3d11_cursor_quads *quads);
 
 /*!
  * Get the atlas texture SRV for weaving.
@@ -279,6 +377,17 @@ void *
 comp_d3d11_renderer_get_atlas_texture(struct comp_d3d11_renderer *renderer);
 
 /*!
+ * #2564: the worst-case atlas extent (u_tiling_compute_system_atlas over the
+ * device's modes). A genuine atlas grow adds headroom up to it, so a window
+ * resize drag costs one or two reallocations instead of one per step.
+ * 0 = no cap known (the grow still never goes below what the content needs).
+ *
+ * @ingroup comp_d3d11
+ */
+void
+comp_d3d11_renderer_set_atlas_cap(struct comp_d3d11_renderer *renderer, uint32_t cap_width, uint32_t cap_height);
+
+/*!
  * Resize the renderer's atlas texture to match a new view size.
  *
  * Recreates the atlas texture, SRV, RTV, depth texture, and DSV at the
@@ -330,6 +439,18 @@ comp_d3d11_renderer_flatten_local_2d(struct comp_d3d11_renderer *renderer,
                                      bool unpremultiplied);
 
 /*!
+ * #2273 — re-encode the composed atlas in place from sRGB to SMPTE ST 2084 PQ
+ * (1.0 linear = 203 cd/m^2, primaries passed through), for a DP that accepted
+ * @ref XRT_ATLAS_ENCODING_PQ. Requires the R10G10B10A2 atlas
+ * (DXR_ATLAS_FORMAT=rgb10a2); any other format returns an error and leaves the
+ * atlas untouched. Leaves no SRV/RTV bound.
+ *
+ * @ingroup comp_d3d11
+ */
+xrt_result_t
+comp_d3d11_renderer_encode_atlas_pq(struct comp_d3d11_renderer *renderer);
+
+/*!
  * Blit the atlas texture to a back buffer with GPU stretching.
  *
  * Used for mono/2D fallback when the atlas texture is smaller than
@@ -351,7 +472,6 @@ comp_d3d11_renderer_blit_stretch(struct comp_d3d11_renderer *renderer,
                                  void *back_buffer_texture,
                                  uint32_t target_width,
                                  uint32_t target_height);
-
 
 #ifdef __cplusplus
 }

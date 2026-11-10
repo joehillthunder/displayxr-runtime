@@ -27,14 +27,17 @@
  *    (@ref ahardwarebuffer_image_allocate, GPU_SAMPLED | GPU_FRAMEBUFFER) and
  *    imports into its own VkImage, so one code path serves both directions. It
  *    is handed back to the caller once per (re)allocation over the same socket.
- *  - Input-ready sync: no keyed mutex exists here either. The contract is the
- *    macOS one — the caller completes its GPU writes into the input buffer
- *    before calling xrWeaveSubmitDXR. An `acquire` sync_file fd is a documented
- *    follow-up (a latency optimisation, not a correctness requirement).
- *  - Completion sync: SYNCHRONOUS — the service vkWaitForFences before the IPC
- *    reply returns, so xrWeaveSubmitDXR returning IS the completion signal.
- *    weave_get_fence reports no fence; XrWeaveOutputDXR::fence stays NULL and
- *    fenceValue is a plain monotonic counter.
+ *  - Input-ready sync: no keyed mutex exists here either. By default the
+ *    contract is the macOS one — the caller completes its GPU writes into the
+ *    input buffer before calling xrWeaveSubmitDXR. From spec v20 a caller may
+ *    instead chain an acquire sync_file (XrWeaveSubmitSyncDXR), waited on the
+ *    GPU by the first batch that reads the input (see "sync_file weave").
+ *  - Completion sync: by default SYNCHRONOUS — the service vkWaitForFences
+ *    before the IPC reply returns, so xrWeaveSubmitDXR returning IS the
+ *    completion signal. weave_get_fence reports no fence; XrWeaveOutputDXR::fence
+ *    stays NULL and fenceValue is a plain monotonic counter. From spec v20 a
+ *    caller that chains XrWeaveOutputSyncDXR gets a per-frame release sync_file
+ *    instead, and the reply no longer waits for the weave.
  *  - Window geometry: Android has no HWND, and a SurfaceView's on-screen
  *    position is known only to the app (a pure MOVE raises no resize, so nothing
  *    in the pipeline can observe it). The caller therefore publishes it
@@ -61,6 +64,7 @@
 
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_processor.h"
+#include "xrt/xrt_session.h"
 
 #include "xrt/xrt_display_processor_vk.h"
 #include "xrt/xrt_display_metrics.h"
@@ -101,6 +105,13 @@ weave_split_enabled(void)
 #include <stdlib.h>
 
 #include <android/hardware_buffer.h>
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#include <math.h>
 
 /*
  *
@@ -253,6 +264,59 @@ weave_import_ahb(struct vk_bundle *vk,
 	return true;
 }
 
+/*
+ * AHardwareBuffer identity across IPC (#1865).
+ *
+ * Every AHardwareBuffer_recvHandleFromUnixSocket() wraps the received native
+ * handle in a NEW GraphicBuffer, so the AHardwareBuffer * the IPC receive hands
+ * us is different on every submit even when the caller re-sends the same
+ * buffer — and since the cache holds the previous reference, the new pointer can
+ * never alias it. Keyed by pointer, both caches below therefore missed on every
+ * frame: the input and the v4 overlay were released and re-imported (Vulkan
+ * AHB import + memory + view) per submit, and the overlay path logged a WARN
+ * each time.
+ *
+ * AHardwareBuffer_getId() returns a system-wide id that is stable across
+ * processes for the lifetime of the allocation, which is the right key. It is
+ * API 31; the runtime's minSdk is 29, so it is resolved at run time. Where it is
+ * missing the key falls back to the pointer, i.e. the old behaviour.
+ */
+typedef int (*weave_pfn_ahb_get_id)(const AHardwareBuffer *buffer, uint64_t *out_id);
+static weave_pfn_ahb_get_id weave_ahb_get_id_fn;
+static pthread_once_t weave_ahb_get_id_once = PTHREAD_ONCE_INIT;
+
+static void
+weave_resolve_ahb_get_id(void)
+{
+	weave_ahb_get_id_fn = (weave_pfn_ahb_get_id)dlsym(RTLD_DEFAULT, "AHardwareBuffer_getId");
+	U_LOG_W("weave(#1865): AHardwareBuffer_getId %s — import caches keyed by %s",
+	        weave_ahb_get_id_fn != NULL ? "available" : "unavailable (API < 31)",
+	        weave_ahb_get_id_fn != NULL ? "buffer id" : "pointer only");
+}
+
+//! System-wide buffer id, or 0 when unknown.
+static uint64_t
+weave_ahb_id(const void *ahb)
+{
+	pthread_once(&weave_ahb_get_id_once, weave_resolve_ahb_get_id);
+	uint64_t id = 0;
+	if (ahb == NULL || weave_ahb_get_id_fn == NULL ||
+	    weave_ahb_get_id_fn((const AHardwareBuffer *)ahb, &id) != 0) {
+		return 0;
+	}
+	return id;
+}
+
+//! Does the incoming buffer name the buffer behind the cached import?
+static bool
+weave_ahb_matches(const void *cached, uint64_t cached_id, const void *incoming, uint64_t incoming_id)
+{
+	if (cached == NULL || incoming == NULL) {
+		return false;
+	}
+	return cached == incoming || (cached_id != 0 && cached_id == incoming_id);
+}
+
 static void
 weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
 {
@@ -273,6 +337,7 @@ weave_release_input(struct vk_bundle *vk, struct multi_compositor *mc)
 		u_graphics_buffer_unref(&h);
 		mc->weave.in_ahb = NULL;
 	}
+	mc->weave.in_ahb_id = 0;
 	mc->weave.in_w = 0;
 	mc->weave.in_h = 0;
 }
@@ -297,6 +362,7 @@ weave_release_overlay(struct vk_bundle *vk, struct multi_compositor *mc)
 		u_graphics_buffer_unref(&h);
 		mc->weave.overlay_ahb = NULL;
 	}
+	mc->weave.overlay_ahb_id = 0;
 	mc->weave.overlay_w = 0;
 	mc->weave.overlay_h = 0;
 }
@@ -311,8 +377,11 @@ weave_create_local(struct vk_bundle *vk,
                    VkImageView *out_view)
 {
 	VkExtent2D extent = {.width = w, .height = h};
+	// COLOR_ATTACHMENT: the rect-scoped un-squeeze draws into the SBS scratch.
+	// TRANSFER_SRC: the #2501 capture reads the DP input back.
 	VkResult ret = vk_create_image_simple(vk, extent, WEAVE_VK_FORMAT,
-	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	                                      out_memory, out_image);
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("weave(#1036): vk_create_image_simple(%ux%u) failed: %s", w, h, vk_result_string(ret));
@@ -349,9 +418,100 @@ weave_release_local(struct vk_bundle *vk, VkImage *image, VkDeviceMemory *memory
 	}
 }
 
+/*!
+ * Per-eye un-squeeze staging (struct comp_multi_weave_eye_stage): free one
+ * slot's image. The caller guarantees no in-flight GPU work still reads it.
+ */
+static void
+weave_eye_stage_release(struct vk_bundle *vk, struct comp_multi_weave_eye_stage *s)
+{
+	if (s->image != VK_NULL_HANDLE) {
+		vk->vkDestroyImage(vk->device, s->image, NULL);
+		s->image = VK_NULL_HANDLE;
+	}
+	if (s->memory != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, s->memory, NULL);
+		s->memory = VK_NULL_HANDLE;
+	}
+	s->w = 0;
+	s->h = 0;
+	s->format = VK_FORMAT_UNDEFINED;
+}
+
+static void
+weave_eye_stage_release_all(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	for (uint32_t i = 0; i < COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; i++) {
+		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][0]);
+		weave_eye_stage_release(vk, &mc->weave.eye_stage[i][1]);
+	}
+}
+
+/*!
+ * The staging image of rect @p slot / @p eye, EXACTLY @p w x @p h in @p format,
+ * (re)allocated only when one of those changes (rects are stable frame to frame,
+ * so steady state allocates nothing). VK_NULL_HANDLE on failure: the caller then
+ * stretches straight out of the input (the pre-fix, edge-bleeding path) rather
+ * than drop the rect. Called while recording, before this frame's first use.
+ */
+static VkImage
+weave_eye_stage_get(struct vk_bundle *vk,
+                    struct multi_compositor *mc,
+                    uint32_t slot,
+                    uint32_t eye,
+                    uint32_t w,
+                    uint32_t h,
+                    VkFormat format)
+{
+	if (slot >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS || eye > 1 || w == 0 || h == 0) {
+		return VK_NULL_HANDLE;
+	}
+	struct comp_multi_weave_eye_stage *s = &mc->weave.eye_stage[slot][eye];
+	if (s->image != VK_NULL_HANDLE && s->w == w && s->h == h && s->format == format) {
+		return s->image;
+	}
+	if (s->image != VK_NULL_HANDLE) {
+		// A resized rect (rare): an earlier submit whose fence wait timed out may
+		// still read the old image — never free it under the GPU.
+		vk_queue_lock(vk->main_queue);
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+		vk_queue_unlock(vk->main_queue);
+		weave_eye_stage_release(vk, s);
+	}
+
+	VkExtent2D extent = {.width = w, .height = h};
+	VkResult ret = vk_create_image_simple(vk, extent, format,
+	                                      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+	                                      &s->memory, &s->image);
+	if (ret != VK_SUCCESS) {
+		s->image = VK_NULL_HANDLE;
+		s->memory = VK_NULL_HANDLE;
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			U_LOG_E(
+			    "weave(#1036): eye staging vk_create_image_simple(%ux%u) failed: %s — "
+			    "stretching from the input (edge bleed)",
+			    w, h, vk_result_string(ret));
+		}
+		return VK_NULL_HANDLE;
+	}
+	s->w = w;
+	s->h = h;
+	s->format = format;
+	return s->image;
+}
+
 static void
 weave_release_scratch(struct vk_bundle *vk, struct multi_compositor *mc)
 {
+	weave_eye_stage_release_all(vk, mc);
+	if (mc->weave.sbs_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, mc->weave.sbs_fb, NULL);
+		mc->weave.sbs_fb = VK_NULL_HANDLE;
+	}
+	mc->weave.sbs_dirty_count = 0;
+	mc->weave.sbs_dirty_full = true;
 	weave_release_local(vk, &mc->weave.sbs_image, &mc->weave.sbs_memory, &mc->weave.sbs_view);
 	mc->weave.sbs_w = 0;
 	mc->weave.sbs_h = 0;
@@ -363,6 +523,125 @@ weave_release_crop(struct vk_bundle *vk, struct multi_compositor *mc)
 	weave_release_local(vk, &mc->weave.crop_image, &mc->weave.crop_memory, &mc->weave.crop_view);
 	mc->weave.crop_w = 0;
 	mc->weave.crop_h = 0;
+}
+
+/*!
+ * Rect-scoped batch weave (the Android browser perf audit, 2026-10-11): the
+ * runtime's per-frame GPU cost was proportional to WINDOW pixels — a whole
+ * 2 x window SBS clear every frame plus a staging copy + blit per eye — while
+ * the content is a few element rects. `debug.dxr.weave_rect_scoped` = 0 restores
+ * the full-clear + copy/blit path (read once per client, logged once).
+ */
+static bool
+weave_rect_scoped_wanted(struct multi_compositor *mc)
+{
+	if (!mc->weave.rect_scoped_checked) {
+		char value[PROP_VALUE_MAX] = {0};
+		const bool set = __system_property_get("debug.dxr.weave_rect_scoped", value) > 0 && value[0] != '\0';
+		mc->weave.rect_scoped = !(set && value[0] == '0');
+		mc->weave.rect_scoped_checked = true;
+		U_LOG_W("weave(#1036): rect-scoped weave %s (debug.dxr.weave_rect_scoped=%s)",
+		        mc->weave.rect_scoped ? "ON: clear only vacated rects, one clamped draw per eye"
+		                              : "OFF: full SBS clear + per-eye staging copy/blit",
+		        set ? value : "unset");
+	}
+	return mc->weave.rect_scoped && !mc->weave.unsqueeze_failed;
+}
+
+/*!
+ * The clamped-copy pipeline + the SBS scratch framebuffer for it, created on
+ * first use / after the scratch is reallocated. false = stay on the copy+blit
+ * path for this frame (and for good, if the pipeline itself failed).
+ */
+static bool
+weave_unsqueeze_ready(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.unsqueeze_initialized) {
+		if (!vk_local2d_composite_init(&mc->weave.unsqueeze, vk, WEAVE_VK_FORMAT, WEAVE_VK_FORMAT) ||
+		    !vk_local2d_composite_init_clamped_copy(&mc->weave.unsqueeze, vk)) {
+			vk_local2d_composite_fini(&mc->weave.unsqueeze, vk);
+			mc->weave.unsqueeze_failed = true;
+			U_LOG_E("weave(#1036): rect-scoped un-squeeze pipeline init failed — copy+blit path");
+			return false;
+		}
+		mc->weave.unsqueeze_initialized = true;
+	}
+	if (mc->weave.sbs_fb == VK_NULL_HANDLE) {
+		if (mc->weave.sbs_view == VK_NULL_HANDLE) {
+			return false;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = mc->weave.unsqueeze.flatten_rp,
+		    .attachmentCount = 1,
+		    .pAttachments = &mc->weave.sbs_view,
+		    .width = mc->weave.sbs_w,
+		    .height = mc->weave.sbs_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &mc->weave.sbs_fb) != VK_SUCCESS) {
+			mc->weave.sbs_fb = VK_NULL_HANDLE;
+			U_LOG_E("weave(#1036): SBS scratch framebuffer failed — copy+blit path");
+			return false;
+		}
+	}
+	return true;
+}
+
+/*!
+ * @p a minus the union of @p b[0..nb): appends up to 4 pieces per subtraction
+ * step to @p out (capacity @p cap). Returns the count, or UINT32_MAX when the
+ * result does not fit (the caller then clears the whole image).
+ */
+static uint32_t
+weave_rect_subtract(VkRect2D a, const VkRect2D *b, uint32_t nb, VkRect2D *out, uint32_t cap)
+{
+	VkRect2D work[64];
+	uint32_t n = 0;
+	work[n++] = a;
+	for (uint32_t j = 0; j < nb && n > 0; j++) {
+		const int32_t bx0 = b[j].offset.x, by0 = b[j].offset.y;
+		const int32_t bx1 = bx0 + (int32_t)b[j].extent.width, by1 = by0 + (int32_t)b[j].extent.height;
+		VkRect2D next[64];
+		uint32_t m = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			const int32_t ax0 = work[i].offset.x, ay0 = work[i].offset.y;
+			const int32_t ax1 = ax0 + (int32_t)work[i].extent.width;
+			const int32_t ay1 = ay0 + (int32_t)work[i].extent.height;
+			if (bx1 <= ax0 || bx0 >= ax1 || by1 <= ay0 || by0 >= ay1) { // disjoint
+				if (m >= 64) {
+					return UINT32_MAX;
+				}
+				next[m++] = work[i];
+				continue;
+			}
+			const int32_t ix0 = bx0 > ax0 ? bx0 : ax0, ix1 = bx1 < ax1 ? bx1 : ax1;
+			const int32_t iy0 = by0 > ay0 ? by0 : ay0, iy1 = by1 < ay1 ? by1 : ay1;
+			// Top band, bottom band (full width), left + right of the overlap row.
+			const VkRect2D pieces[4] = {
+			    {{ax0, ay0}, {(uint32_t)(ax1 - ax0), (uint32_t)(iy0 - ay0)}},
+			    {{ax0, iy1}, {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - iy1)}},
+			    {{ax0, iy0}, {(uint32_t)(ix0 - ax0), (uint32_t)(iy1 - iy0)}},
+			    {{ix1, iy0}, {(uint32_t)(ax1 - ix1), (uint32_t)(iy1 - iy0)}},
+			};
+			for (uint32_t k = 0; k < 4; k++) {
+				if (pieces[k].extent.width == 0 || pieces[k].extent.height == 0) {
+					continue;
+				}
+				if (m >= 64) {
+					return UINT32_MAX;
+				}
+				next[m++] = pieces[k];
+			}
+		}
+		memcpy(work, next, sizeof(VkRect2D) * m);
+		n = m;
+	}
+	if (n > cap) {
+		return UINT32_MAX;
+	}
+	memcpy(out, work, sizeof(VkRect2D) * n);
+	return n;
 }
 
 /*!
@@ -382,8 +661,11 @@ weave_create_output(struct vk_bundle *vk, struct multi_compositor *mc, uint32_t 
 		return false;
 	}
 
-	if (!weave_import_ahb(vk, (void *)ahb, info.bits, &mc->weave.out_image, &mc->weave.out_memory,
-	                      &mc->weave.out_view, &mc->weave.out_w, &mc->weave.out_h, "output")) {
+	// The VkImage adds TRANSFER_SRC (the satellite present blits from it, the
+	// #2501 capture reads it back); no AHardwareBuffer usage bit is needed for it.
+	if (!weave_import_ahb(vk, (void *)ahb, info.bits | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC, &mc->weave.out_image,
+	                      &mc->weave.out_memory, &mc->weave.out_view, &mc->weave.out_w, &mc->weave.out_h,
+	                      "output")) {
 		u_graphics_buffer_unref(&ahb);
 		return false;
 	}
@@ -450,6 +732,63 @@ weave_run_dp_factory_on_main_thread(void *data)
 	struct weave_dp_factory_ctx *c = (struct weave_dp_factory_ctx *)data;
 	c->result = c->factory(c->vk_bundle, c->cmd_pool, NULL /* window_handle */, (int32_t)WEAVE_VK_FORMAT,
 	                       c->out_xdp);
+}
+
+/*!
+ * Apply a HARDWARE 2D/3D request to the engine's own DP and, once the DP
+ * confirmed a CHANGE, tell this client's session (#961: the event follows the
+ * DP, never the bookkeeping). The Android twin of the desktop-Linux engine's
+ * weave_apply_display_mode_locked. Call with mc->weave.mutex held and
+ * mc->weave.dp non-NULL.
+ *
+ * The vendor call is cheap and thread-safe for the IPC thread: the CNSDK DP
+ * only records the wish (an atomic) and its weave loop switches the backlight
+ * on the next process_atlas, which is why the event carries the REQUESTED state
+ * once the DP accepted it, never a read-back (logged as information only).
+ *
+ * A DP without a request_display_mode slot is mode-neutral (sim_display): the
+ * request counts as accepted. A DP that HAS the slot and returns false rejected
+ * it — nothing is recorded or reported, so the session never believes in a
+ * panel state the hardware did not reach.
+ */
+static bool
+weave_apply_display_mode_locked(struct multi_compositor *mc, bool want_3d, const char *why)
+{
+	struct xrt_display_processor *dp = mc->weave.dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	if (!accepted) {
+		U_LOG_W(
+		    "weave(#1036): the display processor REJECTED hardware %s (%s) — panel state unchanged, no "
+		    "event sent",
+		    want_3d ? "3D" : "2D", why);
+		return false;
+	}
+
+	const bool prev_3d = !mc->weave.hw_2d_confirmed;
+	mc->weave.hw_2d_confirmed = !want_3d;
+	if (prev_3d == want_3d) {
+		return true; // already there as far as THIS client knows: silent, no event
+	}
+
+	// One WARN per transition (a human-rate event: a page's 2D/3D toggle).
+	bool panel_3d = false;
+	const bool have_readback = xrt_display_processor_get_hardware_3d_state(dp, &panel_3d);
+	U_LOG_W("weave(#1036): hardware %s -> %s (%s) on the weave engine's display processor (%s); DP readback: %s",
+	        prev_3d ? "3D" : "2D", want_3d ? "3D" : "2D", why,
+	        has_slot ? "request_display_mode accepted" : "mode-neutral DP, nothing to switch",
+	        have_readback ? (panel_3d ? "3D (may lag — the backlight switches on the next weave)"
+	                                  : "2D (may lag — the backlight switches on the next weave)")
+	                      : "none (the DP has no get_hardware_3d_state)");
+
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	const xrt_result_t xret = multi_compositor_push_event(mc, &xse);
+	if (xret != XRT_SUCCESS) {
+		U_LOG_W("weave(#1036): could not push the hardware-state event to the session: %d", xret);
+	}
+	return true;
 }
 
 /*!
@@ -533,6 +872,8 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	// and renders into whatever we hand it via set_target_color_view. Its async
 	// init must be kicked off from a Looper-bearing thread, and we are on an IPC
 	// handler thread — so hop to the service main thread (#510 M2).
+	// One DP by design (#2218 item 6 audit): an Android device has one panel;
+	// per-screen weaving is the desktop-Linux engine's (comp_multi_weave_linux.c).
 	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)mc->msc->base.info.dp_factory_vk;
 	if (factory == NULL) {
 		U_LOG_E("weave(#1036): no Vulkan DP factory — cannot weave");
@@ -554,6 +895,259 @@ weave_ensure_engine(struct vk_bundle *vk, struct multi_compositor *mc)
 	mc->weave.engine_initialized = true;
 	mc->weave.engine_failed = false;
 	U_LOG_W("weave(#1036): Android weave engine initialized (RGBA8, AHardwareBuffer, synchronous)");
+	if (mc->weave.eye_tracking_mode_plus1 != 0) {
+		const uint32_t mode = mc->weave.eye_tracking_mode_plus1 - 1;
+		xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, mode);
+		U_LOG_W("weave(#1036): eye-tracking mode %u applied at engine bring-up", mode);
+	}
+	if (mc->weave.display_mode_requested) {
+		// A hardware request arrived before the DP existed: apply the standing
+		// wish now. Only when the client asked — one that never did keeps the
+		// DP's own default, as before. Runs under mc->weave.mutex (submit path).
+		(void)weave_apply_display_mode_locked(mc, mc->hardware_display_3d,
+		                                      "deferred request, applied at engine bring-up");
+	}
+	return true;
+}
+
+void
+comp_multi_weave_android_set_eye_tracking_mode(struct multi_compositor *mc, uint32_t mode)
+{
+	mc->weave.eye_tracking_mode_plus1 = mode + 1;
+	if (mc->weave.dp != NULL) {
+		xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, mode);
+	}
+	U_LOG_W("weave(#1036): eye-tracking mode %u requested (%s)", mode,
+	        mc->weave.dp != NULL ? "applied to the weave DP" : "held until the engine is up");
+}
+
+bool
+comp_multi_weave_android_request_display_mode(struct multi_compositor *mc, bool enable_3d)
+{
+	if (mc == NULL || mc->msc == NULL) {
+		return false;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->hardware_display_3d = enable_3d; // the standing wish
+	bool ok = true;
+	if (mc->weave.dp != NULL) {
+		ok = weave_apply_display_mode_locked(mc, enable_3d, "xrRequestDisplayModeDXR");
+	} else {
+		mc->weave.display_mode_requested = true;
+		U_LOG_W(
+		    "weave(#1036): hardware %s requested before the weave engine exists — recorded, applied when "
+		    "the engine comes up",
+		    enable_3d ? "3D" : "2D");
+	}
+	os_mutex_unlock(&mc->weave.mutex);
+	return ok;
+}
+
+
+/*
+ *
+ * sync_file weave (XR_DXR_weave v20).
+ *
+ * The caller's acquire sync_file is imported (temporarily) into a binary
+ * semaphore and waited by the first batch that reads the input; the final batch
+ * signals an exportable semaphore whose SYNC_FD export is the caller's release
+ * fence, and the submit then returns without the CPU vkWaitForFences (the next
+ * submit waits that fence before it reuses the command buffers). A
+ * self-submitting DP (CNSDK) sits between the two runtime batches, so it must
+ * join the chain through set_weave_sync: pre_sem (runtime -> DP) and dp_sem
+ * (DP -> runtime). Every path that cannot honour the chain falls back to the
+ * v9 behaviour for that frame — acquire CPU-polled, synchronous completion,
+ * release -1 — which is always correct, only slower.
+ *
+ */
+
+//! Decisions, for the WARN-on-change log (never per frame).
+enum weave_sync_mode
+{
+	WEAVE_SYNC_MODE_NONE = 0,
+	WEAVE_SYNC_MODE_GPU_RECORDING_DP,     //!< one batch: wait acquire, signal release
+	WEAVE_SYNC_MODE_GPU_DP_CHAIN,         //!< pre -> DP (set_weave_sync) -> post
+	WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH,  //!< debug.dxr.weave_sync_fd=0
+	WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD,  //!< device cannot move SYNC_FD semaphores
+	WEAVE_SYNC_MODE_FALLBACK_SATELLITE,   //!< #1277 satellite presents after the fence
+	WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT,    //!< self-submitting DP with DXR_ANDROID_WEAVE_SPLIT=0
+	WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED, //!< DP lacks / declined set_weave_sync
+};
+
+static const char *
+weave_sync_mode_str(enum weave_sync_mode m)
+{
+	switch (m) {
+	case WEAVE_SYNC_MODE_GPU_RECORDING_DP:
+		return "GPU chain (recording DP: one batch waits acquire, signals release)";
+	case WEAVE_SYNC_MODE_GPU_DP_CHAIN: return "GPU chain (self-submitting DP took set_weave_sync)";
+	case WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH: return "FALLBACK: debug.dxr.weave_sync_fd=0 (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD:
+		return "FALLBACK: device has no SYNC_FD semaphores (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_SATELLITE: return "FALLBACK: weave satellite presents (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT:
+		return "FALLBACK: self-submitting DP without the split submit (CPU waits, release -1)";
+	case WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED:
+		return "FALLBACK: DP lacks set_weave_sync or declined it (CPU waits, release -1)";
+	default: return "none";
+	}
+}
+
+static void
+weave_sync_log_mode(struct multi_compositor *mc, enum weave_sync_mode m)
+{
+	if (mc->weave.sync_last_mode != (uint8_t)m) {
+		mc->weave.sync_last_mode = (uint8_t)m;
+		U_LOG_W("weave v20 sync_file: %s", weave_sync_mode_str(m));
+	}
+}
+
+/*!
+ * `debug.dxr.weave_sync_fd` (default 1): 0 ignores the chained sync structs —
+ * the acquire fence is CPU-polled, completion is synchronous, the release fence
+ * is -1. Read per request (a property lookup, no I/O) so it can be flipped
+ * live for an A/B; logged on change.
+ */
+static bool
+weave_sync_fd_enabled(void)
+{
+	static int last = -1;
+	char value[PROP_VALUE_MAX] = {0};
+	const bool off = __system_property_get("debug.dxr.weave_sync_fd", value) > 0 && value[0] == '0';
+	const int now = off ? 0 : 1;
+	if (now != last) {
+		last = now;
+		U_LOG_W("weave v20 sync_file: GPU chain %s (debug.dxr.weave_sync_fd=%s)", off ? "DISABLED" : "enabled",
+		        value[0] != '\0' ? value : "<unset>");
+	}
+	return !off;
+}
+
+//! CPU-wait a sync_file (readable once signalled), bounded, and close it.
+static bool
+weave_sync_poll_and_close(int fd)
+{
+	if (fd < 0) {
+		return true;
+	}
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	int r;
+	do {
+		r = poll(&pfd, 1, 1000);
+	} while (r < 0 && errno == EINTR);
+	close(fd);
+	if (r <= 0) {
+		U_LOG_E("weave v20: acquire sync_file not signalled after 1 s (%s) — refusing this submit",
+		        r == 0 ? "timeout" : strerror(errno));
+		return false;
+	}
+	return true;
+}
+
+static void
+weave_sync_destroy_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	VkSemaphore *sems[] = {&mc->weave.sync_acquire_sem, &mc->weave.sync_pre_sem, &mc->weave.sync_dp_sem,
+	                       &mc->weave.sync_release_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (*sems[i] != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, *sems[i], NULL);
+			*sems[i] = VK_NULL_HANDLE;
+		}
+	}
+	mc->weave.sync_sems_ok = false;
+}
+
+//! Create the four semaphores once; false = this device cannot do the GPU chain.
+static bool
+weave_sync_ensure_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (mc->weave.sync_sems_tried) {
+		return mc->weave.sync_sems_ok;
+	}
+	mc->weave.sync_sems_tried = true;
+	mc->weave.sync_sems_ok = false;
+	if (!vk_has_external_semaphore_fd(vk) || !vk->external.binary_semaphore_sync_fd) {
+		U_LOG_W("weave v20: device lacks SYNC_FD binary semaphores (ext=%d, sync_fd=%d) — fences stay CPU-side",
+		        (int)vk_has_external_semaphore_fd(vk), (int)vk->external.binary_semaphore_sync_fd);
+		return false;
+	}
+	VkSemaphoreCreateInfo plain = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	VkExportSemaphoreCreateInfo export_info = {
+	    .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+	    .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	VkSemaphoreCreateInfo exportable = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &export_info};
+	if (vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_acquire_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_pre_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &plain, NULL, &mc->weave.sync_dp_sem) != VK_SUCCESS ||
+	    vk->vkCreateSemaphore(vk->device, &exportable, NULL, &mc->weave.sync_release_sem) != VK_SUCCESS) {
+		U_LOG_W("weave v20: sync semaphore creation failed — fences stay CPU-side");
+		weave_sync_destroy_sems(vk, mc);
+		return false;
+	}
+	mc->weave.sync_sems_ok = true;
+	return true;
+}
+
+/*!
+ * A semaphore may hold a signal nobody will wait (a dropped DP frame, a failed
+ * submit, a failed export) or an unconsumed temporary payload: drain the queue
+ * and start from fresh ones. Rare; never on the steady-state path.
+ */
+static void
+weave_sync_recreate_sems(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	vk_queue_lock(vk->main_queue);
+	vk->vkQueueWaitIdle(vk->main_queue->queue);
+	vk_queue_unlock(vk->main_queue);
+	weave_sync_destroy_sems(vk, mc);
+	mc->weave.sync_sems_tried = false;
+	mc->weave.sync_dirty = false;
+	(void)weave_sync_ensure_sems(vk, mc);
+}
+
+//! Temporary SYNC_FD import; consumes @p fd on every path.
+static bool
+weave_sync_import(struct vk_bundle *vk, VkSemaphore sem, int fd)
+{
+	VkImportSemaphoreFdInfoKHR info = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
+	    .semaphore = sem,
+	    .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
+	    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	    .fd = fd,
+	};
+	VkResult ret = vk->vkImportSemaphoreFdKHR(vk->device, &info);
+	if (ret != VK_SUCCESS) {
+		// A failed import does not transfer ownership.
+		U_LOG_E("weave v20: vkImportSemaphoreFdKHR(SYNC_FD) failed: %s", vk_result_string(ret));
+		close(fd);
+		return false;
+	}
+	return true;
+}
+
+/*!
+ * Wait the previous submit's fence if it returned asynchronously (v20). Must run
+ * before anything reuses the command buffers or releases a resource that frame
+ * may still read. False = still not done after 1 s (the submit is refused; the
+ * fence stays pending and the next submit re-waits it).
+ */
+static bool
+weave_sync_wait_prev(struct vk_bundle *vk, struct multi_compositor *mc)
+{
+	if (!mc->weave.fence_pending) {
+		return true;
+	}
+	VkResult ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("weave v20: previous weave did not complete within 1s: %s", vk_result_string(ret));
+		return false;
+	}
+	vk->vkResetFences(vk->device, 1, &mc->weave.fence);
+	mc->weave.fence_pending = false;
 	return true;
 }
 
@@ -1354,6 +1948,179 @@ comp_multi_weave_android_satellite_clear(struct multi_compositor *mc)
 	U_LOG_W("weave satellite(#1277): overlay CLEARED on weave-idle (stale-frame guard)");
 }
 
+/*
+ *
+ * #2501: file-trigger capture (comp_multi_weave_capture.h).
+ *
+ */
+
+/*!
+ * Point `$TMPDIR` — where u_capture_intent resolves the trigger and output
+ * paths — at a directory `adb` can reach, once per process, before the first
+ * poll. An Android service process has no usable `$TMPDIR` (the POSIX fallback
+ * `/tmp` does not exist), and `/data/local/tmp` is not writable by an app uid.
+ * Order: the `debug.dxr.capture_dir` property (a tester's override), then this
+ * package's external files dir (`/sdcard/Android/data/<pkg>/files`, created by
+ * the call, readable and writable by `adb shell` without root), then
+ * an inherited writable `$TMPDIR`, then the cache dir. Logged once.
+ */
+static pthread_once_t weave_capture_dir_once = PTHREAD_ONCE_INIT;
+
+static void
+weave_capture_resolve_dir(void)
+{
+	char dir[MCP_CAPTURE_PATH_MAX] = {0};
+	const char *source = NULL;
+	char prop[PROP_VALUE_MAX] = {0};
+	if (__system_property_get("debug.dxr.capture_dir", prop) > 0 && prop[0] != '\0') {
+		snprintf(dir, sizeof(dir), "%s", prop);
+		source = "debug.dxr.capture_dir";
+	} else if (android_globals_get_app_dir(true, dir, sizeof(dir))) {
+		source = "external files dir";
+	} else {
+		const char *tmp = getenv("TMPDIR");
+		if (tmp != NULL && tmp[0] != '\0' && access(tmp, W_OK | X_OK) == 0) {
+			snprintf(dir, sizeof(dir), "%s", tmp);
+			source = "$TMPDIR (inherited)";
+		} else if (android_globals_get_app_dir(false, dir, sizeof(dir))) {
+			source = "cache dir (adb needs run-as)";
+		}
+	}
+	if (source == NULL || dir[0] == '\0') {
+		U_LOG_W(
+		    "weave capture (#2501): no capture directory (no Context, no property) — triggers are not polled");
+		return;
+	}
+	setenv("TMPDIR", dir, 1);
+	U_LOG_W("weave capture (#2501): capture dir %s (%s); touch %s/displayxr_atlas_trigger[.<client-pkg>]", dir,
+	        source, dir);
+}
+
+void
+comp_multi_weave_android_set_capture_uid(struct xrt_compositor *xc, long peer_uid)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	const bool resolved = mc->weave.capture_tag_resolved && mc->weave.capture_tag_uid == peer_uid;
+	os_mutex_unlock(&mc->weave.mutex);
+	if (resolved) {
+		return;
+	}
+	// The JNI lookup runs outside the weave mutex (it may attach this thread).
+	char name[sizeof(mc->weave.capture.tag)] = {0};
+	if (!android_globals_get_name_for_uid(peer_uid, name, sizeof(name))) {
+		name[0] = '\0';
+	}
+	// A shared uid answers "<sharedUserId>:<uid>": not a usable file suffix.
+	if (strchr(name, ':') != NULL || strchr(name, '/') != NULL) {
+		name[0] = '\0';
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	snprintf(mc->weave.capture.tag, sizeof(mc->weave.capture.tag), "%s", name);
+	mc->weave.capture_tag_resolved = true;
+	mc->weave.capture_tag_uid = peer_uid;
+	os_mutex_unlock(&mc->weave.mutex);
+	U_LOG_W("weave capture (#2501): client uid %ld -> per-client trigger tag '%s'", peer_uid,
+	        name[0] != '\0' ? name : "(none: global triggers only)");
+}
+
+/*!
+ * `debug.dxr.overlay_filter_strength` (a float in [0, 1]): a dev override of the
+ * 2D-under-the-lens filter strength the app sent, for A/B runs without an app
+ * rebuild. Unset / empty / out of range = pass the app's value through. Read once
+ * per client (a client restart re-reads it), logged once when set.
+ */
+static float
+weave_filter_strength(struct multi_compositor *mc)
+{
+	if (!mc->weave.filter_strength_override_checked) {
+		mc->weave.filter_strength_override_checked = true;
+		mc->weave.filter_strength_override = NAN;
+		char value[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.overlay_filter_strength", value) > 0 && value[0] != '\0') {
+			char *end = NULL;
+			const float f = strtof(value, &end);
+			if (end != value && f >= 0.0f && f <= 1.0f) {
+				mc->weave.filter_strength_override = f;
+				U_LOG_W(
+				    "weave(#1036) v15: debug.dxr.overlay_filter_strength=%s OVERRIDES the app's 2D "
+				    "filter strength (dev knob)",
+				    value);
+			} else {
+				U_LOG_W("weave(#1036) v15: debug.dxr.overlay_filter_strength='%s' ignored (want 0..1)",
+				        value);
+			}
+		}
+	}
+	return isnan(mc->weave.filter_strength_override) ? mc->weave.overlay_filter_strength
+	                                                 : mc->weave.filter_strength_override;
+}
+
+void
+comp_multi_weave_android_set_overlay_hints(struct xrt_compositor *xc, bool overlay_unchanged, float filter_strength)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	mc->weave.overlay_unchanged = overlay_unchanged;
+	// Out of range (incl. NaN) = not set by the app: the DP's own default.
+	mc->weave.overlay_filter_strength =
+	    (filter_strength >= 0.0f && filter_strength <= 1.0f) ? filter_strength : -1.0f;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+void
+comp_multi_weave_android_set_sync(struct xrt_compositor *xc, int acquire_fence_fd, bool want_release_fence)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || mc->msc == NULL) {
+		if (acquire_fence_fd >= 0) {
+			close(acquire_fence_fd);
+		}
+		return;
+	}
+	weave_ensure_mutex(mc);
+	os_mutex_lock(&mc->weave.mutex);
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd); // an unconsumed request (never happens: take_sync_result drops it)
+	}
+	mc->weave.sync_requested = true;
+	mc->weave.sync_have_acquire = acquire_fence_fd >= 0;
+	mc->weave.sync_acquire_fd = acquire_fence_fd;
+	mc->weave.sync_want_release = want_release_fence;
+	os_mutex_unlock(&mc->weave.mutex);
+}
+
+int
+comp_multi_weave_android_take_sync_result(struct xrt_compositor *xc)
+{
+	struct multi_compositor *mc = multi_compositor(xc);
+	if (mc == NULL || !mc->weave.mutex_initialized) {
+		return -1;
+	}
+	os_mutex_lock(&mc->weave.mutex);
+	// A refused submit may never have reached the request: drop it.
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd);
+	}
+	mc->weave.sync_have_acquire = false;
+	mc->weave.sync_acquire_fd = -1;
+	mc->weave.sync_requested = false;
+	mc->weave.sync_want_release = false;
+	int fd = mc->weave.sync_have_release ? mc->weave.sync_release_fd : -1;
+	mc->weave.sync_have_release = false;
+	mc->weave.sync_release_fd = -1;
+	os_mutex_unlock(&mc->weave.mutex);
+	return fd;
+}
+
 bool
 comp_multi_weave_android_satellite_presented(struct multi_compositor *mc)
 {
@@ -1720,16 +2487,85 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 	weave_ensure_mutex(mc);
 	os_mutex_lock(&mc->weave.mutex);
 
+	// XR_DXR_weave v20 sync_file state for THIS submit (see "sync_file weave"
+	// above). All false / -1 for a caller that chained nothing, which leaves
+	// every line below exactly as it was before v20.
+	int acquire_fd = -1;           // owned here until imported, polled or closed
+	bool want_release = false;     // the caller chained XrWeaveOutputSyncDXR
+	bool sync_gpu = false;         // this frame runs the GPU chain
+	bool acquire_imported = false; // acquire_fd now lives in sync_acquire_sem
+	bool acquire_consumed = false; // ... and a submitted batch waits it
+	bool dp_sync_armed = false;    // the DP took set_weave_sync for the next process_atlas
+	bool atlas_done = false;       // process_atlas ran (the DP consumed the pair)
+	bool dp_dropped = false;       // ... and reported the frame dropped
+	bool capturing = false;        // #2501: this submit consumed a capture trigger
+
 	bool ok = false;
 	do {
 		if (!weave_ensure_engine(vk, mc)) {
 			break;
 		}
 
-		// (Re)import the input on identity change. AHardwareBuffer pointers are
-		// stable for as long as anyone holds a reference, and we hold one for the
-		// cached import — so pointer identity is a sound cache key here.
-		if (mc->weave.in_image == VK_NULL_HANDLE || mc->weave.in_ahb != (void *)input) {
+		// v20: a previous submit that returned without the CPU wait must be
+		// done before anything below reuses its command buffers or releases a
+		// resource it reads. No-op for a caller that never asked for a release
+		// fence (fence_pending is only ever set by one).
+		if (!weave_sync_wait_prev(vk, mc)) {
+			break;
+		}
+		if (mc->weave.sync_dirty) {
+			weave_sync_recreate_sems(vk, mc);
+		}
+
+		// v20: take this submit's sync request and decide how to honour it.
+		if (mc->weave.sync_requested) {
+			mc->weave.sync_requested = false;
+			if (mc->weave.sync_have_acquire) {
+				acquire_fd = mc->weave.sync_acquire_fd;
+				mc->weave.sync_have_acquire = false;
+				mc->weave.sync_acquire_fd = -1;
+			}
+			want_release = mc->weave.sync_want_release;
+			mc->weave.sync_want_release = false;
+			if (acquire_fd >= 0 || want_release) {
+				const bool selfsub = xrt_display_processor_is_self_submitting(mc->weave.dp);
+				enum weave_sync_mode mode;
+				if (!weave_sync_fd_enabled()) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH;
+				} else if (!weave_sync_ensure_sems(vk, mc)) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_NO_SYNC_FD;
+				} else if (weave_satellite_wanted(mc)) {
+					mode = WEAVE_SYNC_MODE_FALLBACK_SATELLITE; // presents after the fence
+				} else if (selfsub && !weave_split_enabled()) {
+					// The DP would submit before our pre-weave batch exists.
+					mode = WEAVE_SYNC_MODE_FALLBACK_NO_SPLIT;
+				} else {
+					sync_gpu = true;
+					// A self-submitting DP is confirmed (or not) by set_weave_sync below.
+					mode = selfsub ? WEAVE_SYNC_MODE_NONE : WEAVE_SYNC_MODE_GPU_RECORDING_DP;
+				}
+				if (mode != WEAVE_SYNC_MODE_NONE) {
+					weave_sync_log_mode(mc, mode);
+				}
+				if (!sync_gpu) {
+					// v9 behaviour for this frame: the caller's GPU work is
+					// done before ours starts.
+					const bool signalled = weave_sync_poll_and_close(acquire_fd);
+					acquire_fd = -1;
+					if (!signalled) {
+						break;
+					}
+				}
+			}
+		}
+
+		// (Re)import the input on identity change. NOT pointer identity: every
+		// IPC receive produces a fresh AHardwareBuffer * for the same buffer, so
+		// the key is the system-wide buffer id (#1865, weave_ahb_id). On a hit the
+		// per-call reference stays in `input` and is released at the end.
+		const uint64_t input_id = weave_ahb_id((void *)input);
+		if (mc->weave.in_image == VK_NULL_HANDLE ||
+		    !weave_ahb_matches(mc->weave.in_ahb, mc->weave.in_ahb_id, (void *)input, input_id)) {
 			weave_release_input(vk, mc);
 			if (!weave_import_ahb(vk, (void *)input,
 			                      XRT_SWAPCHAIN_USAGE_SAMPLED | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC,
@@ -1738,23 +2574,64 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				break;
 			}
 			mc->weave.in_ahb = (void *)input; // adopt the reference
+			mc->weave.in_ahb_id = input_id;
 			mc->weave.in_first_use = true;
+			const uint32_t n = mc->weave.in_imports++;
+			if (n == 0 || (n % 300) == 0) {
+				U_LOG_W("weave(#1036) input import #%u (%ux%u, id=%" PRIu64 ")", n + 1, mc->weave.in_w,
+				        mc->weave.in_h, input_id);
+			}
 			input = XRT_GRAPHICS_BUFFER_HANDLE_INVALID; // ownership transferred
 		}
 
 		// v4 overlay: same, into the SEPARATE overlay cache.
+		//
+		// XR_DXR_weave v18 (browser-pvt#226), two rules the desktop-Linux engine
+		// has had since v16 and the D3D11 service always had:
+		//  1. PER SUBMIT. The cache is keyed by buffer identity because the
+		//     caller re-sends the same AHardwareBuffer every frame, but a cached
+		//     import is NOT a standing overlay: a submit that chains none is woven
+		//     with none. Before v18 the last imported overlay was composited on
+		//     every later submit, so a caller that stops sending one (the
+		//     browser's whole-page overlay switches itself off while the page
+		//     scrolls) got its last page composited over a page that had moved.
+		//  2. REFUSE, don't drop. A chained overlay that cannot be imported
+		//     refuses the submit HERE, before anything is recorded, so the woven
+		//     output is left exactly as the previous accepted submit left it. A
+		//     caller that hands its whole 2D over as the overlay reads "accepted
+		//     with the overlay chained" as "composited" and presents the woven
+		//     output as the frame; before v18 that frame would have had its 2D
+		//     missing.
+		mc->weave.overlay_this_submit = overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
+		const uint64_t overlay_id = weave_ahb_id((void *)overlay);
 		if (overlay != XRT_GRAPHICS_BUFFER_HANDLE_INVALID &&
-		    (mc->weave.overlay_image == VK_NULL_HANDLE || mc->weave.overlay_ahb != (void *)overlay)) {
+		    (mc->weave.overlay_image == VK_NULL_HANDLE ||
+		     !weave_ahb_matches(mc->weave.overlay_ahb, mc->weave.overlay_ahb_id, (void *)overlay, overlay_id))) {
 			weave_release_overlay(vk, mc);
-			if (weave_import_ahb(vk, (void *)overlay, XRT_SWAPCHAIN_USAGE_SAMPLED,
-			                     &mc->weave.overlay_image, &mc->weave.overlay_memory,
-			                     &mc->weave.overlay_view, &mc->weave.overlay_w, &mc->weave.overlay_h,
-			                     "overlay")) {
+			if (weave_import_ahb(
+			        vk, (void *)overlay,
+			        XRT_SWAPCHAIN_USAGE_SAMPLED | XRT_SWAPCHAIN_USAGE_TRANSFER_SRC, // #2501 capture
+			        &mc->weave.overlay_image, &mc->weave.overlay_memory, &mc->weave.overlay_view,
+			        &mc->weave.overlay_w, &mc->weave.overlay_h, "overlay")) {
 				mc->weave.overlay_ahb = (void *)overlay;
+				mc->weave.overlay_ahb_id = overlay_id;
 				mc->weave.overlay_first_use = true;
 				overlay = XRT_GRAPHICS_BUFFER_HANDLE_INVALID;
-				U_LOG_W("weave(#1036) v4: overlay import cached (%ux%u)", mc->weave.overlay_w,
-				        mc->weave.overlay_h);
+				// Throttled: a producer that really does change buffers every frame
+				// must not turn this into a per-frame WARN (#1865).
+				const uint32_t n = mc->weave.overlay_imports++;
+				if (n == 0 || (n % 300) == 0) {
+					U_LOG_W("weave(#1036) v4: overlay import #%u cached (%ux%u, id=%" PRIu64 ")", n + 1,
+					        mc->weave.overlay_w, mc->weave.overlay_h, overlay_id);
+				}
+			} else {
+				const uint32_t n = mc->weave.overlay_refusals++;
+				if (n == 0 || (n % 300) == 0) {
+					U_LOG_W("weave(#1036) v18: overlay import failed — submit REFUSED, woven output "
+					        "untouched (refusals=%u)",
+					        n + 1);
+				}
+				break;
 			}
 		}
 
@@ -1868,6 +2745,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			mc->weave.crop_first_use = true;
 		}
 
+		// #2501: file-trigger capture. One poll per submit (the previous submit's
+		// fence is retired by now); only a submit that consumed a trigger records
+		// readbacks (input / atlas / overlay / woven) and writes the PNGs after
+		// its own completion.
+		pthread_once(&weave_capture_dir_once, weave_capture_resolve_dir);
+		capturing = comp_multi_weave_capture_begin(&mc->weave.capture, vk);
+
 		// ---- Record ----
 		VkCommandBuffer cmd = mc->weave.cmd;
 		vk->vkResetCommandBuffer(cmd, 0);
@@ -1881,6 +2765,16 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 		VkImageSubresourceRange range = {
 		    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
+
+		// #2501: the caller's buffer as received. It rests in GENERAL between
+		// submits; a freshly imported one is still UNDEFINED (its first barrier
+		// below discards), so the import frame records no input stage.
+		if (capturing && !mc->weave.in_first_use) {
+			comp_multi_weave_capture_record(&mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_INPUT,
+			                                mc->weave.in_image, mc->weave.in_w, mc->weave.in_h,
+			                                WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_GENERAL,
+			                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT);
+		}
 
 		VkImage dp_src_image = mc->weave.sbs_image;
 		VkImageView dp_src_view = mc->weave.sbs_view;
@@ -1969,130 +2863,408 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			atlas_view_h = cvh;
 			grid_cols = layout->tile_columns;
 			grid_rows = layout->tile_rows;
-		} else {
+		} else if (weave_rect_scoped_wanted(mc) && weave_unsqueeze_ready(vk, mc)) {
+			// Rect-scoped batch record (debug.dxr.weave_rect_scoped, default ON).
+			// Same scratch contents as the copy+blit path below, bought for the
+			// rects' pixels instead of the window's: (1) the scratch is cleared
+			// only where an earlier frame wrote and this frame does not — it is
+			// otherwise transparent already, which is exactly what the whole-image
+			// firstChunk clear guaranteed; (2) each eye is un-squeezed by ONE
+			// draw sampling the input with the sample point clamped to the half-
+			// rect's outermost texel centres — the clamp the per-eye staging image
+			// existed to provide — so there is no staging copy and no staging
+			// image to reallocate (and vkQueueWaitIdle for) when a rect resizes.
+			struct xrt_rect legacy_rect = {
+			    .offset = {.w = 0, .h = 0},
+			    .extent = {.w = (int)want_w, .h = (int)want_h},
+			};
+			const struct xrt_rect *src_rects = rect_count > 0 ? rects : &legacy_rect;
+			uint32_t src_count = rect_count > 0 ? rect_count : 1;
+			if (src_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
+				src_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
+			}
+			struct vk_local2d_clamped_copy copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkRect2D written[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			uint32_t copy_count = 0;
+			for (uint32_t i = 0; i < src_count; i++) {
+				// xrt_offset names its fields w/h; they hold x/y here.
+				const int32_t rx = src_rects[i].offset.w;
+				const int32_t ry = src_rects[i].offset.h;
+				const int32_t rw = src_rects[i].extent.w;
+				const int32_t rh = src_rects[i].extent.h;
+				if (rw <= 0 || rh <= 0 || rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
+				    (uint32_t)(ry + rh) > mc->weave.in_h) {
+					continue;
+				}
+				const int32_t half = rw / 2;
+				if (half <= 0) {
+					continue;
+				}
+				const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+				const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+				const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+				const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
+				if (dx1 <= dx0 || dy1 <= dy0) {
+					continue;
+				}
+				const int32_t src_x[2] = {rx, rx + half};
+				const int32_t src_w[2] = {half, rw - half};
+				const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w};
+				for (uint32_t e = 0; e < 2; e++) {
+					copies[copy_count] = (struct vk_local2d_clamped_copy){
+					    .dst_x = tile_x[e] + dx0,
+					    .dst_y = dy0,
+					    .dst_w = (uint32_t)(dx1 - dx0),
+					    .dst_h = (uint32_t)(dy1 - dy0),
+					    .src_x = src_x[e],
+					    .src_y = ry,
+					    .src_w = (uint32_t)src_w[e],
+					    .src_h = (uint32_t)rh,
+					};
+					written[copy_count] =
+					    (VkRect2D){{copies[copy_count].dst_x, dy0},
+					               {copies[copy_count].dst_w, copies[copy_count].dst_h}};
+					copy_count++;
+				}
+			}
 
-		// Input: keep GENERAL across frames (UNDEFINED would discard the caller's
-		// pixels); the barrier makes external writes visible.
-		VkImageMemoryBarrier in_barrier = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-		    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
-		    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-		    .image = mc->weave.in_image,
-		    .subresourceRange = range,
-		};
-		mc->weave.in_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-		                         NULL, 0, NULL, 1, &in_barrier);
+			// What to clear. A fresh scratch (UNDEFINED contents) is cleared whole
+			// whatever chunk this is; otherwise only the first chunk of a frame
+			// clears — the rects an earlier frame wrote, minus this chunk's.
+			const bool fresh = mc->weave.sbs_first_use;
+			bool full_clear = fresh || (weave_frame_first && mc->weave.sbs_dirty_full);
+			VkRect2D clears[64];
+			uint32_t clear_count = 0;
+			if (weave_frame_first && !full_clear) {
+				for (uint32_t d = 0; d < mc->weave.sbs_dirty_count && !full_clear; d++) {
+					uint32_t n = weave_rect_subtract(mc->weave.sbs_dirty[d], written, copy_count,
+					                                 &clears[clear_count], 64 - clear_count);
+					if (n == UINT32_MAX) {
+						full_clear = true;
+					} else {
+						clear_count += n;
+					}
+				}
+			}
+			if (full_clear) {
+				clear_count = 0;
+			}
+			// Track what the scratch now holds outside "transparent".
+			if (full_clear || weave_frame_first) {
+				mc->weave.sbs_dirty_count = 0;
+				mc->weave.sbs_dirty_full = false;
+			}
+			for (uint32_t k = 0; k < copy_count; k++) {
+				if (mc->weave.sbs_dirty_count >= COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2) {
+					mc->weave.sbs_dirty_full = true; // Next frame clears it all.
+					break;
+				}
+				mc->weave.sbs_dirty[mc->weave.sbs_dirty_count++] = written[k];
+			}
 
-		// Scratch -> TRANSFER_DST (persists across frames: stale regions from
-		// closed elements re-weave harmlessly; the caller composites back only its
-		// current rects — same contract as the Windows output).
-		VkImageMemoryBarrier sbs_to_dst = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .oldLayout = mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
-		                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		mc->weave.sbs_first_use = false;
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_dst);
-
-		// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
-		// transparent on the first submit of a frame, so regions BETWEEN the woven
-		// tiles come out alpha 0 instead of stale.
-		if (weave_frame_first) {
-			VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
-			vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-			                         &sbs_transparent, 1, &range);
-			// Order the whole-image clear before the per-rect blits (both TRANSFER
-			// writes to overlapping regions — no implicit ordering within a stage).
-			VkImageMemoryBarrier clear_to_blit = {
+			// Input: GENERAL -> SHADER_READ for the draw (external writes visible).
+			VkImageMemoryBarrier in_to_read = {
 			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.in_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.in_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+			                         &in_to_read);
+
+			// Scratch: (UNDEFINED | SHADER_READ from the last DP sample) ->
+			// [TRANSFER_DST + whole clear] -> COLOR_ATTACHMENT (LOAD keeps the rest).
+			VkImageLayout sbs_layout =
+			    fresh ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+			mc->weave.sbs_first_use = false;
+			if (full_clear) {
+				VkImageMemoryBarrier sbs_to_dst = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = sbs_layout,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .image = mc->weave.sbs_image,
+				    .subresourceRange = range,
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &sbs_to_dst);
+				VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+				vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                         &sbs_transparent, 1, &range);
+				sbs_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+			}
+			VkImageMemoryBarrier sbs_to_attach = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = full_clear ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT,
+			    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			    .oldLayout = sbs_layout,
+			    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    .image = mc->weave.sbs_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(
+			    cmd, full_clear ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &sbs_to_attach);
+
+			if (copy_count > 0 || clear_count > 0) {
+				vk_local2d_composite_begin_frame(&mc->weave.unsqueeze, vk);
+				if (!vk_local2d_composite_clamped_copy(
+				        &mc->weave.unsqueeze, vk, cmd, mc->weave.sbs_fb, mc->weave.sbs_w,
+				        mc->weave.sbs_h, mc->weave.in_view, mc->weave.in_w, mc->weave.in_h, clears,
+				        clear_count, copies, copy_count)) {
+					static bool logged = false;
+					if (!logged) {
+						logged = true;
+						U_LOG_E(
+						    "weave(#1036): rect-scoped un-squeeze recorded nothing (%u copies, "
+						    "%u clears)",
+						    copy_count, clear_count);
+					}
+					mc->weave.sbs_dirty_full = true;
+				}
+			}
+
+			// Scratch -> SHADER_READ for the DP sample; input back to GENERAL so
+			// the next frame's barrier and the caller's external writes agree.
+			VkImageMemoryBarrier post[2] = {
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			        .image = mc->weave.sbs_image,
+			        .subresourceRange = range,
+			    },
+			    {
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			        .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			        .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			        .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			        .image = mc->weave.in_image,
+			        .subresourceRange = range,
+			    },
+			};
+			vk->vkCmdPipelineBarrier(
+			    cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+			    NULL, 2, post);
+		} else {
+			// Copy+blit batch record (debug.dxr.weave_rect_scoped=0, or the clamped
+			// draw is unavailable). The old path's scratch is not tracked by the
+			// rect-scoped dirty list, so the next scoped frame clears it whole.
+			mc->weave.sbs_dirty_full = true;
+
+			// Input: keep GENERAL across frames (UNDEFINED would discard the caller's
+			// pixels); the barrier makes external writes visible.
+			VkImageMemoryBarrier in_barrier = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			    .oldLayout = mc->weave.in_first_use ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+			    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			    .image = mc->weave.in_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.in_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &in_barrier);
+
+			// Scratch -> TRANSFER_DST (persists across frames: stale regions from
+			// closed elements re-weave harmlessly; the caller composites back only its
+			// current rects — same contract as the Windows output).
+			VkImageMemoryBarrier sbs_to_dst = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
 			    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .oldLayout = mc->weave.sbs_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			                                         : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 			    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 			    .image = mc->weave.sbs_image,
 			    .subresourceRange = range,
 			};
-			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-			                         0, NULL, 0, NULL, 1, &clear_to_blit);
-		}
+			mc->weave.sbs_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &sbs_to_dst);
 
-		// Blit each rect's squeezed-SBS halves into the two atlas tiles: left half
-		// -> left tile at the rect's window position (stretched to full rect
-		// width), right half -> right tile offset by out_w.
-		struct xrt_rect legacy_rect = {
-		    .offset = {.w = 0, .h = 0},
-		    .extent = {.w = (int)want_w, .h = (int)want_h},
-		};
-		const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
-		uint32_t blit_count = rect_count > 0 ? rect_count : 1;
-
-		for (uint32_t i = 0; i < blit_count; i++) {
-			// xrt_offset names its fields w/h; they hold x/y here.
-			int32_t rx = blit_rects[i].offset.w;
-			int32_t ry = blit_rects[i].offset.h;
-			int32_t rw = blit_rects[i].extent.w;
-			int32_t rh = blit_rects[i].extent.h;
-			if (rw <= 0 || rh <= 0) {
-				continue;
-			}
-			// Clamp to the input.
-			if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
-			    (uint32_t)(ry + rh) > mc->weave.in_h) {
-				continue;
-			}
-			int32_t half = rw / 2;
-			if (half <= 0) {
-				continue;
+			// v5 firstChunk (browser#22): clear the SBS scratch to premultiplied
+			// transparent on the first submit of a frame, so regions BETWEEN the woven
+			// tiles come out alpha 0 instead of stale.
+			if (weave_frame_first) {
+				VkClearColorValue sbs_transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+				vk->vkCmdClearColorImage(cmd, mc->weave.sbs_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				                         &sbs_transparent, 1, &range);
+				// Order the whole-image clear before the per-rect blits (both TRANSFER
+				// writes to overlapping regions — no implicit ordering within a stage).
+				VkImageMemoryBarrier clear_to_blit = {
+				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+				    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+				    .image = mc->weave.sbs_image,
+				    .subresourceRange = range,
+				};
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1,
+				                         &clear_to_blit);
 			}
 
-			// Physical-rect mode: content lands in the (physical-sized) atlas
-			// at scaled coordinates; identity when sat_pscale == 1.
-			const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
-			const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
-			const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
-			const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
-			VkImageBlit blits[2] = {
-			    // Left eye: input rect's left half -> left tile, unsqueezed.
-			    {
-			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx, ry, 0}, {rx + half, ry + rh, 1}},
-			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{dx0, dy0, 0}, {dx1, dy1, 1}},
-			    },
-			    // Right eye: input rect's right half -> right tile (+out_w).
-			    {
-			        .srcSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .srcOffsets = {{rx + half, ry, 0}, {rx + rw, ry + rh, 1}},
-			        .dstSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-			        .dstOffsets = {{(int32_t)mc->weave.out_w + dx0, dy0, 0},
-			                       {(int32_t)mc->weave.out_w + dx1, dy1, 1}},
-			    },
+			// Un-squeeze each rect's SBS halves into the two atlas tiles: left half ->
+			// left tile at the rect's window position (stretched to full rect width),
+			// right half -> right tile offset by out_w. A LINEAR blit clamps at the
+			// edge of the whole SOURCE IMAGE, not at srcOffsets, so stretching straight
+			// out of the input would read 25 % of the texel beyond each half-rect (the
+			// caller's never-cleared ring on the outer edges = a dark 1-px border; the
+			// other eye at the midline). Each half is therefore first copied 1:1 into
+			// an image of exactly its size and that WHOLE image is stretched: the edge
+			// clamp is then the half-rect's own outermost texel centres. Odd widths
+			// keep the split they always had: left = rw / 2, right = the rest.
+			struct xrt_rect legacy_rect = {
+			    .offset = {.w = 0, .h = 0},
+			    .extent = {.w = (int)want_w, .h = (int)want_h},
 			};
-			vk->vkCmdBlitImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL, mc->weave.sbs_image,
-			                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, blits, VK_FILTER_LINEAR);
-		}
+			const struct xrt_rect *blit_rects = rect_count > 0 ? rects : &legacy_rect;
+			uint32_t blit_count = rect_count > 0 ? rect_count : 1;
+			if (blit_count > COMP_MULTI_WEAVE_EYE_STAGE_SLOTS) {
+				blit_count = COMP_MULTI_WEAVE_EYE_STAGE_SLOTS; // The IPC server already rejects more.
+			}
 
-		// Scratch -> SHADER_READ for the DP sample.
-		VkImageMemoryBarrier sbs_to_read = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = mc->weave.sbs_image,
-		    .subresourceRange = range,
-		};
-		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
-		                         0, NULL, 0, NULL, 1, &sbs_to_read);
+			VkImageBlit eye_blits[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImage
+			    eye_src[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2]; // VK_NULL_HANDLE = straight from the input.
+			VkImage stage_images[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImageCopy stage_copies[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			VkImageMemoryBarrier stage_barriers[COMP_MULTI_WEAVE_EYE_STAGE_SLOTS * 2];
+			uint32_t eye_count = 0;
+			uint32_t staged_count = 0;
+			const VkImageSubresourceLayers color_layer = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			                                              .layerCount = 1};
+
+			for (uint32_t i = 0; i < blit_count; i++) {
+				// xrt_offset names its fields w/h; they hold x/y here.
+				int32_t rx = blit_rects[i].offset.w;
+				int32_t ry = blit_rects[i].offset.h;
+				int32_t rw = blit_rects[i].extent.w;
+				int32_t rh = blit_rects[i].extent.h;
+				if (rw <= 0 || rh <= 0) {
+					continue;
+				}
+				// Clamp to the input.
+				if (rx < 0 || ry < 0 || (uint32_t)(rx + rw) > mc->weave.in_w ||
+				    (uint32_t)(ry + rh) > mc->weave.in_h) {
+					continue;
+				}
+				int32_t half = rw / 2;
+				if (half <= 0) {
+					continue;
+				}
+
+				// Physical-rect mode: content lands in the (physical-sized) atlas
+				// at scaled coordinates; identity when sat_pscale == 1.
+				const int32_t dx0 = (int32_t)((float)rx * sat_pscale + 0.5f);
+				const int32_t dy0 = (int32_t)((float)ry * sat_pscale + 0.5f);
+				const int32_t dx1 = (int32_t)((float)(rx + rw) * sat_pscale + 0.5f);
+				const int32_t dy1 = (int32_t)((float)(ry + rh) * sat_pscale + 0.5f);
+				const int32_t src_x[2] = {rx, rx + half};
+				const int32_t src_w[2] = {half, rw - half};
+				const int32_t tile_x[2] = {0, (int32_t)mc->weave.out_w}; // Right tile (+out_w).
+				for (uint32_t e = 0; e < 2; e++) {
+					VkImage stage = weave_eye_stage_get(vk, mc, i, e, (uint32_t)src_w[e],
+					                                    (uint32_t)rh, WEAVE_VK_FORMAT);
+					eye_blits[eye_count] = (VkImageBlit){
+					    .srcSubresource = color_layer,
+					    .srcOffsets = {{src_x[e], ry, 0}, {src_x[e] + src_w[e], ry + rh, 1}},
+					    .dstSubresource = color_layer,
+					    .dstOffsets = {{tile_x[e] + dx0, dy0, 0}, {tile_x[e] + dx1, dy1, 1}},
+					};
+					if (stage != VK_NULL_HANDLE) {
+						// Stretch the WHOLE staged image instead of the input sub-rect.
+						eye_blits[eye_count].srcOffsets[0] = (VkOffset3D){0, 0, 0};
+						eye_blits[eye_count].srcOffsets[1] = (VkOffset3D){src_w[e], rh, 1};
+						stage_images[staged_count] = stage;
+						stage_copies[staged_count] = (VkImageCopy){
+						    .srcSubresource = color_layer,
+						    .srcOffset = {src_x[e], ry, 0},
+						    .dstSubresource = color_layer,
+						    .dstOffset = {0, 0, 0},
+						    .extent = {(uint32_t)src_w[e], (uint32_t)rh, 1},
+						};
+						// Fully overwritten by the copy: discard from UNDEFINED. The
+						// TRANSFER src scope orders it after an earlier submit's
+						// stretch read of the same image (WAR — execution only).
+						stage_barriers[staged_count] = (VkImageMemoryBarrier){
+						    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+						    .srcAccessMask = 0,
+						    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+						    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+						    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+						    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+						    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+						    .image = stage,
+						    .subresourceRange = range,
+						};
+						staged_count++;
+					}
+					eye_src[eye_count] = stage;
+					eye_count++;
+				}
+			}
+
+			if (staged_count > 0) {
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+				                         staged_count, stage_barriers);
+				for (uint32_t k = 0; k < staged_count; k++) {
+					vk->vkCmdCopyImage(cmd, mc->weave.in_image, VK_IMAGE_LAYOUT_GENERAL,
+					                   stage_images[k], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+					                   &stage_copies[k]);
+				}
+				// Copy writes -> stretch reads.
+				for (uint32_t k = 0; k < staged_count; k++) {
+					stage_barriers[k].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+					stage_barriers[k].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+					stage_barriers[k].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+					stage_barriers[k].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+				}
+				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+				                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL,
+				                         staged_count, stage_barriers);
+			}
+
+			// Stretches, in rect order (a later rect still overwrites an overlapping
+			// earlier one).
+			for (uint32_t k = 0; k < eye_count; k++) {
+				const bool staged = eye_src[k] != VK_NULL_HANDLE;
+				VkImage src = staged ? eye_src[k] : mc->weave.in_image;
+				VkImageLayout src_layout =
+				    staged ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+				vk->vkCmdBlitImage(cmd, src, src_layout, mc->weave.sbs_image,
+				                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &eye_blits[k],
+				                   VK_FILTER_LINEAR);
+			}
+
+			// Scratch -> SHADER_READ for the DP sample.
+			VkImageMemoryBarrier sbs_to_read = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.sbs_image,
+			    .subresourceRange = range,
+			};
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+			                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
+			                         &sbs_to_read);
 		} // end !nview (legacy/batch SBS record)
 
 		// Output -> COLOR_ATTACHMENT (fully re-rendered every submit, so the
@@ -2146,7 +3318,121 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// completion contract for the whole frame.
 		// Kill-switch: debug.xrt.DXR_ANDROID_WEAVE_SPLIT=0 restores the old
 		// single-submission behaviour.
+		// 2D under the lens (ADR-027 Amendment): offer the v4 overlay to the DP so
+		// it composites the layer INSIDE the weave and band-limits it for the lens,
+		// instead of the post-weave blend below (which aliases per eye wherever the
+		// lens is on). Only when the layer is exactly the process_atlas target size
+		// (the slot's contract; the satellite physical-rect and v6 N-view targets
+		// are not window-sized). The layer is put in SHADER_READ_ONLY here, BEFORE
+		// the self-submit split, so it is ready when a self-submitting DP (CNSDK)
+		// samples it during process_atlas. A DP that declines leaves the post-weave
+		// blend to do exactly what it did before. Per submit (#1835): the import
+		// is cached by AHB pointer, so a submit that chains no overlay must not
+		// hand the DP the last one.
+		// #2501: the atlas the DP is about to consume (SBS scratch / v6 crop / the
+		// zero-copy input, all in SHADER_READ_ONLY here). Recorded before the
+		// self-submitting split, so it reads what the DP reads.
+		if (capturing) {
+			uint32_t src_w = mc->weave.sbs_w, src_h = mc->weave.sbs_h;
+			if (dp_src_image == mc->weave.crop_image) {
+				src_w = mc->weave.crop_w;
+				src_h = mc->weave.crop_h;
+			} else if (dp_src_image == mc->weave.in_image) {
+				src_w = mc->weave.in_w;
+				src_h = mc->weave.in_h;
+			}
+			comp_multi_weave_capture_record(
+			    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_ATLAS, dp_src_image, src_w, src_h,
+			    WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+		}
+
+		struct xrt_display_processor_vk *dp_vk = (struct xrt_display_processor_vk *)mc->weave.dp;
+		bool ov_in_dp = false;
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit &&
+		    mc->weave.overlay_w == mc->weave.out_w &&
+		    mc->weave.overlay_h == mc->weave.out_h && xrt_display_processor_vk_supports_overlay_2d(dp_vk)) {
+			VkImageMemoryBarrier ov_to_read = {
+			    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+			    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+			    .oldLayout = mc->weave.overlay_first_use ? VK_IMAGE_LAYOUT_UNDEFINED
+			                                             : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+			    .image = mc->weave.overlay_image,
+			    .subresourceRange = range,
+			};
+			mc->weave.overlay_first_use = false;
+			vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			                         0, 0, NULL, 0, NULL, 1, &ov_to_read);
+			// #2501: the 2D layer exactly as handed to the DP.
+			if (capturing) {
+				comp_multi_weave_capture_record(
+				    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_OVERLAY,
+				    mc->weave.overlay_image, mc->weave.overlay_w, mc->weave.overlay_h, WEAVE_VK_FORMAT,
+				    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+				    VK_ACCESS_SHADER_READ_BIT);
+			}
+			// v15 strength first: the D3D11 / Linux order.
+			xrt_display_processor_vk_set_overlay_2d_filter_strength(dp_vk, weave_filter_strength(mc));
+			ov_in_dp = xrt_display_processor_vk_set_overlay_2d(
+			    dp_vk, mc->weave.overlay_view, (VkFormat_XDP)WEAVE_VK_FORMAT, mc->weave.overlay_w,
+			    mc->weave.overlay_h, XRT_ATLAS_ENCODING_ENCODED, mc->weave.overlay_unchanged);
+		}
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit) {
+			const uint8_t verdict = ov_in_dp ? 2u : 1u;
+			if (verdict != mc->weave.overlay_in_dp) {
+				mc->weave.overlay_in_dp = verdict;
+				U_LOG_W("weave(#1036) v4: 2D overlay %ux%u (target %ux%u) -> %s", mc->weave.overlay_w,
+				        mc->weave.overlay_h, mc->weave.out_w, mc->weave.out_h,
+				        ov_in_dp ? "composited by the DP inside the weave (2D under the lens)"
+				                 : "runtime post-weave premul-over blend");
+			}
+		}
+
 		bool weave_split = weave_split_enabled() && xrt_display_processor_is_self_submitting(mc->weave.dp);
+
+		// v20, self-submitting DP: its interlace batch sits between our two
+		// batches, so it has to wait pre_sem (our pre-weave batch, which reads
+		// the input) and signal dp_sem (its last target write) for the chain to
+		// hold without a CPU wait. Armed before the pre-weave submit — only
+		// set_target_color_view lies between here and process_atlas. A DP that
+		// lacks the slot or declines it gets the v9 frame.
+		if (sync_gpu && weave_split) {
+			if (xrt_display_processor_vk_set_weave_sync(dp_vk, (VkSemaphore_XDP)mc->weave.sync_pre_sem, 0,
+			                                            (VkSemaphore_XDP)mc->weave.sync_dp_sem, 0)) {
+				dp_sync_armed = true;
+				weave_sync_log_mode(mc, WEAVE_SYNC_MODE_GPU_DP_CHAIN);
+			} else {
+				sync_gpu = false;
+				weave_sync_log_mode(mc, WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED);
+				const bool signalled = weave_sync_poll_and_close(acquire_fd);
+				acquire_fd = -1;
+				if (!signalled) {
+					break;
+				}
+			}
+		}
+		// v20: the acquire fence goes into a semaphore the FIRST batch of this
+		// frame waits (the pre-weave batch under the split, else the only one).
+		// An import failure CPU-polls it instead and keeps the release chain.
+		if (sync_gpu && acquire_fd >= 0) {
+			const int dup_fd = fcntl(acquire_fd, F_DUPFD_CLOEXEC, 0);
+			if (dup_fd >= 0 && weave_sync_import(vk, mc->weave.sync_acquire_sem, dup_fd)) {
+				close(acquire_fd);
+				acquire_imported = true;
+			} else {
+				U_LOG_W("weave v20: acquire sync_file import failed — CPU-polling it this frame");
+				const bool signalled = weave_sync_poll_and_close(acquire_fd);
+				if (!signalled) {
+					acquire_fd = -1;
+					break;
+				}
+			}
+			acquire_fd = -1;
+		}
+		const VkPipelineStageFlags sync_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+
 		if (weave_split) {
 			if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
 				U_LOG_E("weave(#1036): vkEndCommandBuffer (pre-weave) failed");
@@ -2154,8 +3440,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 			VkSubmitInfo pre_submit = {
 			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .waitSemaphoreCount = acquire_imported ? 1u : 0u,
+			    .pWaitSemaphores = &mc->weave.sync_acquire_sem,
+			    .pWaitDstStageMask = &sync_wait_stage,
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
+			    .signalSemaphoreCount = dp_sync_armed ? 1u : 0u,
+			    .pSignalSemaphores = &mc->weave.sync_pre_sem,
 			};
 			vk_queue_lock(vk->main_queue);
 			VkResult pre_ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_submit, VK_NULL_HANDLE);
@@ -2164,6 +3455,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				U_LOG_E("weave(#1036): pre-weave vkQueueSubmit failed: %s", vk_result_string(pre_ret));
 				break;
 			}
+			acquire_consumed = acquire_imported;
 			// Everything after the weave records into the second buffer; the
 			// final submit + fence + wait below then retire BOTH batches (same
 			// queue, in order), so next frame's reset of either is safe.
@@ -2197,6 +3489,13 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		                                    mc->weave.out_w, mc->weave.out_h,       //
 		                                    (VkFormat_XDP)WEAVE_VK_FORMAT,          //
 		                                    0, 0, 0, 0);
+		atlas_done = true;
+		// v20: a dropped frame may not have signalled dp_sem (the slot contract
+		// asks the DP to signal anyway, but the runtime does not bet a GPU hang
+		// on it): no GPU wait on it, CPU completion, fresh semaphores next time.
+		if (dp_sync_armed) {
+			dp_dropped = xrt_display_processor_vk_get_last_frame_dropped(dp_vk);
+		}
 
 		// v6: restore the input atlas to GENERAL so the next frame's barrier
 		// (oldLayout=GENERAL) is correct and the caller's external writes land into
@@ -2223,7 +3522,7 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 		// blend, so crisp 2D lands on top of the interlaced 3D at screen depth.
 		// The overlay is NOT woven — it is drawn after process_atlas onto the same
 		// output attachment.
-		if (mc->weave.overlay_image != VK_NULL_HANDLE) {
+		if (mc->weave.overlay_image != VK_NULL_HANDLE && mc->weave.overlay_this_submit && !ov_in_dp) {
 			bool blend_ready = mc->weave.overlay_blend_initialized;
 			if (!blend_ready) {
 				blend_ready = vk_local2d_composite_init(&mc->weave.overlay_blend, vk, WEAVE_VK_FORMAT,
@@ -2251,6 +3550,14 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
 				                         &ov_to_read);
+				// #2501: the 2D layer as the runtime's own blend takes it.
+				if (capturing) {
+					comp_multi_weave_capture_record(
+					    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_OVERLAY,
+					    mc->weave.overlay_image, mc->weave.overlay_w, mc->weave.overlay_h,
+					    WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+				}
 
 				VkImageMemoryBarrier out_weave_to_blend = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2276,6 +3583,17 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			}
 		}
 
+		// #2501: the woven output, everything drawn (weave, flat 2D, the overlay
+		// whether the DP or the runtime composited it). Under the self-submit
+		// split `cmd` is the post-weave buffer here, so the copy follows the
+		// DP's own submit in queue order.
+		if (capturing) {
+			comp_multi_weave_capture_record(
+			    &mc->weave.capture, vk, cmd, COMP_MULTI_WEAVE_CAPTURE_WOVEN, mc->weave.out_image,
+			    mc->weave.out_w, mc->weave.out_h, WEAVE_VK_FORMAT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+			    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+		}
+
 		// Output -> GENERAL for the caller's cross-process read.
 		VkImageMemoryBarrier out_to_general = {
 		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2298,11 +3616,35 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			break;
 		}
 
-		// ---- Submit + synchronous completion (the Android/macOS sync contract) ----
+		// ---- Submit + completion ----
+		// v9 (no sync chained): synchronous — the bounded CPU wait below, so the
+		// IPC reply IS the completion signal (the Android/macOS contract).
+		// v20 GPU chain: this batch waits the acquire (no split) and/or the DP's
+		// dp_sem, signals release_sem, and its SYNC_FD export is the caller's
+		// release fence; the CPU wait moves to the top of the next submit.
+		VkSemaphore final_waits[2];
+		VkPipelineStageFlags final_stages[2];
+		uint32_t final_wait_count = 0;
+		if (!weave_split && acquire_imported) {
+			final_waits[final_wait_count] = mc->weave.sync_acquire_sem;
+			final_stages[final_wait_count++] = sync_wait_stage;
+		}
+		if (dp_sync_armed && !dp_dropped) {
+			final_waits[final_wait_count] = mc->weave.sync_dp_sem;
+			final_stages[final_wait_count++] = sync_wait_stage;
+		}
+		// #2501: a capturing submit completes synchronously (release -1 is a
+		// valid "already complete" answer) so its readbacks resolve below.
+		const bool signal_release = sync_gpu && want_release && !dp_dropped && !capturing;
 		VkSubmitInfo submit = {
 		    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		    .waitSemaphoreCount = final_wait_count,
+		    .pWaitSemaphores = final_waits,
+		    .pWaitDstStageMask = final_stages,
 		    .commandBufferCount = 1,
 		    .pCommandBuffers = &cmd,
+		    .signalSemaphoreCount = signal_release ? 1u : 0u,
+		    .pSignalSemaphores = &mc->weave.sync_release_sem,
 		};
 		vk_queue_lock(vk->main_queue);
 		VkResult ret = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit, mc->weave.fence);
@@ -2311,13 +3653,70 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 			U_LOG_E("weave(#1036): vkQueueSubmit failed: %s", vk_result_string(ret));
 			break;
 		}
-		// Bounded wait (#967b style): a wedged vendor weaver must not hang the
-		// caller's present thread forever behind a synchronous IPC call.
-		ret = vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
-		vk->vkResetFences(vk->device, 1, &mc->weave.fence);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("weave(#1036): weave did not complete within 1s: %s", vk_result_string(ret));
-			break;
+		if (!weave_split) {
+			acquire_consumed = acquire_imported;
+		}
+
+		bool completed_async = false;
+		if (signal_release) {
+			VkSemaphoreGetFdInfoKHR get_info = {
+			    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+			    .semaphore = mc->weave.sync_release_sem,
+			    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+			};
+			int release_fd = -1;
+			VkResult gret = vk->vkGetSemaphoreFdKHR(vk->device, &get_info, &release_fd);
+			if (gret == VK_SUCCESS) {
+				// -1 is a valid "already signalled" sync_file; either way the
+				// caller is answered without our CPU wait.
+				mc->weave.sync_release_fd = release_fd;
+				mc->weave.sync_have_release = true;
+				mc->weave.fence_pending = true;
+				completed_async = true;
+			} else {
+				// release_sem now holds a signal nobody consumes: synchronous
+				// this frame, fresh semaphores next time.
+				U_LOG_E("weave v20: vkGetSemaphoreFdKHR(SYNC_FD) failed: %s — synchronous this frame",
+				        vk_result_string(gret));
+				mc->weave.sync_dirty = true;
+			}
+		}
+		if (!completed_async) {
+			// Bounded wait (#967b style): a wedged vendor weaver must not hang
+			// the caller's present thread forever behind a synchronous IPC call.
+			ret =
+			    vk->vkWaitForFences(vk->device, 1, &mc->weave.fence, VK_TRUE, 1000ULL * 1000ULL * 1000ULL);
+			vk->vkResetFences(vk->device, 1, &mc->weave.fence);
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("weave(#1036): weave did not complete within 1s: %s", vk_result_string(ret));
+				break;
+			}
+		}
+		if (dp_dropped) {
+			// The DP cannot know whether its vendor weaver consumed pre_sem on a
+			// drop (and must not wait it twice), and it signals dp_sem itself
+			// with an empty submit we never wait: destroy and recreate the pair
+			// NOW (queue drained first), before any later weave can reuse them.
+			weave_sync_recreate_sems(vk, mc);
+			static uint32_t dropped_logs = 0;
+			if ((dropped_logs++ % 300) == 0) {
+				U_LOG_W(
+				    "weave v20: DP dropped a sync'd frame (#%u) — CPU completion, release -1, "
+				    "semaphores recreated",
+				    dropped_logs);
+			}
+		}
+
+		// #2501: the fence above was waited, so every recorded readback is done.
+		if (capturing) {
+			char what[192];
+			snprintf(what, sizeof(what), "backend=android client=%s %s layout, output %ux%u, overlay %s",
+			         mc->weave.capture.tag[0] != 0 ? mc->weave.capture.tag : "?",
+			         nview ? "v6 N-view" : (rect_count > 0 ? "v3 batch" : "legacy"), mc->weave.out_w,
+			         mc->weave.out_h,
+			         !mc->weave.overlay_this_submit ? "none"
+			                                        : (ov_in_dp ? "DP-composited" : "runtime-blended"));
+			comp_multi_weave_capture_finish(&mc->weave.capture, vk, what);
 		}
 
 		mc->weave.fence_value++;
@@ -2354,6 +3753,30 @@ comp_multi_weave_submit(struct xrt_compositor *xc,
 
 		ok = true;
 	} while (false);
+
+	// v20 cleanup for a submit that stopped part-way.
+	if (acquire_fd >= 0) {
+		close(acquire_fd); // never reached a batch
+	}
+	if (dp_sync_armed && !atlas_done) {
+		// The DP holds the pair for a process_atlas that never ran: clear it
+		// (NULL = nothing to wait / signal) so it cannot leak into a later frame.
+		(void)xrt_display_processor_vk_set_weave_sync((struct xrt_display_processor_vk *)mc->weave.dp,
+		                                              (VkSemaphore_XDP)VK_NULL_HANDLE, 0,
+		                                              (VkSemaphore_XDP)VK_NULL_HANDLE, 0);
+		mc->weave.sync_dirty = true; // pre_sem may hold an unwaited signal
+	}
+	if (acquire_imported && !acquire_consumed) {
+		mc->weave.sync_dirty = true; // sync_acquire_sem holds an unconsumed temporary payload
+	}
+	if (!ok && mc->weave.sync_have_release) {
+		// Never hand out a fence for a refused frame.
+		if (mc->weave.sync_release_fd >= 0) {
+			close(mc->weave.sync_release_fd);
+		}
+		mc->weave.sync_have_release = false;
+		mc->weave.sync_release_fd = -1;
+	}
 
 	os_mutex_unlock(&mc->weave.mutex);
 
@@ -2447,8 +3870,8 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 	os_mutex_lock(&mc->weave.mutex);
 	if (vk != NULL) {
 		if (mc->weave.engine_initialized) {
-			// Nothing may be in flight (submits are synchronous), but a
-			// belt-and-braces idle keeps teardown safe if that changes.
+			// A v20 submit may have returned with its weave still in flight
+			// (release sync_file instead of the CPU wait): drain first.
 			vk_queue_lock(vk->main_queue);
 			vk->vkQueueWaitIdle(vk->main_queue->queue);
 			vk_queue_unlock(vk->main_queue);
@@ -2459,17 +3882,33 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 		weave_release_scratch(vk, mc);
 		weave_release_crop(vk, mc);
 		weave_release_output(vk, mc);
+		comp_multi_weave_capture_release(&mc->weave.capture, vk); // #2501 (queue idle above)
 		if (mc->weave.overlay_blend_initialized) {
 			vk_local2d_composite_fini(&mc->weave.overlay_blend, vk);
 			mc->weave.overlay_blend_initialized = false;
 		}
+		if (mc->weave.unsqueeze_initialized) {
+			vk_local2d_composite_fini(&mc->weave.unsqueeze, vk);
+			mc->weave.unsqueeze_initialized = false;
+		}
 		if (mc->weave.dp != NULL) {
+			// The vendor's no-face policy can be per device core, not per DP:
+			// hand MANAGED back so a MANUAL client doesn't leave it off for
+			// whoever weaves next.
+			if (mc->weave.eye_tracking_mode_plus1 > 1) {
+				xrt_display_processor_set_eye_tracking_mode(mc->weave.dp, 0);
+			}
+			mc->weave.eye_tracking_mode_plus1 = 0;
 			xrt_display_processor_destroy(&mc->weave.dp);
 		}
 		if (mc->weave.render_pass != VK_NULL_HANDLE) {
 			vk->vkDestroyRenderPass(vk->device, mc->weave.render_pass, NULL);
 			mc->weave.render_pass = VK_NULL_HANDLE;
 		}
+		// v20: the queue is idle (above), so no batch still waits or signals these.
+		weave_sync_destroy_sems(vk, mc);
+		mc->weave.sync_sems_tried = false;
+		mc->weave.fence_pending = false;
 		if (mc->weave.fence != VK_NULL_HANDLE) {
 			vk->vkDestroyFence(vk->device, mc->weave.fence, NULL);
 			mc->weave.fence = VK_NULL_HANDLE;
@@ -2479,6 +3918,16 @@ comp_multi_weave_fini(struct multi_compositor *mc)
 			mc->weave.cmd_pool = VK_NULL_HANDLE;
 		}
 	}
+	// v20: fds a request or a result still held.
+	if (mc->weave.sync_have_acquire && mc->weave.sync_acquire_fd >= 0) {
+		close(mc->weave.sync_acquire_fd);
+	}
+	if (mc->weave.sync_have_release && mc->weave.sync_release_fd >= 0) {
+		close(mc->weave.sync_release_fd);
+	}
+	mc->weave.sync_have_acquire = false;
+	mc->weave.sync_have_release = false;
+	mc->weave.sync_requested = false;
 	mc->weave.engine_initialized = false;
 	os_mutex_unlock(&mc->weave.mutex);
 	os_mutex_destroy(&mc->weave.mutex);

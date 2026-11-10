@@ -67,7 +67,8 @@ struct xrt_input_plugin_host_iface {
     uint32_t struct_size;
     uint32_t host_api_version;
     xrt_result_t (*get_display_geometry)(struct xrt_input_host_display_geometry *inout);
-    void *reserved[13];
+    xrt_component_get_setting_fn_t get_setting; /* N3c: the one options contract, carved from reserved[1] */
+    void *reserved[12];
 };
 ```
 
@@ -107,6 +108,27 @@ The numbers are **nominal** — the panel as the display processor reports
 it, and the nominal viewer position, never the tracked eyes. Use them for
 solver geometry (how big the working volume is, where the plane sits),
 never as a head pose.
+
+### `get_setting` — the one options contract (ADR-054 decision 7, N3c)
+
+`host->get_setting(iface->id, "KEY", buf, cap)` is the ONLY way a provider
+reads one of its own knobs — never `getenv` (in the service the environment is
+the host's, not the user's shell, and only this path is reachable by
+`displayxr-cli input options|set|unset`). The runtime resolves
+`DXR_INPUT_<ID>_<KEY>` in the hosting process's environment (always wins) →
+the per-user store (HKCU `…\InputProviders\<id>\Settings\<KEY>` / POSIX
+`<id>.settings.json`) → the row's HKLM `Settings\<KEY>` / manifest
+`settings` → false (keep your compiled default). Strings; you parse. Carved
+from `reserved[1]` at an unchanged ABI (`XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING`;
+NULL on an older runtime — check it, and cover-check `struct_size`); the
+pointer lives for the process, so copy it at negotiate and read at
+`probe()` / `create_devices()`. Declare your keys through the appended
+`iface->describe_settings` slot (`XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`,
+a `static const struct xrt_component_setting_desc[]` of
+`{key, type, default, help}`) so `input options <id>` can list them.
+Reference: `drivers/sim_input/sim_input_settings.c` (`ENABLE`, `NAV`,
+`NAV_HOLD_MS`, `NAV_RECENTER_MS`; spec: input-provider-discovery.md §3
+*Component settings*).
 
 ## The navigation device — driving the rig (#1380)
 
@@ -307,8 +329,11 @@ device is still a candidate. Hand-role churn bumps the same
 `generation_id` without disturbing the rig.
 
 `HKLM\Software\DisplayXR\Input\ForceQwerty` (POSIX: a `force_qwerty` file
-next to the manifests) skips providers entirely. Details: discovery spec
-§4 (hands) and §4b (rig).
+next to the manifests) skips providers entirely;
+`InputProviders\Policy\EmulatedControllers = 0` (POSIX: `emulated_controllers`)
+withholds the qwerty pair instead, so the hands fall to **no role** rather
+than to qwerty when yours is absent (ADR-054 N7). Details: discovery spec
+§4 (hands, items 3 / 3b) and §4b (rig).
 
 ## What providers must NOT do
 
@@ -346,7 +371,10 @@ next to the manifests) skips providers entirely. Details: discovery spec
 ## Diagnostics
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
-  (no DLL load) + the predicted active one + the ForceQwerty state.
+  (no DLL load) + Enabled / PreferredPlugin + the one ranked first + the
+  ForceQwerty and EmulatedControllers state; `input enable|disable <id>` and
+  `input use <id>` / `input reset` write those two values (ADR-054 verbs,
+  N3a; discovery spec §3 / §6), `input emulated on|off` the gate (N7).
 - `displayxr-cli selftest` — with a provider registered, not overridden,
   **and reporting `PRESENT`**, asserts left+right role devices with a
   valid interaction profile. Provider absence never fails, and neither

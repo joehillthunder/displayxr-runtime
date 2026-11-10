@@ -1,0 +1,718 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  Display hotplug (ADR-047 Amendment 8): the claim sweep's pure parts.
+ *
+ * - the scheduler: debounce, the max-delay cap, the follow-up re-runs an OS
+ *   event arms (a vendor backend may recognise a panel seconds after the OS
+ *   saw the monitor) and the ones a plug-in request does not;
+ * - the per-monitor winner across a hotplug, driven through the exact pair the
+ *   loader's resolve uses (target_screen_collect_candidates +
+ *   target_screen_pick_ex) over fake monitor lists and fake claim sources:
+ *   a panel appearing, its vendor plug-in claiming it once loaded, the
+ *   DXR_SCREEN_PLUGIN pin and PreferredPlugin still deciding, ProbeOrder
+ *   forcing (#1521) unchanged, unplug;
+ * - the published screen-list comparison (what bumps the generation);
+ * - the topology signature the poll compares.
+ */
+
+#include "catch_amalgamated.hpp"
+
+#include "xrt/xrt_plugin.h"
+#include "xrt/xrt_screen.h"
+#include "xrt/xrt_config_os.h"
+
+#include "target_display_hotplug.h"
+#include "target_screen_pin.h"
+
+#include "os/os_display_topology.h"
+
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+constexpr uint64_t MS = 1000ull * 1000ull;
+
+} // namespace
+
+
+/*
+ *
+ * Scheduler.
+ *
+ */
+
+TEST_CASE("hotplug sched: a storm is one debounced re-run", "[target][hotplug]")
+{
+	target_hotplug_sched s;
+	target_hotplug_sched_init(&s, 300 * MS, 1000 * MS);
+	CHECK(target_hotplug_sched_deadline(&s) == TARGET_HOTPLUG_NEVER);
+	CHECK_FALSE(target_hotplug_sched_take(&s, 0, nullptr, nullptr));
+
+	// CoreGraphics reports a reconfiguration as a burst; each event moves
+	// the quiet deadline out.
+	target_hotplug_sched_event(&s, 1000 * MS, TARGET_HOTPLUG_SOURCE_OS);
+	target_hotplug_sched_event(&s, 1100 * MS, TARGET_HOTPLUG_SOURCE_OS);
+	target_hotplug_sched_event(&s, 1250 * MS, TARGET_HOTPLUG_SOURCE_POLL);
+	CHECK(target_hotplug_sched_deadline(&s) == 1550 * MS);
+	CHECK_FALSE(target_hotplug_sched_take(&s, 1549 * MS, nullptr, nullptr));
+
+	bool followup = true;
+	uint32_t sources = 0;
+	REQUIRE(target_hotplug_sched_take(&s, 1550 * MS, &followup, &sources));
+	CHECK_FALSE(followup);
+	CHECK(sources == (TARGET_HOTPLUG_SOURCE_OS | TARGET_HOTPLUG_SOURCE_POLL));
+	// Consumed: the same instant does not run it twice (the first follow-up is 0.5 s out).
+	CHECK_FALSE(target_hotplug_sched_take(&s, 1550 * MS, &followup, &sources));
+}
+
+TEST_CASE("hotplug sched: a continuous storm still runs within the max delay", "[target][hotplug]")
+{
+	target_hotplug_sched s;
+	target_hotplug_sched_init(&s, 300 * MS, 1000 * MS);
+	for (uint64_t t = 0; t <= 2000; t += 100) {
+		target_hotplug_sched_event(&s, t * MS, TARGET_HOTPLUG_SOURCE_OS);
+		if (t * MS >= 1000 * MS) {
+			break;
+		}
+		CHECK_FALSE(target_hotplug_sched_take(&s, t * MS, nullptr, nullptr));
+	}
+	// Events every 100 ms never leave 300 ms of quiet; the cap (first + 1 s) fires.
+	CHECK(target_hotplug_sched_deadline(&s) == 1000 * MS);
+	CHECK(target_hotplug_sched_take(&s, 1000 * MS, nullptr, nullptr));
+}
+
+TEST_CASE("hotplug sched: an OS event arms follow-ups, a plug-in request does not", "[target][hotplug]")
+{
+	target_hotplug_sched s;
+	target_hotplug_sched_init(&s, 0, 0); // defaults: 300 ms / 1 s
+	CHECK(s.settle_ns == TARGET_HOTPLUG_SETTLE_NS);
+	CHECK(s.max_delay_ns == TARGET_HOTPLUG_MAX_DELAY_NS);
+
+	// Plug-in: "my displays are ready" — one run, nothing after it.
+	target_hotplug_sched_event(&s, 0, TARGET_HOTPLUG_SOURCE_PLUGIN);
+	bool followup = false;
+	uint32_t sources = 0;
+	REQUIRE(target_hotplug_sched_take(&s, 300 * MS, &followup, &sources));
+	CHECK(sources == TARGET_HOTPLUG_SOURCE_PLUGIN);
+	CHECK(target_hotplug_sched_deadline(&s) == TARGET_HOTPLUG_NEVER);
+
+	// OS: the run at +300 ms, then follow-ups at +0.5 .. +32 s after it — the
+	// tail outlasts an SR service retrying FPC authentication (1 s .. 30 s backoff).
+	target_hotplug_sched_event(&s, 10000 * MS, TARGET_HOTPLUG_SOURCE_OS);
+	REQUIRE(target_hotplug_sched_take(&s, 10300 * MS, &followup, &sources));
+	CHECK_FALSE(followup);
+	const uint64_t base = 10300 * MS;
+	const uint64_t offs[] = {500, 1000, 1500, 2000, 3000, 4000, 6000, 8000, 12000, 16000, 24000, 32000};
+	REQUIRE(sizeof(offs) / sizeof(offs[0]) == TARGET_HOTPLUG_FOLLOWUPS);
+	for (uint64_t off : offs) {
+		CHECK(target_hotplug_sched_deadline(&s) == base + off * MS);
+		CHECK_FALSE(target_hotplug_sched_take(&s, base + off * MS - 1, nullptr, nullptr));
+		REQUIRE(target_hotplug_sched_take(&s, base + off * MS, &followup, &sources));
+		CHECK(followup);
+		CHECK(sources == 0);
+	}
+	CHECK(target_hotplug_sched_deadline(&s) == TARGET_HOTPLUG_NEVER);
+}
+
+TEST_CASE("hotplug sched: a late wake-up runs a follow-up once, a new OS event restarts them", "[target][hotplug]")
+{
+	target_hotplug_sched s;
+	target_hotplug_sched_init(&s, 0, 0);
+	target_hotplug_sched_event(&s, 0, TARGET_HOTPLUG_SOURCE_OS);
+	REQUIRE(target_hotplug_sched_take(&s, 300 * MS, nullptr, nullptr));
+
+	// Asleep through +0.5, +1 and +1.5 s: one follow-up, not three.
+	bool followup = false;
+	REQUIRE(target_hotplug_sched_take(&s, 300 * MS + 1600 * MS, &followup, nullptr));
+	CHECK(followup);
+	CHECK_FALSE(target_hotplug_sched_take(&s, 300 * MS + 1600 * MS, nullptr, nullptr));
+	CHECK(target_hotplug_sched_deadline(&s) == 300 * MS + 2000 * MS);
+
+	// A new OS event (the panel's mode switch) restarts the window from its run.
+	target_hotplug_sched_event(&s, 5000 * MS, TARGET_HOTPLUG_SOURCE_OS);
+	REQUIRE(target_hotplug_sched_take(&s, 5300 * MS, &followup, nullptr));
+	CHECK_FALSE(followup);
+	CHECK(target_hotplug_sched_deadline(&s) == 5300 * MS + 500 * MS);
+
+	// A plug-in request in the middle keeps the armed follow-ups.
+	target_hotplug_sched_event(&s, 5400 * MS, TARGET_HOTPLUG_SOURCE_PLUGIN);
+	REQUIRE(target_hotplug_sched_take(&s, 5700 * MS, &followup, nullptr));
+	CHECK_FALSE(followup);
+	CHECK(target_hotplug_sched_deadline(&s) == 5300 * MS + 500 * MS);
+}
+
+
+/*
+ *
+ * The per-monitor winner across a hotplug, through the loader's own pair.
+ *
+ */
+
+namespace {
+
+struct fake_source
+{
+	const char *id;
+	bool active;
+	std::vector<uint64_t> mons;
+	std::vector<uint32_t> conf;
+};
+
+struct pick
+{
+	int index;
+	const char *plugin;
+	target_screen_pick_reason why;
+};
+
+/*!
+ * Resolve one monitor the way target_plugin_resolve_displays does: collect
+ * every source's claim (sources listed in ascending ProbeOrder), then pick.
+ */
+pick
+resolve(const std::vector<fake_source> &srcs, uint64_t monitor, const char *pin, const char *preferred)
+{
+	std::vector<target_screen_source_claims> view;
+	for (const auto &s : srcs) {
+		view.push_back({s.id, s.active, s.mons.data(), s.conf.data(), (uint32_t)s.mons.size()});
+	}
+	target_screen_candidate cands[8];
+	const uint32_t n =
+	    target_screen_collect_candidates(view.data(), (uint32_t)view.size(), monitor, cands, nullptr, nullptr, 8);
+	pick p{};
+	p.index = target_screen_pick_ex(cands, n, pin, nullptr, preferred, &p.why, nullptr, nullptr);
+	p.plugin = p.index >= 0 ? cands[p.index].plugin_id : nullptr;
+	return p;
+}
+
+constexpr uint64_t BUILTIN = 0xB1B1;
+constexpr uint64_t ODYSSEY = 0x0D55;
+
+} // namespace
+
+TEST_CASE("hotplug claims: a panel plugged in while sim-display runs goes to its vendor once it is loaded",
+          "[target][hotplug]")
+{
+	// Instance create, no panel: leia-sr (ProbeOrder 50) declined, sim-display
+	// (200) is active and claims every monitor at FALLBACK.
+	std::vector<fake_source> srcs = {
+	    {"sim-display", true, {BUILTIN}, {10}},
+	};
+	pick p = resolve(srcs, BUILTIN, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// The Odyssey appears; the OS saw it, the SR service has not authenticated
+	// it yet, so leia-sr still declines: sim-display takes it (flat / sim weave).
+	srcs[0].mons = {BUILTIN, ODYSSEY};
+	srcs[0].conf = {10, 10};
+	p = resolve(srcs, ODYSSEY, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// The panel is listed by SR but not authenticated yet: leia-sr claims it
+	// PRESENT_NOT_READY (20). That already beats sim-display's FALLBACK claim
+	// (the carve-out), so no sim weave reaches the panel — the registry flags
+	// the entry not-ready and the screen shows flat 2D.
+	{
+		std::vector<fake_source> nr = srcs;
+		nr.insert(nr.begin(), fake_source{"leia-sr", false, {ODYSSEY}, {20}});
+		pick q = resolve(nr, ODYSSEY, nullptr, nullptr);
+		CHECK(std::string(q.plugin) == "leia-sr");
+		CHECK(q.why == TARGET_SCREEN_PICK_BETTER_RANKED);
+		CHECK(q.index == 0);
+	}
+
+	// A follow-up sweep: leia-sr probes OK now and joins the claim sources in
+	// ProbeOrder (before sim-display). Its VERIFIED claim beats the active
+	// plug-in's FALLBACK one — the carve-out — and only on the panel.
+	srcs.insert(srcs.begin(), fake_source{"leia-sr", false, {ODYSSEY}, {100}});
+	p = resolve(srcs, ODYSSEY, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "leia-sr");
+	CHECK(p.why == TARGET_SCREEN_PICK_BETTER_RANKED);
+	p = resolve(srcs, BUILTIN, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// DXR_SCREEN_PLUGIN still pins the monitor (the pin outranks everything).
+	p = resolve(srcs, ODYSSEY, "sim-display", nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_PIN);
+	// ...and a PreferredPlugin pinning sim-display keeps sim on the panel.
+	p = resolve(srcs, ODYSSEY, nullptr, "sim-display");
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_PREFERRED);
+
+	// Unplug: leia-sr stays a claim source but claims nothing; the monitor
+	// is simply gone, the built-in is untouched.
+	srcs[0].mons.clear();
+	srcs[0].conf.clear();
+	srcs[1].mons = {BUILTIN};
+	srcs[1].conf = {10};
+	p = resolve(srcs, ODYSSEY, nullptr, nullptr);
+	CHECK(p.index == -1);
+	p = resolve(srcs, BUILTIN, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// Re-plug: claimed by leia-sr again, no restart needed.
+	srcs[0].mons = {ODYSSEY};
+	srcs[0].conf = {100};
+	srcs[1].mons = {BUILTIN, ODYSSEY};
+	srcs[1].conf = {10, 10};
+	p = resolve(srcs, ODYSSEY, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "leia-sr");
+}
+
+TEST_CASE("hotplug claims: the carve-out never fires for ProbeOrder forcing (#1521) or a real active claim",
+          "[target][hotplug]")
+{
+	// run_cts.ps1 -Plugin sim-display: sim registered AHEAD of leia, both
+	// load, sim is active. Its FALLBACK claim must still win the panel.
+	const std::vector<fake_source> forced = {
+	    {"sim-display", true, {BUILTIN, ODYSSEY}, {10, 10}},
+	    {"leia-sr", false, {ODYSSEY}, {100}},
+	};
+	pick p = resolve(forced, ODYSSEY, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// An active vendor's own claim (EDID / VERIFIED) is never displaced by a
+	// better-ranked plug-in: the carve-out is for FALLBACK claims only.
+	const std::vector<fake_source> vendors = {
+	    {"vendor-a", false, {ODYSSEY}, {100}},
+	    {"vendor-b", true, {ODYSSEY}, {50}},
+	};
+	p = resolve(vendors, ODYSSEY, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "vendor-b");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+
+	// A better-ranked source with only a FALLBACK claim of its own does not
+	// displace the active one either.
+	const std::vector<fake_source> two_fallbacks = {
+	    {"other-fallback", false, {BUILTIN}, {10}},
+	    {"sim-display", true, {BUILTIN}, {10}},
+	};
+	p = resolve(two_fallbacks, BUILTIN, nullptr, nullptr);
+	CHECK(std::string(p.plugin) == "sim-display");
+	CHECK(p.why == TARGET_SCREEN_PICK_ACTIVE);
+}
+
+TEST_CASE("hotplug claims: the #1874 shortcut is unchanged by the carve-out", "[target][hotplug]")
+{
+	// sim-display active and claiming both monitors: the resolve-time
+	// shortcut still loads nothing else (the hotplug rescan, not the
+	// shortcut, is what re-probes a declined vendor plug-in).
+	target_screen_monitor mons[] = {
+	    {BUILTIN, "BUILTIN", "", true, nullptr},
+	    {ODYSSEY, "ODYSSEY", "", true, nullptr},
+	};
+	target_screen_pins none;
+	REQUIRE(target_screen_pin_parse(nullptr, &none, nullptr) == 0);
+	CHECK(target_screen_active_decides_every_monitor("sim-display", nullptr, &none, mons, 2));
+	// A pin for the panel still loads the vendor plug-in for its claim.
+	target_screen_pins pins;
+	REQUIRE(target_screen_pin_parse("0xd55=leia-sr", &pins, nullptr) == 1);
+	CHECK_FALSE(target_screen_active_decides_every_monitor("sim-display", nullptr, &pins, mons, 2));
+}
+
+
+/*
+ *
+ * The published screen-list comparison.
+ *
+ */
+
+namespace {
+
+xrt_screen
+screen(uint64_t id, const char *plugin, int32_t x, uint32_t w, bool is_default = false)
+{
+	xrt_screen s{};
+	s.id = id;
+	s.flags = is_default ? XRT_SCREEN_FLAG_SYSTEM_DEFAULT : 0u;
+	s.confidence = 10;
+	s.desktop_left = x;
+	s.desktop_width = w;
+	s.desktop_height = 1080;
+	s.native_width = w * 2;
+	s.native_height = 2160;
+	s.desktop_scale = 2.0f;
+	std::snprintf(s.plugin_id, sizeof(s.plugin_id), "%s", plugin);
+	std::snprintf(s.device_name, sizeof(s.device_name), "mon-%llx", (unsigned long long)id);
+	return s;
+}
+
+} // namespace
+
+TEST_CASE("hotplug screens: what counts as a change", "[target][hotplug]")
+{
+	xrt_screen_list before{};
+	before.count = 1;
+	before.screens[0] = screen(BUILTIN, "sim-display", 0, 1512, true);
+
+	target_screens_change c{};
+	// Identical: no change, no generation bump.
+	xrt_screen_list same = before;
+	CHECK_FALSE(target_screens_compare(&before, &same, &c));
+
+	// The panel appears (claimed by sim-display until leia-sr is ready).
+	xrt_screen_list plugged = before;
+	plugged.count = 2;
+	plugged.screens[1] = screen(ODYSSEY, "sim-display", 1512, 3840);
+	REQUIRE(target_screens_compare(&before, &plugged, &c));
+	CHECK(c.added == 1);
+	CHECK(c.removed == 0);
+	CHECK(c.claimant_changed == 0);
+	CHECK_FALSE(c.default_moved);
+
+	// leia-sr claims it: a claimant change on the same id.
+	xrt_screen_list claimed = plugged;
+	std::snprintf(claimed.screens[1].plugin_id, sizeof(claimed.screens[1].plugin_id), "leia-sr");
+	claimed.screens[1].confidence = 100;
+	REQUIRE(target_screens_compare(&plugged, &claimed, &c));
+	CHECK(c.added == 0);
+	CHECK(c.claimant_changed == 1);
+	char line[512];
+	target_screens_change_format(&plugged, &claimed, line, sizeof(line));
+	CHECK(std::strstr(line, "claimant 'sim-display' -> 'leia-sr'") != nullptr);
+
+	// A live display-scale change (#2251): the same screen, same claimant,
+	// a new X11 extent and factor — a geometry change, so a new generation.
+	xrt_screen_list rescaled = claimed;
+	rescaled.screens[1].desktop_width = 5120;
+	rescaled.screens[1].desktop_height = 2880;
+	rescaled.screens[1].desktop_scale = 1.5f;
+	REQUIRE(target_screens_compare(&claimed, &rescaled, &c));
+	CHECK(c.geometry_changed == 1);
+	CHECK(c.added == 0);
+	CHECK(c.claimant_changed == 0);
+	char scale_line[512];
+	target_screens_change_format(&claimed, &rescaled, scale_line, sizeof(scale_line));
+	CHECK(std::strstr(scale_line, "1512,0 3840x1080 x2.00 -> 1512,0 5120x2880 x1.50") != nullptr);
+	// The factor alone (PHYSICAL layout: no pixel moves) still counts.
+	xrt_screen_list refactored = claimed;
+	refactored.screens[1].desktop_scale = 1.0f;
+	REQUIRE(target_screens_compare(&claimed, &refactored, &c));
+	CHECK(c.geometry_changed == 1);
+
+	// Rearranged: geometry.
+	xrt_screen_list moved = claimed;
+	moved.screens[1].desktop_left = -3840;
+	REQUIRE(target_screens_compare(&claimed, &moved, &c));
+	CHECK(c.geometry_changed == 1);
+
+	// Eye tracking came up on it (flags / info): "other".
+	xrt_screen_list tracked = claimed;
+	tracked.screens[1].flags |= XRT_SCREEN_FLAG_TRACKED;
+	REQUIRE(target_screens_compare(&claimed, &tracked, &c));
+	CHECK(c.other_changed == 1);
+
+	// Unplugged.
+	REQUIRE(target_screens_compare(&claimed, &before, &c));
+	CHECK(c.removed == 1);
+	target_screens_change_format(&claimed, &before, line, sizeof(line));
+	CHECK(std::strstr(line, "-0x") != nullptr);
+
+	// The system default moves (its monitor was unplugged).
+	xrt_screen_list only_panel{};
+	only_panel.count = 1;
+	only_panel.screens[0] = screen(ODYSSEY, "leia-sr", 0, 3840, true);
+	REQUIRE(target_screens_compare(&claimed, &only_panel, &c));
+	CHECK(c.default_moved);
+	CHECK(c.removed == 1);
+}
+
+
+TEST_CASE("hotplug screens: an identical or EDID-mm-only republish is not a new generation", "[target][hotplug]")
+{
+	// The Odyssey replug trace (2026-10-13): the sweep at +0.5 s lists the
+	// panel with CoreGraphics' 598x341 mm (join=cg-ids), the one at +1 s with
+	// the EDID's own 600x340 mm (join=iokit-edid, IOKit published the blob).
+	// Same id, bounds, claimant and claim level: that must not bump the
+	// generation, or every live session rebuilds its segment DPs.
+	xrt_screen_list was{};
+	was.count = 2;
+	was.screens[0] = screen(BUILTIN, "sim-display", 0, 1512, true);
+	was.screens[1] = screen(ODYSSEY, "leia-sr", 1512, 1920);
+	was.screens[1].confidence = 100;
+	was.screens[1].physical_width_mm = 598;
+	was.screens[1].physical_height_mm = 341;
+
+	target_screens_change c{};
+	xrt_screen_list same = was;
+	CHECK_FALSE(target_screens_compare(&was, &same, &c));
+	CHECK(c.metadata_changed == 0);
+	char line[512];
+	target_screens_change_format(&was, &same, line, sizeof(line));
+	CHECK(std::strstr(line, "no screen added") != nullptr);
+
+	xrt_screen_list refined = was;
+	refined.screens[1].physical_width_mm = 600;
+	refined.screens[1].physical_height_mm = 340;
+	CHECK_FALSE(target_screens_compare(&was, &refined, &c));
+	CHECK(c.metadata_changed == 1);
+	CHECK(c.other_changed == 0);
+	CHECK(c.claim_changed == 0);
+	target_screens_change_format(&was, &refined, line, sizeof(line));
+	CHECK(std::strstr(line, "physical 598x341 -> 600x340 mm") != nullptr);
+
+	// ...but anything the size feeds that an app sees (the derived metres) is.
+	xrt_screen_list derived = refined;
+	derived.screens[1].info.width_m = 0.600f;
+	REQUIRE(target_screens_compare(&was, &derived, &c));
+	CHECK(c.other_changed == 1);
+	target_screens_change_format(&was, &derived, line, sizeof(line));
+	CHECK(std::strstr(line, "display info") != nullptr);
+}
+
+TEST_CASE("hotplug screens: a claim-level change and new bounds still publish", "[target][hotplug]")
+{
+	xrt_screen_list not_ready{};
+	not_ready.count = 2;
+	not_ready.screens[0] = screen(BUILTIN, "sim-display", 0, 1512, true);
+	not_ready.screens[1] = screen(ODYSSEY, "leia-sr", 1512, 1920);
+	not_ready.screens[1].confidence = XRT_DISPLAY_CLAIM_PRESENT_NOT_READY;
+
+	// PRESENT_NOT_READY -> claimed (FPC auth finished): same claimant, new level.
+	target_screens_change c{};
+	xrt_screen_list ready = not_ready;
+	ready.screens[1].confidence = 100;
+	REQUIRE(target_screens_compare(&not_ready, &ready, &c));
+	CHECK(c.claim_changed == 1);
+	CHECK(c.claimant_changed == 0);
+	char line[512];
+	target_screens_change_format(&not_ready, &ready, line, sizeof(line));
+	char want[64];
+	std::snprintf(want, sizeof(want), "claim level %u -> 100", (unsigned)XRT_DISPLAY_CLAIM_PRESENT_NOT_READY);
+	CHECK(std::strstr(line, want) != nullptr);
+
+	// The same panel re-bound at new bounds (test D): geometry, even if the
+	// EDID mm were refined in the same sweep.
+	xrt_screen_list rebound = ready;
+	rebound.screens[1].desktop_left = -1920;
+	rebound.screens[1].physical_width_mm = 600;
+	REQUIRE(target_screens_compare(&ready, &rebound, &c));
+	CHECK(c.geometry_changed == 1);
+	CHECK(c.metadata_changed == 0);
+
+	// Same screens, other order (the system default moved to the panel).
+	xrt_screen_list swapped = ready;
+	swapped.screens[0] = ready.screens[1];
+	swapped.screens[1] = ready.screens[0];
+	REQUIRE(target_screens_compare(&ready, &swapped, &c));
+}
+
+/*
+ *
+ * Topology signature.
+ *
+ */
+
+TEST_CASE("hotplug topology hash: equal lists hash equal, any monitor change does not", "[target][hotplug]")
+{
+	os_display_desktop_info a[2]{};
+	a[0].left = 0;
+	a[0].width = 1512;
+	a[0].height = 982;
+	a[0].native_width = 3024;
+	a[0].native_height = 1964;
+	a[0].scale = 2.0;
+	a[0].is_primary = true;
+	std::snprintf(a[0].device_name, sizeof(a[0].device_name), "37D8832A-2D66-02CA-B9F7-8F30A301B230");
+	os_display_desktop_info b[2];
+	std::memcpy(b, a, sizeof(a));
+
+	const uint64_t h1 = target_display_topology_hash(a, 1);
+	CHECK(h1 == target_display_topology_hash(b, 1));
+
+	// A second monitor appears.
+	b[1] = a[0];
+	b[1].left = 1512;
+	b[1].is_primary = false;
+	std::snprintf(b[1].device_name, sizeof(b[1].device_name), "ODYSSEY");
+	CHECK(target_display_topology_hash(b, 2) != h1);
+
+	// A mode change on the same monitor.
+	std::memcpy(b, a, sizeof(a));
+	b[0].native_width = 2560;
+	CHECK(target_display_topology_hash(b, 1) != h1);
+
+	// A rearrangement.
+	std::memcpy(b, a, sizeof(a));
+	b[0].left = -1512;
+	CHECK(target_display_topology_hash(b, 1) != h1);
+}
+
+
+/*
+ *
+ * #2305: in-process re-probe on Windows and Linux — the default, the poll's
+ * platform signature and its blink filter.
+ *
+ */
+
+TEST_CASE("hotplug default: on in-process, off where the host feeds its own re-probe, env wins", "[target][hotplug]")
+{
+#if defined(XRT_OS_MACOS) || defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
+	CHECK(target_display_hotplug_default_enabled(nullptr, false));
+	CHECK(target_display_hotplug_default_enabled("", false));
+#else
+	CHECK_FALSE(target_display_hotplug_default_enabled(nullptr, false));
+#endif
+	// The Windows / desktop-Linux service: its tray / uevent feeders drive reprobe_run.
+	CHECK_FALSE(target_display_hotplug_default_enabled(nullptr, true));
+	// DXR_DISPLAY_HOTPLUG: 0 is the opt-out, anything else forces it on.
+	CHECK_FALSE(target_display_hotplug_default_enabled("0", false));
+	CHECK(target_display_hotplug_default_enabled("1", true));
+}
+
+TEST_CASE("hotplug poll filter: a blink back to the baseline is no event", "[target][hotplug]")
+{
+	target_topology_filter f;
+	target_topology_filter_init(&f, 0);
+	CHECK(f.stable_needed == TARGET_HOTPLUG_POLL_STABLE);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA)); // first: baseline only
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	// The DS1 HDMI blink: the panel's output gone for one poll, then back.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	// Flapping between two states never settles: no event either.
+	for (int i = 0; i < 6; i++) {
+		CHECK_FALSE(target_topology_filter_feed(&f, (i & 1) != 0 ? 0xA : 0xB));
+	}
+}
+
+TEST_CASE("hotplug poll filter: a change that holds is one event, then the new baseline", "[target][hotplug]")
+{
+	target_topology_filter f;
+	target_topology_filter_init(&f, 2);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xA));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB));
+	CHECK(target_topology_filter_feed(&f, 0xB));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xB)); // steady: nothing more
+	// A storm still moving restarts the count.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xC));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xD));
+	CHECK(target_topology_filter_feed(&f, 0xD));
+	// A sweep (OS / plug-in triggered) re-bases: the topology it saw is no event.
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+	target_topology_filter_rebase(&f, 0xE);
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+	CHECK_FALSE(target_topology_filter_feed(&f, 0xE));
+}
+
+namespace {
+
+os_display_topology_entry
+output(const char *key, uint32_t state, int32_t left, uint32_t w, uint32_t h)
+{
+	os_display_topology_entry e{};
+	std::snprintf(e.key, sizeof(e.key), "%s", key);
+	e.state = state;
+	e.left = left;
+	e.width = w;
+	e.height = h;
+	return e;
+}
+
+} // namespace
+
+TEST_CASE("hotplug platform signature: a virtual monitor, a different panel, a mode or state change all move it",
+          "[target][hotplug]")
+{
+	// A Windows laptop + a 3D panel on a second output (EnumDisplayDevicesW keys).
+	os_display_topology_entry a[3] = {
+	    output("\\\\.\\DISPLAY1|\\\\?\\DISPLAY#BOE0A1C#4&1&UID8388688#{e6f07b5f}", 0x5, 0, 2560, 1600),
+	    output("\\\\.\\DISPLAY5|\\\\?\\DISPLAY#LEN6611#5&2&UID4352#{e6f07b5f}", 0x1, -3840, 3840, 2160),
+	};
+	const uint64_t h0 = os_display_topology_hash(a, 2);
+	CHECK(h0 == os_display_topology_hash(a, 2));
+	CHECK(h0 != os_display_topology_hash(a, 1));
+	CHECK(os_display_topology_hash(nullptr, 3) == os_display_topology_hash(nullptr, 0));
+
+	// A casting tool's IddCx "extend" monitor appears (no real EDID): the
+	// signature moves, so the sweep runs — the TRIGGER. Whether it can be the
+	// panel is the claim registry's call (tests_aux_display_desktop_select,
+	// tests_u_screen_home), never this list's.
+	os_display_topology_entry b[3];
+	std::memcpy(b, a, sizeof(a));
+	b[2] = output("\\\\.\\DISPLAY9|\\\\?\\DISPLAY#MTT1337#1&0&UID0#{e6f07b5f}", 0x1, 2560, 1920, 1080);
+	CHECK(os_display_topology_hash(b, 3) != h0);
+
+	// Another panel on the same output (the monitor interface name carries the EDID id).
+	std::memcpy(b, a, sizeof(a));
+	std::snprintf(b[1].key, sizeof(b[1].key), "%s",
+	              "\\\\.\\DISPLAY5|\\\\?\\DISPLAY#LEN6612#5&2&UID4352#{e6f07b5f}");
+	CHECK(os_display_topology_hash(b, 2) != h0);
+
+	// A mode change, a move, a state change (Linux: connected -> disconnected).
+	std::memcpy(b, a, sizeof(a));
+	b[1].width = 1920;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+	std::memcpy(b, a, sizeof(a));
+	b[1].left = 2560;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+	std::memcpy(b, a, sizeof(a));
+	b[1].state = 0;
+	CHECK(os_display_topology_hash(b, 2) != h0);
+
+	// Key boundaries are separated ("ab"+"c" != "a"+"bc").
+	os_display_topology_entry p[2] = {output("ab", 0, 0, 0, 0), output("c", 0, 0, 0, 0)};
+	os_display_topology_entry q[2] = {output("a", 0, 0, 0, 0), output("bc", 0, 0, 0, 0)};
+	CHECK(os_display_topology_hash(p, 2) != os_display_topology_hash(q, 2));
+}
+
+TEST_CASE("hotplug platform signature: this host's read is stable while nothing changes", "[target][hotplug]")
+{
+	// Whatever this host has (0 entries on macOS / a headless CI box): two
+	// reads back to back agree, and so does the combined signature.
+	os_display_topology_entry e1[OS_DISPLAY_TOPOLOGY_MAX];
+	os_display_topology_entry e2[OS_DISPLAY_TOPOLOGY_MAX];
+	const uint32_t n1 = os_display_topology_read(e1, OS_DISPLAY_TOPOLOGY_MAX);
+	const uint32_t n2 = os_display_topology_read(e2, OS_DISPLAY_TOPOLOGY_MAX);
+	CHECK(n1 == n2);
+	CHECK(os_display_topology_hash(e1, n1) == os_display_topology_hash(e2, n2));
+	CHECK(target_display_topology_signature() == target_display_topology_signature());
+}
+
+namespace {
+
+int g_sink_calls = 0;
+char g_sink_reason[96];
+
+void
+record_sink(const char *reason)
+{
+	g_sink_calls++;
+	(void)snprintf(g_sink_reason, sizeof(g_sink_reason), "%s", reason != nullptr ? reason : "");
+}
+
+} // namespace
+
+TEST_CASE("hotplug plug-in request: with no monitor it reaches the host's re-probe sink", "[target][hotplug]")
+{
+	// The service never starts a monitor (it feeds its own re-probe, #2305),
+	// so a plug-in's request_display_rescan (Leia EDID_ONLY -> FPC_VERIFIED)
+	// must go to the sink, not into a latch nothing will serve.
+	g_sink_calls = 0;
+	g_sink_reason[0] = '\0';
+	target_display_hotplug_set_followup_sink(record_sink);
+	target_display_hotplug_plugin_request("panel authenticated");
+	CHECK(g_sink_calls == 1);
+	CHECK(std::strcmp(g_sink_reason, "panel authenticated") == 0);
+
+	target_display_hotplug_plugin_request(nullptr);
+	CHECK(g_sink_calls == 2);
+	CHECK(std::strcmp(g_sink_reason, "plug-in") == 0);
+
+	// No sink (an in-process app before system create): latched, as before.
+	target_display_hotplug_set_followup_sink(nullptr);
+	target_display_hotplug_plugin_request("panel authenticated");
+	CHECK(g_sink_calls == 2);
+}

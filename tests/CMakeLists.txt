@@ -12,6 +12,7 @@ set(tests
     tests_history_buf
     tests_id_ringbuffer
     tests_json
+    tests_openxr_layers
     tests_lowpass_float
     tests_lowpass_integer
     tests_pacing
@@ -23,47 +24,148 @@ set(tests
     tests_vector
     tests_worker
     tests_pose
+    tests_view_rig_point
+    tests_camera_rig_disparity
+    tests_mirror_calib
     tests_vec3_angle
     tests_u_multi_display
     tests_dp_weave_scope
+    tests_dp_windowless_d3d11
     tests_dp_vk_snap_window_rect
     tests_weave_snap_grid
+    tests_lift_mailbox
+    tests_sim_conversion
+    tests_remote_conversion
+    tests_conversion_abi
+    tests_conv_wire
+    tests_conv_select
+    tests_conv_readiness
+    tests_conv_registry
+    tests_conv_store
+    tests_conv_lanes
+    tests_conv_supervisor
+    tests_conv_shm_ring
+    tests_lift_abi
+    tests_conv_viewsyn_math
+    tests_aux_lift_viewpoint
+    tests_aux_lift_rig_depth
+    tests_aux_lift_reproject
+    tests_lift_late_viewsyn_conformance
     tests_space_overseer_rig
     tests_rig_composer
     tests_aux_x11_scale
+    tests_aux_display_desktop_select
     tests_cli_dims_check
+    tests_cli_metres_check
+    tests_cli_lever_catalog
+    tests_cli_input_predict
+    tests_cli_dp_predict
     tests_comp_vblank_grid
+    tests_comp_present_feedback
+    tests_comp_late_weave_adapt
+    tests_comp_residual_window
+    tests_comp_feedback_pace
+    tests_comp_late_weave_depth
     tests_comp_zone_tier1
     tests_comp_swapchain_ring
     tests_aux_bg_neutrality
     tests_aux_color_encoding
     tests_aux_grip_surface
+    tests_aux_cursor_depth
+    tests_aux_stereo_comfort
+    tests_aux_lift_cursor
+    tests_aux_lift_autoconv
     tests_aux_rear_budget
     tests_aux_route_policy
+    tests_aux_vk_queue_lock_route
+    tests_aux_present_owner_route
     tests_aux_overlay_lease
     tests_aux_mini_window_tell
     tests_aux_zone_canvas
     tests_aux_tiling_zero_copy
+    tests_aux_screen_info
+    tests_u_screen_home
+    tests_ipc_app_group
+    tests_status_snapshot
+    tests_status_ipc
+    tests_aux_display_edid_parse
     tests_aux_tiling_row_origin
+    tests_aux_tiling_window_size
+    tests_aux_window_replug
     tests_aux_wayland_geom
+    tests_comp_wl_move_sync_tag
+    tests_comp_vk_async_handoff
+    tests_aux_weave_span2d
+    tests_aux_weave_present_origin
+    tests_aux_display_live_rescale
+    tests_aux_weave_flat
     tests_aux_display_mode_hold
+    tests_aux_mono_auto_2d
+    tests_aux_tracking_any
     tests_comp_rear_budget
+    tests_comp_segments
+    tests_comp_texture_target
+    tests_comp_weave_screens
     tests_comp_lazy_transparency
+    tests_comp_overlay_2d_vk
+    tests_dp_vk_weave_sync
     tests_oxr_weave_latch
+    tests_oxr_mcp_app_result
     tests_oxr_layer_space
     tests_oxr_view_config_rule
+    tests_dxr_abi_snapshot
+    tests_oxr_segment_views
+    tests_segments_ipc
+    tests_weave_segments
+    tests_comp_workspace_screens
+    tests_target_screen_pin
+    tests_u_setting_per_screen
+    tests_u_file_socket_path
+    tests_u_sd_notify
+    tests_u_eye_history
+    tests_sim_eyes
+    tests_dp_eye_positions_at
+    tests_dp_snap_window_rect
+    tests_dp_atlas_encoding_query
     tests_oxr_legacy_mode_rule
     tests_oxr_mode_fillable_rule
     tests_oxr_tracking_properties_rule
+    tests_oxr_hosted_raw_views_rule
+    tests_oxr_input_providers_rule
     tests_xrt_active_mode_scale
     tests_input_arbiter_rig
+    tests_input_arbiter_rerank
+    tests_input_arbiter_floor
+    tests_input_arbiter_per_client
     tests_sim_input_nav
+    tests_sim_input_hands
+    tests_gamepad_map
+    tests_gamepad_hid_report
+    tests_ultraleap_map
+    tests_touch_gesture
     tests_comp_layer_view_camera
     tests_comp_color_policy
     tests_m_matrix_projection
+    tests_stereo_camera
+    tests_camera_consent
+    tests_share_link
+    tests_stereo_rectify
+    tests_stereo_vrefine
+    tests_stereo_uvc
+    tests_sim_webcam_tracking
+    tests_sim_tracking_webcam
 	)
 if(XRT_BUILD_DRIVER_QWERTY)
 	list(APPEND tests tests_qwerty_camera_profile tests_qwerty_velocity)
+endif()
+# ADR-052 -- XR_DXR_spatial_workspace v25 over IPC: the screen list and the
+# placement through their wire forms. Needs the generated protocol.
+if(TARGET ipc_shared)
+	list(APPEND tests tests_workspace_screens_ipc)
+endif()
+# #1727 -- the X11 qwerty front-end's edge logic (one click = one select edge).
+if(XRT_BUILD_DRIVER_QWERTY AND XRT_HAVE_XCB AND NOT ANDROID)
+	list(APPEND tests tests_qwerty_xcb)
 endif()
 
 # #1380 -- the input-provider host iface's display-geometry cache. Needs the
@@ -71,10 +173,82 @@ endif()
 # exists; everything it drives is the exact function pointer providers get.
 if(TARGET target_lists)
 	list(APPEND tests tests_input_host_geometry)
+	# ADR-053 / #1999 -- the conversion-provider loader: manifest + registry row
+	# parsing, ordering, the plug-in-kind router and the ABI gate.
+	list(APPEND tests tests_conversion_loader)
+	# ADR-054 N2 -- the shared component loader: the class-agnostic manifest /
+	# registry row reader, ordering + shadowing, the load path and the ABI gate,
+	# driven by test-only class rows.
+	list(APPEND tests tests_component_loader)
+	# ADR-054 N3c -- the one options contract's store: resolution order
+	# (environment > user > machine / manifest), the DXR_<CLASS>_<ID>_<KEY>
+	# mapping, the per-user JSON lookup, and a live POSIX round trip.
+	list(APPEND tests tests_component_settings)
+	# ADR-054 N7 (#2143) -- the EmulatedControllers gate: the root-policy
+	# resolve rule (user over machine, under Policy\Lock) and the input
+	# loader's live POSIX per-user file read with HOME redirected.
+	list(APPEND tests tests_input_emulated_controllers)
+	# ADR-034 Amendment 5 (#2181) -- per-client input selection policy: the
+	# per-family precedence (Lock > per-app pin > request > PreferredPlugin),
+	# the exe-basename per-app key, and the live POSIX per-app pin file.
+	list(APPEND tests tests_input_selection_policy)
+	# ADR-053 / #2006 -- conversion diagnostics: the snapshot's conversion rows
+	# (DIAG reply size, generation, CONV_* warnings, `conv list --json`), and the
+	# headless pass + selftest exit-13 path on stub providers.
+	list(APPEND tests tests_conv_snapshot)
+	# ADR-054 N6 Part 2 -- the viewer arbitration (DP > provider > nominal), the
+	# composed XR_DXR_display_info advertisement, the viewer-policy slot rule,
+	# the -tracking-provider.json router and sim_tracking's script (pure).
+	list(APPEND tests tests_viewer_arbitration)
+	# Tracking-provider-discovery §4a / ADR-054 N8 -- the viewer pose page
+	# (seqlock, wrap, torn-read stress, stale), its named shm, the host supervisor.
+	list(APPEND tests tests_viewer_pose_page)
+	# The runtime-owned camera calibration store + the get_camera_pose answer both
+	# host ifaces give (tracking-provider-discovery.md section 6).
+	list(APPEND tests tests_camera_calib)
+	# Multi-screen M1 -- target_screens_build: registry -> per-screen list.
+	list(APPEND tests tests_target_screens)
+	# ADR-047 Amendment 8 -- display hotplug: the claim sweep's scheduler, the
+	# per-monitor winner across a hotplug, the published-list comparison.
+	list(APPEND tests tests_target_display_hotplug)
+endif()
+# Multi-screen M0 (#69) -- where a plug-in without probe_displays gets its
+# synthesized display claim (its panel's monitor, not the primary). Pure
+# policy in the loader, so it needs target_lists like the test above.
+if(TARGET target_lists)
+	list(APPEND tests tests_target_backcompat_claim)
+endif()
+# Display dashboard phase 8 -- workspace-controller launch settings: the hotkey
+# grammar, service.json's `controllers` map, the active-controller selection
+# rule and the `workspace list --json` document (target_workspace_config).
+if(TARGET target_workspace_config)
+	list(APPEND tests tests_service_workspace_config)
+endif()
+# #960 CONTROLLER-class verification on POSIX: realpath-compare of the peer's
+# (kernel-resolved) executable against a manifest `binary` that may be a symlink.
+if(TARGET target_workspace_config AND NOT WIN32)
+	list(APPEND tests tests_service_client_class)
+endif()
+# MCP capability marker paths per platform (desktop Linux: XDG config, /etc).
+list(APPEND tests tests_u_mcp_capability)
+# #2207 -- the capture-trigger plumbing the service weave engine uses: the
+# per-client tag trigger, the input/atlas/woven sibling names, RGBA8 readback.
+list(APPEND tests tests_u_capture_intent_tag)
+# Desktop-Linux workspace orchestrator (spawn / respawn / hotkey arming, with a
+# stubbed hotkey backend and a shell-script controller) and the Linux hotkey
+# worker built without its D-Bus / X11 backends -- neither touches the desktop.
+if(TARGET target_workspace_config AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	list(APPEND tests tests_service_orchestrator_linux tests_service_hotkey_linux)
+endif()
+# ADR-051 D6: the service's DRM hotplug feeder -- the kernel-uevent parser and
+# the polling fallback's status hash, against recorded uevent payloads.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	list(APPEND tests tests_service_drm_hotplug_linux)
 endif()
 if(XRT_HAVE_D3D11)
 	list(APPEND tests tests_aux_d3d_d3d11 tests_aux_d3d_render_adapter tests_comp_client_d3d11
 	     tests_comp_xbridge_plane_policy tests_comp_split_gate tests_comp_eye_dp_policy
+	     tests_comp_failsafe_2d_policy
 		)
 endif()
 if(XRT_HAVE_D3D12)
@@ -102,6 +276,68 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# part of the sphere, and does a layer stay inside its angular extent.
 	# WARP, same as above; SKIPs if no D3D11 device exists at all.
 	list(APPEND tests tests_comp_layer_equirect2_warp)
+	# #1956 — the D3D11 service's swapchain format policy (VkFormat wire map,
+	# typeless depth, bind flags, advertised depth set) plus a WARP check that a
+	# depth image created the production way shares across devices (NT handle,
+	# keyed mutex, D3D11 + D3D12 open). SKIPs if no WARP device exists.
+	list(APPEND tests tests_comp_d3d11_service_formats)
+endif()
+# #1956 — depth swapchains for GL clients over IPC (WGL_NV_DX_interop2 path):
+# the GL depth recipe / format filter / transfer layout, cross-checked against
+# the D3D11 service's format policy, plus a WARP run of the D3D11 half of the
+# release copy (colour-family staging -> TYPELESS shared depth under the keyed
+# mutex). SKIPs if no WARP device exists.
+if(WIN32 AND XRT_HAVE_D3D11 AND XRT_HAVE_OPENGL AND TARGET aux_ogl)
+	list(APPEND tests tests_comp_gl_d3d11_depth)
+endif()
+if(TARGET comp_d3d11_lift)
+	# ADR-053 P1a (#2003) -- the legacy lift path's golden replay on WARP: the
+	# sim_display fake behind d3d11_lift, its output bytes pinned before the
+	# conversion core took over the lift thread. SKIPs without a D3D11 device.
+	list(APPEND tests tests_lift_dp_golden)
+	if(TARGET ipc_server_conv)
+		# #2054 -- XR_DXR_lift spec-4 transports on WARP (D3D11 NT + region,
+		# NT + D3D fence, a D3D12 resource + ID3D12Fence, CPU bytes, CPU
+		# export), each reproducing tests_lift_dp_golden's pinned SBS bytes.
+		list(APPEND tests tests_ipc_conv_v4_transports)
+	endif()
+endif()
+if(TARGET comp_d3d11_conv_host_lane)
+	# ADR-053 P2 (#2034) -- the satellite's D3D11 lane on WARP (debug layer when
+	# installed): the host fence is observed on the CPU before any copy, and a
+	# host that never signals costs a bounded CPU wait, never a GPU one.
+	list(APPEND tests tests_conv_host_lane_d3d11)
+endif()
+if(WIN32)
+	# ADR-053 P2 (#2035) -- roadmap §11.2: shared NT-handle textures + shared
+	# fences across a process boundary on WARP, a queue wait on a fence whose
+	# signaller died, and the wrong-adapter open (hardware: DXR_TEST_D3D11_HW=1).
+	list(APPEND tests tests_conv_d3d11_xproc)
+endif()
+if(TARGET comp_d3d11_conv_viewsyn)
+	# ADR-053 S5 -- the reference view synthesis on WARP: a synthetic step edge
+	# rendered into 2 and 4 views, parallax checked against u_conv_viewsyn's
+	# CPU march. SKIPs if no D3D11 device exists at all.
+	list(APPEND tests tests_conv_viewsyn_d3d11)
+endif()
+if(TARGET comp_vk_conv_viewsyn)
+	# ADR-053 P5 -- the Vulkan reference view synthesis against a CPU golden of
+	# the same passes, plus the D3D11 test's step-edge oracles. SKIPs with no
+	# Vulkan device.
+	list(APPEND tests tests_conv_viewsyn_vk)
+endif()
+if(TARGET comp_vk_conv)
+	# ADR-053 P5 -- the Vulkan GPU glue: the allocation rule, exportable memory
+	# (opaque fd / dma-buf on Linux, IOSurface export + import on macOS), CPU <->
+	# image round trips, the mirror upload, S6 readback, S5 on CPU inputs, and a
+	# composed conversion through the core. SKIPs with no Vulkan device.
+	list(APPEND tests tests_conv_vk_gpu)
+endif()
+if(TARGET comp_d3d11_conv_content)
+	# #2030 -- still-image dedupe of GPU PHOTO inputs on WARP: the content
+	# check's key drives the core (two identical inputs -> one convert, a
+	# changed block -> another). SKIPs without a D3D11 device.
+	list(APPEND tests tests_conv_gpu_dedupe)
 endif()
 if(XRT_HAVE_VULKAN)
 	list(APPEND tests tests_comp_client_vulkan tests_uv_to_tangent)
@@ -116,8 +352,67 @@ if(XRT_HAVE_VULKAN
 	# format modifiers (a CI runner's lavapipe has no DRM device).
 	list(APPEND tests tests_vk_dmabuf)
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	# Multi-screen M0 (#69) -- the desktop-Linux EDID enumeration: EDID
+	# parser, DRM sysfs reader (against a temp-dir fixture) and the
+	# RandR <-> DRM join. Hardware-free.
+	list(APPEND tests tests_aux_display_edid_linux)
+	# sim_display adopts a real monitor's device mode + EDID size on desktop
+	# Linux (the #369 fix's twin): the pick, pinned on the DS1 box's records
+	# and end to end from a temp-dir DRM sysfs fixture.
+	list(APPEND tests tests_sim_display_monitor_geometry)
+endif()
+if(APPLE)
+	# macOS monitor enumeration -- CG vendor byte order, the EDID <-> display
+	# match, the shared parser on an IOKit EDID, and a live smoke check that
+	# SKIPs on a headless runner.
+	list(APPEND tests tests_aux_display_edid_macos)
+endif()
+if(TARGET comp_vk_native
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND NOT ANDROID
+	)
+	# #1602 -- the vk_native equirect2 draw, rendered: the Vulkan twin of
+	# tests_comp_layer_equirect2_warp. Prefers a CPU (lavapipe) device and
+	# SKIPs when there is no Vulkan device at all.
+	list(APPEND tests tests_comp_vk_equirect2_draw)
+endif()
+if(TARGET comp_vk_segs)
+	# ADR-047 Amendment 8, home gone (#2305) -- the window-handle hand-back
+	# before a screen-list rebuild, end to end through the Vulkan segment
+	# manager with fake display processors (no Vulkan device needed).
+	list(APPEND tests tests_comp_segments_home_gone)
+endif()
 if(XRT_FEATURE_OPENXR)
 	list(APPEND tests tests_input_transform)
+endif()
+# #2005 -- the XR_DXR_lift v3 startup sequence (properties -> stream ->
+# submit -> first result, IPC session and ADR-049 lift-only link), pinned
+# before ADR-053 re-points the handlers. Needs the generated IPC client header
+# and the lift entry points (not built on Android).
+if(XRT_FEATURE_OPENXR
+   AND TARGET ipc_client
+   AND NOT ANDROID
+	)
+	list(APPEND tests tests_oxr_lift_startup)
+endif()
+# #2005 -- the v3 lift handlers routed to the conversion core (the adapter
+# the handlers call, server/ipc_server_conv.c), driven with the CPU fake
+# provider. Needs the ipc_server_conv target (built with the IPC subtree).
+if(TARGET ipc_server_conv)
+	list(APPEND tests tests_ipc_lift_core)
+	# #2003 -- the legacy DP-lift adapter + the legacy golden replay through the
+	# core and the v3 route, with a scripted lift-thread backend (no GPU).
+	list(APPEND tests tests_conv_dp_lift)
+	# #2054 -- XR_DXR_lift spec 4 at the conv_* adapter: the create rules, the
+	# opt-in / ordered / deduplicated task events, ProvidersChanged on an
+	# install, the depth-kind contract; and the four v3-observable shifts as
+	# golden tests (spec XR_DXR_lift.md section 14.2).
+	list(APPEND tests tests_ipc_conv_v4 tests_lift_v3_shifts)
+	if(NOT WIN32)
+		# The POSIX CPU I/O glue (spec-4 CPU kinds without a D3D11 device).
+		list(APPEND tests tests_ipc_conv_cpu)
+	endif()
 endif()
 if(XRT_FEATURE_OPENXR)
 	# #1488 -- XR_EXT_view_configuration_views_change. Compiles
@@ -142,8 +437,29 @@ if(XRT_HAVE_OPENGL
 	set(_have_opengl_test ON)
 	list(APPEND tests tests_comp_client_opengl)
 endif()
-if(XRT_BUILD_DRIVER_HANDTRACKING)
-	list(APPEND tests tests_levenbergmarquardt)
+# ADR-053 D5 (#2033) -- the conversion-host satellite binary, spawned with the
+# sim provider over a loopback channel; describe / warm / one submit through
+# the shm rings, and the exit-code table. Headless (CPU lane).
+if(TARGET displayxr-conversion-host
+   AND TARGET drv_sim_conversion_plugin
+   AND TARGET target_lists
+	)
+	list(APPEND tests tests_conv_host_satellite)
+endif()
+
+# ADR-053 P2 (#2032): the OS process layer of the conversion-host satellite
+# (os_process.h) against a real helper child. Windows, desktop Linux, macOS.
+if(WIN32 OR APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID))
+	list(APPEND tests tests_conv_os_process)
+	# #2034: the satellite host proxy against a scripted host process.
+	list(APPEND tests tests_conv_proxy)
+endif()
+
+# ADR-056 -- XR_DXR_desktop_control's common layer (consent state machine,
+# store + audit, queue, safety layer) end to end over the in-memory fake
+# backend. Desktop OSes only, like aux_desktop itself.
+if(TARGET aux_desktop)
+	list(APPEND tests tests_desktop_control)
 endif()
 
 foreach(testname ${tests})
@@ -155,7 +471,18 @@ endforeach()
 
 # For tests that require more than just aux_util, link those other libs down here.
 
+# ADR-061 arm 2: the compositor share tap's hook surface over util/u_share_link,
+# compiled straight in (portable C) so the test does not need the compositor module.
+target_sources(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge/comp_xbridge_share_tap.c)
+target_include_directories(tests_share_link PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/xbridge)
+
 target_include_directories(tests_oxr_session_window_binding PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+
+if(TARGET tests_desktop_control)
+	target_link_libraries(tests_desktop_control PRIVATE aux_desktop)
+	# Spec version 3 (ADR-056 Amendment 3): held input, the shell target, the clipboard.
+	target_sources(tests_desktop_control PRIVATE tests_desktop_control_v3.cpp)
+endif()
 
 # #1594 -- compiles oxr_layer_space.c straight into the unit and injects the
 # relations oxr_space_locate_device() would have returned, so the VIEW/LOCAL
@@ -170,6 +497,12 @@ target_include_directories(
 		${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
 	)
 target_link_libraries(tests_oxr_layer_space PRIVATE aux_math)
+
+if(TARGET tests_desktop_control)
+	# The backend hears when the CONTROL grant begins and ends (grant_changed): on
+	# GNOME, window titles from the DisplayXR extension (v18) only while granted.
+	target_sources(tests_desktop_control PRIVATE tests_desktop_control_titles.cpp)
+endif()
 
 if(TARGET tests_oxr_view_config_views_change)
 	# PROJECT_SOURCE_DIR, not CMAKE_SOURCE_DIR -- the vendor plug-in's signing
@@ -203,8 +536,18 @@ if(TARGET tests_qwerty_camera_profile)
 	target_link_libraries(tests_qwerty_camera_profile PRIVATE drv_qwerty drv_qwerty_includes)
 endif()
 
+# The ABI pin for the published XR_DXR_* extensions shipped apps are built
+# against (struct layouts, XrStructureType values, SPEC_VERSIONs). Generated by
+# scripts/gen_dxr_abi_snapshot.py; it is all static_asserts, so a moved field
+# fails the BUILD. Headers only.
+target_link_libraries(tests_dxr_abi_snapshot PRIVATE xrt-external-openxr)
+
 if(TARGET tests_qwerty_velocity)
 	target_link_libraries(tests_qwerty_velocity PRIVATE drv_qwerty drv_qwerty_includes aux_math)
+endif()
+
+if(TARGET tests_qwerty_xcb)
+	target_link_libraries(tests_qwerty_xcb PRIVATE drv_qwerty drv_qwerty_includes)
 endif()
 
 if(WIN32 AND XRT_HAVE_D3D11 AND XRT_FEATURE_OPENXR AND XRT_FEATURE_OPENXR_HEADLESS AND RUNTIME_TARGET)
@@ -220,10 +563,70 @@ endif()
 # arithmetic only; it reads xrt_rendering_mode, hence xrt-interfaces.
 target_link_libraries(tests_aux_tiling_zero_copy PRIVATE xrt-interfaces)
 
+# Multi-screen M1 -- per-screen display-info derivation (u_screen_info.h):
+# system-default / plug-in per-monitor slot / EDID-derived rules. Header only;
+# it reads the plug-in ABI structs, hence xrt-interfaces.
+target_link_libraries(tests_aux_screen_info PRIVATE xrt-interfaces)
+
+# #2305 -- a live session's home screen across display hotplugs (u_screen_home):
+# the SYSTEM_DEFAULT flag the segment managers read never leaves the session DP's panel.
+target_link_libraries(tests_u_screen_home PRIVATE xrt-interfaces)
+
+# Input focus follows the application (#962 follow-up): the pure sibling rule
+# in ipc/shared/ipc_app_group.h — name, process tree, executable tie-break.
+target_link_libraries(tests_ipc_app_group PRIVATE xrt-interfaces)
+target_include_directories(tests_ipc_app_group PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc)
+
+# ADR-051 -- the display status snapshot: §4 warning rules, §3 JSON shape, §7
+# text formatter (util/u_status_snapshot.h). Pure; synthetic snapshots only.
+target_link_libraries(tests_status_snapshot PRIVATE xrt-interfaces)
+
+# ADR-051 D3 (phase 2) -- the snapshot crosses the DIAG IPC path as head + one
+# screen row per system_get_status_snapshot reply + one client row per
+# system_get_client_segments reply; this round-trips a synthetic snapshot
+# through the generated message structs where the protocol is generated.
+target_link_libraries(tests_status_ipc PRIVATE xrt-interfaces)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_status_ipc PRIVATE ipc_shared)
+	target_compile_definitions(tests_status_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
+
+# Portable EDID parser (physical mm) shared by the Windows, Linux + macOS readers.
+target_link_libraries(tests_aux_display_edid_parse PRIVATE aux_os xrt-interfaces)
+
+# ADR-054 §4.1 / N6 Part 1 (#2144): the trunk's eye-pair ring sampled at a
+# target time (exact / interpolate / bounded extrapolate / stale).
+target_link_libraries(tests_u_eye_history PRIVATE aux_os xrt-interfaces)
+# ... and the target-time slot on all five DP vtables: appended last, gated,
+# falling back to the vendor horizon.
+target_link_libraries(tests_dp_eye_positions_at PRIVATE xrt-interfaces)
+# ... and the GL / D3D12 drag phase-snap slot (#2405): appended last, gated, no snap when absent.
+target_link_libraries(tests_dp_snap_window_rect PRIVATE xrt-interfaces)
+# ... and the D3D11 (#2273) + Vulkan (#2340) PQ atlas queries: appended last, gated, false when absent.
+target_link_libraries(tests_dp_atlas_encoding_query PRIVATE xrt-interfaces)
+
+if(TARGET tests_sim_display_monitor_geometry)
+	# The pure pick is compiled straight in; the fixture path uses aux_os's
+	# DRM sysfs reader + RandR <-> DRM join, as the plug-in does.
+	target_sources(
+		tests_sim_display_monitor_geometry
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_monitor_geometry.c
+		)
+	target_include_directories(
+		tests_sim_display_monitor_geometry PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+		)
+	target_link_libraries(tests_sim_display_monitor_geometry PRIVATE aux_os xrt-interfaces)
+endif()
+
 # #1625 -- the atlas tile ROW ORIGIN: view 0 is the top-left tile as displayed,
 # on every backend. The GL-vs-everyone-else disagreement was two lines of
 # integer arithmetic, so it is pinned on the host rather than on five GPUs.
 target_link_libraries(tests_aux_tiling_row_origin PRIVATE xrt-interfaces)
+
+# A bound window with no size (minimized / not sized yet) must never become a
+# 0x0 atlas at compositor create -- that failed xrCreateSession. The create-size
+# pick and the window-scaled view are header arithmetic, pinned on the host.
+target_link_libraries(tests_aux_tiling_window_size PRIVATE xrt-interfaces)
 
 target_link_libraries(tests_cxx_wrappers PRIVATE xrt-interfaces)
 # part of #1633 -- u_grip_surface(), the one grip -> grip_surface transform.
@@ -237,6 +640,15 @@ target_link_libraries(tests_quatexpmap PRIVATE aux_math)
 target_link_libraries(tests_rational PRIVATE aux_math)
 target_link_libraries(tests_relation_chain PRIVATE aux_math)
 target_link_libraries(tests_pose PRIVATE aux_math)
+# XR_DXR_view_rig spec 4 (#2189) -- the rig point mapping hand joints use IS the
+# shared core's eye mapping: bit-for-bit against displayxr-common across a sweep,
+# plus the issue's joint cases.
+target_link_libraries(tests_view_rig_point PRIVATE aux_math)
+# #2451: the legacy camera rig's disparity is canvas-relative, independent of the
+# display's physical size and of the dormant display-rig virtual height.
+target_link_libraries(tests_camera_rig_disparity PRIVATE aux_math)
+# Mirror-alignment camera-pose calibration solver (tracking-provider-discovery.md, "Camera pose calibration").
+target_link_libraries(tests_mirror_calib PRIVATE aux_math)
 target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
 target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
 target_link_libraries(tests_vec3_angle PRIVATE aux_math)
@@ -280,8 +692,174 @@ target_compile_definitions(
 	tests_comp_color_policy PRIVATE "DXR_COMP_SRC_DIR=\"${PROJECT_SOURCE_DIR}/src/xrt/compositor\""
 	)
 
+if(TARGET tests_target_screens)
+	target_link_libraries(tests_target_screens PRIVATE target_lists xrt-interfaces aux_os)
+endif()
+if(TARGET tests_viewer_arbitration)
+	target_sources(
+		tests_viewer_arbitration PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_tracking_script.c
+		)
+	target_include_directories(tests_viewer_arbitration PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking)
+	target_link_libraries(tests_viewer_arbitration PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
+if(TARGET tests_viewer_pose_page)
+	target_link_libraries(tests_viewer_pose_page PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
+if(TARGET tests_camera_calib)
+	target_link_libraries(tests_camera_calib PRIVATE target_lists xrt-interfaces aux_util aux_os)
+endif()
+if(TARGET tests_target_display_hotplug)
+	target_link_libraries(tests_target_display_hotplug PRIVATE target_lists xrt-interfaces aux_os)
+endif()
+
 if(TARGET tests_input_host_geometry)
 	target_link_libraries(tests_input_host_geometry PRIVATE target_lists xrt-interfaces)
+endif()
+if(TARGET tests_conversion_loader)
+	target_link_libraries(tests_conversion_loader PRIVATE target_lists xrt-interfaces aux_util)
+	# Three stub binaries the loader is pointed at by path (never registered):
+	# a well-formed provider, the same provider built against the next ABI
+	# major, and a display-processor-shaped DLL with no conversion entry point.
+	# ADR-054 N4 adds the display and input shapes and their ABI-mismatch
+	# twins (`*_dp_abi`, `*_input_abi`): CI's per-class conformance step
+	# registers those under HKLM for one self-test run to prove every class
+	# loader rejects a foreign ABI major and falls through (ADR-020 rule 3).
+	foreach(_stub ok abi dp dp_abi input input_abi tracking_abi)
+		add_library(tests_conversion_loader_stub_${_stub} MODULE tests_conversion_loader_stub.c)
+		target_link_libraries(tests_conversion_loader_stub_${_stub} PRIVATE xrt-interfaces)
+		set_target_properties(tests_conversion_loader_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
+		add_dependencies(tests_conversion_loader tests_conversion_loader_stub_${_stub})
+	endforeach()
+	target_compile_definitions(tests_conversion_loader_stub_ok PRIVATE STUB_KIND_CONVERSION)
+	target_compile_definitions(
+		tests_conversion_loader_stub_abi PRIVATE STUB_KIND_CONVERSION
+							 "STUB_PLUGIN_API=(XRT_CONVERSION_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	target_compile_definitions(tests_conversion_loader_stub_dp PRIVATE STUB_KIND_DISPLAY)
+	target_compile_definitions(
+		tests_conversion_loader_stub_dp_abi PRIVATE STUB_KIND_DISPLAY
+							    "STUB_PLUGIN_API=(XRT_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	target_compile_definitions(tests_conversion_loader_stub_input PRIVATE STUB_KIND_INPUT)
+	target_compile_definitions(
+		tests_conversion_loader_stub_input_abi PRIVATE STUB_KIND_INPUT
+							       "STUB_PLUGIN_API=(XRT_INPUT_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	# ADR-054 N6 Part 2: the viewer-tracking class's ABI-mismatch twin (N4 cell).
+	target_compile_definitions(
+		tests_conversion_loader_stub_tracking_abi PRIVATE STUB_KIND_TRACKING
+								  "STUB_PLUGIN_API=(XRT_TRACKING_PLUGIN_API_VERSION_CURRENT + 1)"
+		)
+	target_compile_definitions(
+		tests_conversion_loader
+		PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
+			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
+			"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
+		)
+endif()
+if(TARGET tests_component_settings)
+	target_link_libraries(tests_component_settings PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_input_emulated_controllers)
+	target_link_libraries(tests_input_emulated_controllers PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_input_selection_policy)
+	target_link_libraries(tests_input_selection_policy PRIVATE target_lists xrt-interfaces aux_util)
+endif()
+if(TARGET tests_component_loader)
+	target_link_libraries(tests_component_loader PRIVATE target_lists xrt-interfaces aux_util)
+	# Reuses the conversion loader's stub binaries: a conversion-shaped module
+	# and a display-processor-shaped one, so the shared load path can be shown
+	# to resolve each class's entry point and refuse the other's.
+	if(TARGET tests_conversion_loader_stub_ok)
+		add_dependencies(tests_component_loader tests_conversion_loader_stub_ok tests_conversion_loader_stub_dp)
+		target_compile_definitions(
+			tests_component_loader
+			PRIVATE "CONV_STUB_OK_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_ok>\""
+				"CONV_STUB_DP_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_dp>\""
+			)
+	endif()
+endif()
+# #2436 -- a module whose static import cannot be resolved from the test
+# process: the dependency is written to an isolated directory (never next to
+# the dependent, the test executable, or on PATH), so loading the dependent
+# fails with error 126 and the loader must name the missing import.
+if(WIN32 AND TARGET tests_component_loader)
+	add_library(tests_component_loader_dep SHARED tests_component_loader_missing_dep.c)
+	target_compile_definitions(tests_component_loader_dep PRIVATE TCL_DEP_LIBRARY)
+	set_target_properties(
+		tests_component_loader_dep
+		PROPERTIES PREFIX ""
+			   OUTPUT_NAME "dxr_test_missing_dep"
+			   RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tcl_isolated_dep"
+			   ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tcl_isolated_dep"
+		)
+	add_library(tests_component_loader_needs_dep MODULE tests_component_loader_missing_dep.c)
+	target_link_libraries(tests_component_loader_needs_dep PRIVATE tests_component_loader_dep)
+	set_target_properties(tests_component_loader_needs_dep PROPERTIES PREFIX "")
+	add_dependencies(tests_component_loader tests_component_loader_needs_dep)
+	target_compile_definitions(
+		tests_component_loader
+		PRIVATE "TCL_NEEDS_DEP_PATH=\"$<TARGET_FILE:tests_component_loader_needs_dep>\""
+			"TCL_DEP_NAME=\"$<TARGET_FILE_NAME:tests_component_loader_dep>\""
+		)
+endif()
+if(TARGET tests_conv_host_satellite)
+	target_link_libraries(tests_conv_host_satellite PRIVATE conv_host_core xrt-interfaces aux_util)
+	add_dependencies(tests_conv_host_satellite displayxr-conversion-host drv_sim_conversion_plugin
+	                 tests_conversion_loader_stub_abi)
+	target_compile_definitions(
+		tests_conv_host_satellite
+		PRIVATE "CONV_HOST_EXE=\"$<TARGET_FILE:displayxr-conversion-host>\""
+			"SIM_CONVERSION_PATH=\"$<TARGET_FILE:drv_sim_conversion_plugin>\""
+			"CONV_STUB_ABI_PATH=\"$<TARGET_FILE:tests_conversion_loader_stub_abi>\""
+		)
+	set_target_properties(tests_conv_host_satellite PROPERTIES CXX_STANDARD 17)
+	if(WIN32)
+		# The D3D11 NT-handle lane case (WARP, debug layer when installed).
+		target_link_libraries(tests_conv_host_satellite PRIVATE d3d11 dxgi)
+	endif()
+endif()
+if(TARGET tests_conv_snapshot)
+	target_link_libraries(
+		tests_conv_snapshot PRIVATE target_lists displayxr::conversion_core xrt-interfaces aux_util
+					    xrt-external-cjson
+		)
+	# ADR-053 P4 (#2108): the model-store pack rows (std::filesystem temp store).
+	target_link_libraries(tests_conv_snapshot PRIVATE displayxr::conversion_store)
+	set_target_properties(tests_conv_snapshot PROPERTIES CXX_STANDARD 17)
+	# The selftest verdict (cli_query_apply_conversion, exit 13) where the CLI's
+	# query core is built.
+	if(TARGET cli_query)
+		# cli_query.c references xrt_instance_create: link the no-compositor instance too.
+		target_link_libraries(tests_conv_snapshot PRIVATE cli_query target_instance_no_comp)
+		target_compile_definitions(tests_conv_snapshot PRIVATE TESTS_HAVE_CLI_QUERY)
+	endif()
+	# Three stub providers handed to the headless pass by path (never registered).
+	foreach(_stub good malformed bad_state)
+		add_library(tests_conv_snapshot_stub_${_stub} MODULE tests_conv_snapshot_stub.c)
+		target_link_libraries(tests_conv_snapshot_stub_${_stub} PRIVATE xrt-interfaces)
+		set_target_properties(tests_conv_snapshot_stub_${_stub} PROPERTIES C_VISIBILITY_PRESET hidden PREFIX "")
+		add_dependencies(tests_conv_snapshot tests_conv_snapshot_stub_${_stub})
+	endforeach()
+	target_compile_definitions(tests_conv_snapshot_stub_good PRIVATE STUB_VARIANT_GOOD)
+	target_compile_definitions(tests_conv_snapshot_stub_malformed PRIVATE STUB_VARIANT_MALFORMED)
+	target_compile_definitions(tests_conv_snapshot_stub_bad_state PRIVATE STUB_VARIANT_BAD_STATE)
+	# The shipped sim provider through the same pass: what CI's selftest gate sees
+	# (#2002). Linked in: its DLL needs the runtime DLLs next to it.
+	if(TARGET sim_conversion_static)
+		target_link_libraries(tests_conv_snapshot PRIVATE sim_conversion_static)
+		target_compile_definitions(tests_conv_snapshot PRIVATE CONV_SNAP_SIM_STATIC)
+	endif()
+	target_compile_definitions(
+		tests_conv_snapshot
+		PRIVATE "CONV_SNAP_STUB_GOOD=\"$<TARGET_FILE:tests_conv_snapshot_stub_good>\""
+			"CONV_SNAP_STUB_MALFORMED=\"$<TARGET_FILE:tests_conv_snapshot_stub_malformed>\""
+			"CONV_SNAP_STUB_BAD_STATE=\"$<TARGET_FILE:tests_conv_snapshot_stub_bad_state>\""
+		)
+endif()
+if(TARGET tests_target_backcompat_claim)
+	target_link_libraries(tests_target_backcompat_claim PRIVATE target_lists xrt-interfaces aux_os)
 endif()
 
 # #1380 rig composer -- the head device's pose source. Compiled straight into
@@ -374,6 +952,145 @@ if(TARGET tests_oxr_view_space)
 	# stay on qwerty, and that is precisely the configuration in which the
 	# dynamic-role CACHE (empty until xrSyncActions) used to make
 	# xrGetSystemProperties answer XR_FALSE.
+	# #2189 — rig-scoped hand joints need a hand-tracking provider resident: the
+	# sim-input plug-in through a generated manifest, in its own process (the
+	# provider scan is one-shot per process).
+	if(TARGET drv_sim_input_plugin)
+		# Per-config directory: the manifest names the plug-in binary through
+		# $<TARGET_FILE>, which differs per configuration on a multi-config
+		# generator (Visual Studio), and file(GENERATE) must not write one path
+		# with two contents. The environment rides in the COMMAND (cmake -E env),
+		# where generator expressions are evaluated per configuration too.
+		set(_rig_hands_dir "${CMAKE_CURRENT_BINARY_DIR}/rig_hands_plugins/$<CONFIG>")
+		file(GENERATE
+		     OUTPUT "${_rig_hands_dir}/200-sim-input-input-provider.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-input\",\n    \"display_name\": \"DisplayXR Sim Input\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_input_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		add_dependencies(tests_oxr_view_space drv_sim_input_plugin)
+		# POSIX discovery reads XRT_PLUGIN_SEARCH_PATH; Windows discovery is
+		# registry-only, so there the arm finds no provider and SUCCEEDs with a WARN.
+		add_test(NAME tests_oxr_view_space_rig_hands
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_rig_hands_dir}"
+		                 DXR_INPUT_SIM_INPUT_ENABLE=1 $<TARGET_FILE:tests_oxr_view_space> "[rig_hands]" --success
+		                 --allow-running-no-tests
+		         )
+		# #2191 — HANDS=right PINCH=hold: one tracked hand holding one pinch.
+		add_test(NAME tests_oxr_view_space_rig_hands_hold
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_rig_hands_dir}"
+		                 DXR_INPUT_SIM_INPUT_ENABLE=1 DXR_INPUT_SIM_INPUT_HANDS=right
+		                 DXR_INPUT_SIM_INPUT_PINCH=hold $<TARGET_FILE:tests_oxr_view_space> "[rig_hands_hold]"
+		                 --success --allow-running-no-tests
+		         )
+	endif()
+	# ADR-054 N6 Part 2 — the viewer-tracking class end to end: sim_tracking's
+	# scripted sweep drives xrLocateViews through sim_display (EXTERNAL_OK, no
+	# tracker of its own), and XR_DXR_display_info advertises the COMPOSED
+	# MANAGED|MANUAL. Its own process (the tracking scan is one-shot), with the
+	# sim-display manifest beside it so the dev build's DP is the one found.
+	# POSIX only: discovery there reads XRT_PLUGIN_SEARCH_PATH, while Windows
+	# discovery is registry-only, so the arms would find no provider and fail
+	# (CI's per-class conformance step covers the Windows registry path).
+	# XRT_PREFERRED_TRACKING_PLUGIN_ID pins sim-tracking: the search path ADDS a
+	# directory, it does not hide the system one, so a provider installed on the
+	# box (open-tracking, probe order 100) would otherwise outrank it.
+	if(NOT WIN32 AND TARGET drv_sim_tracking_plugin AND TARGET drv_sim_display_plugin)
+		set(_viewer_dir "${CMAKE_CURRENT_BINARY_DIR}/viewer_tracking_plugins/$<CONFIG>")
+		file(GENERATE
+		     OUTPUT "${_viewer_dir}/200-sim-tracking-tracking-provider.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-tracking\",\n    \"display_name\": \"DisplayXR Sim Tracking\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_tracking_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		file(GENERATE
+		     OUTPUT "${_viewer_dir}/200-sim-display.json"
+		     CONTENT "{\n  \"file_format_version\": \"1.0\",\n  \"plugin\": {\n    \"id\": \"sim-display\",\n    \"display_name\": \"DisplayXR Sim Display\",\n    \"binary_path\": \"$<TARGET_FILE:drv_sim_display_plugin>\",\n    \"probe_order\": 200\n  }\n}\n"
+		     )
+		add_dependencies(tests_oxr_view_space drv_sim_tracking_plugin drv_sim_display_plugin)
+		add_test(NAME tests_oxr_view_space_viewer_tracking
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+		                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=2000
+		                 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1 DXR_VIEWER_POSE_PAGE=none
+		                 $<TARGET_FILE:tests_oxr_view_space> "[viewer_tracking]" --success --allow-running-no-tests
+		         )
+		# (DXR_VIEWER_POSE_PAGE=none: never attach to a live service's page on a
+		# dev box; this arm is the in-process LOCAL hosting.)
+
+		# §4a out-of-process hosting end to end: probe, serve on demand, kill ->
+		# restart with backoff, orderly stop, all read off the page here; and the
+		# in-process runtime glue as a READER of that page (no provider loaded).
+		if(TARGET displayxr-tracking-host)
+			add_executable(tests_tracking_host tests_tracking_host.cpp)
+			target_link_libraries(
+				tests_tracking_host PRIVATE xrt-external-catch2 target_lists xrt-interfaces aux_util aux_os
+				)
+			target_compile_definitions(
+				tests_tracking_host PRIVATE "TRACKING_HOST_EXE=\"$<TARGET_FILE:displayxr-tracking-host>\""
+				)
+			add_dependencies(tests_tracking_host displayxr-tracking-host drv_sim_tracking_plugin)
+			add_test(NAME tests_tracking_host
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_SCRIPT=sweep
+			                 DXR_TRACKING_SIM_TRACKING_PERIOD_MS=500 DXR_TRACKING_SIM_TRACKING_AMPLITUDE_M=0.1
+			                 $<TARGET_FILE:tests_tracking_host> --success
+			         )
+		endif()
+
+		# Camera-pose calibration end to end (tracking-provider-discovery.md, "Camera
+		# pose calibration"): the real sim_tracking plug-in with a hidden
+		# CAMERA_TRUE_POSE -> camera-space samples at five dots x two distances ->
+		# the solver -> CAMERA_POSE_0 -> the provider's display-space output. The
+		# collected pairs feed the CLI arms (`tracking calibrate solve` on them,
+		# `tracking calibrate --watch --json` on the live provider).
+		add_executable(tests_tracking_calibrate_e2e tests_tracking_calibrate_e2e.cpp)
+		target_link_libraries(
+			tests_tracking_calibrate_e2e PRIVATE xrt-external-catch2 target_lists xrt-interfaces aux_math aux_util
+			                                     aux_os
+			)
+		add_dependencies(tests_tracking_calibrate_e2e drv_sim_tracking_plugin)
+		set(_calib_pairs "${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_e2e_pairs.json")
+		# With the CLI built, the commit goes through the real 'tracking calibrate apply'.
+		set(_calib_cli "")
+		if(TARGET cli)
+			add_dependencies(tests_tracking_calibrate_e2e cli)
+			set(_calib_cli "DXR_CALIB_E2E_CLI=$<TARGET_FILE:cli>")
+		endif()
+		add_test(NAME tests_tracking_calibrate_e2e
+		         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+		                 "DXR_CALIB_E2E_OUT=${_calib_pairs}" ${_calib_cli} $<TARGET_FILE:tests_tracking_calibrate_e2e>
+		                 --success
+		         )
+		set_tests_properties(tests_tracking_calibrate_e2e PROPERTIES FIXTURES_SETUP calib_pairs)
+		if(TARGET cli)
+			add_test(NAME tracking_calibrate_cli_solve
+			         COMMAND $<TARGET_FILE:cli> tracking calibrate solve --in ${_calib_pairs} --mode b --json)
+			set_tests_properties(
+				tracking_calibrate_cli_solve PROPERTIES FIXTURES_REQUIRED calib_pairs PASS_REGULAR_EXPRESSION
+				                                        "\"ok\":[ \t]*true"
+				)
+			# No calibration stored (a config dir that does not exist): the hello's camera_pose is
+			# the default prior, the layout prior the Dashboard sizes its targets from.
+			add_test(NAME tracking_calibrate_cli_watch
+			         COMMAND ${CMAKE_COMMAND} -E env "XRT_PLUGIN_SEARCH_PATH=${_viewer_dir}" DXR_ALLOW_DEV_PLUGIN_PATHS=1 XRT_PREFERRED_TRACKING_PLUGIN_ID=sim-tracking
+			                 DXR_TRACKING_SIM_TRACKING_ENABLE=1 DXR_TRACKING_SIM_TRACKING_CAMERA=1
+			                 "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/tracking_calibrate_cli_none"
+			                 $<TARGET_FILE:cli> tracking calibrate --screen E2E-1 --watch --json --count 3
+			         )
+			# No calibration stored (a config dir that does not exist): the answer is still a
+			# pose, the default prior on top of a 194 mm-high panel (97 + 8 mm).
+			add_test(NAME camera_calibration_cli_show_prior
+			         COMMAND ${CMAKE_COMMAND} -E env
+			                 "XDG_CONFIG_HOME=${CMAKE_CURRENT_BINARY_DIR}/camera_calibration_cli_none"
+			                 $<TARGET_FILE:cli> camera calibration show --camera cam0 --screen S1 --panel-mm 344x194
+			                 --json
+			         )
+			set_tests_properties(
+				camera_calibration_cli_show_prior PROPERTIES PASS_REGULAR_EXPRESSION
+				                                             "\"source\":[ \t]*\"default-prior\".*\"t_m\":[^]]*0\\.105"
+				)
+			set_tests_properties(
+				tracking_calibrate_cli_watch PROPERTIES PASS_REGULAR_EXPRESSION
+				                                        "\"tracks_camera_space\":true.*\"camera_pose\":{\"t_m\":\\[[^]]*\\],\"q\":\\[[^]]*\\],\"source\":\"default-prior\"}.*\"camera\":{\"key\":\"sim-tracking:webcam0\""
+				)
+		endif()
+	endif()
 	add_test(NAME tests_oxr_view_space_no_input_providers
 		 COMMAND tests_oxr_view_space "[tracking_props_noproviders]" --success --allow-running-no-tests
 		)
@@ -407,6 +1124,89 @@ target_include_directories(
 	)
 target_link_libraries(tests_sim_input_nav PRIVATE xrt-interfaces aux_os)
 
+# #2191 — the sim_input HAND script: placement relative to the display plane,
+# HANDS / PINCH / HAND_DISTANCE_M, and the pinch-hold tip gap through the real
+# u_hand_simulation. Pure functions, compiled straight in like the nav unit.
+# The end-to-end placement check is tests_oxr_view_space_rig_hands.
+target_sources(
+	tests_sim_input_hands PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input/sim_input_hand_script.c
+	)
+target_include_directories(
+	tests_sim_input_hands PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_input
+			      ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_sim_input_hands PRIVATE xrt-interfaces aux_math)
+
+# The gamepad input provider's mapping table (drivers/gamepad/gamepad_map.c):
+# stick -> rig velocity with deadzone, the integrator, the button actions.
+# Pure functions with no OS or device dependency, compiled straight into the
+# unit like tests_sim_input_nav — what is under test is the POLICY the
+# provider's devices trust, and it needs no pad.
+target_sources(
+	tests_gamepad_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad/gamepad_map.c
+	)
+target_include_directories(
+	tests_gamepad_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad
+			  ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_gamepad_map PRIVATE xrt-interfaces)
+# #2472 -- the Sony pad HID report parsers + rumble builders the Windows HID
+# reader trusts (drivers/gamepad/gamepad_hid_report.c). Pure byte layouts, so
+# compiled straight in and run on every platform; no pad needed.
+target_sources(
+	tests_gamepad_hid_report
+	PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad/gamepad_hid_report.c
+	)
+target_include_directories(
+	tests_gamepad_hid_report PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad
+				 ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_gamepad_hid_report PRIVATE xrt-interfaces)
+# Dev probe (not a test, never built by default): reads the real Windows
+# gamepad backend -- XInput + HID dispatch -- and prints the live reader and
+# the pad state at 2 Hz for 15 s. `gamepad_backend_probe [--rumble]`.
+if(WIN32)
+	set(_gp ${PROJECT_SOURCE_DIR}/src/xrt/drivers/gamepad)
+	add_executable(
+		gamepad_backend_probe EXCLUDE_FROM_ALL
+		gamepad_backend_probe.c ${_gp}/gamepad_backend_win.c ${_gp}/gamepad_backend_xinput.c
+		${_gp}/gamepad_backend_hid_win.c ${_gp}/gamepad_hid_report.c
+		)
+	target_include_directories(
+		gamepad_backend_probe PRIVATE ${_gp} ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+		)
+	target_link_libraries(
+		gamepad_backend_probe PRIVATE xrt-interfaces aux_util xinput9_1_0 hid setupapi
+		)
+	set_target_properties(gamepad_backend_probe PROPERTIES LINKER_LANGUAGE CXX)
+	unset(_gp)
+endif()
+# The Ultraleap provider's display-plane mapping (drivers/ultraleap/ultraleap_map.c):
+# relative (display heights, the default) and physical (measured mount) modes,
+# radii / velocity gain, and the settings parse. Pure C with no LeapC
+# dependency, compiled straight in — so it builds and runs on every box,
+# including the CI ones that carry no Leap SDK and never build the plug-in.
+target_sources(
+	tests_ultraleap_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/ultraleap/ultraleap_map.c
+	)
+target_include_directories(
+	tests_ultraleap_map PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/ultraleap
+	)
+# aux_math: the hand-frame re-expression (ul_map_joints_to_hand_frame) is pose math.
+target_link_libraries(tests_ultraleap_map PRIVATE xrt-interfaces aux_math)
+# #132 — the touch provider's gesture recogniser + rig/aim math, and the
+# pointer-event ring it is fed from. Compiled straight in for the same reason
+# as tests_sim_input_nav: what is under test is the mapping table (pure
+# functions of the events and timestamps fed in), not discovery.
+target_sources(
+	tests_touch_gesture PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/touch_input/touch_gesture.c
+	)
+target_include_directories(
+	tests_touch_gesture PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/touch_input
+			     ${PROJECT_SOURCE_DIR}/src/xrt/auxiliary
+	)
+target_link_libraries(tests_touch_gesture PRIVATE xrt-interfaces aux_util aux_os)
+
 # #1380 — the rig (navigation) role in the input arbiter. The arbiter is pure
 # decision logic over a candidate table, so the unit compiles it straight in
 # (like tests_comp_rear_budget does) rather than linking the target_lists
@@ -423,12 +1223,56 @@ target_include_directories(
 	)
 target_link_libraries(tests_input_arbiter_rig PRIVATE xrt-interfaces aux_os)
 
+# ADR-054 N3d (#2051) — the arbiter's live re-rank: a PreferredPlugin flip and
+# an Enabled = 0 withdrawal move the roles at once and bump generation_id.
+# Same shape as tests_input_arbiter_rig (the arbiter compiled straight in).
+target_sources(
+	tests_input_arbiter_rerank PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_rerank PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_rerank PRIVATE xrt-interfaces aux_os)
+
+# ADR-054 N7 (#2143) -- the optional hand-role floor: no qwerty pair means the
+# hands fall to -1 (a lone provider is still arbitrated), and a live
+# EmulatedControllers flip withdraws / re-admits an existing pair. Same shape.
+target_sources(
+	tests_input_arbiter_floor PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_floor PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_floor PRIVATE xrt-interfaces aux_os)
+
+# ADR-034 Amendment 5 (#2181) — per-client role resolution: the overlay walk
+# (pins only where the provider claims the family, presence-gated), per-client
+# monotonic generations across a global re-rank, persist, Lock, enumerate,
+# holders. Same shape as tests_input_arbiter_floor (the arbiter compiled in;
+# the policy store faked through t_input_arbiter_set_policy).
+target_sources(
+	tests_input_arbiter_per_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_input_arbiter.c
+	)
+target_include_directories(
+	tests_input_arbiter_per_client PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_input_arbiter_per_client PRIVATE xrt-interfaces aux_os)
+
 # #1427 — the XR_DXR_weave handle-export latch rule. A pure boolean header with
 # no runtime dependency (see tests_oxr_weave_latch.cpp for why the entry point
 # itself is not host-drivable), so it needs the st_oxr include path and nothing
 # else.
 target_include_directories(
 	tests_oxr_weave_latch PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# XR_DXR_mcp_tools result shaping (an XR_FALSE submit keeps the app's message as
+# an isError result). Pure cJSON -- compiled straight in; aux_util brings cJSON.
+target_sources(
+	tests_oxr_mcp_app_result PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_mcp_app_result.c
+	)
+target_include_directories(
+	tests_oxr_mcp_app_result PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
 # #1486 — the two xrEndFrame projection-layer viewCount rules (tight
@@ -469,6 +1313,19 @@ target_include_directories(
 	tests_oxr_tracking_properties_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
 	)
 
+# #2322 — which hosted sessions DXR_HOSTED_RAW_VIEWS reaches: header-only and
+# bool-only like the rule above, so the include is the whole dependency.
+target_include_directories(
+	tests_oxr_hosted_raw_views_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+
+# ADR-034 Amendment 5 (#2181) — XR_DXR_input_providers event discipline: the
+# setter's "should I queue the event" rule, header-only like the rules above.
+target_include_directories(
+	tests_oxr_input_providers_rule PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_oxr_input_providers_rule PRIVATE xrt-interfaces)
+
 # One source of truth for the ACTIVE mode's per-view scale. The accessor is a
 # static inline over xrt_device / xrt_rendering_mode, so headers are all it
 # needs -- but it is the thing three hand-maintained overwrite sites used to do
@@ -480,11 +1337,54 @@ target_link_libraries(tests_xrt_active_mode_scale PRIVATE xrt-interfaces)
 # Windows-only, the rule is not), so there is nothing to link but the include.
 target_include_directories(tests_cli_dims_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
 
+# Display dashboard phase 0 (ADR-051): the non-failing selftest rule "every
+# VERIFIED claim has physical metres" (the 0 m screen trap). Header-only.
+target_include_directories(tests_cli_metres_check PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+target_link_libraries(tests_cli_metres_check PRIVATE xrt-interfaces)
+
+# perf-settings Phase 2A: the generated Tier 1/2 lever catalog behind
+# `perf list --all` (scripts/gen_lever_catalog.py). Header-only data; aux_util
+# (linked by the loop) supplies u_setting_is_managed for the managed-lever check.
+target_include_directories(tests_cli_lever_catalog PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli)
+target_link_libraries(tests_cli_lever_catalog PRIVATE xrt-interfaces)
+
+# N3a (ADR-054): the `input list` prediction rule — PreferredPlugin over
+# ProbeOrder, Enabled=0 never predicted — and the provider-id check behind
+# `input enable|disable|use`. Header-only; the loader header it includes is
+# only used for the descriptor struct.
+target_include_directories(
+	tests_cli_input_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_cli_input_predict PRIVATE xrt-interfaces)
+
+# N3b (ADR-054): the `dp list` twin — PreferredPlugin over ProbeOrder among
+# ENABLED plug-ins, a disabled one never predicted (the fallback takes over),
+# and the registered gate behind `dp enable|disable`. Header-only.
+target_include_directories(
+	tests_cli_dp_predict PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/cli ${PROJECT_SOURCE_DIR}/src/xrt/targets/common
+	)
+target_link_libraries(tests_cli_dp_predict PRIVATE xrt-interfaces)
+
 # Android late-weave / repaint pacing (#868/#902). The vblank grid is
 # header-only and deliberately free of Vulkan and DXGI types — that is what
 # lets its drift / staleness / mode-switch logic be tested on the host, where
 # those bugs are actually findable.
 target_include_directories(tests_comp_vblank_grid PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #902 desktop Linux: window-system presentation feedback -> vblank grid.
+# Header-only decisions on top of the grid, same include path, nothing to link.
+target_include_directories(tests_comp_present_feedback PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2068: self-correcting late-weave deadlines on a composited desktop. Header-only.
+target_include_directories(tests_comp_late_weave_adapt PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2068: windowed #206 residual statistics. Header-only.
+target_include_directories(tests_comp_residual_window PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2068: feedback pacing (wait / slip / backoff). Header-only.
+target_include_directories(tests_comp_feedback_pace PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2119: present_wait depth governor (lag floor + slip machine). Header-only.
+target_include_directories(tests_comp_late_weave_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #1748 -- the move-sync tag encode is a header-only function in vk_native.
+target_include_directories(tests_comp_wl_move_sync_tag PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+# #2356 -- which frames may take the non-blocking hand-off. Header-only.
+target_include_directories(tests_comp_vk_async_handoff PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 # ADR-027 tier-1 dispatch (#1331). Header-only pure logic -- no compositor
 # library, no graphics API, no device -- so it needs the include path and
 # nothing else.
@@ -531,16 +1431,194 @@ target_sources(
 target_include_directories(tests_comp_rear_budget PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
 target_link_libraries(tests_comp_rear_budget PRIVATE xrt-interfaces aux_os xrt-external-stb)
 
-if(XRT_BUILD_DRIVER_HANDTRACKING)
-	target_link_libraries(
-		tests_levenbergmarquardt
-		PRIVATE
-			aux_math
-			t_ht_mercury_includes
-			t_ht_mercury_kine_lm_includes
-			t_ht_mercury
-			t_ht_mercury_kine_lm
+# Multi-screen M2: the segment table, the per-segment 1:1 policy and the DP
+# lifecycle hysteresis. Pure math -- compiled into the unit like
+# tests_comp_rear_budget instead of linking the Vulkan-gated comp_util.
+target_sources(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(tests_comp_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_segments PRIVATE xrt-interfaces aux_util)
+
+# #2370: the windowless D3D11 DP rule shared by the native texture tier and the
+# hub's client-presents strategy (header-only).
+target_include_directories(tests_dp_windowless_d3d11 PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_dp_windowless_d3d11 PRIVATE xrt-interfaces)
+
+# ADR-060: the texture target binding's one resolve (header-only math).
+target_include_directories(tests_comp_texture_target PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_texture_target PRIVATE xrt-interfaces aux_util)
+
+# #2218 item 6: the desktop-Linux service's XR_DXR_weave present-owner woven per
+# screen — the window placed against the screens in one pixel frame, the table
+# cut from it, who weaves each part, and the change classification a hotplug /
+# re-claim takes. Pure math, compiled into the unit (comp_util is Vulkan-gated).
+target_sources(
+	tests_comp_weave_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_weave_screens.c
+	${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	)
+target_include_directories(tests_comp_weave_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+target_link_libraries(tests_comp_weave_screens PRIVATE xrt-interfaces aux_util)
+
+# Multi-screen M3 — per-segment views: the pure geometry oxr_session_locate_views
+# composes (oxr_segment_views.c) plus the shared Kooima core it feeds (aux_math
+# carries displayxr-common), so two screens' frusta are asserted end to end.
+target_sources(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c)
+target_include_directories(tests_oxr_segment_views PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+target_link_libraries(tests_oxr_segment_views PRIVATE xrt-interfaces aux_math)
+
+# Multi-screen on the service / IPC path (ADR-047 Amendment 3): the routed-view
+# mosaic placement and the change-only table publish (compositor/util), the
+# client's change-only routing send (oxr), and -- where the IPC protocol is
+# generated -- that the two new wire messages fit one IPC buffer.
+target_sources(tests_segments_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c)
+target_include_directories(
+	tests_segments_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_segments_ipc PRIVATE xrt-interfaces aux_util)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_segments_ipc PRIVATE ipc_shared)
+	target_compile_definitions(tests_segments_ipc PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
+
+# ADR-052 -- the workspace on N screens: which screens present, the anchor-screen
+# placement mapping, the window -> presenter split and the workspace-pixel
+# cursor space. Pure math, compiled into the unit (comp_util is Vulkan-gated).
+# + the state tracker's per-segment geometry, so a per-screen-views table
+# (ADR-052 D2) is checked against what the client frames from it.
+target_sources(
+	tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_workspace_screens.c
+	${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c
+	)
+target_include_directories(
+	tests_comp_workspace_screens PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_comp_workspace_screens PRIVATE xrt-interfaces aux_util)
+
+if(TARGET ipc_shared)
+	target_sources(
+		tests_workspace_screens_ipc
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_workspace_screens.c
+			${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
 		)
+	target_include_directories(
+		tests_workspace_screens_ipc PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+		)
+	target_link_libraries(tests_workspace_screens_ipc PRIVATE xrt-interfaces aux_util ipc_shared xrt-external-openxr)
+endif()
+
+# XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): a present-owner's weave rects
+# split per screen -- the segment table (compositor/util), the per-rect parts
+# the client cuts from it (aux util, header-only) and, where the IPC protocol
+# is generated, the weave_get_segments reply carrying every screen's eyes.
+# Amendment 4 addendum: which screen frames an element's views (aux util), its
+# window metrics cross-checked against the per-segment views' own
+# (oxr_segment_views.c), and the submit reply's cheap split signal.
+target_sources(
+	tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/util/comp_segments.c
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_segment_views.c
+	)
+target_include_directories(
+	tests_weave_segments PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+	${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+	)
+target_link_libraries(tests_weave_segments PRIVATE xrt-interfaces aux_util)
+if(TARGET ipc_shared)
+	target_link_libraries(tests_weave_segments PRIVATE ipc_shared)
+	target_compile_definitions(tests_weave_segments PRIVATE DXR_TESTS_HAVE_IPC_PROTOCOL)
+endif()
+
+# Multi-screen M4 — DXR_SCREEN_PLUGIN (per-screen plug-in pin) and the per-monitor
+# winner rule of the DP registry, pure functions of target_screen_pin.c.
+target_sources(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common/target_screen_pin.c)
+target_include_directories(tests_target_screen_pin PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/common)
+
+if(TARGET target_workspace_config)
+	target_link_libraries(tests_service_workspace_config PRIVATE target_workspace_config xrt-external-cjson)
+endif()
+if(TARGET tests_service_client_class)
+	target_sources(
+		tests_service_client_class PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_client_class.c
+		)
+	# Compiled without the orchestrator (a service-target-only unit): the
+	# manifest registry is the source of truth here.
+	target_compile_definitions(tests_service_client_class PRIVATE SERVICE_CLIENT_CLASS_NO_ORCHESTRATOR)
+	target_link_libraries(tests_service_client_class PRIVATE target_workspace_config xrt-interfaces)
+endif()
+if(TARGET tests_service_orchestrator_linux)
+	target_sources(
+		tests_service_orchestrator_linux
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_orchestrator.c
+		)
+	target_link_libraries(
+		tests_service_orchestrator_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
+		)
+	# The chord forward to a running controller, against a recording stand-in
+	# of the controller-key queue header (keeps the IPC server out of the test).
+	target_include_directories(
+		tests_service_orchestrator_linux PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fake_controller_key
+		)
+	target_sources(
+		tests_service_hotkey_linux PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_hotkey_linux.c
+		)
+	target_link_libraries(
+		tests_service_hotkey_linux PRIVATE target_workspace_config xrt-interfaces aux_os xrt-pthreads
+		)
+endif()
+
+if(TARGET tests_service_drm_hotplug_linux)
+	target_sources(
+		tests_service_drm_hotplug_linux
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_drm_hotplug_linux.c
+		        ${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_display_layout_linux.c
+		)
+	target_include_directories(
+		tests_service_drm_hotplug_linux PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/targets/service
+		)
+	target_link_libraries(tests_service_drm_hotplug_linux PRIVATE xrt-interfaces aux_util xrt-pthreads)
+endif()
+
+# The hotkey worker's GNOME-extension backend against a fake WorkspaceHotkey1
+# on a PRIVATE session bus (dbus-run-session; python3-gi plays the extension).
+# Registered only where all three exist, so a bare build host just skips it.
+if(TARGET tests_service_hotkey_linux AND XRT_HAVE_DBUS)
+	find_program(DXR_DBUS_RUN_SESSION dbus-run-session)
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(DXR_DBUS_RUN_SESSION AND Python3_Interpreter_FOUND)
+		execute_process(
+			COMMAND ${Python3_EXECUTABLE} -c "from gi.repository import Gio"
+			RESULT_VARIABLE _dxr_py_gi
+			OUTPUT_QUIET ERROR_QUIET
+			)
+		if(_dxr_py_gi EQUAL 0)
+			add_executable(
+				tests_service_hotkey_linux_dbus tests_service_hotkey_linux_dbus.cpp
+				${PROJECT_SOURCE_DIR}/src/xrt/targets/service/service_hotkey_linux.c
+				)
+			target_compile_definitions(tests_service_hotkey_linux_dbus PRIVATE SERVICE_HOTKEY_HAVE_DBUS)
+			target_include_directories(tests_service_hotkey_linux_dbus SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+			target_link_libraries(
+				tests_service_hotkey_linux_dbus
+				PRIVATE xrt-external-catch2
+					aux_util
+					target_workspace_config
+					xrt-interfaces
+					aux_os
+					xrt-pthreads
+					xrt-external-cjson
+					${DBUS_LIBRARIES}
+				)
+			add_test(
+				NAME tests_service_hotkey_linux_dbus
+				COMMAND
+					${DXR_DBUS_RUN_SESSION} -- ${Python3_EXECUTABLE}
+					${CMAKE_CURRENT_SOURCE_DIR}/fake_workspace_hotkey_ext.py
+					$<TARGET_FILE:tests_service_hotkey_linux_dbus> --success
+				)
+		endif()
+	endif()
 endif()
 
 if(XRT_HAVE_D3D11)
@@ -573,6 +1651,11 @@ if(XRT_HAVE_D3D11)
 			${PROJECT_SOURCE_DIR}/src/xrt/ipc
 		)
 	target_link_libraries(tests_comp_eye_dp_policy PRIVATE xrt-interfaces)
+	# #814 / #2416 -- the hardware-2D teardown failsafe's decision (incl. the
+	# controller-lost pass). Pure header, no device.
+	target_include_directories(
+		tests_comp_failsafe_2d_policy PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+		)
 	# Phase 2 — comp_d3d11_client.cpp now references the
 	# comp_ipc_client_compositor_{get,set}_workspace_sync_fence{,_value}
 	# bridge symbols defined in ipc_client_compositor.c. Add ipc_client to
@@ -609,6 +1692,25 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		tests_comp_layer_equirect2_warp PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor
 		)
 	target_link_libraries(tests_comp_layer_equirect2_warp PRIVATE d3dcompiler d3d11)
+
+	# #1956 — header-only policy from the service directory; aux_d3d for
+	# d3d_dxgi_formats.h (+ its Vulkan format constants), xrt-interfaces for the
+	# swapchain usage bits.
+	target_include_directories(
+		tests_comp_d3d11_service_formats PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+		)
+	target_link_libraries(tests_comp_d3d11_service_formats PRIVATE aux_d3d xrt-interfaces d3d11 dxgi)
+	if(TARGET tests_comp_gl_d3d11_depth)
+		target_include_directories(
+			tests_comp_gl_d3d11_depth PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor/d3d11_service
+							  ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+			)
+		target_link_libraries(tests_comp_gl_d3d11_depth PRIVATE aux_d3d aux_ogl xrt-interfaces d3d11 dxgi)
+	endif()
+	if(XRT_HAVE_D3D12)
+		target_compile_definitions(tests_comp_d3d11_service_formats PRIVATE DXR_TEST_HAVE_D3D12)
+		target_link_libraries(tests_comp_d3d11_service_formats PRIVATE d3d12)
+	endif()
 endif()
 
 if(XRT_HAVE_D3D12)
@@ -631,6 +1733,20 @@ if(XRT_HAVE_VULKAN)
 endif()
 if(TARGET tests_vk_dmabuf)
 	target_link_libraries(tests_vk_dmabuf PRIVATE comp_util aux_vk)
+endif()
+if(TARGET tests_comp_segments_home_gone)
+	target_link_libraries(tests_comp_segments_home_gone PRIVATE comp_vk_segs comp_util aux_vk)
+	target_include_directories(tests_comp_segments_home_gone PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+endif()
+if(TARGET tests_comp_vk_equirect2_draw)
+	# The generated SPIR-V headers (shaders/equirect2.*.h) live in
+	# comp_vk_native's binary dir; the packer header in its source dir.
+	get_target_property(_vk_native_bin comp_vk_native BINARY_DIR)
+	target_include_directories(
+		tests_comp_vk_equirect2_draw PRIVATE ${_vk_native_bin} ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	add_dependencies(tests_comp_vk_equirect2_draw comp_vk_native)
+	target_link_libraries(tests_comp_vk_equirect2_draw PRIVATE xrt-interfaces Vulkan::Vulkan)
 endif()
 
 if(XRT_FEATURE_OPENXR)
@@ -663,3 +1779,425 @@ endif()
 add_test(NAME tests_ipc_proto COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests_ipc_proto.py
 					 ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared
 	)
+
+# ADR-053 S5: the reference view synthesis' pure math lives in aux_util
+# (u_conv_viewsyn), which every unit links; no graphics API.
+if(TARGET tests_conv_host_lane_d3d11)
+	target_link_libraries(tests_conv_host_lane_d3d11 PRIVATE comp_d3d11_conv_host_lane d3d11 dxgi)
+endif()
+if(TARGET tests_conv_d3d11_xproc)
+	add_executable(tests_conv_d3d11_xproc_helper tests_conv_d3d11_xproc_helper.cpp)
+	target_link_libraries(tests_conv_d3d11_xproc_helper PRIVATE d3d11 dxgi)
+	target_link_libraries(tests_conv_d3d11_xproc PRIVATE d3d11 dxgi)
+	target_compile_definitions(
+		tests_conv_d3d11_xproc
+		PRIVATE "CONV_D3D11_XPROC_HELPER=\"$<TARGET_FILE:tests_conv_d3d11_xproc_helper>\""
+		)
+	add_dependencies(tests_conv_d3d11_xproc tests_conv_d3d11_xproc_helper)
+endif()
+if(TARGET comp_d3d11_conv_viewsyn)
+	target_link_libraries(tests_conv_viewsyn_d3d11 PRIVATE comp_d3d11_conv_viewsyn d3d11)
+endif()
+if(TARGET tests_conv_viewsyn_vk)
+	target_link_libraries(tests_conv_viewsyn_vk PRIVATE comp_vk_conv_viewsyn comp_util aux_vk)
+endif()
+if(TARGET tests_conv_vk_gpu)
+	target_sources(tests_conv_vk_gpu PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_conv_vk_gpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_conv_vk_gpu PRIVATE comp_vk_conv comp_util aux_vk ipc_server_conv ipc_shared displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_conv_vk_gpu PROPERTIES CXX_STANDARD 17)
+	if(APPLE)
+		target_link_libraries(tests_conv_vk_gpu PRIVATE "-framework CoreFoundation" "-framework IOSurface")
+		if(XRT_HAVE_METAL)
+			# The macOS Metal weave backend's lifted-rect recorder, on a
+			# headless Metal device (SKIPs without one).
+			target_sources(
+				tests_conv_vk_gpu
+				PRIVATE conv_metal_weave_rig.m
+					${PROJECT_SOURCE_DIR}/src/xrt/compositor/multi/comp_multi_weave_metal_lift.m
+				)
+			target_include_directories(tests_conv_vk_gpu PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/compositor)
+			target_compile_definitions(tests_conv_vk_gpu PRIVATE CONV_TEST_HAVE_METAL_WEAVE)
+			target_link_libraries(tests_conv_vk_gpu PRIVATE "-framework Metal" "-framework Foundation")
+		endif()
+	endif()
+endif()
+if(TARGET tests_conv_gpu_dedupe)
+	target_sources(tests_conv_gpu_dedupe PRIVATE conv_fake_provider.c)
+	target_link_libraries(tests_conv_gpu_dedupe PRIVATE comp_d3d11_conv_content displayxr::conversion_runtime d3d11 dxgi)
+endif()
+if(TARGET tests_lift_dp_golden)
+	# The sim_display fake lift + the synthesis it shares with the sim provider,
+	# compiled straight in (the plug-in DLL is not linkable). The fake lift
+	# reads its knobs through the settings shim (N3c), so that comes along;
+	# unbound (no host) it answers from the env aliases, as before.
+	target_sources(
+		tests_lift_dp_golden
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_lift_d3d11.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_settings.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c
+		)
+	target_include_directories(
+		tests_lift_dp_golden PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+					     ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion
+		)
+	target_link_libraries(tests_lift_dp_golden PRIVATE comp_d3d11_lift aux_os d3d11 dxgi d3dcompiler)
+	# #2003: the same conversions core-routed (the v3 adapter over the core).
+	if(TARGET ipc_server_conv)
+		target_link_libraries(tests_lift_dp_golden PRIVATE ipc_server_conv displayxr::conversion_runtime)
+	endif()
+	set_target_properties(tests_lift_dp_golden PROPERTIES CXX_STANDARD 17)
+endif()
+if(TARGET tests_ipc_conv_v4_transports)
+	# As tests_lift_dp_golden: the sim_display fake lift compiled straight in, with
+	# the settings shim it reads its knobs through (N3c).
+	target_sources(
+		tests_ipc_conv_v4_transports
+		PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_lift_d3d11.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_settings.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.c
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_synth.cpp
+			${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c
+		)
+	target_include_directories(
+		tests_ipc_conv_v4_transports PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display
+						     ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion
+		)
+	target_link_libraries(
+		tests_ipc_conv_v4_transports PRIVATE comp_d3d11_lift ipc_server_conv displayxr::conversion_runtime aux_os
+						     d3d11 d3d12 dxgi d3dcompiler
+		)
+	set_target_properties(tests_ipc_conv_v4_transports PROPERTIES CXX_STANDARD 17)
+endif()
+
+if(TARGET tests_oxr_lift_startup)
+	# The REAL entry points (oxr_conv.c) and client (ipc_client_lift.c), plus
+	# the handle and logger code they verify with, compiled straight in; the
+	# wire calls, the lift link and the session bridge under them are faked in
+	# tests_oxr_lift_startup_fake.c. Deliberately NOT linked: st_oxr, ipc_client
+	# and ipc_shared, whose real definitions of those seams would collide with
+	# the fakes. ipc_client is a build dependency only, for its generated
+	# headers.
+	target_sources(
+		tests_oxr_lift_startup
+		PRIVATE tests_oxr_lift_startup_fake.c
+			tests_oxr_lift_startup_conv_fake.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_conv.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_conv_gpu_d3d.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_handle_base.c
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr/oxr_logger.c
+			${PROJECT_SOURCE_DIR}/src/xrt/ipc/client/ipc_client_lift.c
+		)
+	target_include_directories(
+		tests_oxr_lift_startup
+		PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+			${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr
+			$<TARGET_PROPERTY:ipc_client,INTERFACE_INCLUDE_DIRECTORIES>
+		)
+	target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-interfaces xrt-external-openxr aux_os)
+	if(NOT WIN32)
+		# The POSIX CPU kind's shared sections (oxr_conv_gpu_d3d.c): no fake,
+		# the real ones (they touch no IPC seam the fakes stand in for).
+		target_sources(
+			tests_oxr_lift_startup PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc/shared/ipc_cpu_buffer.c
+			)
+		if(APPLE)
+			target_link_libraries(tests_oxr_lift_startup PRIVATE "-framework IOSurface" "-framework CoreFoundation")
+		endif()
+	endif()
+	if(TARGET Vulkan::Vulkan)
+		# oxr_objects.h pulls in xrt_vulkan_includes.h; st_oxr gets those headers
+		# through aux_vk, which this test deliberately does not link (macOS CI has
+		# no system vulkan/vulkan.h, Linux does).
+		target_link_libraries(tests_oxr_lift_startup PRIVATE Vulkan::Vulkan)
+	endif()
+	if(XRT_FEATURE_RENDERDOC)
+		target_link_libraries(tests_oxr_lift_startup PRIVATE xrt-external-renderdoc)
+	endif()
+	add_dependencies(tests_oxr_lift_startup ipc_client ipc_shared)
+endif()
+
+if(TARGET tests_conv_dp_lift)
+	target_sources(tests_conv_dp_lift PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_conv_dp_lift PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_conv_dp_lift PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_conv_dp_lift PROPERTIES CXX_STANDARD 17)
+endif()
+foreach(_t tests_ipc_conv_v4 tests_lift_v3_shifts)
+	if(TARGET ${_t})
+		target_sources(${_t} PRIVATE conv_fake_provider.c)
+		target_include_directories(${_t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+		                                          ${PROJECT_SOURCE_DIR}/src/xrt/state_trackers/oxr)
+		target_link_libraries(${_t} PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os xrt-external-openxr)
+		set_target_properties(${_t} PROPERTIES CXX_STANDARD 17)
+	endif()
+endforeach()
+if(TARGET tests_ipc_conv_cpu)
+	target_link_libraries(tests_ipc_conv_cpu PRIVATE ipc_server_conv ipc_shared displayxr::conversion_runtime aux_os)
+	set_target_properties(tests_ipc_conv_cpu PROPERTIES CXX_STANDARD 17)
+endif()
+if(TARGET tests_ipc_lift_core)
+	target_sources(tests_ipc_lift_core PRIVATE conv_fake_provider.c)
+	target_include_directories(tests_ipc_lift_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+	target_link_libraries(tests_ipc_lift_core PRIVATE ipc_server_conv displayxr::conversion_runtime aux_os)
+	if(NOT WIN32)
+		target_link_libraries(tests_ipc_lift_core PRIVATE ipc_shared) # the CPU I/O glue's buffers
+	endif()
+	set_target_properties(tests_ipc_lift_core PROPERTIES CXX_STANDARD 17)
+endif()
+
+# ADR-042: the sim_display FAKE lift's splat PLY is pinned host-side next to the
+# lift mailbox tests (the module that emits it is Windows/D3D11-only).
+# ADR-042: the FAKE lift's splat PLY is pinned host-side next to the lift
+# mailbox tests. Shared by sim_display's deprecated fake and the
+# DisplayXR-SimConversion provider (src/xrt/drivers/sim_conversion/).
+target_sources(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion/sim_conv_fake_ply.c)
+target_include_directories(tests_lift_mailbox PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_conversion)
+
+# ADR-053 P1a: the DisplayXR-SimConversion provider, linked statically through
+# its own entry point (sim_conversion_static): no dlopen, no registry, no GPU.
+target_link_libraries(tests_sim_conversion PRIVATE sim_conversion_static displayxr::conversion_store)
+set_target_properties(tests_sim_conversion PROPERTIES CXX_STANDARD 17)
+
+# ADR-057 S1 + S2: the remote conversion provider (remote_conversion_static)
+# against tests/conv_remote_test_server.py, a stdlib-only contract-v1 endpoint
+# on 127.0.0.1 started by the test; pack url / auth, the camera-block writer and
+# the off-box consent store. Without a Python 3 interpreter the endpoint cases
+# SKIP.
+target_link_libraries(tests_remote_conversion PRIVATE remote_conversion_static displayxr::conversion_store)
+set_target_properties(tests_remote_conversion PROPERTIES CXX_STANDARD 17)
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+	target_compile_definitions(
+		tests_remote_conversion PRIVATE "DXR_TEST_PYTHON=\"${Python3_EXECUTABLE}\""
+		                                "DXR_TEST_SERVER_PY=\"${CMAKE_CURRENT_SOURCE_DIR}/conv_remote_test_server.py\""
+		)
+endif()
+
+# ADR-053 P1a: the conversion-provider ABI (xrt_conversion_plugin.h) and the
+# conv_* wire family (xrt_conv_wire.h). The ABI test builds as C++17 on purpose
+# (the header promises C11 + C++17); the wire test carries a C11 TU so both
+# headers also compile as C with every _Static_assert.
+target_link_libraries(tests_conversion_abi PRIVATE xrt-interfaces)
+set_target_properties(tests_conversion_abi PROPERTIES CXX_STANDARD 17)
+target_sources(tests_conv_wire PRIVATE tests_conv_wire_c.c)
+target_link_libraries(tests_conv_wire PRIVATE xrt-interfaces)
+
+# ADR-053 P1a (#2000): the conversion core's pure modules - selection,
+# readiness state machine + spec-3 mapping, registry + describe cache.
+foreach(_conv_test tests_conv_select tests_conv_readiness tests_conv_registry)
+	target_link_libraries(${_conv_test} PRIVATE displayxr::conversion_core)
+endforeach()
+
+# ADR-053 P4 (#2108): the model store - root order, write protocol over a
+# file:// pack, tamper rejection, research-only gating, the store ACL (Windows).
+target_link_libraries(tests_conv_store PRIVATE displayxr::conversion_store)
+set_target_properties(tests_conv_store PROPERTIES CXX_STANDARD 17)
+
+# ADR-053 P1a (#2001): the conversion core's runtime half (hosts, lanes,
+# pipeline, policy, jobs) against a scriptable CPU fake provider.
+target_sources(tests_conv_lanes PRIVATE conv_fake_provider.c)
+target_link_libraries(tests_conv_lanes PRIVATE displayxr::conversion_runtime)
+# #2030: the still-image dedupe measured against the shipped sim provider.
+if(TARGET sim_conversion_static)
+	target_link_libraries(tests_conv_lanes PRIVATE sim_conversion_static)
+	target_compile_definitions(tests_conv_lanes PRIVATE CONV_LANES_SIM_STATIC)
+endif()
+
+# ADR-053 P2 (#2032): the satellite supervisor FSM (pure, scripted clock) and
+# the shm command / completion rings with the host wire records.
+target_link_libraries(tests_conv_supervisor PRIVATE displayxr::conversion_core)
+target_link_libraries(tests_conv_shm_ring PRIVATE displayxr::conversion_core)
+if(TARGET tests_conv_os_process)
+	add_executable(tests_conv_os_process_helper tests_conv_os_process_helper.c)
+	target_link_libraries(tests_conv_os_process_helper PRIVATE aux_os displayxr::conversion_core)
+	target_link_libraries(tests_conv_os_process PRIVATE displayxr::conversion_core)
+	target_compile_definitions(
+		tests_conv_os_process
+		PRIVATE "CONV_OS_PROCESS_HELPER=\"$<TARGET_FILE:tests_conv_os_process_helper>\""
+		)
+	add_dependencies(tests_conv_os_process tests_conv_os_process_helper)
+endif()
+if(TARGET tests_conv_proxy)
+	add_executable(tests_conv_proxy_host tests_conv_proxy_host.c)
+	target_link_libraries(tests_conv_proxy_host PRIVATE aux_os aux_util displayxr::conversion_core)
+	if(NOT WIN32)
+		target_link_libraries(tests_conv_proxy_host PRIVATE xrt-pthreads)
+	else()
+		target_link_libraries(tests_conv_proxy_host PRIVATE user32)
+	endif()
+	target_link_libraries(tests_conv_proxy PRIVATE displayxr::conversion_runtime)
+	target_compile_definitions(
+		tests_conv_proxy PRIVATE "CONV_PROXY_HOST=\"$<TARGET_FILE:tests_conv_proxy_host>\""
+		)
+	add_dependencies(tests_conv_proxy tests_conv_proxy_host)
+	if(WIN32)
+		# #2056: the update-flow test drives a real Restart Manager session.
+		target_link_libraries(tests_conv_proxy PRIVATE rstrtmgr)
+	endif()
+	# The real host + the sim provider, compared against the same sources in-service.
+	if(TARGET displayxr-conversion-host AND TARGET drv_sim_conversion_plugin AND TARGET sim_conversion_static)
+		target_link_libraries(tests_conv_proxy PRIVATE sim_conversion_static)
+		if(WIN32 AND TARGET comp_d3d11_lift AND TARGET comp_d3d11_conv_host_lane)
+			# The real host over the D3D11 lane on WARP (service glue allocator + lane ops).
+			target_link_libraries(
+				tests_conv_proxy PRIVATE comp_d3d11_lift comp_d3d11_conv_host_lane d3d11 dxgi
+				)
+		endif()
+		add_dependencies(tests_conv_proxy displayxr-conversion-host drv_sim_conversion_plugin)
+		target_compile_definitions(
+			tests_conv_proxy
+			PRIVATE "CONV_REAL_HOST_EXE=\"$<TARGET_FILE:displayxr-conversion-host>\""
+				"SIM_CONVERSION_PATH=\"$<TARGET_FILE:drv_sim_conversion_plugin>\""
+			)
+	endif()
+endif()
+
+# ADR-053 P1a: every XR_DXR_lift v3 sizeof / offsetof / enum pinned, so spec 4
+# can only append.
+target_link_libraries(tests_lift_abi PRIVATE xrt-external-openxr)
+
+# XR_DXR_lift v3 (ADR-048 Addendum A): the app-rig mapping is checked against the
+# shared displayxr-common rig core xrLocateViews runs.
+target_link_libraries(tests_aux_lift_rig_depth PRIVATE displayxr::math_core)
+
+# #1855: the webcam eye tracker core (owned by sim_tracking, shared with
+# sim_display's deprecated WEBCAM_TRACKING alias) -- geometry, camera-space
+# measurement, one-euro, timeout/collapse, device/mode selection, the core
+# through its sim_webcam_settings seam, and the worker end to end on the
+# synthetic UVC backend with a fake face estimator (no camera is ever opened).
+# Always the stub estimator: the default build's contract.
+set(_sim_webcam_test_core
+	${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_webcam_tracking.c
+	${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_webcam_tracker.c
+	${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_webcam_source.c
+	${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_face_estimator_none.c
+	${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_face_yunet.c
+	)
+target_sources(tests_sim_webcam_tracking PRIVATE ${_sim_webcam_test_core})
+target_include_directories(tests_sim_webcam_tracking PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking)
+target_link_libraries(tests_sim_webcam_tracking PRIVATE aux_os aux_os_uvc xrt-interfaces)
+
+# sim_tracking SOURCE=webcam through the provider ABI (negotiate / probe /
+# describe / start / stop) with a fake host, the synthetic camera and a fake
+# estimator injected through the provider's test seam.
+target_sources(
+	tests_sim_tracking_webcam
+	PRIVATE ${_sim_webcam_test_core}
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_tracking_plugin.c
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_tracking_script.c
+		${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking/sim_tracking_webcam.c
+	)
+target_include_directories(tests_sim_tracking_webcam PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_tracking)
+target_link_libraries(tests_sim_tracking_webcam PRIVATE aux_os aux_os_uvc xrt-interfaces)
+
+# N6 Part 1 (#2144): sim_display's synthetic viewer at a target time — the pure
+# half of its get_eye_positions_at slot (sway + square-wave tracking), pinned
+# host-side (it compiles into the plug-in).
+target_sources(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_eyes.c)
+target_include_directories(tests_sim_eyes PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+target_link_libraries(tests_sim_eyes PRIVATE xrt-interfaces)
+
+# ADR-043: the sim_display FAKE stereo camera's scene is pinned host-side next to
+# the ring / conversion / disparity-probe tests (it compiles into the plug-in).
+target_sources(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_camera PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display)
+
+# ADR-043 R2: the rectifier (u_stereo_rectify) against OpenCV-generated golden
+# fixtures, and end to end on the sim_display DISTORTED fake (its scene +
+# synthetic lens live in the pattern file).
+target_sources(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_rectify PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures)
+
+# ADR-043 R2: the online vertical-alignment refinement — on the distorted fake
+# with an injected, uncalibrated offset + slope, and on one REAL raw frame from
+# a Leia SR laptop (fixtures/stereo_vrefine_sr_raw.jpg, decoded with stb_image).
+target_sources(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display/sim_display_stereo_camera_pattern.c)
+target_include_directories(tests_stereo_vrefine PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/drivers/sim_display ${CMAKE_CURRENT_SOURCE_DIR}/fixtures ${PROJECT_SOURCE_DIR}/src/external/stb)
+target_compile_definitions(tests_stereo_vrefine PRIVATE STEREO_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+
+# ADR-043 Amendment 4: the service's REAL camera manager end to end, driven
+# through its IPC handlers with the UVC source on its fake backend (no device,
+# no Media Foundation, no service process). Compiles the manager straight in
+# rather than linking ipc_server, whose handler file pulls in every compositor;
+# the glue stubs the two symbols it would have taken from there.
+if(TARGET ipc_server)
+	add_executable(
+		tests_stereo_camera_manager
+		tests_stereo_camera_manager.cpp tests_stereo_camera_manager_glue.c tests_stereo_camera_manager_glue.h
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_stereo_camera.c
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_peer_creds.c
+		)
+	target_link_libraries(
+		tests_stereo_camera_manager PRIVATE xrt-external-catch2 xrt-interfaces aux_util aux_os aux_os_uvc ipc_shared
+		)
+	# ipc_server_generated.h (handler prototypes) is generated with ipc_server.
+	add_dependencies(tests_stereo_camera_manager ipc_server)
+	add_test(NAME tests_stereo_camera_manager COMMAND tests_stereo_camera_manager --success
+							 --allow-running-no-tests
+		)
+endif()
+
+# ADR-043 Amendment 4, Windows: the Media Foundation UVC backend's scaled output
+# (GPU and CPU video processor) is a plain resize, never letterboxed — through
+# the real backend on a generated YUY2 AVI. SKIPs without Media Foundation.
+if(WIN32 AND TARGET aux_os_uvc)
+	add_executable(tests_uvc_capture_mf tests_uvc_capture_mf.cpp)
+	target_link_libraries(tests_uvc_capture_mf PRIVATE xrt-external-catch2 aux_util aux_os aux_os_uvc)
+	add_test(NAME tests_uvc_capture_mf COMMAND tests_uvc_capture_mf --success --allow-running-no-tests)
+endif()
+
+# ADR-043 Amendment 4, desktop Linux: the V4L2 UVC backend's hardware-free
+# parts — enumeration from a fake sysfs/udev tree, format selection, the MJPEG
+# decoder (standard-DHT insertion, scale choice, chroma, the built-in decoder;
+# libturbojpeg when it loads) and the real backend on a file: MJPEG stream.
+# Never opens a camera.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID AND TARGET aux_os_uvc)
+	add_executable(tests_uvc_capture_v4l2 tests_uvc_capture_v4l2.cpp)
+	target_link_libraries(tests_uvc_capture_v4l2 PRIVATE xrt-external-catch2 aux_util aux_os aux_os_uvc)
+	target_include_directories(tests_uvc_capture_v4l2 PRIVATE ${PROJECT_SOURCE_DIR}/src/external/stb)
+	add_test(NAME tests_uvc_capture_v4l2 COMMAND tests_uvc_capture_v4l2 --success --allow-running-no-tests)
+endif()
+
+# Shared-surface FRAME_TICK coalescing into the controller's input queue
+# (macOS + desktop Linux; the queue is pthread-based, so POSIX only). Compiles
+# the queue and the comp_multi workspace registry straight into the unit.
+if(NOT WIN32 AND NOT ANDROID)
+	add_executable(
+		tests_ipc_input_queue_frame_tick
+		tests_ipc_input_queue_frame_tick.cpp
+		${PROJECT_SOURCE_DIR}/src/xrt/ipc/server/ipc_server_input_queue.c
+		${PROJECT_SOURCE_DIR}/src/xrt/compositor/multi/comp_multi_workspace.c
+		)
+	target_include_directories(
+		tests_ipc_input_queue_frame_tick PRIVATE ${PROJECT_SOURCE_DIR}/src/xrt/ipc
+							 ${PROJECT_SOURCE_DIR}/src/xrt/compositor
+		)
+	target_link_libraries(tests_ipc_input_queue_frame_tick PRIVATE xrt-external-catch2 aux_util aux_os)
+	add_test(NAME tests_ipc_input_queue_frame_tick COMMAND tests_ipc_input_queue_frame_tick --success)
+endif()
+
+# #886 -- VK_LAYER_DXR_queue_lock's activation routes through the REAL Vulkan
+# loader: the explicit + implicit manifests side by side (as the .deb installs
+# them), the enable2 injection unaffected by the implicit twin, the
+# DXR_VK_QUEUE_LOCK=1 opt-in for vulkan_enable1 apps, and the route the layer
+# reports. Desktop Linux only (the implicit manifest ships there); SKIPs (77)
+# without a Vulkan driver.
+if(NOT WIN32
+   AND NOT ANDROID
+   AND NOT APPLE
+   AND TARGET VkLayer_DXR_queue_lock
+   AND TARGET Vulkan::Vulkan
+	)
+	add_executable(tests_vk_queue_lock_activation tests_vk_queue_lock_activation.c)
+	target_link_libraries(tests_vk_queue_lock_activation PRIVATE Vulkan::Vulkan)
+	add_dependencies(tests_vk_queue_lock_activation VkLayer_DXR_queue_lock)
+	add_test(NAME tests_vk_queue_lock_activation
+		 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests_vk_queue_lock_activation.sh
+			 $<TARGET_FILE:tests_vk_queue_lock_activation>
+			 $<TARGET_FILE_DIR:VkLayer_DXR_queue_lock>
+		)
+	set_tests_properties(tests_vk_queue_lock_activation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+endif()

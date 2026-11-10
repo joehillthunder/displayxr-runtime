@@ -10,11 +10,37 @@
 # lib/ so displayxr-cli's `$ORIGIN/../lib` RUNPATH resolves exactly as it does
 # in package_linux.sh):
 #   /usr/lib/displayxr/bin/displayxr-cli
-#   /usr/lib/displayxr/lib/openxr_displayxr.so           (the in-process runtime)
+#   /usr/lib/displayxr/bin/displayxr-service             (out-of-process compositor, #1744)
+#   /usr/lib/displayxr/bin/displayxr-tracking-host       (viewer-tracking provider host,
+#       tracking-provider-discovery §4a: spawned + supervised by the service)
+#   /usr/lib/displayxr/bin/displayxr-conversion-host     (conversion-provider satellite,
+#       ADR-053 D5: spawned by the service from its own directory, one per provider)
+#   /usr/lib/displayxr/lib/openxr_displayxr.so           (the HYBRID runtime: in-process
+#       for ordinary apps, IPC to displayxr-service for XR_DXR_weave present-owners
+#       and workspace controllers — the Windows/macOS shape)
+#   /usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so  (#902 / #2036: the Vulkan
+#       layer the runtime injects at xrCreateVulkanInstanceKHR so the #868 repaint
+#       can share the app's only graphics queue — tier 2; without it every VK app
+#       on a single-graphics-queue GPU (Intel) runs with repaint OFF)
+#   /usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
+#       its manifest, on the loader's DEFAULT explicit-layer path (no env needed),
+#       with an ABSOLUTE library_path so it does not depend on the manifest dir
+#   /usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json
+#       #886: the SAME layer as an IMPLICIT layer for vulkan_enable1 apps (which
+#       create their own VkInstance, so the runtime cannot inject it). Inert
+#       unless DXR_VK_QUEUE_LOCK=1 is set (enable_environment);
+#       DXR_VK_QUEUE_LOCK_DISABLE=1 vetoes it (disable_environment)
 #   /usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so   (built-in fallback DP)
 #   /usr/lib/displayxr/plugins/200-sim-display.json      (its discovery manifest)
 #   /usr/bin/displayxr-cli -> ../lib/displayxr/bin/displayxr-cli  (PATH symlink;
 #       exec'd via the symlink, ld.so still takes $ORIGIN from the real target)
+#   /usr/bin/displayxr-service -> ../lib/displayxr/bin/displayxr-service
+#   /usr/lib/systemd/user/displayxr.socket + displayxr.service
+#       systemd USER units (scripts/linux/systemd/): the socket is enabled for
+#       every user (postinst: systemctl --global enable) and socket-activates
+#       the service on the first client that dials it, so a user who never runs
+#       a present-owner / workspace client never starts it; the service exits
+#       30 s after its last client leaves (IPC_EXIT_WHEN_IDLE).
 #   /usr/share/gnome-shell/extensions/window-geometry@displayxr.org/
 #       the GNOME Shell extension from contrib/gnome-shell/ (window geometry for
 #       windowed Wayland weaving; capture exclusion for transparency)
@@ -24,9 +50,21 @@
 #       explicit opt-out (the script's header has the rules, and why a dconf
 #       default alone would not reach most users)
 #
-#   Provides/Conflicts/Replaces the virtual package
-#   displayxr-window-geometry-publisher: exactly one installed package may own
-#   the extension's D-Bus name (docs/specs/runtime/wayland-window-geometry.md §4).
+#   /usr/lib/displayxr/bin/displayxr-dashboard          (the DisplayXR Dashboard:
+#       Avalonia / .NET 10, self-contained single file — no .NET runtime Depends;
+#       it runs the displayxr-cli beside it)
+#   /usr/bin/displayxr-dashboard -> ../lib/displayxr/bin/displayxr-dashboard
+#   /usr/share/applications/displayxr-dashboard.desktop
+#   /usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
+#       (scripts/linux/dashboard/; the binary comes from
+#       resolve_dashboard_bin.sh — CI's DashboardLinux artifact)
+#
+#   Provides the virtual package displayxr-window-geometry-publisher (what
+#   consumers depend on) and Provides/Conflicts/Replaces the per-compositor
+#   displayxr-window-geometry-publisher-gnome: exactly one installed package
+#   may own the GNOME extension's D-Bus name, while a publisher for another
+#   compositor (KWin, #1928) installs alongside
+#   (docs/specs/runtime/wayland-window-geometry.md §4).
 #
 #   postinst writes /etc/xdg/openxr/1/active_runtime.json (the Khronos loader
 #   well-known path — the Linux ActiveRuntime equivalent) pointing at the
@@ -39,10 +77,12 @@
 #                               /usr/lib/displayxr/plugins (loader searches it
 #                               when the env is unset; target_plugin_loader.c)
 #
-# Phase 1 scope: the IN-PROCESS runtime only. displayxr-service is intentionally
-# NOT packaged — Linux out-of-process service render is not ready (#710). So the
-# build is done WITHOUT --service. The vendor (Leia SR) plug-in ships its own
-# .deb in a later phase; this package stays vendor-free (sim-display fallback).
+# Build: `build_linux.sh --hybrid` (#1744). Until then the package shipped the
+# in-process-only runtime and no service, so every XR_DXR_weave call on an
+# installed box returned XR_ERROR_FEATURE_UNSUPPORTED ("the weave service is
+# only available on the out-of-process (service) path") — the DisplayXR browser
+# could not weave. The vendor (Leia SR) plug-in ships its own .deb; this package
+# stays vendor-free (sim-display fallback).
 
 set -euo pipefail
 
@@ -88,18 +128,101 @@ else
     # from an earlier checkout would ship wrong code under a fresh `git describe`
     # version string — the silent correctness bug from the Suzhou Odyssey Track B
     # run (cube-hw finding A: 58039d4 bits shipped as 6afba6a → zero-config
-    # discovery broke). Phase 1: IN-PROCESS runtime, no service (#710).
-    echo "==> Clean build via build_linux.sh --no-test (in-process, no service)"
+    # discovery broke). --hybrid: the service + the hybrid runtime (#1744).
+    echo "==> Clean build via build_linux.sh --hybrid --no-test (hybrid runtime + displayxr-service)"
     rm -rf "$BUILD_DIR"
-    "$ROOT/scripts/build_linux.sh" --no-test
+    "$ROOT/scripts/build_linux.sh" --hybrid --no-test
 fi
 
 RUNTIME_SO="$(find_runtime)"
 CLI_BIN="$(find "$BUILD_DIR/src/xrt/targets/cli" -maxdepth 1 -name displayxr-cli -type f | head -1)"
 PLUGIN_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimDisplay.so" -type f | head -1)"
+# ADR-054 §2 clause 3: every component class ships its sim_* reference. Both
+# decline at probe until their ENABLE setting is on (`displayxr-cli input set
+# sim-input ENABLE 1` / `conv set sim-conversion ENABLE 1`), so shipping them
+# changes nothing for a user: qwerty keeps the hand roles, no task moves.
+SIMINPUT_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimInput.so" -type f | head -1)"
+SIMCONV_SO="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+# `|| true`: no targets/service dir at all in a non-service build; the check
+# below turns that into the real error message.
+SERVICE_BIN="$(find "$BUILD_DIR/src/xrt/targets/service" -maxdepth 1 -name displayxr-service -type f 2>/dev/null | head -1 || true)"
+VKLAYER_SO="$(find "$BUILD_DIR/src/xrt/targets/vk_layer" -maxdepth 1 -name libVkLayer_DXR_queue_lock.so -type f 2>/dev/null | head -1 || true)"
+# ADR-053 P2: the conversion-host satellite. The service spawns it from its
+# own directory (one process per conversion-provider binary), so it ships
+# beside displayxr-service.
+HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
+# Tracking-provider-discovery §4a: the viewer-tracking host, same rule.
+TRACKHOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-tracking-host -type f 2>/dev/null | head -1 || true)"
 
 for f in "$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO"; do
     [ -n "$f" ] || { echo "error: missing build artifact (runtime/cli/plugin)" >&2; exit 1; }
+done
+# #2036: refuse a package without the queue-lock layer — its absence is silent
+# at run time (the runtime retries without it and repaint just stays off).
+[ -n "$VKLAYER_SO" ] || {
+    echo "error: libVkLayer_DXR_queue_lock.so not built under $BUILD_DIR/src/xrt/targets/vk_layer" >&2
+    echo "       (the .deb ships it, #2036)." >&2
+    exit 1
+}
+[ -n "$SERVICE_BIN" ] || {
+    echo "error: displayxr-service not built — the .deb ships it (#1744). Build with" >&2
+    echo "       scripts/build_linux.sh --hybrid (--no-build reuses whatever is in $BUILD_DIR)." >&2
+    exit 1
+}
+[ -n "$HOST_BIN" ] || {
+    echo "error: displayxr-conversion-host not built — the .deb ships it beside the service" >&2
+    echo "       (ADR-053 P2). Build with scripts/build_linux.sh --hybrid." >&2
+    exit 1
+}
+[ -n "$TRACKHOST_BIN" ] || {
+    echo "error: displayxr-tracking-host not built — the .deb ships it beside the service" >&2
+    echo "       (tracking-provider-discovery §4a). Build with scripts/build_linux.sh --hybrid." >&2
+    exit 1
+}
+[ -n "$SIMINPUT_SO" ] && [ -n "$SIMCONV_SO" ] || {
+    echo "error: DisplayXR-SimInput.so / DisplayXR-SimConversion.so not built under $BUILD_DIR/src/xrt/drivers" >&2
+    echo "       (the .deb ships the reference provider of every class, ADR-054 §2 clause 3)." >&2
+    exit 1
+}
+SIMCONV_PACK="$(dirname "$SIMCONV_SO")/sim-conversion.models.json"
+[ -f "$SIMCONV_PACK" ] && [ -d "$(dirname "$SIMCONV_SO")/sim-conversion-blobs" ] || {
+    echo "error: sim-conversion.models.json / sim-conversion-blobs not next to $SIMCONV_SO (ADR-053 P4 pack)." >&2
+    exit 1
+}
+
+# The DisplayXR Dashboard (src/dashboard): prebuilt (DXR_DASHBOARD_BIN), else
+# published here when the .NET SDK is present; CI sets DXR_REQUIRE_DASHBOARD=1.
+DASH_TMP="$(mktemp -d)"
+trap 'rm -rf "$DASH_TMP"' EXIT
+DASHBOARD_BIN="$("$ROOT/scripts/linux/dashboard/resolve_dashboard_bin.sh" "$DASH_TMP")"
+DASH_SRC="$ROOT/scripts/linux/dashboard"
+
+# The runtime must be the HYBRID one (#1744). An in-process-only .so has no IPC
+# client, so present-owners silently lose XR_DXR_weave; an IPC-only one (plain
+# --service) would push EVERY app through the service. The hybrid router's
+# lifecycle log line is the marker that it is compiled in. (A here-string,
+# not `echo | grep -q`: grep -q exits at the first match, the echo takes
+# SIGPIPE, and under pipefail the pipeline then reports failure.)
+RUNTIME_STRINGS="$(strings -a "$RUNTIME_SO" 2>/dev/null || true)"
+if ! grep -q 'Hybrid mode: XR_DXR_weave present-owner' <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO is not the hybrid runtime (no present-owner IPC routing)." >&2
+    echo "       Build with scripts/build_linux.sh --hybrid." >&2
+    exit 1
+fi
+# #2355: the runtime must carry the qwerty driver. Without it nothing binds a
+# pose source to the display head, so a legacy/hosted app's head sits at the
+# display's static pose (0.1 m above STAGE, 1.5 m under LOCAL) and the legacy
+# camera rig compiles out — silently: every app still starts. Its HMD reseed
+# log line is the marker that drv_qwerty is linked in.
+if ! grep -q 'qwerty: HMD pose reseeded' <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO has no qwerty driver (legacy apps would get a floor-level head, #2355)." >&2
+    echo "       Build with scripts/build_linux.sh (qwerty is ON unless --no-qwerty)." >&2
+    exit 1
+fi
+
+SYSTEMD_SRC="$ROOT/scripts/linux/systemd"
+for f in displayxr.socket displayxr.service.in; do
+    [ -f "$SYSTEMD_SRC/$f" ] || { echo "error: missing $SYSTEMD_SRC/$f (systemd user units)" >&2; exit 1; }
 done
 
 # The GNOME Shell extension is source, not a build artifact: ship it from the
@@ -118,15 +241,37 @@ for f in $EXT_FILES; do
 done
 [ -f "$EXT_ENABLE" ] || { echo "error: missing $EXT_ENABLE" >&2; exit 1; }
 
-# --- Version: turn `git describe` into a Debian-legal upstream version. -----
-# v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123 ; dirty -> +dirty
-RAW="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo 0.0.0)"
-VERSION="$(echo "$RAW" | sed -e 's/^v//' -e 's/-dirty$/+dirty/' -e 's/-\([0-9]\+\)-g/+\1.g/')"
-# A Debian upstream version must start with a digit; fall back if we only had a hash.
+# --- Version: what the binaries in $BUILD_DIR were BUILT as (#1790). ---------
+# cmake/DisplayXRVersion.cmake derives it once per configure and writes it next
+# to the build; the .deb is named after that, so the package version and the
+# runtimeVersion the runtime reports cannot disagree. Already Debian-legal:
+# v2.1.0 -> 2.1.0 ; v2.1.0-3-gabc123 -> 2.1.0+3.gabc123. A tree with
+# uncommitted changes still gets +dirty (that is about the checkout NOW, which
+# the configure-time stamp cannot know).
+VERSION_FILE="$BUILD_DIR/displayxr-version.txt"
+[ -f "$VERSION_FILE" ] || {
+    echo "error: $VERSION_FILE missing -- the build predates #1790's version stamp; rebuild (drop --no-build)." >&2
+    exit 1
+}
+ver_field() { sed -n "s/^$1=//p" "$VERSION_FILE"; }
+RT_VERSION="$(ver_field DXR_RUNTIME_VERSION)"
+RT_DESCRIBE="$(ver_field DXR_RUNTIME_VERSION_DESCRIBE)"
+VERSION="$(ver_field DXR_RUNTIME_VERSION_PACKAGE)"
 case "$VERSION" in
-    [0-9]*) : ;;
-    *) VERSION="0.0.0+g$VERSION" ;;
+    [0-9]*.[0-9]*.[0-9]*) : ;;
+    *) echo "error: $VERSION_FILE names no usable package version ('$VERSION')." >&2; exit 1 ;;
 esac
+if [ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+    VERSION="$VERSION+dirty"
+fi
+# The runtime itself must carry the describe the package is named after: a
+# stale build dir (or a configure from another checkout) fails HERE rather
+# than shipping a .deb whose name and runtimeVersion disagree.
+if ! grep -qxF "$RT_DESCRIBE" <<<"$RUNTIME_STRINGS"; then
+    echo "error: $RUNTIME_SO does not carry '$RT_DESCRIBE' (from $VERSION_FILE) -- stale build?" >&2
+    exit 1
+fi
+echo "==> Version $VERSION (runtime reports $RT_VERSION, '$RT_DESCRIBE')"
 # Derive the Debian arch from the build host so the label matches the binaries:
 # x86 CI / release boxes -> amd64; an arm64 dev box (e.g. Apple-silicon colima)
 # -> arm64. The runtime .deb targets whatever the build produced.
@@ -141,14 +286,51 @@ mkdir -p "$STAGE/DEBIAN" \
          "$STAGE/usr/lib/displayxr/bin" \
          "$STAGE/usr/lib/displayxr/lib" \
          "$STAGE/usr/lib/displayxr/plugins" \
+         "$STAGE/usr/share/vulkan/explicit_layer.d" \
+         "$STAGE/usr/share/vulkan/implicit_layer.d" \
          "$STAGE/usr/share/gnome-shell/extensions/$EXT_UUID" \
+         "$STAGE/usr/lib/systemd/user" \
          "$STAGE/etc/xdg/autostart"
 
 install -m 0755 "$CLI_BIN"     "$STAGE/usr/lib/displayxr/bin/displayxr-cli"
+install -m 0755 "$SERVICE_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-service"
+install -m 0755 "$HOST_BIN"    "$STAGE/usr/lib/displayxr/bin/displayxr-conversion-host"
+install -m 0755 "$TRACKHOST_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-tracking-host"
 install -m 0644 "$RUNTIME_SO"  "$STAGE/usr/lib/displayxr/lib/openxr_displayxr.so"
 install -m 0644 "$PLUGIN_SO"   "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimDisplay.so"
+install -m 0644 "$SIMINPUT_SO" "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimInput.so"
+install -m 0644 "$SIMCONV_SO"  "$STAGE/usr/lib/displayxr/plugins/DisplayXR-SimConversion.so"
+install -m 0644 "$SIMCONV_PACK" "$STAGE/usr/lib/displayxr/plugins/sim-conversion.models.json"
+mkdir -p "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs"
+install -m 0644 "$(dirname "$SIMCONV_SO")/sim-conversion-blobs"/* "$STAGE/usr/lib/displayxr/plugins/sim-conversion-blobs/"
+install -m 0644 "$VKLAYER_SO"  "$STAGE/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so"
+# The dashboard sits beside displayxr-cli, which it resolves next to itself.
+# Never strip it: the payload is appended to the ELF host.
+if [ -n "$DASHBOARD_BIN" ]; then
+    install -m 0755 "$DASHBOARD_BIN" "$STAGE/usr/lib/displayxr/bin/displayxr-dashboard"
+    ln -s ../lib/displayxr/bin/displayxr-dashboard "$STAGE/usr/bin/displayxr-dashboard"
+    mkdir -p "$STAGE/usr/share/applications" "$STAGE/usr/share/icons/hicolor/256x256/apps"
+    sed 's|@DASHBOARD_BIN@|/usr/lib/displayxr/bin/displayxr-dashboard|g' \
+        "$DASH_SRC/displayxr-dashboard.desktop.in" >"$STAGE/usr/share/applications/displayxr-dashboard.desktop"
+    chmod 0644 "$STAGE/usr/share/applications/displayxr-dashboard.desktop"
+    install -m 0644 "$DASH_SRC/displayxr-dashboard.png" \
+        "$STAGE/usr/share/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+fi
 # PATH entry — relative symlink so it stays valid regardless of install root.
 ln -s ../lib/displayxr/bin/displayxr-cli "$STAGE/usr/bin/displayxr-cli"
+ln -s ../lib/displayxr/bin/displayxr-service "$STAGE/usr/bin/displayxr-service"
+
+# --- systemd user units: socket-activated service (#1744) -------------------
+# Why socket activation (vs. an always-on user service or an XDG autostart
+# entry): the service owns a Vulkan device and the display processor, and most
+# users never run a client that needs it. With the socket it costs nothing
+# until a present-owner / workspace client dials
+# $XDG_RUNTIME_DIR/displayxr_comp_ipc, and it exits when idle. It needs no
+# terminal and no libsystemd: the service reads the LISTEN_FDS hand-off itself.
+install -m 0644 "$SYSTEMD_SRC/displayxr.socket" "$STAGE/usr/lib/systemd/user/displayxr.socket"
+sed 's|@SERVICE_BIN@|/usr/lib/displayxr/bin/displayxr-service|g' "$SYSTEMD_SRC/displayxr.service.in" \
+    >"$STAGE/usr/lib/systemd/user/displayxr.service"
+chmod 0644 "$STAGE/usr/lib/systemd/user/displayxr.service"
 
 # --- GNOME Shell extension + the per-user enable at login -------------------
 for f in $EXT_FILES; do
@@ -189,6 +371,63 @@ cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json" <<EOF
 EOF
 chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-display.json"
 
+# --- Reference input + conversion provider manifests (ADR-054 §2 clause 3) --
+# The `-input-provider.json` / `-conversion-provider.json` suffixes route each
+# manifest to its class loader. Shipped as dpkg-tracked files like the DP one;
+# both providers stay inert until their ENABLE setting is on.
+cat > "$STAGE/usr/lib/displayxr/plugins/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "$VERSION",
+        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-SimInput.so",
+        "probe_order":  200
+    }
+}
+EOF
+cat > "$STAGE/usr/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "$VERSION",
+        "binary_path":  "/usr/lib/displayxr/plugins/DisplayXR-SimConversion.so",
+        "probe_order":  250,
+        "packs":        ["/usr/lib/displayxr/plugins/sim-conversion.models.json"]
+    }
+}
+EOF
+chmod 0644 "$STAGE/usr/lib/displayxr/plugins/200-sim-input-input-provider.json" \
+           "$STAGE/usr/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json"
+
+# --- VK_LAYER_DXR_queue_lock manifest (#902 / #2036) ------------------------
+# Generated from the same template CMake uses (src/xrt/targets/vk_layer), with
+# the ABSOLUTE installed path: /usr/share/vulkan/explicit_layer.d is on the
+# loader's default search path, so every Vulkan process finds the layer with no
+# env var. (Like the Windows ExplicitLayers key, it is EXPLICIT: nothing loads
+# it unless enabled by name, which the runtime does for its own sessions only.)
+VKLAYER_JSON_IN="$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock.json.in"
+[ -f "$VKLAYER_JSON_IN" ] || { echo "error: missing $VKLAYER_JSON_IN" >&2; exit 1; }
+sed 's|@DXR_QL_LIBRARY_PATH@|/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so|' "$VKLAYER_JSON_IN" \
+    >"$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+chmod 0644 "$STAGE/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+
+# #886: its IMPLICIT twin — same name, same library — for vulkan_enable1 apps.
+# The loader dedupes the two by name, so an enable2 session (runtime-injected,
+# by name) and an enable1 app run with DXR_VK_QUEUE_LOCK=1 both get exactly one
+# copy in the chain; without that env var the implicit manifest is inert
+# (pinned by tests/tests_vk_queue_lock_activation.sh).
+VKLAYER_IMPLICIT_JSON_IN="$ROOT/src/xrt/targets/vk_layer/VkLayer_DXR_queue_lock_implicit.json.in"
+[ -f "$VKLAYER_IMPLICIT_JSON_IN" ] || { echo "error: missing $VKLAYER_IMPLICIT_JSON_IN" >&2; exit 1; }
+sed 's|@DXR_QL_LIBRARY_PATH@|/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so|' "$VKLAYER_IMPLICIT_JSON_IN" \
+    >"$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
+chmod 0644 "$STAGE/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
+
 # --- Depends (#1656) ---------------------------------------------------------
 # ONE .deb for Ubuntu 22.04, 24.04 and 26.04. Two things make that true, and
 # both are checked here rather than trusted to the build host:
@@ -222,9 +461,22 @@ STABLE_SONAMES=(
     libudev.so.1                    # libudev1
     libX11.so.6 libX11-xcb.so.1     # libx11-6, libx11-xcb1
     libxcb.so.1 libxcb-randr.so.0   # libxcb1, libxcb-randr0
+    libxcb-shape.so.0               # libxcb-shape0 (adopt-own-window input region, #2322)
     libXrandr.so.2                  # libxrandr2
+    libwayland-client.so.0          # libwayland-client0 (move-sync frame tag, #1748)
 )
-ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$PLUGIN_SO")
+# EVERY ELF the .deb installs (the staging block above) — one list, so a binary
+# added there must be added here. It used to be assigned twice: the second
+# assignment silently dropped the queue-lock layer from these checks, and the
+# sim-input / sim-conversion plug-ins were never in it.
+ELF_FILES=("$RUNTIME_SO" "$CLI_BIN" "$SERVICE_BIN" "$HOST_BIN" "$TRACKHOST_BIN" "$PLUGIN_SO"
+    "$SIMINPUT_SO" "$SIMCONV_SO" "$VKLAYER_SO")
+# The dashboard's ELF host goes through the same checks (its DT_NEEDED are libc,
+# libm, libstdc++, libgcc_s ...; .NET's host needs glibc >= 2.23). The Skia /
+# HarfBuzz natives are INSIDE the single-file bundle, so neither objdump nor
+# dpkg-shlibdeps sees them; what they load at run time (fontconfig, the X11
+# client libraries Avalonia uses) is a desktop's, declared as Recommends below.
+[ -z "$DASHBOARD_BIN" ] || ELF_FILES+=("$STAGE/usr/lib/displayxr/bin/displayxr-dashboard")
 
 command -v dpkg-shlibdeps >/dev/null 2>&1 || {
     echo "error: dpkg-shlibdeps not found — install dpkg-dev." >&2
@@ -300,6 +552,14 @@ fi
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
+# The dashboard's GUI needs (loaded by the bundled natives / Avalonia.X11 at
+# window creation, never by `--version`): fontconfig for Skia, and the X11
+# client libraries. Recommends, not Depends: the runtime works without the
+# dashboard, and every desktop has them. Names checked on every supported
+# release by verify_deb_install_linux.sh.
+RECOMMENDS=""
+[ -z "$DASHBOARD_BIN" ] || RECOMMENDS="libfontconfig1, libice6, libsm6, libx11-6, libxcursor1, libxi6, libxrandr2"
+
 # --- control ---------------------------------------------------------------
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
@@ -308,16 +568,19 @@ Section: libs
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
-Provides: displayxr-window-geometry-publisher
-Conflicts: displayxr-window-geometry-publisher
-Replaces: displayxr-window-geometry-publisher
+${RECOMMENDS:+Recommends: $RECOMMENDS
+}Provides: displayxr-window-geometry-publisher, displayxr-window-geometry-publisher-gnome
+Conflicts: displayxr-window-geometry-publisher-gnome
+Replaces: displayxr-window-geometry-publisher-gnome
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/displayxr-runtime
-Description: DisplayXR OpenXR runtime for 3D displays (in-process, sim-display)
+Description: DisplayXR OpenXR runtime for 3D displays (sim-display)
  Lightweight standalone OpenXR runtime purpose-built for 3D displays. This
- package ships the in-process runtime, the displayxr-cli diagnostic tool, and
- the vendor-neutral sim-display display processor as the built-in fallback.
+ package ships the runtime, the displayxr-service out-of-process compositor,
+ the displayxr-cli diagnostic tool, the DisplayXR Dashboard (displays,
+ windows, components and performance settings, over displayxr-cli), and the
+ vendor-neutral sim-display display processor as the built-in fallback.
  .
  After install the box needs no environment variables: the OpenXR ActiveRuntime
  is registered at /etc/xdg/openxr/1/active_runtime.json and the runtime's
@@ -325,8 +588,13 @@ Description: DisplayXR OpenXR runtime for 3D displays (in-process, sim-display)
  .
  A vendor display plug-in (e.g. Leia SR) installs alongside with a lower
  probe_order and claims the display automatically when present; otherwise
- sim-display drives apps. The out-of-process service is not included on Linux
- yet (see issue #710).
+ sim-display drives apps.
+ .
+ Ordinary apps run in-process. Apps that need the out-of-process path (the
+ XR_DXR_weave present-owners such as the DisplayXR browser, and workspace
+ controllers) connect to displayxr-service, which a systemd user socket
+ (displayxr.socket, enabled for every user) starts on demand; it exits when
+ its last client leaves.
  .
  It also installs the GNOME Shell extension window-geometry@displayxr.org,
  which windowed weaving under Wayland and transparent apps on a 3D panel both
@@ -345,6 +613,17 @@ CONF_DIR="/etc/xdg/openxr/1"
 ACTIVE="$CONF_DIR/active_runtime.json"
 BACKUP="$ACTIVE.pre-displayxr.bak"
 LIB="/usr/lib/displayxr/lib/openxr_displayxr.so"
+
+# Run `systemctl --user <args>` in every user manager running right now
+# (--machine=USER@ needs systemd >= 248; Ubuntu 22.04 has 249). Never fails.
+dxr_each_user_manager() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    for dxr_user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        dxr_uid="$(id -u "$dxr_user" 2>/dev/null)" || continue
+        [ -d "/run/user/$dxr_uid/systemd" ] || continue
+        timeout 10 systemctl --user --machine="$dxr_user@" "$@" >/dev/null 2>&1 || true
+    done
+}
 
 case "$1" in
 configure)
@@ -365,6 +644,19 @@ configure)
 JSON
     echo "displayxr-runtime: OpenXR ActiveRuntime -> $ACTIVE"
     echo "displayxr-runtime: verify with  displayxr-cli selftest"
+
+    # displayxr-service (#1744): enable the socket for every user (a symlink
+    # under /etc/systemd/user — works offline), then start it in the user
+    # managers already running so nobody has to log out first. Best effort
+    # throughout: a box without systemd (a container) just has no socket, and
+    # clients then stay in-process.
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --global enable displayxr.socket >/dev/null 2>&1 || true
+        dxr_each_user_manager daemon-reload
+        dxr_each_user_manager start displayxr.socket
+        echo "displayxr-runtime: displayxr-service is socket-activated per user (displayxr.socket)"
+        echo "  check with  systemctl --user status displayxr.socket"
+    fi
     # Required notice (wayland-window-geometry.md §4): until the user logs in
     # again the extension is absent and every consumer silently falls back
     # (display-scoped weaving, silhouette transparency).
@@ -407,7 +699,39 @@ esac
 exit 0
 EOF
 
-chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm"
+cat > "$STAGE/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+# Before the unit files go away: stop displayxr-service in running user
+# sessions and drop the global enablement (#1744). NOT on upgrade: a live
+# service keeps serving its clients with the old binary and exits when idle,
+# and the next connect starts the new one — stopping it here would cut off a
+# running browser mid-session.
+set -e
+
+# Run `systemctl --user <args>` in every user manager running right now
+# (--machine=USER@ needs systemd >= 248; Ubuntu 22.04 has 249). Never fails.
+dxr_each_user_manager() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    for dxr_user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        dxr_uid="$(id -u "$dxr_user" 2>/dev/null)" || continue
+        [ -d "/run/user/$dxr_uid/systemd" ] || continue
+        timeout 10 systemctl --user --machine="$dxr_user@" "$@" >/dev/null 2>&1 || true
+    done
+}
+
+case "$1" in
+remove|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+        dxr_each_user_manager stop displayxr.socket displayxr.service
+        systemctl --global disable displayxr.socket >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
+EOF
+
+chmod 0755 "$STAGE/DEBIAN/postinst" "$STAGE/DEBIAN/postrm" "$STAGE/DEBIAN/prerm"
 
 # --- build the .deb --------------------------------------------------------
 mkdir -p "$DIST_DIR"

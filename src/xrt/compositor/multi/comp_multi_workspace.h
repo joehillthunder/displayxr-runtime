@@ -45,12 +45,29 @@ extern "C" {
  * renders an empty backdrop + DXR splash + launcher band while a controller is
  * connected, even with no active content app session (a controller never
  * xrBeginSession's). Called from the IPC workspace activate / deactivate handlers.
- * No-op / unused on other platforms (defined under XRT_OS_MACOS).
+ * Defined wherever COMP_MULTI_SHARED_SURFACE is (macOS, desktop Linux, Android);
+ * on Android it is the request that turns the workspace overlay mode on / off,
+ * applied by the render thread at the top of a frame (#1006).
  *
  * @ingroup comp_multi
  */
 void
 comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active);
+
+/*!
+ * #967 D-5 / #1006: the workspace controller's hardware 2D/3D request for the
+ * shared display processor (the controller is the display-mode authority while
+ * it is active — workspace-controller-registration.md "Display mode authority").
+ * Recorded here, applied on the render thread by the shared-DP mode channel,
+ * which tells every composited client once the DP accepted it. Cleared when the
+ * workspace deactivates, so the focused / lone client's own wish governs again.
+ *
+ * @return true when a shared surface exists to take it (always where the shared
+ *         surface is compiled).
+ * @ingroup comp_multi
+ */
+bool
+comp_multi_system_request_workspace_display_mode(struct xrt_system_compositor *xsc, bool hardware_3d);
 
 /*!
  * Compositor-local mirror of the controller's chrome layout — the subset the
@@ -318,6 +335,15 @@ comp_multi_workspace_set_cursor_depth(float hit_z_m, bool over_window);
 bool
 comp_multi_workspace_get_cursor(struct xrt_swapchain **out_xsc, struct comp_multi_cursor_state *out);
 
+/*!
+ * Pointer position meaning "not over the service surface" (both coordinates).
+ * The cursor composite draws nothing for an off-surface position, and FRAME_TICK
+ * / POINTER_MOTION carry it as-is, so a controller's hit-test misses and its
+ * hover clears — the Windows service likewise reports an off-panel cursor as
+ * out-of-range panel coordinates. Also the initial value.
+ */
+#define COMP_MULTI_POINTER_OUTSIDE (-1)
+
 //! Latest pointer position in target framebuffer pixels (top-left origin). The
 //! macOS AppKit pump writes it on mouse move; the cursor composite reads it.
 void
@@ -372,6 +398,41 @@ uint32_t
 comp_multi_workspace_copy_overlays(struct comp_multi_overlay_state *out_states,
                                    struct xrt_swapchain **out_xscs,
                                    uint32_t max);
+
+/*!
+ * One shared-surface frame, as the workspace controller's FRAME_TICK reports it
+ * (XR_DXR_spatial_workspace spec_version 6/20/22; payload identical to the
+ * Windows D3D11 service's): the tracked viewer's eye midpoint in display space
+ * (metres) and the cursor in workspace (display) px.
+ */
+struct comp_multi_frame_tick
+{
+	uint64_t timestamp_ns;
+	float viewer_x, viewer_y, viewer_z;
+	bool viewer_valid; //!< The DP reported eyes (held ~0.5 s across a dropout, then false).
+	int32_t cursor_x, cursor_y;
+};
+
+//! Receives one tick per rendered shared-surface frame while a controller is up.
+typedef void (*comp_multi_frame_tick_fn)(void *userdata, const struct comp_multi_frame_tick *tick);
+
+//! Install (or clear, NULL) the process-wide frame-tick sink (the IPC server's input queue).
+void
+comp_multi_workspace_set_frame_tick_sink(comp_multi_frame_tick_fn fn, void *userdata);
+
+//! Called by the shared-surface render loop once per rendered frame.
+void
+comp_multi_workspace_emit_frame_tick(const struct comp_multi_frame_tick *tick);
+
+/*!
+ * Drop the controller-owned session-global state — cursor sprite, overlays and
+ * the focused client — when the workspace controller deactivates or
+ * disconnects, so a dead controller's cursor / launcher band does not stay
+ * composited on the surface (and its swapchains are released). Per-client
+ * chrome, poses and styles are dropped with their clients.
+ */
+void
+comp_multi_workspace_reset_controller_state(void);
 
 #ifdef __cplusplus
 }

@@ -14,6 +14,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_misc.h"
+#include "util/u_color_encoding.h"
 
 #include "d3d/d3d_dxgi_formats.h"
 
@@ -23,6 +24,7 @@
 #include <dxgi1_6.h>
 
 #include <cstring>
+#include <atomic>
 
 /*!
  * Maximum number of images in a swapchain.
@@ -52,6 +54,11 @@ struct comp_d3d12_swapchain
 	//! Per-image state for multi-acquire tracking (#151).
 	//! 0 = FREE, 1 = ACQUIRED, 2 = WAITED.
 	uint8_t img_state[MAX_SWAPCHAIN_IMAGES];
+
+	//! #2362: the app's published release-fence value when it released each
+	//! image (0 = none). Written on the app's releasing thread, read by
+	//! layer_commit.
+	std::atomic<uint64_t> release_value[MAX_SWAPCHAIN_IMAGES];
 
 	//! Round-robin hint for next acquire.
 	uint32_t next_hint;
@@ -185,14 +192,34 @@ d3d12_swapchain_release_image(struct xrt_swapchain *xsc, uint32_t index)
 		return XRT_ERROR_IPC_FAILURE;
 	}
 
+	// #2362: sample the app's release value for THIS image now — the app
+	// publishes it immediately before this call, on this thread.
+	sc->release_value[index].store(comp_d3d12_compositor_sample_release_value(sc->c), std::memory_order_release);
+
 	sc->img_state[index] = IMG_FREE;
 	return XRT_SUCCESS;
+}
+
+extern "C" uint64_t
+comp_d3d12_swapchain_get_release_value(struct xrt_swapchain *xsc, uint32_t index)
+{
+	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+	if (sc == nullptr || index >= sc->image_count) {
+		return 0;
+	}
+	return sc->release_value[index].load(std::memory_order_acquire);
 }
 
 static void
 d3d12_swapchain_destroy(struct xrt_swapchain *xsc)
 {
 	struct comp_d3d12_swapchain *sc = d3d12_sc(xsc);
+
+	// #2362: a hub-route frame with a deferred idle-wait may still read these.
+	// Takes c->mutex. The compositor outlives its swapchains: the state
+	// tracker destroys every swapchain (a session child) before the session's
+	// compositor, and the compositor holds no swapchain references.
+	comp_d3d12_compositor_drain_deferred(sc->c);
 
 	for (uint32_t i = 0; i < sc->image_count; i++) {
 		if (sc->images[i] != nullptr) {
@@ -219,6 +246,15 @@ d3d12_swapchain_destroy(struct xrt_swapchain *xsc)
  */
 static const GUID kDxrRequestedViewFormatGuid = {
     0x2e9f6c41, 0x0b17, 0x4c8a, {0x9e, 0x52, 0x5f, 0x2d, 0x3a, 0x7c, 0x1b, 0x84}};
+
+/*!
+ * XR_DXR_swapchain_color_encoding: stamped (a BOOL) on the images of a
+ * swapchain the app declared display-encoded, so every reading of the
+ * resource — sample, compose, is-encoded — answers as for an `_SRGB` one.
+ *
+ * {7C1E5B92-3D46-4F0A-A8E1-62B9C04D7F35}
+ */
+static const GUID kDxrColorEncodedGuid = {0x7c1e5b92, 0x3d46, 0x4f0a, {0xa8, 0xe1, 0x62, 0xb9, 0xc0, 0x4d, 0x7f, 0x35}};
 
 /*
  *
@@ -294,6 +330,14 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 	 * still created exactly as requested.
 	 */
 	DXGI_FORMAT resource_format = d3d_dxgi_format_to_typeless_dxgi(dxgi_format);
+	// The shared helper leaves the 10-bit family typed (the runtime's deep
+	// atlas relies on that); an app swapchain image is TYPELESS like every
+	// other colour family, which is what the CTS checks.
+	if (dxgi_format == DXGI_FORMAT_R10G10B10A2_UNORM) {
+		resource_format = DXGI_FORMAT_R10G10B10A2_TYPELESS;
+	}
+	const BOOL color_encoded =
+	    (info->create & XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB) != 0 && !d3d_dxgi_format_is_srgb(dxgi_format);
 
 	// Create committed resources
 	D3D12_HEAP_PROPERTIES heap_props = {};
@@ -367,6 +411,10 @@ comp_d3d12_swapchain_create(struct comp_d3d12_compositor *c,
 		// asked for. comp_d3d12_swapchain_sample_format() reads it back when
 		// the compositor needs a view over this image.
 		sc->images[i]->SetPrivateData(kDxrRequestedViewFormatGuid, (UINT)sizeof(dxgi_format), &dxgi_format);
+		if (color_encoded) {
+			sc->images[i]->SetPrivateData(kDxrColorEncodedGuid, (UINT)sizeof(color_encoded),
+			                              &color_encoded);
+		}
 
 		// Store resource pointer as native image handle
 		sc->base.images[i].handle = reinterpret_cast<xrt_graphics_buffer_handle_t>(sc->images[i]);
@@ -428,6 +476,16 @@ requested_typed_format(ID3D12Resource *res)
 	return typed;
 }
 
+//! XR_DXR_swapchain_color_encoding: was the image's swapchain declared display-encoded?
+static bool
+resource_color_encoded(ID3D12Resource *res)
+{
+	BOOL encoded = FALSE;
+	UINT size = (UINT)sizeof(encoded);
+	return SUCCEEDED(res->GetPrivateData(kDxrColorEncodedGuid, &size, &encoded)) && size == sizeof(encoded) &&
+	       encoded != FALSE;
+}
+
 extern "C" DXGI_FORMAT
 comp_d3d12_swapchain_sample_format(void *resource)
 {
@@ -466,7 +524,25 @@ comp_d3d12_swapchain_compose_format(void *resource)
 	if (d3d_dxgi_format_is_srgb(typed)) {
 		return typed;
 	}
+	// XR_DXR_swapchain_color_encoding: a display-encoded 8-bit image decodes
+	// through its `_SRGB` sibling (the resource is TYPELESS). A deeper format
+	// has none; the renderer composes it through a shadow instead
+	// (comp_d3d12_swapchain_resource_needs_compose_shadow).
+	if (resource_color_encoded(res)) {
+		const DXGI_FORMAT sibling = d3d_dxgi_format_srgb_rtv(typed);
+		if (sibling != DXGI_FORMAT_UNKNOWN) {
+			return sibling;
+		}
+	}
 	return d3d_dxgi_format_to_unorm_sample(typed);
+}
+
+extern "C" bool
+comp_d3d12_swapchain_resource_needs_compose_shadow(void *resource)
+{
+	auto *res = static_cast<ID3D12Resource *>(resource);
+	return res != nullptr && !u_color_legacy_unorm_encoded() && resource_color_encoded(res) &&
+	       d3d_dxgi_format_srgb_rtv(requested_typed_format(res)) == DXGI_FORMAT_UNKNOWN;
 }
 
 extern "C" bool
@@ -476,5 +552,7 @@ comp_d3d12_swapchain_resource_is_srgb(void *resource)
 	if (res == nullptr) {
 		return false;
 	}
-	return d3d_dxgi_format_is_srgb(requested_typed_format(res));
+	// An `_SRGB` format, or values declared display-encoded
+	// (XR_DXR_swapchain_color_encoding): either way the bytes are encoded.
+	return d3d_dxgi_format_is_srgb(requested_typed_format(res)) || resource_color_encoded(res);
 }

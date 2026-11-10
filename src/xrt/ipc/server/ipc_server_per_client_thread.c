@@ -22,6 +22,7 @@ DEBUG_GET_ONCE_NUM_OPTION(test_exit_on_disconnect, "DXR_TEST_EXIT_ON_DISCONNECT"
 #include "shared/ipc_shmem.h"
 #include "shared/ipc_utils.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h"
 #include "ipc_server_generated.h"
 #include "xrt/xrt_config_have.h"
 
@@ -29,8 +30,11 @@ DEBUG_GET_ONCE_NUM_OPTION(test_exit_on_disconnect, "DXR_TEST_EXIT_ON_DISCONNECT"
 #include "d3d11_service/comp_d3d11_service.h"
 #endif
 
-#ifdef XRT_OS_MACOS
-#include "ipc_server_input_queue.h" // #61: drop a client's input-routing queue on destroy
+#include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
+
+#ifdef COMP_MULTI_SHARED_SURFACE
+#include "ipc_server_input_queue.h"     // #61: drop a client's input-routing queue on destroy
+#include "multi/comp_multi_workspace.h" // workspace_active + controller state on controller loss
 #endif
 
 #ifndef XRT_OS_WINDOWS
@@ -89,6 +93,17 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// workspace-mode controller and tear down workspace overlay state.
 	unsigned long this_client_pid = (unsigned long)ics->client_state.pid;
 
+	// XR_DXR_input_providers (ADR-034 Am.5): this client's per-client role
+	// overlay is keyed by client_state.id, so it must be released BEFORE
+	// client_state is zeroed below — after the memset the key reads 0, which
+	// is the service's own implicit client, and the departed client's holder
+	// rows stayed listed forever (win-box row 6, 2026-10-19).
+	ipc_server_client_input_release(ics);
+
+	// ADR-061 arm 2: so is a service link (client_state.id again): unregistered
+	// after the memset, a crashed in-process app stayed listed AVAILABLE forever.
+	ipc_server_client_stereo_camera_link_release(ics);
+
 	/*
 	 * Remove the thread from the server.
 	 */
@@ -107,6 +122,8 @@ common_shutdown(volatile struct ipc_client_state *ics)
 
 	// Decrement the connected client counter
 	ics->server->global_state.connected_client_count--;
+	// ADR-051: a disconnect is a status event (leaf lock; safe under this one).
+	ipc_server_status_bump(ics->server, false);
 
 	os_mutex_unlock(&ics->server->global_state.lock);
 
@@ -118,11 +135,25 @@ common_shutdown(volatile struct ipc_client_state *ics)
 	// If the session hasn't been stopped, destroy the compositor.
 	ipc_server_client_destroy_session_and_compositor(ics);
 
-#ifdef XRT_OS_LINUX_DESKTOP
-	// XR_DXR_weave v10 (#1699): the last weave reply's release sync_file / output
-	// dup were parked for a next call that will never come.
+#ifdef XRT_OS_LINUX
+	// XR_DXR_weave v10 (#1699) / v20 (Android): the last weave reply's release
+	// sync_file / output dup were parked for a next call that will never come.
 	ipc_server_client_weave_flush_deferred_fds(ics);
+	// v20: an acquire fence delivered for a submit that never came.
+	if (ics->weave_have_pending_acquire) {
+		if (ics->weave_pending_acquire_fd >= 0) {
+			close(ics->weave_pending_acquire_fd);
+		}
+		ics->weave_have_pending_acquire = false;
+		ics->weave_pending_acquire_fd = -1;
+	}
 #endif
+
+	// XR_DXR_lift (ADR-042): streams are owned by the connection, not a session.
+	ipc_server_client_lift_release(ics);
+
+	// XR_DXR_stereo_camera (ADR-043): streams are owned by the connection.
+	ipc_server_client_stereo_camera_release(ics);
 
 	// Make sure undestroyed spaces are unreferenced
 	for (uint32_t i = 0; i < IPC_MAX_CLIENT_SPACES; i++) {
@@ -209,8 +240,27 @@ common_shutdown(volatile struct ipc_client_state *ics)
 			ics->server->xsysc->info.workspace_mode = false;
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 			comp_d3d11_service_deactivate_workspace(ics->server->xsysc);
+			// #2416: this client's compositor was torn down while the
+			// workspace was still active, so the #814 failsafe skipped
+			// itself; run it now that the controller no longer owns the
+			// mode, or a dead controller leaves the lens in 3D.
+			comp_d3d11_service_workspace_controller_lost(ics->server->xsysc);
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+			// The shared surface keeps rendering while workspace_active; a dead
+			// controller must not leave it (and its cursor / band) up (#61).
+			comp_multi_system_set_workspace_active(ics->server->xsysc, false);
+			comp_multi_workspace_reset_controller_state();
+			ipc_server_input_queue_set_input_grab(false);
+			ipc_server_input_queue_set_pointer_capture(false);
+			ipc_server_input_queue_clear_frame_tick();
 #endif
 		}
+#ifdef XRT_OS_ANDROID
+		// #1006: the overlay ends with its controller.
+		ics->server->workspace_controller_uid = -1;
+		ipc_server_android_notify_overlay(false, -1);
+#endif
 	}
 	// #558 service-overlay teardown is NOT done here: tearing it down on the IPC
 	// client thread races the Android service-shutdown lifecycle and posts an
@@ -579,6 +629,17 @@ client_loop(volatile struct ipc_client_state *ics)
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics)
 {
+	// XR_DXR_display_info v25: the hint is the session's; a next session on
+	// this connection starts asking for a viewer again until it says otherwise.
+	ics->fixed_viewer = false;
+
+	// ADR-061: an app share of this session ends (SOURCE_LOST) and its tap is
+	// detached BEFORE the compositor it reads goes away.
+	if (ics->xs != NULL) {
+		ipc_server_stereo_camera_app_session_ending(ics);
+	}
+	ics->app_share_opt_out = false;
+
 	// Destroy the compositor BEFORE dropping our xscs swapchain
 	// references (#238). The compositor's destroy path runs under its
 	// own render_mutex (close-button fix in commit 30e5648a1) and
@@ -589,7 +650,7 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	//   - our xscs drop took the strong ref count from 2 → 1,
 	//   - the snapshot's lingering strong ref kept the swapchain alive,
 	//   - the render thread could be mid-snapshot-deref on a slot
-	//     that's already partially torn down (Ctrl+Space deactivate
+	//     that's already partially torn down (launch-hotkey deactivate
 	//     hits this because the workspace controller's compositor
 	//     destroy runs in a different order than per-client destroys).
 	// Reversing the order means the snapshot's strong refs are gone
@@ -602,12 +663,25 @@ ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_stat
 	// pointer (its key) is freed and potentially reused for a new client, which
 	// would otherwise inherit stale forwarded events. The compositor pointer value
 	// is still a valid key here even though xrt_comp_destroy frees the object.
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	ipc_server_input_queue_drop((void *)ics->xc);
 #endif
 
-	// Cast away volatile.
-	xrt_comp_destroy((struct xrt_compositor **)&ics->xc);
+	// #1988: detach the compositor from ics under global_state.lock BEFORE
+	// destroying it. Other threads walk every client's ics->xc under that lock
+	// (flush_state_to_all_clients_locked -> xrt_syscomp_set_state, the overlay
+	// visibility pushes); destroying through &ics->xc left the pointer
+	// published until after the object was freed, and a focus flush landing
+	// in that window dereferenced a deleted compositor. Destroy stays OUTSIDE
+	// the lock: it takes the compositor's render mutex, and the render side
+	// takes global_state.lock (sync_focus_from_compositor), so nesting would
+	// invert the lock order.
+	os_mutex_lock(&ics->server->global_state.lock);
+	struct xrt_compositor *xc = (struct xrt_compositor *)ics->xc; // Cast away volatile.
+	ics->xc = NULL;
+	os_mutex_unlock(&ics->server->global_state.lock);
+
+	xrt_comp_destroy(&xc);
 
 	// Multiple threads might be looking at these fields.
 	os_mutex_lock(&ics->server->global_state.lock);
@@ -640,6 +714,9 @@ client_thread_body(void *_ics)
 	volatile struct ipc_client_state *ics = (volatile struct ipc_client_state *)_ics;
 
 	client_loop(ics);
+
+	// #1815: the server's shutdown waits on this before joining.
+	ics->thread_done = true;
 
 	return NULL;
 }

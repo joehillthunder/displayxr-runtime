@@ -30,18 +30,28 @@
 #include "util/u_pretty_print.h"
 
 #include "util/u_git_tag.h"
+#include "util/u_setting.h"
+#include "util/u_exe_basename.h"
+#include "util/u_sd_notify.h" // #2515: systemd WATCHDOG=1 / STOPPING=1 (desktop Linux; no-op elsewhere)
 
+#include "shared/ipc_app_group.h" // input focus follows the application
+#include "util/u_session.h"        // #2262: the server pushes the sibling's FOCUSED state itself
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_shmem.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h"
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server_peer_creds.h"
 
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 #include "d3d11_service/comp_d3d11_service.h" // #962: focused-slot authority
 #include "xrt/xrt_display_processor_d3d11.h"  // XRT_DP_BACKEND_STATE_* for the [HEALTH] dp= word
-#elif defined(XRT_OS_MACOS)
-#include "multi/comp_multi_workspace.h" // #962: focused-client authority
+#else
+#include "multi/comp_multi_interface.h" // COMP_MULTI_SHARED_SURFACE
+#if defined(COMP_MULTI_SHARED_SURFACE)
+#include "multi/comp_multi_workspace.h" // #962: focused-client authority (macOS, desktop Linux)
+#include "server/ipc_server_input_queue.h" // FRAME_TICK sink
+#endif
 #endif
 
 #include <stdlib.h>
@@ -62,6 +72,19 @@
 
 #if defined(XRT_OS_MACOS)
 #include <CoreFoundation/CoreFoundation.h>
+#endif
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+#include "server/ipc_server_linux_input.h" // service-surface input → workspace queues (#710)
+#endif
+
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+#include "xrt/xrt_screen.h"
+struct ipc_server;
+static void
+multi_weave_screens_refresh(struct ipc_server *s); // #2218 item 6, defined with the re-probe worker
+static void
+multi_weave_screens_follow_generation(struct ipc_server *s);
 #endif
 
 
@@ -235,11 +258,83 @@ print_linux_end_user_started_information(enum u_logging_level log_level)
 	U_LOG_IFL_I(log_level, "%s", sink.buffer);
 }
 
+/*!
+ * Wait for every per-client thread to finish before teardown_all() destroys
+ * what they use.
+ *
+ * Once main_loop() returns (s->running is false), a client thread can still be
+ * between polls. Its loop exits within one 500 ms poll timeout and then runs
+ * common_shutdown(), which takes global_state.lock and destroys its session
+ * and compositor. Tearing those down first aborted the macOS service on
+ * SIGTERM (os_mutex_lock asserting on the destroyed lock, #1815).
+ *
+ * The wait keeps this (main) thread's run loop turning: on macOS a client's
+ * compositor teardown dispatch_sync()s window work onto the main queue, so a
+ * bare join here would deadlock. Bounded: a thread still busy at the deadline
+ * is left unjoined, with a WARN, rather than hanging the exit.
+ *
+ * POSIX only: both POSIX client loops (kqueue / epoll) poll with a timeout and
+ * re-check s->running. The Windows loop blocks in ReadFile.
+ */
+static void
+join_client_threads(struct ipc_server *s)
+{
+#ifndef XRT_OS_WINDOWS
+	const int64_t deadline = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+	for (;;) {
+		bool pending = false;
+		for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+			if (s->threads[i].state != IPC_THREAD_READY && !s->threads[i].ics.thread_done) {
+				pending = true;
+			}
+		}
+		if (!pending || os_monotonic_get_ns() > deadline) {
+			break;
+		}
+#if defined(XRT_OS_MACOS)
+		CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+#else
+		os_nanosleep(U_TIME_1MS_IN_NS * 10);
+#endif
+	}
+
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		struct ipc_thread *it = &s->threads[i];
+		if (it->state == IPC_THREAD_READY) {
+			continue;
+		}
+		if (!it->ics.thread_done) {
+			U_LOG_W("#1815: client thread %u still busy at shutdown; not joined", i);
+			continue;
+		}
+		os_thread_join(&it->thread);
+		os_thread_destroy(&it->thread);
+		it->state = IPC_THREAD_READY;
+	}
+#else
+	(void)s;
+#endif
+}
+
 static void
 teardown_all(struct ipc_server *s)
 {
 	u_var_remove_root(s);
 
+	// Before the instance: the camera threads call into the plug-in.
+	ipc_server_stereo_camera_destroy(&s->stereo_camera);
+
+	// ADR-051: the status snapshot (no threads; reads only on DIAG RPCs).
+	ipc_server_status_fini(s);
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-053 P1a (#2003): the conversion core lets go of the GPU side first.
+	ipc_server_conv_detach_d3d11();
+#endif
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+	// ADR-053 P5: the same for the Vulkan glue (macOS / desktop Linux).
+	ipc_server_conv_detach_vk();
+#endif
 	xrt_syscomp_destroy(&s->xsysc);
 
 	teardown_idevs(s);
@@ -251,6 +346,13 @@ teardown_all(struct ipc_server *s)
 	xrt_instance_destroy(&s->xinst);
 
 	ipc_server_mainloop_deinit(&s->ml);
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	ipc_server_linux_input_uninstall();
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+	comp_multi_workspace_set_frame_tick_sink(NULL, NULL);
+#endif
 
 	u_process_destroy(s->process);
 
@@ -500,6 +602,7 @@ init_server_state(struct ipc_server *s)
 	s->global_state.last_active_client_index = -1;
 	s->global_state.connected_client_count = 0; // No clients connected initially
 	s->current_slot_index = 0;
+	s->workspace_controller_uid = -1; // #1006: 0 would be root's uid
 
 	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
 		volatile struct ipc_client_state *ics = &s->threads[i].ics;
@@ -561,6 +664,35 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 	xret = xrt_instance_create_system(s->xinst, &s->xsys, &s->xsysd, &s->xso, &s->xsysc);
 	IPC_CHK_WITH_GOTO(s, xret, "xrt_instance_create_system", error);
 
+	// XR_DXR_stereo_camera (ADR-043): the service owns every plug-in camera.
+	s->stereo_camera = ipc_server_stereo_camera_create(s->xinst);
+	// In-process consumers (the input host iface shared-camera slot) share the
+	// CAMERA_CONSUMER quota with connections.
+	ipc_server_stereo_camera_attach_server(s->stereo_camera, s);
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-061: the D3D11 service compositor's pre-weave tap.
+	ipc_server_share_tap_d3d11_install(s);
+#endif
+
+	// ADR-051 D3: the display status snapshot + generation counters.
+	ipc_server_status_init(s);
+
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #2218 item 6: the screens the present-owner weave engines segment against.
+	multi_weave_screens_follow_generation(s); // records the generation it describes
+	multi_weave_screens_refresh(s);
+#endif
+
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ADR-053 P1a (#2003): the device exists now — attach its GPU side (and
+	// the dp-lift row) to the conversion core.
+	ipc_server_conv_attach_d3d11(s->xsysc);
+#endif
+#if defined(XRT_HAVE_VK_CONV_SERVICE)
+	// ADR-053 P5: the Vulkan device exists now (macOS / desktop Linux).
+	ipc_server_conv_attach_vk(s->xsysc);
+#endif
+
 	// Always succeeds.
 	init_idevs(s);
 	init_tracking_origins(s);
@@ -570,6 +702,17 @@ init_all(struct ipc_server *s, enum u_logging_level log_level)
 		xret = XRT_ERROR_IPC_MAINLOOP_FAILED_TO_INIT;
 	}
 	IPC_CHK_WITH_GOTO(s, xret, "ipc_server_mainloop_init", error);
+
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	// Desktop Linux (#710): the shared surface's window input feeds the
+	// workspace input queues (the macOS AppKit pump's role).
+	ipc_server_linux_input_install(s);
+#endif
+#if defined(COMP_MULTI_SHARED_SURFACE)
+	// FRAME_TICK (macOS + desktop Linux): the shared surface's per-frame ticks
+	// reach the controller through the coalescing input queue.
+	comp_multi_workspace_set_frame_tick_sink(ipc_server_input_queue_frame_tick_sink, NULL);
+#endif
 
 	// Never fails, do this second last.
 	init_server_state(s);
@@ -599,6 +742,74 @@ error:
 static bool
 controller_connected_locked(struct ipc_server *s); // #962, defined below
 
+/*!
+ * Fill @p out with the [HEALTH] facts. Caller holds global_state.lock (the
+ * same lock connect/disconnect take), so the snapshot is consistent with the
+ * slot table.
+ */
+static void
+fill_health_locked(struct ipc_server *s, struct ipc_service_health *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->max_clients = s->max_clients;
+	out->active_idx = s->global_state.active_client_index;
+	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
+		if (s->threads[i].state != IPC_THREAD_RUNNING && s->threads[i].state != IPC_THREAD_STARTING) {
+			continue;
+		}
+		volatile struct ipc_client_state *ics = &s->threads[i].ics;
+		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
+		struct ipc_service_health_slot *h = &out->slots[out->slot_count++];
+		h->slot = i;
+		h->id = cs->id;
+		h->pid = (int64_t)cs->pid;
+		h->client_class = cs->client_class;
+		h->class_verified = ics->class_verified;
+		snprintf(h->name, sizeof(h->name), "%s", cs->info.application_name);
+		h->session_active = cs->session_active;
+		h->session_visible = cs->session_visible;
+		h->session_focused = cs->session_focused;
+		h->input_focus_shared = ics->input_focus_shared;
+		h->io_active = ics->io_active;
+		h->primary_application = cs->primary_application;
+		h->swapchain_count = ics->swapchain_count;
+		h->space_count = ics->space_count;
+	}
+	// #961: who holds the PANEL LEASE — the controller while one is connected,
+	// else (default policy) the focused client, else nobody.
+	if (controller_connected_locked(s)) {
+		out->lease = IPC_SERVICE_LEASE_CONTROLLER;
+	} else if (out->active_idx >= 0) {
+		out->lease = IPC_SERVICE_LEASE_SLOT;
+		out->lease_slot = out->active_idx;
+	} else {
+		out->lease = IPC_SERVICE_LEASE_NONE;
+	}
+	// #1002: the device state. A lost device makes every client fail
+	// identically and silently; one word in the summary line is the
+	// difference between "why is everything black" and a known cause.
+	// Same idea for the vendor display processor's BACKEND: the vendor platform
+	// service can restart underneath us, after which a DP that cannot reconnect
+	// keeps returning successful-but-stale eye positions and every app weaves
+	// untracked. "degraded" = the DP is reconnecting, "stale" = it cannot and
+	// the compositor is recreating it.
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	if (s->xsysc != NULL) {
+		out->device_removed = comp_d3d11_service_device_is_removed(s->xsysc);
+		out->dp_state_known = true;
+		out->dp_backend_state = comp_d3d11_service_dp_backend_state(s->xsysc);
+	}
+#endif
+}
+
+void
+ipc_server_get_health(struct ipc_server *s, struct ipc_service_health *out)
+{
+	os_mutex_lock(&s->global_state.lock);
+	fill_health_locked(s, out);
+	os_mutex_unlock(&s->global_state.lock);
+}
+
 static void
 emit_health_if_elapsed(struct ipc_server *s)
 {
@@ -613,61 +824,45 @@ emit_health_if_elapsed(struct ipc_server *s)
 	}
 	last_ns = now_ns;
 
+	// Large (one entry per slot) and only ever touched by the mainloop thread.
+	static struct ipc_service_health h;
 	os_mutex_lock(&s->global_state.lock);
-	uint32_t active = 0;
-	int32_t active_idx = s->global_state.active_client_index;
-	for (uint32_t i = 0; i < IPC_MAX_CLIENTS; i++) {
-		if (s->threads[i].state != IPC_THREAD_RUNNING && s->threads[i].state != IPC_THREAD_STARTING) {
-			continue;
-		}
-		volatile struct ipc_client_state *ics = &s->threads[i].ics;
-		const struct ipc_app_state *cs = (const struct ipc_app_state *)&ics->client_state;
-		const char *name = cs->info.application_name[0] ? cs->info.application_name : "?";
+	fill_health_locked(s, &h);
+
+	// The log lines below are grepped by peers: keep them byte-identical.
+	for (uint32_t k = 0; k < h.slot_count; k++) {
+		const struct ipc_service_health_slot *sl = &h.slots[k];
+		const char *name = sl->name[0] ? sl->name : "?";
 		// #960: the verified class ("APP" until describe_client has run).
-		const char *kind = ics->class_verified ? ipc_server_client_class_str(cs->client_class) : "unverified";
-		active++;
+		const char *kind = sl->class_verified ? ipc_server_client_class_str(sl->client_class) : "unverified";
 		U_LOG_W(
 		    "[HEALTH] slot=%u id=%u pid=%d class=%s name='%s' session=%c%c%c io=%c primary=%c%s "
 		    "swapchains=%u spaces=%u",
-		    i, cs->id, (int)cs->pid, kind, name, cs->session_active ? 'a' : '-',
-		    cs->session_visible ? 'v' : '-', cs->session_focused ? 'f' : '-', ics->io_active ? 'y' : 'n',
-		    cs->primary_application ? 'y' : 'n', ((int32_t)i == active_idx) ? " ACTIVE" : "",
-		    ics->swapchain_count, ics->space_count);
+		    sl->slot, sl->id, (int)sl->pid, kind, name, sl->session_active ? 'a' : '-',
+		    sl->session_visible ? 'v' : '-', sl->session_focused ? 'f' : (sl->input_focus_shared ? 's' : '-'),
+		    sl->io_active ? 'y' : 'n',
+		    sl->primary_application ? 'y' : 'n', ((int32_t)sl->slot == h.active_idx) ? " ACTIVE" : "",
+		    sl->swapchain_count, sl->space_count);
 	}
-	// #961: who holds the PANEL LEASE — the controller while one is connected,
-	// else (default policy) the focused client, else nobody.
 	char lease[32];
-	if (controller_connected_locked(s)) {
-		snprintf(lease, sizeof(lease), "controller");
-	} else if (active_idx >= 0) {
-		snprintf(lease, sizeof(lease), "slot=%d", active_idx);
-	} else {
-		snprintf(lease, sizeof(lease), "none");
+	switch (h.lease) {
+	case IPC_SERVICE_LEASE_CONTROLLER: snprintf(lease, sizeof(lease), "controller"); break;
+	case IPC_SERVICE_LEASE_SLOT: snprintf(lease, sizeof(lease), "slot=%d", h.lease_slot); break;
+	default: snprintf(lease, sizeof(lease), "none"); break;
 	}
-	// #1002: name the device state here too. A lost device makes every client
-	// fail identically and silently; one word in the summary line is the
-	// difference between "why is everything black" and a known cause.
-	const char *device_state = "ok";
-	// Same idea for the vendor display processor's BACKEND: the vendor platform
-	// service can restart underneath us, after which a DP that cannot reconnect
-	// keeps returning successful-but-stale eye positions and every app weaves
-	// untracked. "degraded" = the DP is reconnecting, "stale" = it cannot and
-	// the compositor is recreating it.
+	const char *device_state = h.device_removed ? "REMOVED" : "ok";
 	const char *dp_state = "n/a";
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
-	if (s->xsysc != NULL && comp_d3d11_service_device_is_removed(s->xsysc)) {
-		device_state = "REMOVED";
-	}
-	if (s->xsysc != NULL) {
-		switch (comp_d3d11_service_dp_backend_state(s->xsysc)) {
+	if (h.dp_state_known) {
+		switch (h.dp_backend_state) {
 		case XRT_DP_BACKEND_STATE_DEGRADED: dp_state = "degraded"; break;
 		case XRT_DP_BACKEND_STATE_STALE: dp_state = "stale"; break;
 		default: dp_state = "ok"; break;
 		}
 	}
 #endif
-	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s dp=%s window_s=%ld", active, s->max_clients,
-	        active_idx, lease, device_state, dp_state, period_ms / 1000);
+	U_LOG_W("[HEALTH] clients=%u/%u active_idx=%d lease=%s device=%s dp=%s window_s=%ld", h.slot_count,
+	        h.max_clients, h.active_idx, lease, device_state, dp_state, period_ms / 1000);
 	os_mutex_unlock(&s->global_state.lock);
 }
 
@@ -733,6 +928,314 @@ repull_display_info_if_unknown(struct ipc_server *s)
 	// until they reconnect. See docs/reference/xrt_plugin_iface.md.
 }
 
+#ifndef XRT_OS_ANDROID
+/*
+ *
+ * ADR-045 R-c: world-event display re-probe + adoption restart.
+ *
+ * Selection used to be re-evaluated only on CLIENT events (connect,
+ * compositor create, the #1721 1 Hz pull while the display info is unknown).
+ * A display plugged in, a vendor platform coming up, or a plug-in registered
+ * while no client happened to connect went unnoticed until the next app
+ * launch. The service host now reports world events through
+ * ipc_server_request_display_reprobe(); a small worker debounces them and runs
+ * the same refresh callback the client paths use, plus a slow timer while the
+ * fallback plug-in is active (its platform may come up without any event we
+ * can see). The refresh itself never swaps away from a non-fallback plug-in
+ * (target_plugin_refresh_active, "no live swap").
+ *
+ * The worker deliberately does NOT take global_state.lock: a plug-in that
+ * predates the ~100 ms probe rule can block inside probe() for many seconds,
+ * and the main loop takes that lock every tick. The refresh callback guards
+ * its own state (loader + display-info mutexes), exactly as on the
+ * compositor-create path, which also calls it without the global lock.
+ *
+ */
+
+//! Bursts of world events (a dock connecting fires several DEVNODES_CHANGED +
+//! DISPLAYCHANGE) collapse into one refresh this long after the last of them.
+#define REPROBE_DEBOUNCE_NS ((uint64_t)U_TIME_1S_IN_NS)
+//! Slow re-probe cadence while the fallback plug-in is the active one.
+#define REPROBE_FALLBACK_PERIOD_NS ((uint64_t)10 * U_TIME_1S_IN_NS)
+//! An adoption restart waits for this much continuous idleness, so a client
+//! that is just reconnecting is not raced.
+#define ADOPTION_RESTART_IDLE_NS ((uint64_t)2 * U_TIME_1S_IN_NS)
+
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+/*!
+ * #2218 item 6: hand the system's screens (with the DP registry as it stands
+ * now) to the multi system compositor, whose XR_DXR_weave present-owner
+ * engines weave each window with the display processor of every screen it
+ * covers. At start-up and after every re-probe; a call that changes nothing
+ * leaves the live engines alone.
+ */
+static void
+multi_weave_screens_refresh(struct ipc_server *s)
+{
+	if (s == NULL || s->xinst == NULL || s->xsysc == NULL) {
+		return;
+	}
+	struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (list != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+		comp_multi_system_set_screens(s->xsysc, list);
+	}
+	free(list);
+}
+
+//! The display-topology generation the weave engines' table was last refreshed for.
+static uint64_t g_weave_screens_display_generation = 0;
+
+/*!
+ * #2218 item 6: the in-process display hotplug sweep (target_display_hotplug,
+ * ADR-047 Amendment 8 — on by default on macOS, where the service has no
+ * other display-change source) publishes a new screen table by moving the
+ * display-topology generation; nothing else tells the weave engines. Polled
+ * from the main loop: one mutex read per tick, a refresh only when it moved.
+ * The sweep never moves it for an EDID physical-size refinement alone
+ * (#2097), and comp_multi_system_set_screens keeps that rule too.
+ */
+static void
+multi_weave_screens_follow_generation(struct ipc_server *s)
+{
+	if (s == NULL || s->xinst == NULL || s->xsysc == NULL) {
+		return;
+	}
+	const uint64_t gen = xrt_instance_get_display_generation(s->xinst);
+	if (gen == g_weave_screens_display_generation) {
+		return;
+	}
+	const bool first = g_weave_screens_display_generation == 0;
+	g_weave_screens_display_generation = gen;
+	if (!first) {
+		U_LOG_I("weave(#2218): display topology generation %llu — refreshing the present-owner screen table",
+		        (unsigned long long)gen);
+		multi_weave_screens_refresh(s);
+	}
+}
+#endif
+
+static struct os_mutex g_reprobe_mutex;
+static struct os_cond g_reprobe_cond;
+static struct os_thread g_reprobe_thread;
+static volatile bool g_reprobe_active = false; //!< worker accepting requests
+static bool g_reprobe_stop = false;            //!< guarded by g_reprobe_mutex
+static bool g_reprobe_pending = false;         //!< guarded by g_reprobe_mutex
+static const char *g_reprobe_reason = NULL;    //!< guarded by g_reprobe_mutex
+static uint64_t g_reprobe_last_request_ns = 0; //!< guarded by g_reprobe_mutex
+
+static bool g_allow_adoption_restart = false;
+static volatile bool g_restart_requested = false;
+
+void
+ipc_server_request_display_reprobe(const char *reason)
+{
+	if (!g_reprobe_active) {
+		return;
+	}
+	os_mutex_lock(&g_reprobe_mutex);
+	g_reprobe_pending = true;
+	g_reprobe_reason = reason;
+	g_reprobe_last_request_ns = os_monotonic_get_ns();
+	os_cond_signal(&g_reprobe_cond);
+	os_mutex_unlock(&g_reprobe_mutex);
+}
+
+bool
+ipc_server_restart_requested(void)
+{
+	return g_restart_requested;
+}
+
+static void
+reprobe_run(struct ipc_server *s, const char *reason, bool world_event)
+{
+	if (s->xsysc == NULL || s->xsysc->info.refresh_display_processors == NULL) {
+		return;
+	}
+	U_LOG_I("display re-probe (%s): re-evaluating display-processor selection.", reason != NULL ? reason : "?");
+	const bool was_fallback = s->xsysc->info.active_plugin_is_fallback;
+	// ADR-051 D6: what a topology bump below is judged against.
+	const uint64_t gen_before = xrt_instance_get_display_generation(s->xinst);
+	char plugin_before[sizeof(s->xsysc->info.active_plugin_id)];
+	(void)snprintf(plugin_before, sizeof(plugin_before), "%s", s->xsysc->info.active_plugin_id);
+	// Display dashboard phase 7: a per-screen DP preference may have been
+	// written since this process read the stores (`dp use --screen`, the
+	// dashboard) — re-read them before re-resolving.
+	u_setting_per_screen_reload();
+	// The world-event variant re-resolves the screen registry even while the
+	// active plug-in declines its display info (the monitor list itself moved).
+	if (world_event && s->xsysc->info.refresh_display_processors_world != NULL) {
+		s->xsysc->info.refresh_display_processors_world(&s->xsysc->info);
+	} else {
+		s->xsysc->info.refresh_display_processors(&s->xsysc->info);
+	}
+#if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// ...and hand the re-resolved screens to every client's segment manager:
+	// a screen whose plug-in changed gets its segment DP recreated (the
+	// session's primary DP never swaps live).
+	if (s->xinst != NULL && comp_d3d11_service_is_d3d11_service(s->xsysc)) {
+		struct xrt_screen_list *list = U_TYPED_CALLOC(struct xrt_screen_list);
+		if (list != NULL && xrt_instance_enumerate_displays(s->xinst, list) == XRT_SUCCESS) {
+			comp_d3d11_service_refresh_segment_screens(s->xsysc, list);
+			// ADR-052: the workspace's screen set (raises SCREENS_CHANGED on a change).
+			comp_d3d11_service_workspace_update_screens(s->xsysc, list, false);
+		}
+		free(list);
+	}
+#endif
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	// #2218 item 6: ...and to the desktop-Linux / macOS present-owner weave engines.
+	multi_weave_screens_refresh(s);
+#endif
+	// ADR-051 D6: a re-probe is a topology event only when it changed the
+	// topology — the published screen table (its generation moved) or the
+	// active plug-in. The fallback timer re-probes every 10 s while the
+	// fallback plug-in is active; bumping unconditionally made every status
+	// watcher refetch an identical snapshot every 10 s. Anything else a
+	// status read can see move is caught by the status tick's own keys.
+	const bool screens_moved = xrt_instance_get_display_generation(s->xinst) != gen_before;
+	const bool plugin_moved = strncmp(plugin_before, s->xsysc->info.active_plugin_id, sizeof(plugin_before)) != 0 ||
+	                          was_fallback != s->xsysc->info.active_plugin_is_fallback;
+	if (screens_moved || plugin_moved) {
+		ipc_server_status_bump(s, true);
+		// #1961: a display's camera (and the screen it belongs to) follows now.
+		ipc_server_stereo_camera_rescan_soon(s->stereo_camera);
+	}
+	if (was_fallback && !s->xsysc->info.active_plugin_is_fallback) {
+		U_LOG_W("display re-probe (%s): adopted plug-in '%s' (was the fallback).",
+		        reason != NULL ? reason : "?", s->xsysc->info.active_plugin_id);
+	}
+}
+
+static void *
+reprobe_thread_func(void *ptr)
+{
+	struct ipc_server *s = (struct ipc_server *)ptr;
+	uint64_t last_fallback_ns = os_monotonic_get_ns();
+
+	os_mutex_lock(&g_reprobe_mutex);
+	while (!g_reprobe_stop) {
+		const uint64_t now = os_monotonic_get_ns();
+		const char *reason = NULL;
+		bool world_event = false;
+
+		if (g_reprobe_pending) {
+			const uint64_t since = now - g_reprobe_last_request_ns;
+			if (since < REPROBE_DEBOUNCE_NS) {
+				// Still inside a burst: wait for it to settle.
+				os_cond_wait_timeout_ns(&g_reprobe_cond, &g_reprobe_mutex, REPROBE_DEBOUNCE_NS - since);
+				continue;
+			}
+			reason = g_reprobe_reason;
+			g_reprobe_pending = false;
+			world_event = true;
+		} else if (s->xsysc != NULL && s->xsysc->info.active_plugin_is_fallback &&
+		           now - last_fallback_ns >= REPROBE_FALLBACK_PERIOD_NS) {
+			reason = "fallback timer";
+		}
+
+		if (reason == NULL) {
+			os_cond_wait_timeout_ns(&g_reprobe_cond, &g_reprobe_mutex, U_TIME_1S_IN_NS);
+			continue;
+		}
+
+		os_mutex_unlock(&g_reprobe_mutex);
+		reprobe_run(s, reason, world_event);
+		last_fallback_ns = os_monotonic_get_ns();
+		os_mutex_lock(&g_reprobe_mutex);
+	}
+	os_mutex_unlock(&g_reprobe_mutex);
+	return NULL;
+}
+
+static void
+reprobe_start(struct ipc_server *s)
+{
+	if (os_mutex_init(&g_reprobe_mutex) != 0) {
+		return;
+	}
+	if (os_cond_init(&g_reprobe_cond) != 0) {
+		os_mutex_destroy(&g_reprobe_mutex);
+		return;
+	}
+	g_reprobe_stop = false;
+	if (os_thread_init(&g_reprobe_thread) != 0 ||
+	    os_thread_start(&g_reprobe_thread, reprobe_thread_func, (void *)s) != 0) {
+		U_LOG_W(
+		    "display re-probe worker could not start; only client events will re-probe display "
+		    "selection.");
+		return;
+	}
+	os_thread_name(&g_reprobe_thread, "dxr-reprobe");
+	g_reprobe_active = true;
+}
+
+static void
+reprobe_stop(void)
+{
+	if (!g_reprobe_active) {
+		return;
+	}
+	g_reprobe_active = false;
+	os_mutex_lock(&g_reprobe_mutex);
+	g_reprobe_stop = true;
+	os_cond_signal(&g_reprobe_cond);
+	os_mutex_unlock(&g_reprobe_mutex);
+	// Bounded by one in-flight refresh. The mutex/cond are intentionally not
+	// destroyed: a world-event source on another thread may still be between
+	// its g_reprobe_active check and the lock, and the process exits next.
+	os_thread_join(&g_reprobe_thread);
+	os_thread_destroy(&g_reprobe_thread);
+}
+
+/*!
+ * Main-loop half of a complete adoption (ADR-045): a refresh adopted a better
+ * plug-in, but the system's head device still belongs to the previous one.
+ * Once no client has been connected for ADOPTION_RESTART_IDLE_NS, end the
+ * main loop and let the host start a successor whose system is built on the
+ * new plug-in. Clients connected meanwhile keep running on the weaving DP and
+ * display info that already switched; they pick up the complete system when
+ * they reconnect after the restart.
+ */
+static void
+maybe_request_adoption_restart(struct ipc_server *s)
+{
+	if (s->xsysc == NULL || !s->xsysc->info.head_device_stale || g_restart_requested) {
+		return;
+	}
+	static uint64_t idle_since_ns = 0;
+	static bool warned_disallowed = false;
+	if (!g_allow_adoption_restart) {
+		if (!warned_disallowed) {
+			warned_disallowed = true;
+			U_LOG_W(
+			    "plug-in adoption is partial (head device from the previous plug-in) and this instance "
+			    "will not restart itself for it; restart the service for a complete adoption.");
+		}
+		return;
+	}
+	os_mutex_lock(&s->global_state.lock);
+	const uint32_t clients = s->global_state.connected_client_count;
+	os_mutex_unlock(&s->global_state.lock);
+	const uint64_t now = os_monotonic_get_ns();
+	if (clients != 0) {
+		idle_since_ns = 0;
+		return;
+	}
+	if (idle_since_ns == 0) {
+		idle_since_ns = now;
+		return;
+	}
+	if (now - idle_since_ns < ADOPTION_RESTART_IDLE_NS) {
+		return;
+	}
+	U_LOG_W("plug-in adoption: no client connected — restarting the service so the head device follows '%s'.",
+	        s->xsysc->info.active_plugin_id);
+	g_restart_requested = true;
+	s->running = false;
+}
+#endif // !XRT_OS_ANDROID
+
 static int
 main_loop(struct ipc_server *s)
 {
@@ -769,12 +1272,23 @@ main_loop(struct ipc_server *s)
 		// #962: mirror the compositor's focus into the IPC layer (controller policy).
 		sync_focus_from_compositor(s);
 
+#if (defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)) && !defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+		// #2218 item 6: a hotplug the in-process sweep published reaches the
+		// present-owner weave engines.
+		multi_weave_screens_follow_generation(s);
+#endif
+
 		// #951: per-client health snapshot, throttled.
 		emit_health_if_elapsed(s);
 
 		// #1721: ~1 Hz display-info re-pull while the plug-in has not
 		// identified the panel yet; a no-op once it has.
 		repull_display_info_if_unknown(s);
+
+#ifndef XRT_OS_ANDROID
+		// ADR-045: complete a partial plug-in adoption by restarting when idle.
+		maybe_request_adoption_restart(s);
+#endif
 
 #ifdef XRT_OS_ANDROID
 		// #1278: drive the visibility/weave-idle convergent pass from THIS
@@ -788,6 +1302,14 @@ main_loop(struct ipc_server *s)
 
 		// Check polling.
 		ipc_server_mainloop_poll(s, &s->ml);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+		// #2515: the systemd watchdog is fed from THIS loop, never from a timer
+		// thread, so a main loop that wedges stops the pings and systemd kills
+		// the service (socket activation then starts a fresh one). Rate-limited
+		// to half of WatchdogSec inside; a no-op when not under a watchdog.
+		u_sd_notify_watchdog_tick(os_monotonic_get_ns());
+#endif
 	}
 
 	return 0;
@@ -902,7 +1424,7 @@ compositor_focused_xc(struct ipc_server *s)
 {
 #if defined(XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
 	return s->xsysc != NULL ? comp_d3d11_service_get_focused_xc(s->xsysc) : NULL;
-#elif defined(XRT_OS_MACOS)
+#elif defined(COMP_MULTI_SHARED_SURFACE)
 	(void)s;
 	return comp_multi_workspace_get_focused_client();
 #else
@@ -1004,9 +1526,74 @@ handle_focused_client_events(volatile struct ipc_client_state *ics, int active_i
 	ics->client_state.session_focused = focused;
 	ics->client_state.z_order = z_order;
 
+	/*
+	 * Input focus follows the APPLICATION, not the connection (#962 follow-up,
+	 * ipc_app_group.h). A connection that is not the focused one but belongs
+	 * to the focused client's application — same declared name, same process
+	 * tree — gets its device reads (actions, hand tracking) while the sibling
+	 * is focused. The browser presents from its GPU process and owns the hand
+	 * trackers from the browser process; without this the trackers' session
+	 * was VISIBLE, never FOCUSED, and every joint set came back inactive.
+	 * What is shared: the input gate (client_input_allowed) and, #2262, the
+	 * SESSION STATE the sibling's app sees — OpenXR lets xrSyncActions act
+	 * only in XR_SESSION_STATE_FOCUSED, so a sibling left at VISIBLE got hand
+	 * joints but no action state. The compositor's own bookkeeping is NOT
+	 * touched: it still sees the sibling as focused=false (the panel lease,
+	 * the presenter and the workspace's focused slot key off that), and the
+	 * FOCUSED event is pushed by the server straight into the sibling's
+	 * session below.
+	 */
+	bool shared = false;
+	if (!focused && active_id >= 0 && active_id < (int)IPC_MAX_CLIENTS && ics->server_thread_index != active_id &&
+	    ics->class_verified) {
+		volatile struct ipc_client_state *act = &ics->server->threads[active_id].ics;
+		if (act->server_thread_index >= 0 && act->class_verified) {
+			shared = ipc_app_group_same((const char *)ics->client_state.info.application_name,
+			                            (const char *)ics->peer_exe_path, ics->peer_pid, ics->peer_parent_pid,
+			                            (const char *)act->client_state.info.application_name,
+			                            (const char *)act->peer_exe_path, act->peer_pid, act->peer_parent_pid);
+		}
+	}
+	if (shared != ics->input_focus_shared) {
+		ics->input_focus_shared = shared;
+		// Lifecycle (a focus change), never per frame.
+		U_LOG_W("input focus: client id=%u pid=%ld ('%s') %s the focused client's application — device reads %s",
+		        ics->client_state.id, ics->peer_pid, (const char *)ics->client_state.info.application_name,
+		        shared ? "is a sibling connection of" : "is no longer a sibling connection of",
+		        shared ? "live (shared input focus)" : "gated by its own focus again");
+	}
+
 	if (ics->xc != NULL) {
 		xrt_syscomp_set_state(ics->server->xsysc, ics->xc, visible, focused);
 		xrt_syscomp_set_z_order(ics->server->xsysc, ics->xc, z_order);
+	}
+
+	/*
+	 * #2262: a shared sibling's app must see FOCUSED (xrSyncActions is a no-op
+	 * at VISIBLE) while the compositor keeps seeing it as unfocused. The
+	 * compositor's set_state above pushes its own {visible, false} only when
+	 * ITS cached state changes, so the server adds the app-facing event here:
+	 * FOCUSED when the sharing starts (or visible flips while it lasts),
+	 * back to the compositor's truth when it ends. Idempotent across flushes.
+	 */
+	if (ics->xs != NULL && !focused) {
+		union xrt_session_event xse = XRT_STRUCT_INIT;
+		xse.type = XRT_SESSION_EVENT_STATE_CHANGE;
+		xse.state.visible = visible;
+		if (shared && (!ics->shared_focus_event_sent || ics->shared_focus_event_visible != visible)) {
+			xse.state.focused = true;
+			(void)u_session_event_push((struct u_session *)ics->xs, &xse);
+			ics->shared_focus_event_sent = true;
+			ics->shared_focus_event_visible = visible;
+		} else if (!shared && ics->shared_focus_event_sent) {
+			xse.state.focused = false;
+			(void)u_session_event_push((struct u_session *)ics->xs, &xse);
+			ics->shared_focus_event_sent = false;
+		}
+	} else if (ics->shared_focus_event_sent) {
+		// The connection became the focused one itself (or lost its session):
+		// the compositor's event now carries FOCUSED; nothing of ours to undo.
+		ics->shared_focus_event_sent = false;
 	}
 }
 
@@ -1348,6 +1935,16 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	long peer_pid = ipc_server_derive_peer_pid(ipc_handle, &peer_create_ns);
 	unsigned long orch_pid = ipc_server_get_orchestrator_workspace_pid();
 
+	// ADR-034 Am.5 (#2181): the per-app input key from the PEER process, resolved
+	// here — outside the global lock, since it opens the process.
+	char input_exe[XRT_INPUT_EXE_BASENAME_SIZE] = {0};
+	{
+		char exe_path[512];
+		if (peer_pid != 0 && ipc_server_peer_exe_path(peer_pid, exe_path, sizeof(exe_path))) {
+			(void)u_exe_basename_from_path(exe_path, input_exe, sizeof(input_exe));
+		}
+	}
+
 	os_mutex_lock(&vs->global_state.lock);
 
 	// #959: runtime-admitted cap with a reserved controller slot. A client whose
@@ -1387,6 +1984,8 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 
 	// Increment the connected client counter
 	vs->global_state.connected_client_count++;
+	// ADR-051: a connect is a status event (leaf lock; safe under this one).
+	ipc_server_status_bump(vs, false);
 
 	// A client connected, so we're no longer in a delayed exit state
 	// (The delay thread will still check the client count before exiting)
@@ -1448,11 +2047,20 @@ ipc_server_handle_client_connected(struct ipc_server *vs, xrt_ipc_handle_t ipc_h
 	// browser#103 RC-1: the opener IS the peer until (and unless) a declaration
 	// says otherwise; it stays the authoriser after one is accepted.
 	ics->opener_pid = peer_pid;
+	// Stereo camera A2 (Android): the opener's uid (SO_PEERCRED; -1 elsewhere / unknown).
+#ifdef XRT_OS_WINDOWS
+	ics->peer_uid = -1;
+#else
+	ics->peer_uid = ipc_server_derive_peer_uid(ipc_handle);
+#endif
+	ics->last_weave_ns = 0;
 	ics->imc.ipc_handle = ipc_handle;
 	ics->imc.dup_target_pid = 0;
 	ics->server = vs;
 	ics->server_thread_index = cs_index;
 	ics->io_active = true;
+	// ADR-034 Am.5 (#2181): the per-app key, resolved before the lock was taken.
+	memcpy((char *)ics->input_exe_basename, input_exe, sizeof(input_exe));
 
 	ics->plane_detection_size = 0;
 	ics->plane_detection_count = 0;
@@ -1556,11 +2164,33 @@ ipc_server_main(int argc, char **argv, const struct ipc_server_main_info *ismi)
 	// Print a very clear service started message.
 	print_linux_end_user_started_information(log_level);
 #endif
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the unit is Type=simple, for which systemd ignores READY=1; it is
+	// sent anyway so the unit could become Type=notify without a code change.
+	(void)u_sd_notify_send("READY=1");
+#endif
+	// ADR-045 R-c: world-event re-probe worker (the service host feeds it).
+	g_allow_adoption_restart = ismi->allow_adoption_restart;
+	reprobe_start(s);
+
 	// Main loop.
 	ret = main_loop(s);
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: the exit path starts here. STOPPING=1 moves the unit to
+	// "deactivating", which ends the watchdog and arms TimeoutStopSec=, so a
+	// teardown or exit() that hangs (a plug-in destructor, an SDK crash handler
+	// deadlocked in malloc) is killed instead of holding the activated socket.
+	(void)u_sd_notify_send("STOPPING=1");
+#endif
+
+	reprobe_stop();
+
 	// Stop the UI before tearing everything down.
 	u_debug_gui_stop(&s->debug_gui);
+
+	// Client threads use the lock and the compositor teardown_all() destroys.
+	join_client_threads(s);
 
 	// Done after UI stopped.
 	teardown_all(s);
@@ -1603,6 +2233,7 @@ ipc_server_main_android(struct ipc_server **ps, void (*startup_complete_callback
 
 	ret = main_loop(s);
 
+	join_client_threads(s);
 	teardown_all(s);
 	free(s);
 

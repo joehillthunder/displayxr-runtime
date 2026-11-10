@@ -16,7 +16,26 @@ if [ -f "$AGENT" ]; then
     fi
     sudo rm -f "$AGENT"
 fi
+# Desktop-capture helper (#2264): same order — agent first, then the process.
+CAPTURE_AGENT="/Library/LaunchAgents/com.displayxr.desktop-capture.plist"
+if [ -f "$CAPTURE_AGENT" ]; then
+    echo "Stopping + removing DisplayXR desktop-capture LaunchAgent..."
+    CONSOLE_USER="$(stat -f%Su /dev/console 2>/dev/null || true)"
+    if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+        CONSOLE_UID="$(id -u "$CONSOLE_USER" 2>/dev/null || true)"
+        [ -n "$CONSOLE_UID" ] && launchctl bootout "gui/$CONSOLE_UID/com.displayxr.desktop-capture" 2>/dev/null || true
+    fi
+    sudo rm -f "$CAPTURE_AGENT"
+fi
+pkill -x DisplayXRDesktopCapture 2>/dev/null || true
+# Forget the helper's Screen Recording grant and its one-time-prompt marker, so
+# a later reinstall asks again instead of silently staying NOT_GRANTED. Both
+# are per-user state: run as the invoking user, not via sudo.
+tccutil reset ScreenCapture com.displayxr.desktop-capture >/dev/null 2>&1 || true
+rm -f "$HOME/Library/Application Support/DisplayXR/desktop-capture-prompted"
 pkill -x displayxr-service 2>/dev/null || true
+pkill -x displayxr-conversion-host 2>/dev/null || true
+pkill -x displayxr-tracking-host 2>/dev/null || true
 
 echo "Removing DisplayXR runtime..."
 # This recursive delete covers the runtime dylib, the
@@ -26,6 +45,11 @@ echo "Removing DisplayXR runtime..."
 # Support/DisplayXR/DisplayProcessors/ are intentionally left alone —
 # those are user-owned dev-iteration state.
 sudo rm -rf "/Library/Application Support/DisplayXR"
+
+# The postinstall's /usr/local/bin/displayxr-cli link — only if it is ours.
+case "$(readlink /usr/local/bin/displayxr-cli 2>/dev/null || true)" in
+    "/Library/Application Support/DisplayXR/"*) sudo rm -f /usr/local/bin/displayxr-cli ;;
+esac
 
 echo "Removing OpenXR runtime registration..."
 # The postinstall registers active_runtime.json in both the XDG config dir and

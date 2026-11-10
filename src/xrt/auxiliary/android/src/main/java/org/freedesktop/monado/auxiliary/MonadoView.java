@@ -20,6 +20,7 @@ import android.hardware.display.DisplayManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -191,7 +192,11 @@ public class MonadoView extends SurfaceView
             systemUiController = new SystemUiController(activity.getWindow().getDecorView());
             systemUiController.hide();
             pinDisplayModeIfRequested(activity);
+            applySustainedPerformanceIfRequested(activity);
             registerHostDestroyHook(activity);
+        } else if (isSustainedPerfRequested() && !sustainedPerfOverlaySkipLogged) {
+            sustainedPerfOverlaySkipLogged = true;
+            Log.w(TAG, "MonadoView: debug.dxr.sustained_perf=1 but this is a service-owned overlay (no host Activity); skipped (#1917)");
         }
         SurfaceHolder surfaceHolder = getHolder();
         surfaceHolder.addCallback(this);
@@ -229,10 +234,81 @@ public class MonadoView extends SurfaceView
             // so raw-vs-local on a REAL drag measures the scale. Free — we already see
             // every event here.
             miniLayout.measureTouchScale(event);
+            // #132: the runtime's own input path. The hosted view is the ONE surface
+            // the runtime owns in-process, so this is where its touch provider's
+            // events come from; the app still gets every event below, unchanged.
+            publishTouchToNative(event);
             hostActivity.dispatchTouchEvent(event);
             return true; // claim the gesture so we keep receiving MOVE/UP
         }
         return super.onTouchEvent(event);
+    }
+
+    // ---------------------------------------------------------------- touch -> native (#132)
+
+    /** Set once {@link #nativeTouchEvent} fails to link (older runtime .so): stop trying. */
+    private boolean touchNativeUnavailable = false;
+
+    /**
+     * Feed one MotionEvent into the runtime's pointer-event queue
+     * ({@code u_pointer_sink}, read by the touch input provider), as one platform-neutral
+     * event PER POINTER: a MOVE carries every finger, so it is unrolled; a POINTER_DOWN / UP
+     * names its own finger. Coordinates are view-local pixels with the view's extent, so the
+     * provider can normalise without knowing where the window sits. Only the in-process hosted
+     * view (host Activity + native counterpart) reports; the service-owned overlay and the weave
+     * satellite have no host Activity and are excluded, exactly like the window rect (#1367).
+     */
+    private void publishTouchToNative(android.view.MotionEvent event) {
+        if (touchNativeUnavailable || !reportsRectToNative()) {
+            return;
+        }
+        final long ptr = nativeCounterpart.getNativePointer();
+        final int w = getWidth();
+        final int h = getHeight();
+        final long tNs = event.getEventTime() * 1_000_000L; // uptimeMillis == CLOCK_MONOTONIC
+        final int masked = event.getActionMasked();
+        final int count = event.getPointerCount();
+        try {
+            switch (masked) {
+                case android.view.MotionEvent.ACTION_DOWN:
+                case android.view.MotionEvent.ACTION_POINTER_DOWN:
+                    {
+                        final int i = event.getActionIndex();
+                        final int id = event.getPointerId(i);
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 1, id, x, y, count, w, h, tNs);
+                        break;
+                    }
+                case android.view.MotionEvent.ACTION_MOVE:
+                    for (int i = 0; i < count; i++) {
+                        final int id = event.getPointerId(i);
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 2, id, x, y, count, w, h, tNs);
+                    }
+                    break;
+                case android.view.MotionEvent.ACTION_UP:
+                case android.view.MotionEvent.ACTION_POINTER_UP:
+                    {
+                        final int i = event.getActionIndex();
+                        final int id = event.getPointerId(i);
+                        final int left = count - 1;
+                        final float x = event.getX(i);
+                        final float y = event.getY(i);
+                        nativeTouchEvent(ptr, 3, id, x, y, left, w, h, tNs);
+                        break;
+                    }
+                case android.view.MotionEvent.ACTION_CANCEL:
+                    nativeTouchEvent(ptr, 4, 0, 0f, 0f, 0, w, h, tNs);
+                    break;
+                default:
+                    break;
+            }
+        } catch (UnsatisfiedLinkError e) {
+            touchNativeUnavailable = true;
+            Log.w(TAG, "nativeTouchEvent not registered; touch stays with the app only (#132)", e);
+        }
     }
 
     @Override
@@ -840,6 +916,22 @@ public class MonadoView extends SurfaceView
             long nativePointer, int x, int y, int w, int h, int displayId, int dispW, int dispH);
 
     /**
+     * Registered by native code like {@link #nativeWindowRectChanged} (#132). {@code action} is
+     * the platform-neutral {@code xrt_input_pointer_action}: 1 down, 2 move, 3 up, 4 cancel;
+     * {@code count} is the number of pointers down AFTER the event.
+     */
+    private static native void nativeTouchEvent(
+            long nativePointer,
+            int action,
+            int pointerId,
+            float x,
+            float y,
+            int count,
+            int surfaceW,
+            int surfaceH,
+            long eventTimeNs);
+
+    /**
      * #558 P3: make this service-owned overlay declare an explicit touchable Region via the hidden
      * ViewTreeObserver.addOnComputeInternalInsetsListener API, instead of FLAG_NOT_TOUCHABLE.
      *
@@ -1063,6 +1155,7 @@ public class MonadoView extends SurfaceView
      */
     @Keep
     public static void removeFromWindow(@NonNull MonadoView view) {
+        view.clearSustainedPerformance();
         view.unregisterHostDestroyHook();
         view.detachFromWindow();
     }
@@ -1167,6 +1260,7 @@ public class MonadoView extends SurfaceView
                             return;
                         }
                         Log.i(TAG, "Host activity destroyed — removing the hosted window (#1389)");
+                        clearSustainedPerformance();
                         unregisterHostDestroyHook();
                         detachFromWindow();
                     }
@@ -1479,6 +1573,93 @@ public class MonadoView extends SurfaceView
             // Never let a display-policy nicety take down session creation.
             Log.w(TAG, "MonadoView: display-mode pin failed: " + e);
         }
+    }
+
+    // ---------------------------------------------------------------- sustained perf (#1917)
+
+    /** Set once a service-owned overlay has logged that it skipped the sustained-perf request. */
+    private static boolean sustainedPerfOverlaySkipLogged = false;
+
+    /** True once setSustainedPerformanceMode(true) was applied to the host window. UI thread. */
+    private boolean sustainedPerfApplied = false;
+
+    /** Reads {@code debug.dxr.sustained_perf} ("1" = on) via the same hidden-API route as above. */
+    private static boolean isSustainedPerfRequested() {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            String v =
+                    (String) sp.getMethod("get", String.class)
+                            .invoke(null, "debug.dxr.sustained_perf");
+            return "1".equals(v);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Run on the UI thread: inline when already there, otherwise posted to the main looper. */
+    private static void runOnUiThread(@NonNull Runnable r) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            r.run();
+        } else {
+            new Handler(Looper.getMainLooper()).post(r);
+        }
+    }
+
+    /**
+     * EXPERIMENT (#1917), default OFF: ask for sustained-performance mode on the host window.
+     *
+     * <p>Measured on the Lume phone and the NP02J (Android 13, Adreno 740): the Power HAL has no
+     * ADPF hint sessions ({@code dumpsys performance_hint} → HAL Support: false), so
+     * {@code APerformanceHint_createSession} fails, and the msm-adreno-tz governor parks the GPU at
+     * 220 MHz (max 680) under a submit→wait app. Fixed-performance mode changed nothing; this is the
+     * last app-reachable lever. It trades peak clocks for a stable sustainable level, so it stays
+     * behind {@code debug.dxr.sustained_perf=1} until measured.
+     */
+    private void applySustainedPerformanceIfRequested(@NonNull final Activity activity) {
+        if (!isSustainedPerfRequested()) {
+            return;
+        }
+        runOnUiThread(
+                () -> {
+                    boolean supported = false;
+                    boolean applied = false;
+                    try {
+                        PowerManager pm =
+                                (PowerManager) activity.getSystemService(Context.POWER_SERVICE);
+                        supported = pm != null && pm.isSustainedPerformanceModeSupported();
+                        if (supported) {
+                            activity.getWindow().setSustainedPerformanceMode(true);
+                            applied = true;
+                            sustainedPerfApplied = true;
+                        }
+                    } catch (Exception e) {
+                        Log.w(TAG, "MonadoView: setSustainedPerformanceMode failed: " + e);
+                    }
+                    Log.w(TAG, "MonadoView: sustained-perf (#1917) supported="
+                            + (supported ? "yes" : "no") + " applied=" + (applied ? "yes" : "no")
+                            + " activity=" + activity.getClass().getName());
+                });
+    }
+
+    /** Undo {@link #applySustainedPerformanceIfRequested}; no-op unless it was applied. */
+    private void clearSustainedPerformance() {
+        final Activity activity = hostActivity;
+        if (activity == null) {
+            return;
+        }
+        runOnUiThread(
+                () -> {
+                    if (!sustainedPerfApplied) {
+                        return;
+                    }
+                    sustainedPerfApplied = false;
+                    try {
+                        activity.getWindow().setSustainedPerformanceMode(false);
+                        Log.w(TAG, "MonadoView: sustained-perf cleared (#1917)");
+                    } catch (Exception e) {
+                        Log.w(TAG, "MonadoView: clearing sustained-perf failed: " + e);
+                    }
+                });
     }
 
 }

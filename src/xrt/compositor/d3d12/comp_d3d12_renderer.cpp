@@ -13,8 +13,13 @@
 // #1602: the equirect2 HLSL, shared verbatim with both D3D11 paths. The ray /
 // sphere math is ~100 lines and must not be forked — see the header's preamble.
 #include "d3d_shared/comp_equirect2_shaders.h"
+// XR_DXR_cursor_depth v5: the runtime-drawn cursor quad (shared with D3D11).
+#include "d3d_shared/comp_cursor_shaders.h"
+#include "util/comp_cursor_look.h"
+#include "util/u_cursor_depth.h"
 
 #include "util/comp_layer_accum.h"
+#include "util/u_tiling.h"
 // #1580: the ONE per-view camera every layer type is projected through, plus
 // the composition policy (eye visibility, quad facing, the blend rule) that
 // goes with it. Shared across every backend so the answer cannot depend on
@@ -507,6 +512,11 @@ struct comp_d3d12_renderer
 	ID3D12RootSignature *flatten_root_signature;
 	ID3D12PipelineState *flatten_pso_premul;   // SrcBlend = ONE
 	ID3D12PipelineState *flatten_pso_straight; // SrcBlend = SRC_ALPHA
+	//! #1795 / ADR-044: the same two blends into the scratch's `_SRGB` RTV
+	//! (a D3D12 PSO bakes its RTV format), so the flatten blends in LINEAR
+	//! and the render target applies the OETF once, on write.
+	ID3D12PipelineState *flatten_pso_premul_srgb;
+	ID3D12PipelineState *flatten_pso_straight_srgb;
 	//! Shader-visible SRV heap for flatten source images — one slot per layer
 	//! draw (D3D12 consumes descriptors at GPU-execute time, so concurrent
 	//! draws in one cmd-list each need their own slot). Written fresh / frame.
@@ -533,6 +543,11 @@ struct comp_d3d12_renderer
 	//! frame without reallocating. d3d12_crop_atlas_for_dp rect-crops it out.
 	uint32_t atlas_alloc_width;
 	uint32_t atlas_alloc_height;
+
+	//! #2564: worst-case atlas extent across the device's modes; a grow adds
+	//! headroom up to it (u_tiling_grow_atlas_extent). 0 = no cap known.
+	uint32_t atlas_cap_width;
+	uint32_t atlas_cap_height;
 
 	/*!
 	 * #1264 heavy-d3d12 reroute: the atlas is an EXTERNAL, imported resource
@@ -581,8 +596,57 @@ struct comp_d3d12_renderer
 	//! byte-identically to the pre-#1589 renderer.
 	bool compose_active;
 
+	//! XR_DXR_swapchain_color_encoding: the raw fill of compose shadows
+	//! (renderer_fill_compose_shadows), built on first use.
+	struct
+	{
+		ID3D12RootSignature *root_signature;
+		ID3D12PipelineState *pso;
+		ID3D12DescriptorHeap *rtv_heap; //!< One CPU RTV, rewritten per slice
+		bool failed;
+		bool logged; //!< One WARN when a frame first composes through a shadow
+	} shadow;
+
+	//! Bumped once per frame; stamps compose-shadow fills.
+	uint64_t frame_serial;
+
 	//! @ref u_color_legacy_unorm_encoded, cached at create.
 	bool legacy_color;
+
+	/*!
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B) — the runtime-drawn
+	 * cursor. ZERO COST UNLESS REQUESTED: `frame.count` is 0 on every frame
+	 * of a session that never asked, and every resource below stays NULL
+	 * until the first frame that draws one. Shares the quad root signature
+	 * (SRV table + 32 root constants, static CLAMP sampler); its own pipeline
+	 * per RTV format, like every other atlas pipeline here (#1610).
+	 */
+	struct
+	{
+		//! This frame's cursor (set by the compositor, cleared after the pass).
+		struct comp_d3d12_cursor_quads frame;
+		//! [variant][target is the `_SRGB` compose target], no depth.
+		//! Variant: CURSOR_PSO_STRAIGHT / _STRAIGHT_LAYERED (the app's sprite,
+		//! straight alpha, Texture2D / Texture2DArray) or _PREMUL (the default
+		//! look, premultiplied - comp_cursor_look).
+		ID3D12PipelineState *pso[3][2];
+		bool failed; //!< creation failed once: never retried per frame
+		//! ADR-046 Amendment 2 B.7: the same three variants with the
+		//! crosstalk-softening pixel shader (DXR_SOFTEN, its parameters in
+		//! root constants 16..19). Built on the first frame that softens,
+		//! never for an on-glass cursor; a failure draws the cursor crisp.
+		ID3D12PipelineState *pso_soft[3][2];
+		bool soft_failed;
+		//! The default look's texture: TYPELESS storage, read through a UNORM
+		//! (fast path) or `_SRGB` (compose path) SRV. Rests in
+		//! PIXEL_SHADER_RESOURCE once uploaded.
+		ID3D12Resource *look_tex;
+		//! Its upload buffer, kept until the next upload: the GPU has
+		//! retired it by then (every commit resets the allocator first).
+		ID3D12Resource *look_upload;
+		uint64_t look_generation;
+		bool announced;
+	} cursor;
 };
 
 /*!
@@ -702,8 +766,11 @@ create_atlas_texture(struct comp_d3d12_renderer *r, ID3D12Device *device, uint32
 	// Content packs top-left; d3d12_crop_atlas_for_dp rect-crops it back out.
 	uint32_t content_w = r->tile_columns * width;       // Atlas: tile_columns views across
 	uint32_t content_h = r->tile_rows * r->view_height; // Atlas: tile_rows views tall
-	uint32_t alloc_w = content_w > r->atlas_alloc_width ? content_w : r->atlas_alloc_width;
-	uint32_t alloc_h = content_h > r->atlas_alloc_height ? content_h : r->atlas_alloc_height;
+	// #2564: a grow adds headroom (1.5x, 256 px aligned, capped at the
+	// worst case across modes) so a window resize drag does not reallocate on
+	// every step. The first allocation (nothing allocated yet) stays exact.
+	uint32_t alloc_w = u_tiling_grow_atlas_extent(r->atlas_alloc_width, content_w, r->atlas_cap_width);
+	uint32_t alloc_h = u_tiling_grow_atlas_extent(r->atlas_alloc_height, content_h, r->atlas_cap_height);
 
 	D3D12_HEAP_PROPERTIES heap_props = {};
 	heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -931,6 +998,302 @@ renderer_target_rtv(struct comp_d3d12_renderer *r)
 	return rtv;
 }
 
+/*
+ * XR_DXR_swapchain_color_encoding — compose shadows.
+ *
+ * A swapchain image the app declared display-encoded is read like an `_SRGB`
+ * one. On the fast path that needs nothing (its values reach the encoded
+ * atlas raw); a COMPOSING frame needs them decoded on sample, and a 10/16-bit
+ * format has no `_SRGB` view to do it. Such an image is first copied raw into
+ * an 8-bit TYPELESS shadow (a UNORM view in, a UNORM target out: no transfer
+ * function), and the layer then samples the shadow through its `_SRGB` view,
+ * so the decode is the hardware's like every other `_SRGB` source (ADR-044 §3).
+ *
+ * The shadow hangs off the image as private data, so it lives exactly as long
+ * as the image; a second private-data stamp records the frame it was filled
+ * in, so an image two views share is filled once.
+ */
+
+// {5A9D2C17-8E43-4B61-9F0D-3C7E1A6B2D84}
+static const GUID kDxrComposeShadowGuid = {
+    0x5a9d2c17, 0x8e43, 0x4b61, {0x9f, 0x0d, 0x3c, 0x7e, 0x1a, 0x6b, 0x2d, 0x84}};
+// {B04E6F38-21C9-4D7A-8E5B-9A1F3C2D7E60}
+static const GUID kDxrComposeShadowStampGuid = {
+    0xb04e6f38, 0x21c9, 0x4d7a, {0x8e, 0x5b, 0x9a, 0x1f, 0x3c, 0x2d, 0x7e, 0x60}};
+
+static const char *const shadow_fill_source = R"(
+cbuffer ShadowFillCB : register(b0)
+{
+    uint slice;
+};
+
+Texture2DArray source : register(t0);
+
+void vs_main(uint id : SV_VertexID, out float4 position : SV_Position)
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    position = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+
+float4 ps_main(float4 position : SV_Position) : SV_Target
+{
+    return source.Load(int4(position.xy, slice, 0));
+}
+)";
+
+static bool
+renderer_ensure_shadow_fill(struct comp_d3d12_renderer *r, ID3D12Device *device)
+{
+	if (r->shadow.pso != nullptr) {
+		return true;
+	}
+	if (r->shadow.failed) {
+		return false;
+	}
+
+	D3D12_DESCRIPTOR_RANGE range = {};
+	range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+	range.NumDescriptors = 1;
+	range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+	D3D12_ROOT_PARAMETER params[2] = {};
+	params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+	params[0].DescriptorTable.NumDescriptorRanges = 1;
+	params[0].DescriptorTable.pDescriptorRanges = &range;
+	params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+	params[1].Constants.Num32BitValues = 1;
+	params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+	D3D12_ROOT_SIGNATURE_DESC rs_desc = {};
+	rs_desc.NumParameters = 2;
+	rs_desc.pParameters = params;
+
+	ID3DBlob *sig = nullptr, *errors = nullptr, *vs = nullptr, *ps = nullptr;
+	bool ok = SUCCEEDED(D3D12SerializeRootSignature(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &errors)) &&
+	          SUCCEEDED(device->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+	                                                IID_PPV_ARGS(&r->shadow.root_signature))) &&
+	          SUCCEEDED(compile_shader(shadow_fill_source, "vs_main", "vs_5_0", &vs)) &&
+	          SUCCEEDED(compile_shader(shadow_fill_source, "ps_main", "ps_5_0", &ps));
+	if (ok) {
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+		pso.pRootSignature = r->shadow.root_signature;
+		pso.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+		pso.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+		pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		pso.SampleMask = UINT_MAX;
+		pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		pso.RasterizerState.DepthClipEnable = TRUE;
+		pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		pso.NumRenderTargets = 1;
+		pso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+		pso.SampleDesc.Count = 1;
+		D3D12_DESCRIPTOR_HEAP_DESC heap = {};
+		heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		heap.NumDescriptors = 1;
+		ok = SUCCEEDED(device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&r->shadow.pso))) &&
+		     SUCCEEDED(device->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&r->shadow.rtv_heap)));
+	}
+	for (ID3DBlob *blob : {sig, errors, vs, ps}) {
+		if (blob != nullptr) {
+			blob->Release();
+		}
+	}
+	if (!ok) {
+		r->shadow.failed = true;
+		U_LOG_W(
+		    "XR_DXR_swapchain_color_encoding: compose shadow fill unavailable; deep encoded layers compose "
+		    "as if linear");
+	}
+	return ok;
+}
+
+//! The shadow of @p src, created on first use. Borrowed: @p src owns it.
+static ID3D12Resource *
+renderer_get_compose_shadow(ID3D12Device *device, ID3D12Resource *src)
+{
+	ID3D12Resource *shadow = nullptr;
+	UINT size = (UINT)sizeof(shadow);
+	if (SUCCEEDED(src->GetPrivateData(kDxrComposeShadowGuid, &size, &shadow)) && shadow != nullptr) {
+		shadow->Release(); // GetPrivateData added a reference; src keeps its own
+		return shadow;
+	}
+
+	const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+	D3D12_RESOURCE_DESC desc = {};
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = src_desc.Width;
+	desc.Height = src_desc.Height;
+	desc.DepthOrArraySize = src_desc.DepthOrArraySize;
+	desc.MipLevels = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	desc.SampleDesc.Count = 1;
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc,
+	                                           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+	                                           IID_PPV_ARGS(&shadow)))) {
+		return nullptr;
+	}
+	shadow->SetName(L"DXR.compose_shadow");
+	src->SetPrivateDataInterface(kDxrComposeShadowGuid, shadow);
+	shadow->Release(); // src holds it now
+	return shadow;
+}
+
+static D3D12_RESOURCE_BARRIER
+shadow_transition(ID3D12Resource *res, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	barrier.Transition.pResource = res;
+	barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	barrier.Transition.StateBefore = before;
+	barrier.Transition.StateAfter = after;
+	return barrier;
+}
+
+//! Fill @p src's shadow for this frame (once), raw.
+static void
+renderer_fill_compose_shadow(struct comp_d3d12_renderer *r,
+                             ID3D12GraphicsCommandList *cmd_list,
+                             ID3D12Device *device,
+                             ID3D12Resource *src)
+{
+	if (!renderer_ensure_shadow_fill(r, device)) {
+		return;
+	}
+	ID3D12Resource *shadow = renderer_get_compose_shadow(device, src);
+	if (shadow == nullptr) {
+		return;
+	}
+	uint64_t stamp = 0;
+	UINT size = (UINT)sizeof(stamp);
+	if (SUCCEEDED(shadow->GetPrivateData(kDxrComposeShadowStampGuid, &size, &stamp)) && stamp == r->frame_serial) {
+		return;
+	}
+	const uint32_t srv_slot = r->next_srv_slot++;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in compose shadow fill (slot %u >= %u)", srv_slot,
+		        r->srv_heap_size);
+		return;
+	}
+	shadow->SetPrivateData(kDxrComposeShadowStampGuid, (UINT)sizeof(r->frame_serial), &r->frame_serial);
+
+	const D3D12_RESOURCE_DESC desc = src->GetDesc();
+	if (!r->shadow.logged) {
+		r->shadow.logged = true;
+		U_LOG_W(
+		    "XR_DXR_swapchain_color_encoding: composing a display-encoded %ux%u x%u source through its "
+		    "8-bit shadow (no _SRGB view for its format)",
+		    (unsigned)desc.Width, (unsigned)desc.Height, (unsigned)desc.DepthOrArraySize);
+	}
+
+	// The image's non-decoding view in, the shadow's UNORM view out.
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+	srv.Format = comp_d3d12_swapchain_sample_format(src);
+	srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+	srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srv.Texture2DArray.MipLevels = 1;
+	srv.Texture2DArray.ArraySize = desc.DepthOrArraySize;
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
+	device->CreateShaderResourceView(src, &srv, srv_cpu);
+	D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	srv_gpu.ptr += r->srv_descriptor_size * srv_slot;
+
+	// Swapchain images rest in RENDER_TARGET between layer draws (each draw
+	// site moves its source to PIXEL_SHADER_RESOURCE and back).
+	D3D12_RESOURCE_BARRIER before[2] = {
+	    shadow_transition(src, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+	    shadow_transition(shadow, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+	};
+	cmd_list->ResourceBarrier(2, before);
+
+	cmd_list->SetGraphicsRootSignature(r->shadow.root_signature);
+	cmd_list->SetPipelineState(r->shadow.pso);
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootDescriptorTable(0, srv_gpu);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	const D3D12_VIEWPORT viewport = {0.0f, 0.0f, (float)desc.Width, (float)desc.Height, 0.0f, 1.0f};
+	const D3D12_RECT scissor = {0, 0, (LONG)desc.Width, (LONG)desc.Height};
+	cmd_list->RSSetViewports(1, &viewport);
+	cmd_list->RSSetScissorRects(1, &scissor);
+	const D3D12_CPU_DESCRIPTOR_HANDLE rtv = r->shadow.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT slice = 0; slice < desc.DepthOrArraySize; slice++) {
+		D3D12_RENDER_TARGET_VIEW_DESC rtv_desc = {};
+		rtv_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rtv_desc.Texture2DArray.FirstArraySlice = slice;
+		rtv_desc.Texture2DArray.ArraySize = 1;
+		device->CreateRenderTargetView(shadow, &rtv_desc, rtv); // read at OMSetRenderTargets
+		cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+		cmd_list->SetGraphicsRoot32BitConstant(1, slice, 0);
+		cmd_list->DrawInstanced(3, 1, 0, 0);
+	}
+
+	D3D12_RESOURCE_BARRIER after[2] = {
+	    shadow_transition(shadow, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+	    shadow_transition(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET),
+	};
+	cmd_list->ResourceBarrier(2, after);
+}
+
+/*!
+ * Fill this frame's compose shadows, before the frame binds its own pipeline
+ * state (so nothing has to be restored). Only on composing frames: the fast
+ * path reads every encoded image raw.
+ */
+static void
+renderer_fill_compose_shadows(struct comp_d3d12_renderer *r,
+                              ID3D12GraphicsCommandList *cmd_list,
+                              ID3D12Device *device,
+                              struct comp_layer_accum *layers)
+{
+	if (!r->compose_active) {
+		return;
+	}
+	for (uint32_t i = 0; i < layers->layer_count; i++) {
+		struct comp_layer *layer = &layers->layers[i];
+		switch (layer->data.type) {
+		case XRT_LAYER_PROJECTION:
+		case XRT_LAYER_PROJECTION_DEPTH:
+		case XRT_LAYER_ZONE_3D:
+			// All three lead with the projection views (the draw reads them the same way).
+			for (uint32_t v = 0; v < XRT_MAX_VIEWS; v++) {
+				if (layer->sc_array[v] == nullptr) {
+					continue;
+				}
+				auto *res = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(
+				    layer->sc_array[v], layer->data.proj.v[v].sub.image_index));
+				if (res != nullptr && comp_d3d12_swapchain_resource_needs_compose_shadow(res)) {
+					renderer_fill_compose_shadow(r, cmd_list, device, res);
+				}
+			}
+			break;
+		case XRT_LAYER_QUAD:
+		case XRT_LAYER_WINDOW_SPACE:
+		case XRT_LAYER_EQUIRECT2: {
+			const uint32_t image_index =
+			    layer->data.type == XRT_LAYER_QUAD           ? layer->data.quad.sub.image_index
+			    : layer->data.type == XRT_LAYER_WINDOW_SPACE ? layer->data.window_space.sub.image_index
+			                                                 : layer->data.equirect2.sub.image_index;
+			if (layer->sc_array[0] == nullptr) {
+				break;
+			}
+			auto *res = static_cast<ID3D12Resource *>(
+			    comp_d3d12_swapchain_get_resource(layer->sc_array[0], image_index));
+			if (res != nullptr && comp_d3d12_swapchain_resource_needs_compose_shadow(res)) {
+				renderer_fill_compose_shadow(r, cmd_list, device, res);
+			}
+			break;
+		}
+		default: break;
+		}
+	}
+}
+
 /*!
  * The SRV format a layer's source is sampled through THIS FRAME.
  *
@@ -943,6 +1306,35 @@ layer_source_format(struct comp_d3d12_renderer *r, ID3D12Resource *src_resource)
 {
 	return r->compose_active ? comp_d3d12_swapchain_compose_format(src_resource)
 	                         : comp_d3d12_swapchain_sample_format(src_resource);
+}
+
+/*!
+ * The resource a layer's SRV views THIS FRAME, and its format: the source
+ * itself, or on a composing frame its filled compose shadow
+ * (XR_DXR_swapchain_color_encoding). Barriers stay on the source either way.
+ */
+static ID3D12Resource *
+layer_view_resource(struct comp_d3d12_renderer *r, ID3D12Resource *src_resource, DXGI_FORMAT *out_format)
+{
+	if (r->compose_active && comp_d3d12_swapchain_resource_needs_compose_shadow(src_resource)) {
+		ID3D12Resource *shadow = nullptr;
+		UINT size = (UINT)sizeof(shadow);
+		if (SUCCEEDED(src_resource->GetPrivateData(kDxrComposeShadowGuid, &size, &shadow)) &&
+		    shadow != nullptr) {
+			uint64_t stamp = 0;
+			UINT stamp_size = (UINT)sizeof(stamp);
+			const bool filled =
+			    SUCCEEDED(shadow->GetPrivateData(kDxrComposeShadowStampGuid, &stamp_size, &stamp)) &&
+			    stamp == r->frame_serial;
+			shadow->Release(); // borrowed: the source keeps it alive
+			if (filled) {
+				*out_format = kComposeRtvFormat;
+				return shadow;
+			}
+		}
+	}
+	*out_format = layer_source_format(r, src_resource);
+	return src_resource;
 }
 
 /*!
@@ -1172,6 +1564,17 @@ renderer_frame_takes_fast_path(struct comp_d3d12_renderer *r, struct comp_layer_
 		}
 	}
 
+	// XR_DXR_cursor_depth v5: the cursor sprite is a source this frame too. A
+	// scene-linear (non-`_SRGB`) app sprite owes the encode, which only the
+	// compose target applies; the default look is encoded bytes. Not counted
+	// as a contributing layer - see the D3D11 twin for why.
+	if (r->cursor.frame.count > 0 && r->cursor.frame.xsc != nullptr) {
+		void *res = comp_d3d12_swapchain_get_resource(r->cursor.frame.xsc, 0);
+		if (res != nullptr && !comp_d3d12_swapchain_resource_is_srgb(res)) {
+			all_sources_srgb = false;
+		}
+	}
+
 	return u_color_compose_fast_path(r->legacy_color, contributing, base_is_projection, all_sources_srgb);
 }
 
@@ -1237,14 +1640,14 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 	// app's display-referred bytes reach the DP unchanged. #1503: app
 	// swapchain images are TYPELESS, so either way the view format comes from
 	// the typed format the app requested, not from GetDesc().
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	// Compute per-eye disparity offset
 	float half_disp = ws->disparity / 2.0f;
@@ -1343,6 +1746,88 @@ render_window_space_layer(struct comp_d3d12_renderer *r,
 
 
 /*!
+ * Multi-screen M3: the end of the last routed view range (0 = unrouted).
+ */
+static uint32_t
+routed_view_end(const struct comp_d3d12_eff_layout *layout)
+{
+	uint32_t n = 0;
+	for (uint32_t k = 0; k < layout->route_count && k < XRT_MAX_SEGMENTS; k++) {
+		const uint32_t end = layout->route[k].first_view + layout->route[k].view_count;
+		if (end > n) {
+			n = end;
+		}
+	}
+	return n > XRT_MAX_VIEWS ? XRT_MAX_VIEWS : n;
+}
+
+/*!
+ * Multi-screen M3: how many draws tile @p vi takes — one per routed segment
+ * under routing, else one.
+ */
+static uint32_t
+tile_draw_count(const struct comp_d3d12_eff_layout *layout)
+{
+	return layout->route_count > 0 ? layout->route_count : 1u;
+}
+
+/*!
+ * Multi-screen M3: draw @p k of tile @p vi — which layer view it shows and
+ * where, in target px. Unrouted: the tile's own view at the tile box
+ * (@p vp_w × @p vp_h, the mono clamp applied). Routed: segment k's local view
+ * @p vi at the segment's rect inside the tile. False = nothing to draw (the
+ * segment has fewer views, or an empty rect).
+ */
+static bool
+tile_draw(const struct comp_d3d12_eff_layout *layout,
+          uint32_t vi,
+          uint32_t k,
+          uint32_t vp_w,
+          uint32_t vp_h,
+          uint32_t *out_view,
+          D3D12_VIEWPORT *out_vp,
+          D3D12_RECT *out_scissor)
+{
+	const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
+	const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(tile_x);
+	vp.TopLeftY = static_cast<float>(tile_y);
+	vp.Width = static_cast<float>(vp_w);
+	vp.Height = static_cast<float>(vp_h);
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	D3D12_RECT sc = {};
+	sc.left = tile_x;
+	sc.top = tile_y;
+	sc.right = tile_x + vp_w;
+	sc.bottom = tile_y + vp_h;
+	uint32_t view = vi;
+	if (layout->route_count > 0) {
+		if (k >= layout->route_count || k >= XRT_MAX_SEGMENTS || vi >= layout->route[k].view_count ||
+		    layout->route[k].w == 0 || layout->route[k].h == 0) {
+			return false;
+		}
+		view = layout->route[k].first_view + vi;
+		vp.TopLeftX += static_cast<float>(layout->route[k].x);
+		vp.TopLeftY += static_cast<float>(layout->route[k].y);
+		vp.Width = static_cast<float>(layout->route[k].w);
+		vp.Height = static_cast<float>(layout->route[k].h);
+		sc.left = static_cast<LONG>(tile_x) + layout->route[k].x;
+		sc.top = static_cast<LONG>(tile_y) + layout->route[k].y;
+		sc.right = sc.left + static_cast<LONG>(layout->route[k].w);
+		sc.bottom = sc.top + static_cast<LONG>(layout->route[k].h);
+	}
+	if (view >= XRT_MAX_VIEWS) {
+		return false;
+	}
+	*out_view = view;
+	*out_vp = vp;
+	*out_scissor = sc;
+	return true;
+}
+
+/*!
  * Render one `XrCompositionLayerQuad` into every view tile it is visible in
  * (#1581). Ported from the D3D11 reference render_quad_layer(), and sharing
  * every policy decision with it through comp_layer_view_camera.h.
@@ -1389,10 +1874,14 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	 * Resolved up front so a quad no view can see costs no barrier and no
 	 * descriptor slot.
 	 */
+	// Multi-screen M3: under routing every routed view (camera) is a
+	// candidate, framed against the whole routed view count.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t vis_count = routed_end > view_count ? routed_end : view_count;
 	bool visible[XRT_MAX_VIEWS] = {};
 	bool any_visible = false;
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		visible[vi] = is_layer_view_visible_n(data, vi, view_count) &&
+	for (uint32_t vi = 0; vi < vis_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, vis_count) &&
 		              comp_layer_quad_is_front_facing(&q->pose, &cameras[vi].pose.position);
 		any_visible = any_visible || visible[vi];
 	}
@@ -1437,7 +1926,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 	// takes) the non-decoding view passes the app's bytes through. (#1503
 	// resolves the app's requested format, since the image itself is
 	// TYPELESS.)
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	if (layered) {
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1453,7 +1942,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
 	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
@@ -1489,8 +1978,15 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		}
 	}
 
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		if (!visible[vi]) {
+	// Multi-screen M3: one draw per tile, or one per routed segment per tile
+	// (draw d = tile ti, segment d % n — view vi at its rect).
+	const uint32_t draws_per_tile = tile_draw_count(layout);
+	for (uint32_t d = 0; d < view_count * draws_per_tile && d / draws_per_tile < XRT_MAX_VIEWS; d++) {
+		const uint32_t ti = d / draws_per_tile;
+		uint32_t vi = 0;
+		D3D12_VIEWPORT vp = {};
+		D3D12_RECT scissor = {};
+		if (!tile_draw(layout, ti, d % draws_per_tile, vp_w, vp_h, &vi, &vp, &scissor) || !visible[vi]) {
 			continue;
 		}
 
@@ -1527,7 +2023,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		 * SHADER emits: the fold below is half of that mode, the
 		 * blending-off pipeline state the other.
 		 */
-		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[ti], data->flags);
 		comp_layer_blend_fold_opaque_cover(mode, color_scale, color_bias);
 
 		const float array_params[4] = {layered ? static_cast<float>(q->sub.array_index) : 0.0f, 0.0f, 0.0f,
@@ -1540,23 +2036,7 @@ render_quad_layer(struct comp_d3d12_renderer *r,
 		cmd_list->SetGraphicsRoot32BitConstants(1, 4, color_bias, 24);
 		cmd_list->SetGraphicsRoot32BitConstants(1, 4, array_params, 28);
 
-		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
-		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
-
-		D3D12_VIEWPORT vp = {};
-		vp.TopLeftX = static_cast<float>(tile_x);
-		vp.TopLeftY = static_cast<float>(tile_y);
-		vp.Width = static_cast<float>(vp_w);
-		vp.Height = static_cast<float>(vp_h);
-		vp.MinDepth = 0.0f;
-		vp.MaxDepth = 1.0f;
 		cmd_list->RSSetViewports(1, &vp);
-
-		D3D12_RECT scissor = {};
-		scissor.left = tile_x;
-		scissor.top = tile_y;
-		scissor.right = tile_x + vp_w;
-		scissor.bottom = tile_y + vp_h;
 		cmd_list->RSSetScissorRects(1, &scissor);
 
 		cmd_list->DrawInstanced(4, 1, 0, 0);
@@ -1631,10 +2111,14 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 	 * and applying it here would drop a viewer standing INSIDE the sphere,
 	 * which is the ordinary case for a 360 background.
 	 */
+	// Multi-screen M3: under routing every routed view (camera) is a
+	// candidate, framed against the whole routed view count.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t vis_count = routed_end > view_count ? routed_end : view_count;
 	bool visible[XRT_MAX_VIEWS] = {};
 	bool any_visible = false;
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		visible[vi] = is_layer_view_visible_n(data, vi, view_count);
+	for (uint32_t vi = 0; vi < vis_count && vi < XRT_MAX_VIEWS; vi++) {
+		visible[vi] = is_layer_view_visible_n(data, vi, vis_count);
 		any_visible = any_visible || visible[vi];
 	}
 	if (!any_visible) {
@@ -1674,7 +2158,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 	// so a composing frame must sample it LINEAR and let the `_SRGB` RTV apply
 	// the OETF once. (An equirect2 frame never takes the fast path: the layer
 	// is a sub-rect contributor, so renderer_frame_takes_fast_path() counts it.)
-	srv_desc.Format = layer_source_format(r, src_resource);
+	ID3D12Resource *view_resource = layer_view_resource(r, src_resource, &srv_desc.Format);
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 	if (layered) {
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -1690,7 +2174,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 
 	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
 	srv_cpu.ptr += r->srv_descriptor_size * srv_slot;
-	device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+	device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 	D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
 	gpu_srv.ptr += r->srv_descriptor_size * srv_slot;
@@ -1727,8 +2211,15 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		}
 	}
 
-	for (uint32_t vi = 0; vi < view_count && vi < XRT_MAX_VIEWS; vi++) {
-		if (!visible[vi]) {
+	// Multi-screen M3: one draw per tile, or one per routed segment per tile
+	// (draw d = tile ti, segment d % n — view vi at its rect).
+	const uint32_t draws_per_tile = tile_draw_count(layout);
+	for (uint32_t d = 0; d < view_count * draws_per_tile && d / draws_per_tile < XRT_MAX_VIEWS; d++) {
+		const uint32_t ti = d / draws_per_tile;
+		uint32_t vi = 0;
+		D3D12_VIEWPORT vp = {};
+		D3D12_RECT scissor = {};
+		if (!tile_draw(layout, ti, d % draws_per_tile, vp_w, vp_h, &vi, &vp, &scissor) || !visible[vi]) {
 			continue;
 		}
 
@@ -1778,7 +2269,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		 * covers and nowhere else, which is what "the layer's alpha is one"
 		 * means.
 		 */
-		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[vi], data->flags);
+		const enum comp_layer_blend_mode mode = comp_layer_subrect_blend_mode(&tiles[ti], data->flags);
 		comp_layer_blend_fold_opaque_cover(mode, constants.color_scale, constants.color_bias);
 
 		// The spec says +INFINITY for "as far away as possible"; the shader
@@ -1796,23 +2287,7 @@ render_equirect2_layer(struct comp_d3d12_renderer *r,
 		// there is no per-field offset table to keep in step with the HLSL.
 		cmd_list->SetGraphicsRoot32BitConstants(1, kEquirect2RootConstants, &constants, 0);
 
-		const uint32_t tile_x = (vi % layout->cols) * layout->tile_w;
-		const uint32_t tile_y = (vi / layout->cols) * layout->tile_h;
-
-		D3D12_VIEWPORT vp = {};
-		vp.TopLeftX = static_cast<float>(tile_x);
-		vp.TopLeftY = static_cast<float>(tile_y);
-		vp.Width = static_cast<float>(vp_w);
-		vp.Height = static_cast<float>(vp_h);
-		vp.MinDepth = 0.0f;
-		vp.MaxDepth = 1.0f;
 		cmd_list->RSSetViewports(1, &vp);
-
-		D3D12_RECT scissor = {};
-		scissor.left = tile_x;
-		scissor.top = tile_y;
-		scissor.right = tile_x + vp_w;
-		scissor.bottom = tile_y + vp_h;
 		cmd_list->RSSetScissorRects(1, &scissor);
 
 		// Fullscreen strip, 4 vertices — the viewport restricts it to the tile.
@@ -2617,8 +3092,9 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	}
 
 	// Flatten PSOs: shared masked_composite VS + local2d_flatten PS. The
-	// scratch is always R8G8B8A8_UNORM (the masked composite is channel-
-	// agnostic), so one RTV format covers both blend variants.
+	// scratch is R8G8B8A8 (the masked composite is channel-agnostic); #1795
+	// gives each blend variant a UNORM-RTV PSO (legacy hatch) and an
+	// `_SRGB`-RTV PSO (the honest path: linear blend, encode on write).
 	ID3DBlob *flat_vs_blob = nullptr;
 	ID3DBlob *flat_ps_blob = nullptr;
 	hr = compile_shader(masked_composite_vs_source, "VSMain", "vs_5_0", &flat_vs_blob);
@@ -2662,10 +3138,21 @@ comp_d3d12_renderer_create(struct comp_d3d12_compositor *c,
 	hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
 	                                          reinterpret_cast<void **>(&r->flatten_pso_straight));
 	if (SUCCEEDED(hr)) {
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->flatten_pso_straight_srgb));
+	}
+	if (SUCCEEDED(hr)) {
 		// Premultiplied "over": SrcBlend = ONE (the default for Local2D).
 		flat_pso_desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
 		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
 		                                          reinterpret_cast<void **>(&r->flatten_pso_premul));
+	}
+	if (SUCCEEDED(hr)) {
+		flat_pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+		hr = device->CreateGraphicsPipelineState(&flat_pso_desc, __uuidof(ID3D12PipelineState),
+		                                          reinterpret_cast<void **>(&r->flatten_pso_premul_srgb));
 	}
 	flat_vs_blob->Release();
 	flat_ps_blob->Release();
@@ -2708,6 +3195,32 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 
 	comp_d3d12_renderer *r = *renderer_ptr;
 
+	// XR_DXR_cursor_depth v5 (all NULL unless a cursor was ever drawn).
+	for (uint32_t l = 0; l < 3; l++) {
+		for (uint32_t rt = 0; rt < 2; rt++) {
+			if (r->cursor.pso_soft[l][rt] != nullptr) {
+				r->cursor.pso_soft[l][rt]->Release();
+				r->cursor.pso_soft[l][rt] = nullptr;
+			}
+		}
+	}
+	for (uint32_t l = 0; l < 3; l++) {
+		for (uint32_t rt = 0; rt < 2; rt++) {
+			if (r->cursor.pso[l][rt] != nullptr) {
+				r->cursor.pso[l][rt]->Release();
+				r->cursor.pso[l][rt] = nullptr;
+			}
+		}
+	}
+	if (r->cursor.look_upload != nullptr) {
+		r->cursor.look_upload->Release();
+		r->cursor.look_upload = nullptr;
+	}
+	if (r->cursor.look_tex != nullptr) {
+		r->cursor.look_tex->Release();
+		r->cursor.look_tex = nullptr;
+	}
+
 	if (r->flatten_srv_heap != nullptr) {
 		r->flatten_srv_heap->Release();
 	}
@@ -2717,8 +3230,23 @@ comp_d3d12_renderer_destroy(struct comp_d3d12_renderer **renderer_ptr)
 	if (r->flatten_pso_straight != nullptr) {
 		r->flatten_pso_straight->Release();
 	}
+	if (r->flatten_pso_premul_srgb != nullptr) {
+		r->flatten_pso_premul_srgb->Release();
+	}
+	if (r->flatten_pso_straight_srgb != nullptr) {
+		r->flatten_pso_straight_srgb->Release();
+	}
 	if (r->flatten_root_signature != nullptr) {
 		r->flatten_root_signature->Release();
+	}
+	if (r->shadow.pso != nullptr) {
+		r->shadow.pso->Release();
+	}
+	if (r->shadow.root_signature != nullptr) {
+		r->shadow.root_signature->Release();
+	}
+	if (r->shadow.rtv_heap != nullptr) {
+		r->shadow.rtv_heap->Release();
 	}
 	if (r->composite_srv_heap != nullptr) {
 		r->composite_srv_heap->Release();
@@ -2847,6 +3375,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 	// Reset per-frame SRV slot allocator (slot 0 = atlas, slots 1+ for layers)
 	renderer->next_srv_slot = 1;
+	renderer->frame_serial++;
 
 	// XR_DXR_display_zones (ADR-027): a zones frame composes N placed zone
 	// layers into the window-spanning atlas — the unzoned area must weave
@@ -2904,6 +3433,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	if (!renderer_frame_takes_fast_path(renderer, layers)) {
 		renderer->compose_active = renderer_ensure_compose_target(renderer);
 	}
+	renderer_fill_compose_shadows(renderer, cmd_list, device, layers);
 
 	// Clear the target to black; transparent in zones frames.
 	//
@@ -2959,8 +3489,13 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	    have_wm ? xrt_vec3{canvas->window_center_offset_x_m, canvas->window_center_offset_y_m,
 	                       canvas->window_center_offset_z_m}
 	            : xrt_vec3{0.0f, 0.0f, 0.0f};
+	// Multi-screen M3: under routing a quad / equirect2 is drawn once per
+	// routed view, with THAT view's camera — so resolve every routed view's
+	// camera, not only the first tile's worth.
+	const uint32_t routed_end = routed_view_end(layout);
+	const uint32_t cam_count = routed_end > view_count ? routed_end : view_count;
 	struct comp_layer_view_camera cameras[XRT_MAX_VIEWS] = {};
-	for (uint32_t view = 0; view < view_count && view < XRT_MAX_VIEWS; view++) {
+	for (uint32_t view = 0; view < cam_count && view < XRT_MAX_VIEWS; view++) {
 		comp_layer_view_camera_select_eyes(layers, view, eyes, view_count, have_wm ? &canvas_center : nullptr,
 		                                   have_wm ? canvas->window_width_m : 0.0f,
 		                                   have_wm ? canvas->window_height_m : 0.0f, &cameras[view]);
@@ -3049,7 +3584,39 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 		uint32_t layer_view_count = layer->data.view_count;
 
-		for (uint32_t vi = 0; vi < layer_view_count && vi < view_count; vi++) {
+		// Multi-screen M3: a routed frame paints each tile as a mosaic — one
+		// draw per segment, layer view first_view[k] + ti at the segment's
+		// rect (zones are never routed). Unrouted: one draw, view ti.
+		const bool routed = layout->route_count > 0 && !is_zone;
+		const uint32_t draws_per_tile = routed ? layout->route_count : 1u;
+		const uint32_t tile_count =
+		    routed ? view_count : (layer_view_count < view_count ? layer_view_count : view_count);
+		struct comp_layer_tile_state *tile = nullptr;
+		enum comp_layer_blend_mode proj_mode = COMP_LAYER_BLEND_REPLACE;
+		for (uint32_t d = 0; d < tile_count * draws_per_tile; d++) {
+			const uint32_t ti = d / draws_per_tile;
+			const uint32_t dk = d % draws_per_tile;
+			if (dk == 0) {
+				// #1598 for the tile, decided ONCE before its draws (see
+				// below): every segment of a tile's first projection layer
+				// is that tile's base.
+				tile = ti < XRT_MAX_VIEWS ? &tiles[ti] : nullptr;
+				proj_mode = COMP_LAYER_BLEND_REPLACE;
+				if (!is_zone) {
+					proj_mode = comp_layer_tile_blend_mode(tile, layer->data.flags);
+				}
+			}
+			uint32_t vi = ti;
+			if (routed) {
+				if (dk >= XRT_MAX_SEGMENTS || ti >= layout->route[dk].view_count ||
+				    layout->route[dk].w == 0 || layout->route[dk].h == 0) {
+					continue;
+				}
+				vi = layout->route[dk].first_view + ti;
+				if (vi >= layer_view_count || vi >= XRT_MAX_VIEWS) {
+					continue;
+				}
+			}
 			/*
 			 * #1598: resolved BEFORE the swapchain lookups below, so
 			 * the mark is EAGER — a projection layer that fails to
@@ -3073,12 +3640,6 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			 * unflagged zone must stay PREMULTIPLIED so its texture
 			 * alpha survives).
 			 */
-			struct comp_layer_tile_state *tile = vi < XRT_MAX_VIEWS ? &tiles[vi] : nullptr;
-			enum comp_layer_blend_mode proj_mode = COMP_LAYER_BLEND_REPLACE;
-			if (!is_zone) {
-				proj_mode = comp_layer_tile_blend_mode(tile, layer->data.flags);
-			}
-
 			struct xrt_swapchain *xsc = layer->sc_array[vi];
 			if (xsc == nullptr) {
 				continue;
@@ -3170,7 +3731,7 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 			// private `_SRGB` target re-encodes once on write. #1503: the
 			// image is TYPELESS, so either resolve goes through its stamped
 			// requested format rather than src_desc.Format.
-			srv_desc.Format = layer_source_format(renderer, src_resource);
+			ID3D12Resource *view_resource = layer_view_resource(renderer, src_resource, &srv_desc.Format);
 			srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 			// Honor the projection view's array layer. Under single-pass-instanced
 			// the app submits ONE swapchain with viewCount=2 and per-view
@@ -3195,13 +3756,13 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 
 			D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = renderer->srv_heap->GetCPUDescriptorHandleForHeapStart();
 			srv_cpu.ptr += renderer->srv_descriptor_size * srv_slot;
-			device->CreateShaderResourceView(src_resource, &srv_desc, srv_cpu);
+			device->CreateShaderResourceView(view_resource, &srv_desc, srv_cpu);
 
 			D3D12_GPU_DESCRIPTOR_HANDLE gpu_srv = renderer->srv_heap->GetGPUDescriptorHandleForHeapStart();
 			gpu_srv.ptr += renderer->srv_descriptor_size * srv_slot;
 
 			// Tile position in the effective atlas grid (#542)
-			uint32_t tile_idx = vi;
+			uint32_t tile_idx = ti;
 			uint32_t tile_x = (tile_idx % layout->cols) * layout->tile_w;
 			uint32_t tile_y = (tile_idx / layout->cols) * layout->tile_h;
 
@@ -3293,13 +3854,24 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 				cmd_list->SetPipelineState(proj_pso);
 			}
 
-			cmd_list->RSSetViewports(1, &vp);
-
 			D3D12_RECT scissor = {};
 			scissor.left = tile_x;
 			scissor.top = tile_y;
 			scissor.right = tile_x + vp_w;
 			scissor.bottom = tile_y + vp_h;
+			if (routed) {
+				// Multi-screen M3: this segment's rect inside the tile.
+				vp.TopLeftX += static_cast<float>(layout->route[dk].x);
+				vp.TopLeftY += static_cast<float>(layout->route[dk].y);
+				vp.Width = static_cast<float>(layout->route[dk].w);
+				vp.Height = static_cast<float>(layout->route[dk].h);
+				scissor.left = static_cast<LONG>(tile_x) + layout->route[dk].x;
+				scissor.top = static_cast<LONG>(tile_y) + layout->route[dk].y;
+				scissor.right = scissor.left + static_cast<LONG>(layout->route[dk].w);
+				scissor.bottom = scissor.top + static_cast<LONG>(layout->route[dk].h);
+			}
+
+			cmd_list->RSSetViewports(1, &vp);
 			cmd_list->RSSetScissorRects(1, &scissor);
 
 			if (draw_log && is_zone) {
@@ -3356,6 +3928,496 @@ comp_d3d12_renderer_draw_projection_pass(struct comp_d3d12_renderer *renderer,
 	return XRT_SUCCESS;
 }
 
+/*
+ *
+ * XR_DXR_cursor_depth v5 — the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * The D3D12 twin of the D3D11 / Metal pass: after the app's layers and before
+ * the display processor, one straight-alpha textured quad per view tile, depth
+ * off, scissored to the tile. Recorded onto the frame's command list inside
+ * the window-space pass, so it lands before the atlas's final barrier (and
+ * before the compose publish, so a composing frame encodes it once).
+ * Everything is built on the first frame that draws one.
+ *
+ */
+
+//! The cursor pipeline variants (first index of `cursor.pso`).
+enum
+{
+	CURSOR_PSO_STRAIGHT = 0,
+	CURSOR_PSO_STRAIGHT_LAYERED = 1,
+	CURSOR_PSO_PREMUL = 2,
+};
+
+//! Release one set of cursor pipelines (crisp or soft).
+static void
+cursor_release_pso_set(ID3D12PipelineState *pso[3][2])
+{
+	for (uint32_t l = 0; l < 3; l++) {
+		for (uint32_t rt = 0; rt < 2; rt++) {
+			if (pso[l][rt] != nullptr) {
+				pso[l][rt]->Release();
+				pso[l][rt] = nullptr;
+			}
+		}
+	}
+}
+
+/*!
+ * Build one set of six cursor pipelines: the crisp pixel shader, or (@p soft)
+ * its ADR-046 B.7 DXR_SOFTEN variant reading its parameters from root
+ * constants 16..19 (DXR_SOFTEN_ROOT_B0). Same root signature, blend and
+ * targets either way. On failure nothing is left in @p pso.
+ */
+static HRESULT
+cursor_build_pso_set(struct comp_d3d12_renderer *r, bool soft, ID3D12PipelineState *pso[3][2])
+{
+	ID3DBlob *vs = nullptr;
+	ID3DBlob *ps[2] = {nullptr, nullptr};
+	// ps[1]: same source, Texture2DArray - a layered sprite (array layer 0).
+	static const D3D_SHADER_MACRO plain[] = {{nullptr, nullptr}};
+	static const D3D_SHADER_MACRO layered[] = {{"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+	static const D3D_SHADER_MACRO soft_plain[] = {
+	    {"DXR_SOFTEN", "1"}, {"DXR_SOFTEN_ROOT_B0", "1"}, {nullptr, nullptr}};
+	static const D3D_SHADER_MACRO soft_layered[] = {
+	    {"DXR_SOFTEN", "1"}, {"DXR_SOFTEN_ROOT_B0", "1"}, {"DXR_LAYERED", "1"}, {nullptr, nullptr}};
+	HRESULT hr = compile_shader(cursor_quad_vs_source, "main", "vs_5_0", &vs);
+	if (SUCCEEDED(hr)) {
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[0], soft ? soft_plain : plain);
+	}
+	if (SUCCEEDED(hr)) {
+		hr = compile_shader(cursor_quad_ps_source, "main", "ps_5_0", &ps[1], soft ? soft_layered : layered);
+	}
+	if (SUCCEEDED(hr)) {
+		// The quad root signature: t0 table (param 0), 32 root constants at
+		// b0 (param 1; the cursor reads the first 16, its softening 16..19),
+		// CLAMP linear s0.
+		D3D12_GRAPHICS_PIPELINE_STATE_DESC d = {};
+		d.pRootSignature = r->quad_root_signature;
+		d.VS.pShaderBytecode = vs->GetBufferPointer();
+		d.VS.BytecodeLength = vs->GetBufferSize();
+		// Colour: SrcAlpha (straight sprite) or One (premultiplied default
+		// look), set per variant below; alpha accumulates "over".
+		d.BlendState.RenderTarget[0].BlendEnable = TRUE;
+		d.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+		d.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+		d.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+		d.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+		d.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+		d.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+		d.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+		// No culling: the sprite's winding follows the view's axes.
+		d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+		d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+		d.RasterizerState.DepthClipEnable = TRUE;
+		// Depth OFF: no DSV format, DepthEnable false - never occluded.
+		d.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+		d.NumRenderTargets = 1;
+		d.SampleDesc.Count = 1;
+		d.SampleMask = UINT_MAX;
+		ID3D12Device *device = get_internals(r->c)->device;
+		for (uint32_t l = 0; l < 3 && SUCCEEDED(hr); l++) {
+			ID3DBlob *pl = l == CURSOR_PSO_STRAIGHT_LAYERED ? ps[1] : ps[0];
+			d.PS.pShaderBytecode = pl->GetBufferPointer();
+			d.PS.BytecodeLength = pl->GetBufferSize();
+			d.BlendState.RenderTarget[0].SrcBlend =
+			    l == CURSOR_PSO_PREMUL ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+			for (uint32_t rt = 0; rt < 2 && SUCCEEDED(hr); rt++) {
+				d.RTVFormats[0] = rt == 0 ? DXGI_FORMAT_R8G8B8A8_UNORM : kComposeRtvFormat;
+				hr = device->CreateGraphicsPipelineState(&d, __uuidof(ID3D12PipelineState),
+				                                         reinterpret_cast<void **>(&pso[l][rt]));
+			}
+		}
+	}
+	for (uint32_t l = 0; l < 2; l++) {
+		if (ps[l] != nullptr) {
+			ps[l]->Release();
+		}
+	}
+	if (vs != nullptr) {
+		vs->Release();
+	}
+	if (FAILED(hr)) {
+		cursor_release_pso_set(pso);
+	}
+	return hr;
+}
+
+//! The six pipelines, built on the first cursor frame only.
+static bool
+cursor_ensure_pipeline(struct comp_d3d12_renderer *r)
+{
+	if (r->cursor.pso[CURSOR_PSO_PREMUL][1] != nullptr) {
+		return true; // built last: all six exist
+	}
+	if (r->cursor.failed) {
+		return false;
+	}
+	r->cursor.failed = true; // cleared on success; a failure is never retried per frame
+	const HRESULT hr = cursor_build_pso_set(r, false, r->cursor.pso);
+	if (FAILED(hr)) {
+		U_LOG_E(
+		    "cursor_draw [d3d12]: pipeline creation failed (0x%08x) - the runtime-drawn cursor is not drawn",
+		    (unsigned)hr);
+		return false;
+	}
+	r->cursor.failed = false;
+	return true;
+}
+
+/*!
+ * ADR-046 Amendment 2 B.7: the softening pipelines, built on the first frame
+ * that softens (ADR-046 section 0: an on-glass cursor never builds them). A
+ * failure is logged once and never retried; the cursor is then drawn crisp -
+ * softening never refuses it.
+ */
+static bool
+cursor_ensure_soft_pipeline(struct comp_d3d12_renderer *r)
+{
+	if (r->cursor.pso_soft[CURSOR_PSO_PREMUL][1] != nullptr) {
+		return true; // built last: all six exist
+	}
+	if (r->cursor.soft_failed) {
+		return false;
+	}
+	r->cursor.soft_failed = true;
+	const HRESULT hr = cursor_build_pso_set(r, true, r->cursor.pso_soft);
+	if (FAILED(hr)) {
+		U_LOG_E(
+		    "cursor_draw [d3d12]: softening pipeline creation failed (0x%08x) - the cursor is drawn crisp "
+		    "(ADR-046 B.7)",
+		    (unsigned)hr);
+		return false;
+	}
+	r->cursor.soft_failed = false;
+	return true;
+}
+
+/*!
+ * Upload the default look when its image changed (cursor shape or DPI):
+ * records the copy onto @p cmd_list and leaves the texture in
+ * PIXEL_SHADER_RESOURCE.
+ */
+static bool
+cursor_upload_look(struct comp_d3d12_renderer *r,
+                   ID3D12GraphicsCommandList *cmd_list,
+                   const struct comp_cursor_look *look)
+{
+	if (look == nullptr || look->rgba == nullptr || look->w == 0 || look->h == 0) {
+		return false;
+	}
+	if (r->cursor.look_tex != nullptr && r->cursor.look_generation == look->generation) {
+		return true;
+	}
+	// The previous texture and upload buffer were last used by an earlier
+	// commit, which the GPU has retired (its allocator was reset since).
+	if (r->cursor.look_upload != nullptr) {
+		r->cursor.look_upload->Release();
+		r->cursor.look_upload = nullptr;
+	}
+	if (r->cursor.look_tex != nullptr) {
+		r->cursor.look_tex->Release();
+		r->cursor.look_tex = nullptr;
+	}
+	r->cursor.look_generation = 0;
+
+	ID3D12Device *device = get_internals(r->c)->device;
+
+	// TYPELESS: the same encoded bytes are read raw on the fast path and
+	// decoded on the compose path.
+	D3D12_RESOURCE_DESC td = {};
+	td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	td.Width = look->w;
+	td.Height = look->h;
+	td.DepthOrArraySize = 1;
+	td.MipLevels = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+	td.SampleDesc.Count = 1;
+	td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	td.Flags = D3D12_RESOURCE_FLAG_NONE;
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	HRESULT hr =
+	    device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+	                                    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&r->cursor.look_tex));
+	if (FAILED(hr)) {
+		r->cursor.look_tex = nullptr;
+		return false;
+	}
+	r->cursor.look_tex->SetName(L"DXR.cursor_default_look");
+
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+	UINT rows = 0;
+	UINT64 row_bytes = 0;
+	UINT64 total = 0;
+	device->GetCopyableFootprints(&td, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+
+	D3D12_HEAP_PROPERTIES up_heap = {};
+	up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = total;
+	bd.Height = 1;
+	bd.DepthOrArraySize = 1;
+	bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_UNKNOWN;
+	bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	hr = device->CreateCommittedResource(&up_heap, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+	                                     nullptr, __uuidof(ID3D12Resource),
+	                                     reinterpret_cast<void **>(&r->cursor.look_upload));
+	if (FAILED(hr)) {
+		r->cursor.look_upload = nullptr;
+		r->cursor.look_tex->Release();
+		r->cursor.look_tex = nullptr;
+		return false;
+	}
+	uint8_t *mapped = nullptr;
+	D3D12_RANGE no_read = {0, 0};
+	hr = r->cursor.look_upload->Map(0, &no_read, reinterpret_cast<void **>(&mapped));
+	if (FAILED(hr) || mapped == nullptr) {
+		r->cursor.look_upload->Release();
+		r->cursor.look_upload = nullptr;
+		r->cursor.look_tex->Release();
+		r->cursor.look_tex = nullptr;
+		return false;
+	}
+	for (uint32_t y = 0; y < look->h; y++) {
+		memcpy(mapped + fp.Offset + (size_t)y * fp.Footprint.RowPitch, look->rgba + (size_t)y * look->w * 4,
+		       (size_t)look->w * 4);
+	}
+	r->cursor.look_upload->Unmap(0, nullptr);
+
+	D3D12_TEXTURE_COPY_LOCATION dst = {};
+	dst.pResource = r->cursor.look_tex;
+	dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	dst.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION src = {};
+	src.pResource = r->cursor.look_upload;
+	src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	src.PlacedFootprint = fp;
+	cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = r->cursor.look_tex;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	cmd_list->ResourceBarrier(1, &b);
+
+	r->cursor.look_generation = look->generation;
+	return true;
+}
+
+/*!
+ * Record this frame's cursor into every tile of whatever target the frame
+ * paints (the atlas, or the private compose target before its publish).
+ * @return true if anything was drawn.
+ */
+static bool
+cursor_draw(struct comp_d3d12_renderer *r,
+            ID3D12GraphicsCommandList *cmd_list,
+            const struct comp_d3d12_eff_layout *layout,
+            uint32_t vp_w,
+            uint32_t vp_h)
+{
+	const struct comp_d3d12_cursor_quads *q = &r->cursor.frame;
+	// #1952: every way out that draws nothing reports why.
+	if (!cursor_ensure_pipeline(r)) {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
+		return false;
+	}
+
+	ID3D12Resource *src = nullptr;
+	DXGI_FORMAT src_format = DXGI_FORMAT_UNKNOWN;
+	bool app_image = false;
+	bool layered = false;
+	if (q->xsc != nullptr) {
+		src = static_cast<ID3D12Resource *>(comp_d3d12_swapchain_get_resource(q->xsc, q->image_index));
+		if (src == nullptr) {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+			return false;
+		}
+		// A layered sprite: the spec samples array layer 0.
+		layered = src->GetDesc().DepthOrArraySize > 1;
+		// Format-honest on the compose path, non-decoding on the fast path:
+		// the same rule as every other layer source (ADR-044).
+		src_format = layer_source_format(r, src);
+		app_image = true;
+	} else {
+		if (!cursor_upload_look(r, cmd_list, q->look)) {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+			return false;
+		}
+		src = r->cursor.look_tex;
+		src_format = r->compose_active ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+	}
+
+	const uint32_t n = q->count < layout->views ? q->count : layout->views;
+	if (q->report_only) {
+		// #1952: the app shows its OS cursor this frame - report whether a
+		// tile would take the sprite, and record nothing.
+		const bool any = n > 0 && vp_w > 0 && vp_h > 0 && q->clip[2] > 0.0f && q->clip[3] > 0.0f;
+		if (any) {
+			u_cursor_draw_report_drew(q->req);
+		} else {
+			u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+		}
+		return false;
+	}
+
+	const uint32_t srv_slot = r->next_srv_slot;
+	if (srv_slot >= r->srv_heap_size) {
+		U_LOG_E("D3D12 renderer: SRV heap overflow in the cursor pass (slot %u >= %u)", srv_slot,
+		        r->srv_heap_size);
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
+		return false;
+	}
+	r->next_srv_slot++;
+
+	if (!r->cursor.announced) {
+		r->cursor.announced = true;
+		// The views actually drawn (the request capped to the layout's
+		// tiles, as the loop below does), like the Metal/GL/VK notices.
+		const uint32_t drawn = q->count < layout->views ? q->count : layout->views;
+		U_LOG_W(
+		    "cursor_draw: D3D12 compositor drawing the cursor (%s, %u view(s), %s; ADR-046 Amendment 2 B, "
+		    "one-time notice)",
+		    app_image ? "app sprite" : "default look", drawn,
+		    r->compose_active ? "linear compose" : "encoded fast path");
+	}
+
+	// The app's image rests in RENDER_TARGET (OpenXR D3D12); sample it in
+	// PIXEL_SHADER_RESOURCE and hand it back, as the window-space layers do.
+	D3D12_RESOURCE_BARRIER src_barrier = {};
+	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	src_barrier.Transition.pResource = src;
+	src_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+	if (app_image) {
+		cmd_list->ResourceBarrier(1, &src_barrier);
+	}
+
+	ID3D12Device *device = get_internals(r->c)->device;
+	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+	srv_desc.Format = src_format;
+	if (layered) {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv_desc.Texture2DArray.MipLevels = 1;
+		srv_desc.Texture2DArray.FirstArraySlice = 0;
+		srv_desc.Texture2DArray.ArraySize = 1;
+	} else {
+		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		srv_desc.Texture2D.MipLevels = 1;
+	}
+	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = r->srv_heap->GetCPUDescriptorHandleForHeapStart();
+	srv_cpu.ptr += (SIZE_T)r->srv_descriptor_size * srv_slot;
+	device->CreateShaderResourceView(src, &srv_desc, srv_cpu);
+
+	cmd_list->SetGraphicsRootSignature(r->quad_root_signature);
+	const uint32_t variant =
+	    !app_image ? CURSOR_PSO_PREMUL : (layered ? CURSOR_PSO_STRAIGHT_LAYERED : CURSOR_PSO_STRAIGHT);
+	// ADR-046 B.7: a softened frame draws the padded quad with the
+	// softening shader; if that cannot be built it draws the crisp quad
+	// (q->corners, uv 0..1) exactly as an unsoftened frame would.
+	const bool soft = q->soft && cursor_ensure_soft_pipeline(r);
+	cmd_list->SetPipelineState(soft ? r->cursor.pso_soft[variant][r->compose_active ? 1 : 0]
+	                                : r->cursor.pso[variant][r->compose_active ? 1 : 0]);
+	ID3D12DescriptorHeap *heaps[] = {r->srv_heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = r->srv_heap->GetGPUDescriptorHandleForHeapStart();
+	srv_gpu.ptr += (UINT64)r->srv_descriptor_size * srv_slot;
+	cmd_list->SetGraphicsRootDescriptorTable(0, srv_gpu);
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv = renderer_target_rtv(r);
+	cmd_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); // no DSV: depth OFF
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+	static const float uv[4][2] = {{0.0f, 0.0f}, {0.0f, 1.0f}, {1.0f, 0.0f}, {1.0f, 1.0f}};
+	uint32_t drawn = 0;
+	for (uint32_t i = 0; i < n && i < XRT_MAX_VIEWS; i++) {
+		// The same tile box the window-space layers use (#542 grid).
+		const uint32_t tile_x = (i % layout->cols) * layout->tile_w;
+		const uint32_t tile_y = (i / layout->cols) * layout->tile_h;
+		D3D12_VIEWPORT vp = {};
+		vp.TopLeftX = (float)tile_x;
+		vp.TopLeftY = (float)tile_y;
+		vp.Width = (float)vp_w;
+		vp.Height = (float)vp_h;
+		vp.MinDepth = 0.0f;
+		vp.MaxDepth = 1.0f;
+		cmd_list->RSSetViewports(1, &vp);
+		// Mandatory: a cursor at a tile edge must not spill into the
+		// neighbour view (the DP would weave it into the wrong eye).
+		// Tile box ∩ the request's clip (a display zone's sub-rect, else
+		// the whole tile).
+		D3D12_RECT sr = {};
+		sr.left = (LONG)floorf((float)tile_x + q->clip[0] * (float)vp_w);
+		sr.top = (LONG)floorf((float)tile_y + q->clip[1] * (float)vp_h);
+		sr.right = (LONG)ceilf((float)tile_x + (q->clip[0] + q->clip[2]) * (float)vp_w);
+		sr.bottom = (LONG)ceilf((float)tile_y + (q->clip[1] + q->clip[3]) * (float)vp_h);
+		sr.left = sr.left < (LONG)tile_x ? (LONG)tile_x : sr.left;
+		sr.top = sr.top < (LONG)tile_y ? (LONG)tile_y : sr.top;
+		sr.right = sr.right > (LONG)(tile_x + vp_w) ? (LONG)(tile_x + vp_w) : sr.right;
+		sr.bottom = sr.bottom > (LONG)(tile_y + vp_h) ? (LONG)(tile_y + vp_h) : sr.bottom;
+		if (sr.right <= sr.left || sr.bottom <= sr.top) {
+			continue;
+		}
+		cmd_list->RSSetScissorRects(1, &sr);
+
+		CursorQuadConstants cc = {};
+		for (int k = 0; k < 4; k++) {
+			cc.corners[k][0] = soft ? q->soft_corners[i][k][0] : q->corners[i][k][0];
+			cc.corners[k][1] = soft ? q->soft_corners[i][k][1] : q->corners[i][k][1];
+			cc.corners[k][2] = soft ? q->uv[i][k][0] : uv[k][0];
+			cc.corners[k][3] = soft ? q->uv[i][k][1] : uv[k][1];
+		}
+		cmd_list->SetGraphicsRoot32BitConstants(1, 16, &cc, 0);
+		if (soft) {
+			// .w: straight alpha for the app's sprite, premultiplied for the
+			// default look - the same split as the blend states. Root
+			// constants 16..19 (packoffset c4), after the corners.
+			const CursorSoftenConstants sc = {
+			    {q->soften[i][0], q->soften[i][1], q->soften[i][2], app_image ? 1.0f : 0.0f}};
+			cmd_list->SetGraphicsRoot32BitConstants(1, 4, &sc, kCursorSoftenRootOffset);
+		}
+		cmd_list->DrawInstanced(4, 1, 0, 0);
+		drawn++;
+	}
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(q->req);
+	} else {
+		u_cursor_draw_report_refused(q->req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+	}
+
+	if (app_image) {
+		src_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+		src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		cmd_list->ResourceBarrier(1, &src_barrier);
+	}
+	return true;
+}
+
+extern "C" void
+comp_d3d12_renderer_set_cursor(struct comp_d3d12_renderer *renderer, const struct comp_d3d12_cursor_quads *quads)
+{
+	if (renderer == nullptr) {
+		return;
+	}
+	if (quads == nullptr || quads->count == 0) {
+		renderer->cursor.frame.count = 0;
+		renderer->cursor.frame.xsc = nullptr;
+		renderer->cursor.frame.look = nullptr;
+		return;
+	}
+	renderer->cursor.frame = *quads;
+	if (renderer->cursor.frame.count > XRT_MAX_VIEWS) {
+		renderer->cursor.frame.count = XRT_MAX_VIEWS;
+	}
+}
+
 extern "C" xrt_result_t
 comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             void *cmd_list_ptr,
@@ -3397,12 +4459,19 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
 		}
 	}
 
+	// XR_DXR_cursor_depth v5: the runtime-drawn cursor, LAST - over every app
+	// layer, never occluded, before the publish and the final barrier.
+	bool drew_cursor = false;
+	if (renderer->cursor.frame.count > 0) {
+		drew_cursor = cursor_draw(renderer, cmd_list, layout, ws_vp_w, ws_vp_h);
+	}
+
 	// #1610: republish only when this pass actually drew, so a composing
 	// frame without a window-space layer pays for exactly one atlas copy, not
 	// two. (Each render_window_space_layer states its own target, so the
 	// capture round trip the caller may have run in between costs nothing to
 	// recover from.)
-	if (any_window_space) {
+	if (any_window_space || drew_cursor) {
 		renderer_publish_compose_to_atlas(renderer, cmd_list);
 	}
 
@@ -3477,6 +4546,9 @@ comp_d3d12_renderer_compute_effective_layout(struct comp_d3d12_renderer *rendere
 	}
 
 	out_layout->views = views;
+	// Multi-screen M3: routing is decided by the compositor, after this.
+	out_layout->route_count = 0;
+	memset(out_layout->route, 0, sizeof(out_layout->route));
 	if (views == 1) {
 		out_layout->cols = 1;
 		out_layout->rows = 1;
@@ -3609,6 +4681,15 @@ comp_d3d12_renderer_set_external_atlas(struct comp_d3d12_renderer *renderer,
 	return XRT_SUCCESS;
 }
 
+extern "C" void
+comp_d3d12_renderer_set_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t cap_width, uint32_t cap_height)
+{
+	if (renderer != nullptr) {
+		renderer->atlas_cap_width = cap_width;
+		renderer->atlas_cap_height = cap_height;
+	}
+}
+
 extern "C" xrt_result_t
 comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
                            uint32_t new_view_width,
@@ -3657,12 +4738,11 @@ comp_d3d12_renderer_resize(struct comp_d3d12_renderer *renderer,
 		return XRT_SUCCESS;
 	}
 
-	// TEMP #602 instrumentation — counts genuine atlas (re)allocations; should
-	// stay tiny (≈ startup/warmup) and NOT climb per-frame. Remove before merge.
-	static uint32_t s_realloc_count = 0;
-	U_LOG_W("#602 D3D12 atlas (re)alloc #%u: view %ux%u -> %ux%u, tex_h %u -> %u", ++s_realloc_count,
-	        renderer->view_width, renderer->view_height, new_view_width, new_view_height,
-	        renderer->texture_height, new_texture_height);
+	// One WARN per genuine realloc: rare by construction (#602 high-water
+	// mark, #2564 headroom), so a climbing count is itself the regression.
+	U_LOG_W("D3D12 atlas realloc: alloc %ux%u, content now %ux%u (view %ux%u, cap %ux%u)",
+	        renderer->atlas_alloc_width, renderer->atlas_alloc_height, req_w, req_h, new_view_width,
+	        new_view_height, renderer->atlas_cap_width, renderer->atlas_cap_height);
 
 	// Genuine grow (first allocation / display-mode change / content larger
 	// than any seen before). Release the old resource and recreate; the
@@ -3728,8 +4808,10 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 
 	// Write the 3 SRVs fresh into the dedicated shader-visible heap
 	// (t0 = 2D source scratch, t1 = authored mask staged copy, t2 = weave
-	// snapshot scratch). Formats come from each resource — the scratches are
-	// runtime-created with concrete formats, the mask is R8_UNORM.
+	// snapshot scratch). Formats come from each resource — the mask is
+	// R8_UNORM. #1795: the Local2D scratch is TYPELESS (its flatten writes an
+	// `_SRGB` RTV) and a view cannot be typeless, so it resolves to the UNORM
+	// member: the composite still reads the ENCODED bytes, unchanged.
 	ID3D12Resource *srcs[3] = {
 	    static_cast<ID3D12Resource *>(twod_resource),
 	    static_cast<ID3D12Resource *>(mask_resource),
@@ -3739,7 +4821,7 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
 	for (int i = 0; i < 3; i++) {
 		D3D12_RESOURCE_DESC rd = srcs[i]->GetDesc();
 		D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
-		srv_desc.Format = rd.Format;
+		srv_desc.Format = d3d_dxgi_typeless_to_typed_dxgi(rd.Format);
 		srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 		srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
 		srv_desc.Texture2D.MipLevels = 1;
@@ -3819,7 +4901,8 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
                                      float src_y,
                                      float src_w,
                                      float src_h,
-                                     bool unpremultiplied)
+                                     bool unpremultiplied,
+                                     bool linear_target)
 {
 	if (renderer == nullptr || cmd_list_ptr == nullptr || scratch_rtv_handle == 0 || src_resource == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -3834,8 +4917,7 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
 	auto *src = static_cast<ID3D12Resource *>(src_resource);
 
-	// Source image → sampleable. Sample app color swapchains as their UNORM
-	// sibling (no implicit sRGB decode — the DP wants display-referred bytes).
+	// Source image → sampleable (the view is chosen below, by TARGET).
 	D3D12_RESOURCE_BARRIER src_barrier = {};
 	src_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	src_barrier.Transition.pResource = src;
@@ -3846,7 +4928,14 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 
 	D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
 	// #1503: TYPELESS resource -> resolve the view format from the app's request.
-	srv_desc.Format = comp_d3d12_swapchain_sample_format(src);
+	// #1795: the view follows the TARGET (a D3D12 CPU RTV handle cannot be
+	// asked its format, so the caller says). Into an `_SRGB` RTV (the honest
+	// path) sample the layer as its declared format — an `_SRGB` source
+	// decodes, a UNORM source is read as the linear values it holds — so the
+	// blend is linear and the RTV encodes once. Into a UNORM RTV (legacy
+	// hatch) keep the non-decoding view: bytes pass through as before.
+	srv_desc.Format =
+	    linear_target ? comp_d3d12_swapchain_compose_format(src) : comp_d3d12_swapchain_sample_format(src);
 	srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
 	srv_desc.Texture2D.MipLevels = 1;
 	srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -3856,7 +4945,14 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 
 	cmd_list->SetDescriptorHeaps(1, &renderer->flatten_srv_heap);
 	cmd_list->SetGraphicsRootSignature(renderer->flatten_root_signature);
-	cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight : renderer->flatten_pso_premul);
+	// The PSO's baked RTV format must match the RTV it draws into.
+	if (linear_target) {
+		cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight_srgb
+		                                           : renderer->flatten_pso_premul_srgb);
+	} else {
+		cmd_list->SetPipelineState(unpremultiplied ? renderer->flatten_pso_straight
+		                                           : renderer->flatten_pso_premul);
+	}
 
 	D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
 	rtv.ptr = static_cast<SIZE_T>(scratch_rtv_handle);
@@ -3889,5 +4985,66 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
 	src_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 	cmd_list->ResourceBarrier(1, &src_barrier);
 
+	return XRT_SUCCESS;
+}
+
+
+extern "C" xrt_result_t
+comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
+                              void *cmd_list_ptr,
+                              void *srv_heap,
+                              uint64_t src_srv,
+                              uint32_t src_tex_w,
+                              uint32_t src_tex_h,
+                              int32_t src_x,
+                              int32_t src_y,
+                              uint32_t src_w,
+                              uint32_t src_h,
+                              uint64_t rtv,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h)
+{
+	auto *cmd_list = static_cast<ID3D12GraphicsCommandList *>(cmd_list_ptr);
+	auto *heap = static_cast<ID3D12DescriptorHeap *>(srv_heap);
+	if (renderer == nullptr || cmd_list == nullptr || heap == nullptr || src_srv == 0 || rtv == 0 ||
+	    src_tex_w == 0 || src_tex_h == 0 || src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 ||
+	    renderer->blit_pso[0] == nullptr) {
+		return XRT_ERROR_D3D12;
+	}
+
+	ID3D12DescriptorHeap *heaps[] = {heap};
+	cmd_list->SetDescriptorHeaps(1, heaps);
+	cmd_list->SetGraphicsRootSignature(renderer->root_signature);
+	// Index 0 = the R8G8B8A8_UNORM pipeline, the DXGI back buffer's format.
+	cmd_list->SetPipelineState(renderer->blit_pso[0]);
+	D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+	rtv_handle.ptr = static_cast<SIZE_T>(rtv);
+	cmd_list->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+	cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+
+	D3D12_VIEWPORT vp = {};
+	vp.TopLeftX = static_cast<float>(dst_x);
+	vp.TopLeftY = static_cast<float>(dst_y);
+	vp.Width = static_cast<float>(dst_w);
+	vp.Height = static_cast<float>(dst_h);
+	vp.MinDepth = 0.0f;
+	vp.MaxDepth = 1.0f;
+	cmd_list->RSSetViewports(1, &vp);
+	D3D12_RECT sc = {dst_x, dst_y, dst_x + static_cast<LONG>(dst_w), dst_y + static_cast<LONG>(dst_h)};
+	cmd_list->RSSetScissorRects(1, &sc);
+
+	D3D12_GPU_DESCRIPTOR_HANDLE gpu;
+	gpu.ptr = src_srv;
+	cmd_list->SetGraphicsRootDescriptorTable(0, gpu);
+	const float src_rect[4] = {
+	    static_cast<float>(src_x) / static_cast<float>(src_tex_w),
+	    static_cast<float>(src_y) / static_cast<float>(src_tex_h),
+	    static_cast<float>(src_w) / static_cast<float>(src_tex_w),
+	    static_cast<float>(src_h) / static_cast<float>(src_tex_h),
+	};
+	cmd_list->SetGraphicsRoot32BitConstants(1, 4, src_rect, 0);
+	cmd_list->DrawInstanced(4, 1, 0, 0);
 	return XRT_SUCCESS;
 }

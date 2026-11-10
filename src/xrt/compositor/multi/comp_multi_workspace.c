@@ -49,6 +49,10 @@ static struct os_mutex g_lock;
 static bool g_lock_ready = false;
 static struct chrome_entry g_entries[CHROME_MAX_ENTRIES];
 
+// Process-global focused client (the service is a single process). Read in the
+// content loop, written by the workspace set_focused handler.
+static struct xrt_compositor *g_focused_xc = NULL;
+
 static void
 ensure_lock(void)
 {
@@ -202,6 +206,11 @@ comp_multi_workspace_chrome_clear(struct xrt_compositor *target_xc)
 	if (e != NULL) {
 		free_entry_locked(e);
 	}
+	// The compositor is going away (called from its destroy): a focused pointer
+	// left behind would route keys to a freed (and soon reused) queue key.
+	if (g_focused_xc == target_xc) {
+		g_focused_xc = NULL;
+	}
 	os_mutex_unlock(&g_lock);
 }
 
@@ -283,9 +292,6 @@ comp_multi_workspace_set_client_style(struct xrt_compositor *target_xc,
 	os_mutex_unlock(&g_lock);
 }
 
-// Process-global focused client (the service is a single process). Read in the
-// content loop, written by the workspace set_focused handler.
-static struct xrt_compositor *g_focused_xc = NULL;
 
 void
 comp_multi_workspace_set_focused_client(struct xrt_compositor *target_xc)
@@ -439,8 +445,11 @@ static struct
 	struct comp_multi_cursor_state state;
 } g_cursor;
 
-static int32_t g_pointer_x;
-static int32_t g_pointer_y;
+// Starts OUTSIDE the surface: until the platform reports the pointer over the
+// service surface, the cursor sprite is not drawn (it used to be drawn at the
+// shell origin while the pointer was on another output).
+static int32_t g_pointer_x = COMP_MULTI_POINTER_OUTSIDE;
+static int32_t g_pointer_y = COMP_MULTI_POINTER_OUTSIDE;
 
 struct overlay_entry
 {
@@ -615,4 +624,48 @@ comp_multi_workspace_copy_overlays(struct comp_multi_overlay_state *out_states,
 	}
 	os_mutex_unlock(&g_lock);
 	return count;
+}
+
+void
+comp_multi_workspace_reset_controller_state(void)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	xrt_swapchain_reference(&g_cursor.xsc, NULL);
+	memset(&g_cursor.state, 0, sizeof(g_cursor.state));
+	for (int i = 0; i < COMP_MULTI_WORKSPACE_MAX_OVERLAYS; i++) {
+		if (g_overlays[i].used) {
+			xrt_swapchain_reference(&g_overlays[i].xsc, NULL);
+			g_overlays[i].used = false;
+			memset(&g_overlays[i].state, 0, sizeof(g_overlays[i].state));
+		}
+	}
+	g_focused_xc = NULL;
+	os_mutex_unlock(&g_lock);
+}
+
+static comp_multi_frame_tick_fn g_tick_fn = NULL;
+static void *g_tick_ud = NULL;
+
+void
+comp_multi_workspace_set_frame_tick_sink(comp_multi_frame_tick_fn fn, void *userdata)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	g_tick_fn = fn;
+	g_tick_ud = userdata;
+	os_mutex_unlock(&g_lock);
+}
+
+void
+comp_multi_workspace_emit_frame_tick(const struct comp_multi_frame_tick *tick)
+{
+	ensure_lock();
+	os_mutex_lock(&g_lock);
+	comp_multi_frame_tick_fn fn = g_tick_fn;
+	void *ud = g_tick_ud;
+	os_mutex_unlock(&g_lock);
+	if (fn != NULL && tick != NULL) {
+		fn(ud, tick);
+	}
 }

@@ -256,6 +256,45 @@ component, or run its standalone installer — which requires only the DisplayXR
 
 ---
 
+## Plug-in refused: `REFUSING unverified binary` / `UNTRUSTED` (ADR-054 N4b)
+
+**Symptom.** `displayxr-cli selftest` fails (or an app falls back to `sim-display`,
+or finds no display processor at all) and the log has one ERROR line per refused
+DLL:
+
+```
+plugin loader:   leia-sr: REFUSING unverified binary C:\...\DisplayXR-LeiaSR.dll — unsigned and not allowlisted (to allow: Trust\Allowlist\<sha256>) (enforcing; Trust\Enforce = 0 opts out, ADR-054 N4b).
+```
+
+`displayxr-cli dp list` / `input list` / `conv list` show the row with
+`provenance=unverified` and `UNTRUSTED`; `selftest --json` has the same under
+`plugins[].provenance` / `provenance_reason`.
+
+**Cause — the provenance gate enforces by default on Windows.** A component
+binary must be Authenticode-signed (any trusted root) or have its SHA-256 under
+`HKLM\Software\DisplayXR\Trust\Allowlist`. Released installers satisfy this
+(signed release, or the installer writes the row for what it ships). What trips
+it:
+
+- **A dev-built DLL registered before the gate existed, or rebuilt since.** Every
+  rebuild is a new digest. Re-run `scripts\register_dev_plugin.bat …` (elevated) for
+  the DLL — it registers *and* allowlists — or `scripts/push-runtime-pf.sh`, which
+  allowlists everything it copies into Program Files.
+- **`DXR_ALLOW_DEV_PLUGIN_PATHS=1` set, but the process is elevated.** The dev
+  override is deliberately refused on an elevated host (an admin prompt, an
+  installer-restarted service, a CI runner). Allowlist the file instead, or run the
+  app from a normal prompt.
+- **A vendor installer that ships unsigned builds and writes no row.** The vendor's
+  bug: its installer must write the row (vendor onboarding guide §5), or ship signed.
+
+**Fixes, most to least specific.**
+
+1. Write the row the log names: `reg add HKLM\Software\DisplayXR\Trust\Allowlist /v <sha256> /t REG_SZ /d "why" /f /reg:64` (get the digest with `certutil -hashfile <dll> SHA256`), then restart the service.
+2. Re-run the component's installer (released installers write their rows).
+3. Opt out for this box, one release only: `reg add HKLM\Software\DisplayXR\Trust /v Enforce /t REG_DWORD /d 0 /f /reg:64` — the gate goes back to audit (logs `unverified`, loads anyway). Delete the value to enforce again.
+
+---
+
 ## Vulkan app crashes immediately on launch
 
 **Symptom.** A Vulkan-backed app crashes at or just after startup (often a null-pointer
@@ -396,6 +435,49 @@ camera specifically.
 
 ---
 
+## Samsung Odyssey 3D: the panel stays 2D, or the 3D colours are wrong at 60 Hz
+
+The Samsung Odyssey 3D (e.g. the G90XF) is a common DisplayXR panel, and two of its
+**on-screen-menu (OSD) settings** can defeat 3D while every piece of software reports
+success. Check both before debugging the runtime or the plug-in. Both apply to every OS
+and every app, because the monitor itself decides.
+
+**1. "3D PC selection" must match the video port the computer is on.**
+
+- **Symptom.** The panel never switches to 3D: the app weaves and eye tracking works, but
+  the image stays flat. Power-cycling or unplugging the other cable doesn't help.
+- **How to recognise it.** The DisplayXR side looks healthy: the log shows the vendor DP
+  weaving and fresh eye positions. The vendor service keeps re-requesting the lens. LeiaSR's
+  SR Service logs `LensSwitchBehavior: switching the lens mode to enable three-dimensional
+  viewing` about once a second, indefinitely. The board accepts the command, but the
+  monitor's firmware holds the lens off.
+- **Fix.** In the Odyssey's OSD, set **3D PC selection** to the input the computer is
+  connected to (the HDMI or the DisplayPort input). The lens switches within a second; no
+  restart is needed.
+- **Watch out when swapping units.** The setting is per monitor, so it is the first thing
+  to check on a newly connected unit.
+
+**2. On HDMI, the input must be set to HDMI 2.0, not HDMI 1.4.**
+
+- **Symptom.** 3D works, but the woven image is full of colour. This shows up at 4K
+  **60 Hz**; at 30 Hz the colours are correct. Seen on Windows and macOS alike.
+- **Cause.** In HDMI 1.4 mode the input can't carry full-colour (RGB) 4K60, so the signal
+  arrives chroma-subsampled. Subsampling averages colour across neighbouring pixels, which
+  destroys the per-subpixel view interleave the weave relies on.
+- **Fix.** Set that HDMI input to **HDMI 2.0** in the Odyssey's OSD. If you can't, fall
+  back to 4K at 30 Hz. DisplayPort doesn't have this limit and also allows refresh rates
+  above 60 Hz.
+- **macOS note.** Changing the HDMI mode re-enumerates the monitor, and macOS may bring it
+  back **mirroring** the laptop. Turn mirroring off again in *System Settings → Displays*
+  (the runtime handles the change live; ADR-047 Amendment 8).
+- **How to judge it.** Use a woven left-white / right-black pattern with a fixed viewer
+  rather than app content. On the macOS Metal path, set
+  `DXR_DEBUG_ATLAS_PATTERN=lr_white_black`; with LeiaSR, also set
+  `SR_SIMULATED_VIEWER="0,100,600,63"`. Each eye should see a clean white or a clean black.
+  A colourful mix in both means the link is the problem, not the runtime.
+
+---
+
 ## Wrong runtime loads, or `XR_RUNTIME_JSON` is ignored
 
 **Symptom.** You set `XR_RUNTIME_JSON` to point at a specific (e.g. dev) runtime, but the
@@ -438,6 +520,28 @@ provider.
 
 ---
 
+## Leap hands come back left/right-swapped, or moving a hand sideways moves it in depth
+
+**Symptom:** with the `ultraleap` input provider and a Leap Motion on the desk,
+the left hand drives the right one, and a sideways move shows up as depth. The
+Ultraleap Control Panel says Head-mounted mode even after you set Desktop.
+
+**Cause:** Ultraleap's installer registers its own OpenXR API layer,
+`XR_APILAYER_ULTRALEAP_hand_tracking`, as an **implicit** layer
+(`HKLM`/`HKCU\Software\Khronos\OpenXR\1\ApiLayers\Implicit`). The Khronos
+loader puts implicit layers in *every* OpenXR app, whichever runtime is active,
+so it loads into DisplayXR apps (and the DisplayXR Browser) too, and each load
+resets the Leap tracking service to Head-mounted mode. `displayxr-cli selftest`
+runs without the loader, so it cannot see the layer act. It reads the
+registration instead and prints `WARN: ULTRALEAP_OPENXR_LAYER` (never a
+failure). `displayxr-cli info` and the provider's own log do the same.
+
+**Fix:**
+1. Set `DISABLE_XR_APILAYER_ULTRALEAP_HAND_TRACKING_1=1` in the **user**
+   environment. This is the layer manifest's own `disable_environment` switch.
+2. Close every OpenXR app that already loaded the layer (browsers included).
+3. Set Desktop mode again in the Ultraleap Control Panel.
+
 ## Sampling a client window's Win32 state — key on the HWND the runtime names
 
 When diagnosing "the app went dark / stopped weaving" with `IsWindowVisible`,
@@ -478,6 +582,70 @@ Two related traps:
   weave-on-scanout split engaged; a post-weave PNG showing a plain 2D view
   with the view-cone halo means no viewer was tracked at that instant, not a
   capture fault.
+
+## Installer or bundle fails with "exited with code 6" (or a bare "code 2")
+
+**Symptom.** The runtime installer, or the bundle running it, stops with *"DisplayXR
+Runtime installer exited with code 6. Aborting bundle."* Runtime installers before
+v2.21.5 gave a bare **code 2** in the same situation. It usually happens on one machine
+while the same bundle installs fine elsewhere.
+
+**Cause.** A running program still has `DisplayXRClient.dll` loaded, and the installer
+refuses to replace it rather than leave the client and service on different builds
+(#1268). Every OpenXR application loads that DLL, including ones nobody thinks of as
+OpenXR apps. On the machine behind #1733 it was **Google Chrome's WebXR helper
+process**, which keeps the runtime loaded after the WebXR page that started it has
+closed. Unity or Unreal editors and DisplayXR demos left open do the same.
+
+The installer closes only what it owns: the service, anything running from the runtime
+folder, the DisplayXR Browser, and (from v2.21.5) any Chromium browser's WebXR helper.
+It never force-closes your other programs.
+
+**Fix.**
+- **Run interactively** (double-click the runtime installer). It names the programs
+  holding the DLL and offers to close them normally, to check again after you have
+  closed them yourself, or to cancel. Nothing is changed until the DLL is free.
+- **Silent runs** (`/S`, as the bundle does) exit with code 6 and record the program
+  names in the registry:
+  ```
+  reg query "HKLM\Software\DisplayXR\Runtime" /v LastInstallBlockers
+  ```
+  Close those programs and run the installer or bundle again. The value is cleared on
+  the next successful install.
+- **Unattended deploys** can add `/CLOSEAPPS` to a silent run. The installer then asks
+  the holders to close normally, once, and continues if they did.
+- To see the holders yourself from an admin prompt: `tasklist /m DisplayXRClient.dll`.
+
+## An app's Ctrl+Space (or Ctrl+Shift+Space) does nothing — the workspace hotkey took it
+
+**Symptom.** A keyboard shortcut works in an app until DisplayXR is installed, then pressing
+it does nothing in the app (and may open the workspace controller instead). Typical
+victims of the old default: Blender's *Toggle Maximize Area* (Ctrl+Space), IDE / editor
+completion, the Windows IME switch.
+
+**Cause.** The service's workspace **launch hotkey** is a low-level keyboard hook, so it
+sees the combo before any application and consumes it while no workspace controller is
+running. Until 2026-10-26 the default was **Ctrl+Space**; it is now **Ctrl+Shift+Space**.
+A box that never changed the setting picks up the new default when the runtime is
+upgraded. A box where someone explicitly set `Ctrl+Space` (by hand, or later through the
+CLI or dashboard) keeps it — that is treated as a user choice.
+
+**Check.** `displayxr-cli workspace list` prints each controller's launch hotkey and
+whether it is the `default` or a `user` setting. The tray's Workspace submenu shows the
+same combo (greyed *Launch hotkey: …* line).
+
+**Fix.** Pick a combo your apps do not use, or none:
+
+```
+displayxr-cli workspace set <id> --hotkey ctrl+shift+f9   # any combo
+displayxr-cli workspace reset <id>                        # back to the default (Ctrl+Shift+Space, auto)
+displayxr-cli workspace set <id> --no-hotkey              # no hotkey; launch from the tray or 'workspace launch'
+```
+
+or use the DisplayXR Dashboard (*Components* → workspace controller → *Launch*). A running
+service applies the change immediately. The workspace controller itself (e.g. the
+DisplayXR Shell) claims its own toggle chord only while it is running. Spec:
+`docs/specs/runtime/workspace-controller-registration.md` §*Launch settings*.
 
 ## Still stuck?
 

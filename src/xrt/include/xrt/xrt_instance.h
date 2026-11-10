@@ -23,10 +23,15 @@ extern "C" {
 struct xrt_prober;
 struct xrt_device;
 struct xrt_instance_android;
+struct xrt_stereo_camera_client;
+struct xrt_plugin_iface;
+struct xrt_plugin_instance;
+struct xrt_screen_list;
 struct xrt_space_overseer;
 struct xrt_system;
 struct xrt_system_devices;
 struct xrt_system_compositor;
+struct xrt_system_compositor_info;
 
 struct _JavaVM;
 
@@ -78,7 +83,16 @@ enum xrt_client_class
 	XRT_CLIENT_CLASS_RELAY = 3,         //!< headless relay (XR_MND_headless + display_info; the WebXR bridge)
 	XRT_CLIENT_CLASS_PROVIDER_HOST = 4, //!< service-spawned input-provider host (Phase 4; reserved)
 	XRT_CLIENT_CLASS_DIAG = 5,          //!< read-only diagnostics (displayxr-cli clients, bridge introspection)
-	XRT_CLIENT_CLASS_COUNT = 6,
+	/*!
+	 * XR_DXR_stereo_camera consumer with no compositor session (ADR-043 R3):
+	 * a browser's video-capture utility process, `displayxr-cli camera`. It
+	 * may only use the camera entry points — never a session — and it is
+	 * NOT a panel owner, so it never counts toward the PRESENT_OWNER quota
+	 * even when its executable is the browser's. Declared explicitly
+	 * (XrStereoCameraClientInfoDXR on xrInstanceCreateInfo); verified by use.
+	 */
+	XRT_CLIENT_CLASS_CAMERA_CONSUMER = 6,
+	XRT_CLIENT_CLASS_COUNT = 7,
 };
 
 /*!
@@ -114,6 +128,11 @@ struct xrt_application_info
 	//! (u_sandbox_is_workspace_session); the server just records the claim —
 	//! it is a scoping hint, not a privilege, so there is nothing to verify.
 	bool workspace_session;
+	//! ADR-043: XrStereoCameraClientInfoDXR::flags as the app chained them
+	//! (XRT_STEREO_CAMERA_CLIENT_* in xrt_stereo_camera.h, same bit values).
+	//! Only ever RESTRICTS what the service grants (DECLINE_DELEGATION), so the
+	//! claim needs no verification. Unknown bits are ignored.
+	uint64_t stereo_camera_client_flags;
 };
 
 /*!
@@ -128,6 +147,21 @@ struct xrt_instance_info
 
 	//! Process-specific, platform-specific data.
 	struct xrt_platform_info platform_info;
+
+	/*!
+	 * Did the application enable an extension through which it hands the
+	 * runtime its OWN window or surface (XR_DXR_win32_window_binding,
+	 * XR_DXR_cocoa_window_binding, XR_DXR_xlib_window_binding,
+	 * XR_DXR_wayland_surface_binding, XR_DXR_android_surface_binding)?
+	 *
+	 * Read only by the hybrid router in xrt_instance_create: a window-bound
+	 * app is never a desktop-Linux XR_DXR_weave present-owner (#1744). It is a
+	 * client-side routing input, deliberately NOT in @ref xrt_application_info,
+	 * which is copied verbatim onto the IPC wire (ipc_client_description,
+	 * ipc_app_state) — keeping it here leaves the client<->service layout
+	 * untouched.
+	 */
+	bool window_binding_enabled;
 };
 
 /*!
@@ -230,7 +264,113 @@ struct xrt_instance
 	 * @see xrt_instance_android
 	 */
 	struct xrt_instance_android *android_instance;
+
+	/*!
+	 * XR_DXR_stereo_camera (ADR-043) client aspect. Set by the IPC client
+	 * instance only; NULL for an in-process instance (which enumerates zero
+	 * cameras — the service is each camera's single owner).
+	 */
+	struct xrt_stereo_camera_client *stereo_camera;
+
+	/*!
+	 * Optional: the plug-in that claimed the system for THIS instance, for
+	 * service-side owners of plug-in-provided sources (the IPC server's
+	 * stereo camera manager, ADR-043). Set by the native instance; NULL on
+	 * the IPC client instance. Returns false when no plug-in is active.
+	 */
+	bool (*get_active_plugin)(struct xrt_instance *xinst,
+	                          const struct xrt_plugin_iface **out_iface,
+	                          struct xrt_plugin_instance **out_inst);
+
+	/*!
+	 * Optional (multi-screen M1, `XR_DXR_display_info` v22): the system's
+	 * screens — one per monitor in the per-monitor DP registry, the
+	 * system-default one first — with each screen's display info. The native
+	 * instance builds it from the registry of the system it created; the IPC
+	 * client instance asks the service (`system_enumerate_displays`), so both
+	 * paths return the same list. Call after `create_system`; an empty list
+	 * (count 0) is a valid answer. NULL on instances that cannot answer
+	 * (the no-compositor instance).
+	 */
+	xrt_result_t (*enumerate_displays)(struct xrt_instance *xinst, struct xrt_screen_list *out_list);
+
+	/*!
+	 * Optional (display hotplug, ADR-047 Amendment 8): the display-topology
+	 * generation — 0 until the system exists, then bumped every time the
+	 * published screen list changes after a display was plugged in, removed,
+	 * re-claimed by another plug-in or moved. Cheap enough to read every frame
+	 * (it takes no lock the claim sweep holds). NULL on instances without a
+	 * live claim sweep (the IPC client instance today).
+	 */
+	uint64_t (*get_display_generation)(struct xrt_instance *xinst);
+
+	/*!
+	 * Optional (display hotplug, ADR-047 Amendment 8): one consistent snapshot
+	 * of the screen list (as @ref enumerate_displays builds it), the system
+	 * compositor info it was built from (its per-monitor DP registry
+	 * included), and the generation they belong to — taken under the lock the
+	 * claim sweep rewrites them under, so a session never pairs one sweep's
+	 * list with another's registry. @p out_info and @p out_generation may be
+	 * NULL. NULL on instances without a live claim sweep.
+	 */
+	xrt_result_t (*get_display_snapshot)(struct xrt_instance *xinst,
+	                                     struct xrt_screen_list *out_list,
+	                                     struct xrt_system_compositor_info *out_info,
+	                                     uint64_t *out_generation);
 };
+
+/*!
+ * @copydoc xrt_instance::enumerate_displays
+ *
+ * Returns XRT_ERROR_FEATURE_NOT_SUPPORTED when the instance has no
+ * implementation.
+ *
+ * @public @memberof xrt_instance
+ */
+static inline xrt_result_t
+xrt_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	if (xinst == NULL || xinst->enumerate_displays == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xinst->enumerate_displays(xinst, out_list);
+}
+
+/*!
+ * @copydoc xrt_instance::get_display_generation
+ *
+ * 0 when the instance has no implementation (the topology never changes).
+ *
+ * @public @memberof xrt_instance
+ */
+static inline uint64_t
+xrt_instance_get_display_generation(struct xrt_instance *xinst)
+{
+	if (xinst == NULL || xinst->get_display_generation == NULL) {
+		return 0;
+	}
+	return xinst->get_display_generation(xinst);
+}
+
+/*!
+ * @copydoc xrt_instance::get_display_snapshot
+ *
+ * Returns XRT_ERROR_FEATURE_NOT_SUPPORTED when the instance has no
+ * implementation (the caller falls back to @ref xrt_instance_enumerate_displays).
+ *
+ * @public @memberof xrt_instance
+ */
+static inline xrt_result_t
+xrt_instance_get_display_snapshot(struct xrt_instance *xinst,
+                                  struct xrt_screen_list *out_list,
+                                  struct xrt_system_compositor_info *out_info,
+                                  uint64_t *out_generation)
+{
+	if (xinst == NULL || xinst->get_display_snapshot == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return xinst->get_display_snapshot(xinst, out_list, out_info, out_generation);
+}
 
 /*!
  * @copydoc xrt_instance::create_system

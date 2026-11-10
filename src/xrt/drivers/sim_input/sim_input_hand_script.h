@@ -1,0 +1,203 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  sim_input's hand/controller SCRIPT: where the simulated hands are and
+ *         what their fingers do, as pure functions of the requested timestamp.
+ *
+ * Split out of `sim_input_device.c` (#2191) so the placement and the pinch
+ * policy can be unit-tested with no device, no plug-in and no display
+ * (`tests/tests_sim_input_hands.cpp`).
+ *
+ * **Placement (#2191).** The hands are scripted relative to the DISPLAY
+ * PLANE: origin at the display centre, +X right, +Y up, +Z toward the viewer
+ * (the `XRT_TRACKING_TYPE_RIG_LOCAL` frame of input-provider-discovery.md
+ * §4b.4). Each hand's root rides a small circle centred
+ * `HAND_DISTANCE_M` in front of the glass and a fraction of the display height
+ * to its side (@ref SIM_INPUT_HAND_LATERAL_FRAC), so a default display rig shows both hands without any
+ * app-side offset. The device publishes these poses on a RIG_LOCAL origin,
+ * which the runtime resolves onto the display plane each session sees
+ * (input-provider-discovery.md §4b.4).
+ *
+ * @ingroup drv_sim_input
+ */
+
+#pragma once
+
+#include "xrt/xrt_defines.h"
+
+#include "util/u_hand_tracking.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+//! Radius of each hand's circle (metres), the cap of @ref sim_input_hand_radius.
+#define SIM_INPUT_CIRCLE_RADIUS_M 0.04f
+//! One revolution of the circle (seconds).
+#define SIM_INPUT_CIRCLE_PERIOD_S 4.0
+//! Finger-curl wave period (#825 Tier 2): a full open→fist→open cycle.
+#define SIM_INPUT_CURL_PERIOD_S 3.0
+/*!
+ * Placement is a fraction of the PHYSICAL DISPLAY HEIGHT H, so the hands stay
+ * on small panels (a 0.30 x 0.19 m panel viewed from 0.6 m sees only
+ * |x| < ~0.088 m at z = 0.25 — fixed ±0.12 m was off-screen). H comes from
+ * the host iface's `get_display_geometry` (the display plug-in's
+ * `get_display_info`, published by the builder before `create_devices`).
+ */
+//! Circle centre's distance left/right of the display centre, as a fraction of H.
+#define SIM_INPUT_HAND_LATERAL_FRAC 0.30f
+/*!
+ * Where each circle centre PROJECTS on the display plane, seen from the nominal
+ * viewer, as a fraction of H above the display centre: 0 = vertically centred.
+ * Placing the hands by their projection (not by a fixed height) keeps them in
+ * view for any viewer height and hand distance: the nominal eye sits above the
+ * centre, so a point floating in front of the glass at the centre's height
+ * projects BELOW it (Linux 0.30 x 0.19 m panel: y = -0.02 at z = 0.25 landed on
+ * the bottom edge of the view). Same intent as the reference viewer app, whose
+ * Leap hands land centred on the display at a typical hand height.
+ */
+#define SIM_INPUT_HAND_HEIGHT_FRAC 0.0f
+/*!
+ * Nominal viewer when the host publishes none (metres, display-centre origin,
+ * +Z toward the viewer). Matches sim-display's default nominal viewer.
+ */
+#define SIM_INPUT_VIEWER_FALLBACK_Y_M 0.10f
+#define SIM_INPUT_VIEWER_FALLBACK_Z_M 0.60f
+//! Circle radius as a fraction of H (capped at @ref SIM_INPUT_CIRCLE_RADIUS_M).
+#define SIM_INPUT_CIRCLE_RADIUS_FRAC 0.10f
+/*!
+ * H when the host reports no geometry (older runtime, not yet published):
+ * 0.40 m reproduces the previous fixed placement (±0.12 m, 4 cm circle).
+ */
+#define SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M 0.40f
+//! Default `HAND_DISTANCE_M`: circle centre's distance in front of the glass (metres, NOT scaled).
+#define SIM_INPUT_HAND_DISTANCE_DEFAULT_M 0.25f
+
+/*!
+ * Default `HAND_SCALE_H_PER_M`: display heights of hand per metre of real hand,
+ * the same gain the Ultraleap provider's relative mapping uses
+ * (`ultraleap_map.h`, `UL_MAP_DEFAULT_GAIN_H_PER_M` — the reference viewer
+ * app's scene). On a 0.194 m panel a 10 cm hand shows as 0.25 H = 4.9 cm.
+ */
+#define SIM_INPUT_HAND_SCALE_DEFAULT_H_PER_M 2.5f
+
+//! `HANDS` setting: which hands are tracked.
+enum sim_input_hands_mode
+{
+	SIM_INPUT_HANDS_BOTH = 0, //!< default
+	SIM_INPUT_HANDS_LEFT,
+	SIM_INPUT_HANDS_RIGHT,
+	SIM_INPUT_HANDS_NONE,
+};
+
+//! `PINCH` setting: what the fingers do.
+enum sim_input_pinch_mode
+{
+	SIM_INPUT_PINCH_WAVE = 0, //!< default: the #825 curl wave (open→fist→open every 3 s)
+	SIM_INPUT_PINCH_HOLD,     //!< thumb + index tips held pinched, other fingers relaxed
+	SIM_INPUT_PINCH_OPEN,     //!< every finger relaxed, no pinch ever
+};
+
+/*!
+ * Thumb / index curl that @ref SIM_INPUT_PINCH_HOLD holds: the pair that
+ * brings `u_hand_sim_simulate_for_valve_index_knuckles`'s thumb tip and index
+ * tip closest together (searched over the curl square; pinned by
+ * tests_sim_input_hands — a 6.5 mm tip gap; under 1.5 cm is required).
+ */
+#define SIM_INPUT_PINCH_HOLD_THUMB_CURL 0.94f
+#define SIM_INPUT_PINCH_HOLD_INDEX_CURL 1.0f
+//! Curl of the relaxed (non-pinching) fingers in HOLD / OPEN.
+#define SIM_INPUT_RELAXED_CURL 0.1f
+
+/*!
+ * Parse a `HANDS` value (`both` | `left` | `right` | `none`, case-insensitive).
+ * Returns false (leaving @p out untouched) for anything else.
+ */
+bool
+sim_input_parse_hands(const char *value, enum sim_input_hands_mode *out);
+
+/*!
+ * Parse a `PINCH` value (`wave` | `hold` | `open`, case-insensitive).
+ * Returns false (leaving @p out untouched) for anything else.
+ */
+bool
+sim_input_parse_pinch(const char *value, enum sim_input_pinch_mode *out);
+
+//! Is the @p left (else right) hand tracked under @p mode?
+bool
+sim_input_hand_enabled(enum sim_input_hands_mode mode, bool left);
+
+/*!
+ * The circle centre of one hand in the display-plane (RIG_LOCAL) frame,
+ * @p distance_m out of the glass, placed on the line from the nominal viewer
+ * (@p viewer_y_m, @p viewer_z_m) to the display-plane point
+ * (±@ref SIM_INPUT_HAND_LATERAL_FRAC · H, @ref SIM_INPUT_HAND_HEIGHT_FRAC · H),
+ * so it projects there whatever the viewer height. @p distance_m <= 0 or
+ * non-finite falls back to the default and is capped at 0.8 of the viewer
+ * distance; @p display_height_m falls back to
+ * @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M; a viewer with @p viewer_z_m <= 0 to
+ * @ref SIM_INPUT_VIEWER_FALLBACK_Y_M / @ref SIM_INPUT_VIEWER_FALLBACK_Z_M.
+ */
+struct xrt_pose
+sim_input_hand_center(bool left, float distance_m, float display_height_m, float viewer_y_m, float viewer_z_m);
+
+/*!
+ * The circle radius: projected on the display plane it is
+ * min(@ref SIM_INPUT_CIRCLE_RADIUS_FRAC · H, @ref SIM_INPUT_CIRCLE_RADIUS_M),
+ * so the real radius shrinks by the same perspective factor as the centre.
+ */
+float
+sim_input_hand_radius(float display_height_m, float distance_m, float viewer_z_m);
+
+/*!
+ * The hand's size factor (metres of drawn hand per metre of real hand):
+ * @p gain_h_per_m · H, with H = @p display_height_m or
+ * @ref SIM_INPUT_DISPLAY_HEIGHT_FALLBACK_M. @p gain_h_per_m <= 0 or
+ * non-finite = 1 (1:1 metres, the pre-gain behaviour).
+ *
+ * Display-metric on purpose: H is the PHYSICAL panel, never the window /
+ * canvas, so the hand's size does not follow the window — the same as a real
+ * Leap seen through the window as a portal.
+ */
+float
+sim_input_hand_scale(float gain_h_per_m, float display_height_m);
+
+/*!
+ * Scale a simulated joint set about its root (`hand_pose`, the circle point
+ * the grip / aim / palm poses ride — the wrist of `u_hand_simulation`'s hand)
+ * by @p scale. The joint relations are hand-local (the state tracker composes
+ * `hand_pose` onto them), so each joint's position, its linear velocity and
+ * its radius are multiplied. `hand_pose` itself — and so the circle centre
+ * and radius — is unchanged. @p scale <= 0
+ * or non-finite, or exactly 1, leaves the set untouched.
+ */
+void
+sim_input_hand_scale_joints(struct xrt_hand_joint_set *set, float scale);
+
+/*!
+ * The scripted root/grip relation at @p at_timestamp_ns: @p center plus a
+ * circle of @p radius_m in the display plane's XY, phase-shifted by
+ * @p phase_rad. Pure function of the timestamp, velocity included, so
+ * prediction for any requested time is exact.
+ */
+void
+sim_input_hand_relation(const struct xrt_pose *center,
+                        float radius_m,
+                        double phase_rad,
+                        int64_t at_timestamp_ns,
+                        struct xrt_space_relation *out_relation);
+
+//! The finger curls at @p at_timestamp_ns under @p mode (pure).
+void
+sim_input_hand_curls(enum sim_input_pinch_mode mode,
+                     double phase_rad,
+                     int64_t at_timestamp_ns,
+                     struct u_hand_tracking_curl_values *out_curls);
+
+#ifdef __cplusplus
+}
+#endif

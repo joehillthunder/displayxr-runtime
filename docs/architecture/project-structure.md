@@ -29,7 +29,11 @@ src/xrt/
 │   ├── d3d12/                 Native D3D12 compositor (Windows)
 │   ├── metal/                 Native Metal compositor (macOS)
 │   ├── gl/                    Native OpenGL compositor (Windows + macOS)
-│   ├── vk_native/             Native Vulkan compositor (Windows + macOS)
+│   ├── vk_native/             Native Vulkan compositor (Windows, macOS, Linux, Android)
+│   ├── hub_d3d11/             Windows D3D11 hub: weave + present for in-process tiers (ADR-059)
+│   ├── xbridge/               Cross-adapter atlas transport + output-device split gate
+│   ├── d3d_shared/            HLSL shared by the D3D11 and D3D12 compositors
+│   ├── vk_conv/               Vulkan GPU glue for the conversion core (ADR-053)
 │   ├── client/                Client-side API glue (GL, Vulkan, D3D11, D3D12)
 │   ├── render/                Vulkan render helpers
 │   ├── shaders/               GLSL shader sources
@@ -92,6 +96,9 @@ SIM_DISPLAY_NOMINAL_Z_M=0.5           # Nominal viewing distance
 SIM_DISPLAY_PIXEL_W=3840              # Resolution width
 SIM_DISPLAY_PIXEL_H=2160              # Resolution height
 ```
+Each of these overrides the real monitor's geometry, which sim_display adopts by
+default on Windows, macOS and desktop Linux — see
+[`docs/vendors/sim_display/README.md`](../vendors/sim_display/README.md#panel-geometry).
 
 **Files (4 + shaders):**
 - `sim_display_device.c` — `xrt_device` with configurable specs

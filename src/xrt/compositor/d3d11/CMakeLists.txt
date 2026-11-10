@@ -9,6 +9,27 @@ if(WIN32 AND XRT_HAVE_D3D11)
 	# The cross-adapter atlas bridge is its own static library and lives in
 	# ../xbridge — see that directory's CMakeLists.txt for why.
 
+	# Multi-screen M6: the per-screen segment manager and the output-device
+	# composite unit it blits flat 2D through. Their own static library so the
+	# D3D11 service compositor (../d3d11_service) can segment IPC clients'
+	# windows without linking the whole in-process compositor — the same reason
+	# comp_xbridge is split out.
+	add_library(
+		comp_d3d11_segs STATIC
+		../d3d_shared/comp_masked_composite_shaders.h
+		comp_d3d11_outcomp.cpp
+		comp_d3d11_outcomp.h
+		comp_d3d11_segments.cpp
+		comp_d3d11_segments.h
+		d3d11_layer_shaders.h
+		)
+	target_link_libraries(
+		comp_d3d11_segs
+		PUBLIC xrt-interfaces
+		PRIVATE comp_util aux_util aux_os aux_d3d d3d11 d3dcompiler
+		)
+	target_include_directories(comp_d3d11_segs PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
+
 	add_library(
 		comp_d3d11 STATIC
 		../d3d_shared/comp_equirect2_shaders.h
@@ -16,8 +37,6 @@ if(WIN32 AND XRT_HAVE_D3D11)
 		comp_d3d11_compositor.cpp
 		comp_d3d11_compositor.h
 		comp_d3d11_compositor_internals.h
-		comp_d3d11_outcomp.cpp
-		comp_d3d11_outcomp.h
 		comp_d3d11_renderer.cpp
 		comp_d3d11_renderer.h
 		comp_d3d11_state_guard.h
@@ -42,6 +61,14 @@ if(WIN32 AND XRT_HAVE_D3D11)
 			# path at all — see docs/investigations/hybrid-igpu-weave.md).
 			aux_d3d
 			comp_xbridge
+			comp_xbridge_share_tap
+			comp_d3d11_segs
+			# #2317 P1b: the D3D11 hub the DXR_HUB=1 shim hands its atlas to. A
+			# static-library cycle (the hub links comp_d3d11 for comp_d3d11_target),
+			# which CMake resolves by repeating the pair on the link line.
+			comp_hub_d3d11
+			# XR_DXR_cursor_depth v5: the runtime-drawn cursor's default look
+			comp_cursor_look
 			xrt-external-stb
 			d3d11
 			d3d12

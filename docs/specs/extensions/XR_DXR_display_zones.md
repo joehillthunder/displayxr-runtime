@@ -3,11 +3,11 @@
 | Property | Value |
 |----------|-------|
 | Extension Name | `XR_DXR_display_zones` |
-| Spec Version | 1 |
-| Type Values | `1004999150–1004999153` |
-| Author | Leia Inc. |
+| Spec Version | 3 |
+| Type Values | `1004999150–1004999154` |
+| Author | The DisplayXR Project |
 | Platform | All (extension-app classes only) |
-| Requires | `XR_DXR_local_3d_zone` (≥ v3), `XR_DXR_view_rig` (≥ v2) |
+| Requires | `XR_DXR_local_3d_zone` (≥ v4), `XR_DXR_view_rig` (≥ v2) |
 
 > **Status:** implemented (runtime phases P1–P4 of
 > `docs/roadmap/display-zones.md`); design per
@@ -126,6 +126,14 @@ typedef struct XrDisplayZoneDXR {
     XrRect2Di                rect;    // client-window pixels
 } XrDisplayZoneDXR;
 ```
+
+**Multi-screen (Windows, `XR_DXR_weave` present-owners).** When the session's
+window is woven per screen (ADR-047 Amendment 4), a zone-scoped locate whose
+`rect` lies wholly on a non-primary screen is framed from that screen: its
+eyes, its nominal viewer, and the zone placed on its physical rectangle
+(Amendment 4 addendum). The raw channel then reports that screen's eyes and the
+zone relative to that screen. A zone that straddles a seam is located from the
+primary screen, as before.
 
 `zoneId` exists for locate↔submit pairing (validate mode), debug
 logs/captures, and as the stable referent for the reserved effective-mask

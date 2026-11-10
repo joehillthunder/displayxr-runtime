@@ -37,6 +37,7 @@
 #include "util/u_debug.h"
 #include "util/u_trace_marker.h"
 #include "util/u_distortion_mesh.h"
+#include "util/u_color_encoding.h"
 
 #ifdef XRT_OS_LINUX
 #include "util/u_linux.h"
@@ -51,6 +52,7 @@
 
 // Per-session rendering support (Phase 4)
 #include "util/comp_swapchain.h"
+#include "util/comp_weave_screens.h" // #2218 item 6: the weave engines' screen table
 #include "util/comp_render_helpers.h"
 #include "util/u_tiling.h"
 
@@ -75,6 +77,12 @@
 
 #ifdef XRT_OS_MACOS
 #include "main/comp_window_macos.h" // per-session NSWindow reposition/resize (#59)
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
+#endif
+
+#ifdef XRT_HAVE_COMP_LINUX_WINDOW
+#include "main/comp_window_linux.h" // shared-surface visibility + cursor (#710)
 #endif
 
 #ifdef XRT_BUILD_DRIVER_QWERTY
@@ -425,7 +433,7 @@ find_active_blend_mode(struct multi_compositor **overlay_sorted_clients, size_t 
  */
 // Legacy per-session helper (see the #ifndef block below) — guarded out on macOS,
 // which composites every client into the one shared surface instead.
-#ifndef XRT_OS_MACOS
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Composite LOCAL_2D layers (XR_DXR_local_3d_zone, e.g. the avatar speech
  * bubble, #568) into the final per-session target, post-weave, by scale-blitting
@@ -546,7 +554,7 @@ composite_local_2d_layers(struct multi_compositor *mc,
 	}
 	return any;
 }
-#endif // !XRT_OS_MACOS
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 static bool
 get_session_layer_view(struct multi_layer_entry *layer,
@@ -594,6 +602,79 @@ get_session_layer_view(struct multi_layer_entry *layer,
 	return (*out_image_view != VK_NULL_HANDLE);
 }
 
+/*
+ *
+ * #1007 bounded waits.
+ *
+ */
+
+VkResult
+multi_wait_fences_bounded(
+    struct vk_bundle *vk, uint32_t count, const VkFence *fences, int64_t budget_ns, const char *what)
+{
+	if (vk == NULL || count == 0 || fences == NULL) {
+		return VK_SUCCESS;
+	}
+
+	const int64_t start_ns = os_monotonic_get_ns();
+	for (;;) {
+		const int64_t waited_ns = os_monotonic_get_ns() - start_ns;
+		int64_t slice_ns = budget_ns - waited_ns;
+		if (slice_ns > MULTI_FENCE_TIMEOUT_NS) {
+			slice_ns = MULTI_FENCE_TIMEOUT_NS;
+		}
+		if (slice_ns < 0) {
+			slice_ns = 0;
+		}
+
+		VkResult ret = vk->vkWaitForFences(vk->device, count, fences, VK_TRUE, (uint64_t)slice_ns);
+		if (ret != VK_TIMEOUT) {
+			return ret;
+		}
+		if (slice_ns == 0 || os_monotonic_get_ns() - start_ns >= budget_ns) {
+			return VK_TIMEOUT;
+		}
+		U_LOG_W("multi[#1007]: %s: GPU fence wait > %.0f ms, retrying (budget %.0f ms)", what,
+		        (double)(os_monotonic_get_ns() - start_ns) / 1e6, (double)budget_ns / 1e6);
+	}
+}
+
+/*!
+ * #1007: a bounded stand-in for vkQueueWaitIdle/vkDeviceWaitIdle on the main
+ * queue. An empty submit with a fence signals once every batch submitted to the
+ * queue before it has completed, so waiting on that fence (bounded) drains the
+ * queue without an unbounded device-wide barrier.
+ */
+static VkResult
+multi_drain_main_queue_bounded(struct vk_bundle *vk, int64_t budget_ns, const char *what)
+{
+	VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	VkFence fence = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateFence(vk->device, &fence_info, NULL, &fence);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+
+	vk_queue_lock(vk->main_queue);
+	ret = vk->vkQueueSubmit(vk->main_queue->queue, 0, NULL, fence);
+	vk_queue_unlock(vk->main_queue);
+
+	if (ret == VK_SUCCESS) {
+		ret = multi_wait_fences_bounded(vk, 1, &fence, budget_ns, what);
+	}
+
+	if (ret == VK_TIMEOUT) {
+		// Still pending: destroying a fence a queue will still signal is
+		// invalid usage. Leak it (one handle per expired drain, which only
+		// happens on a wedged queue).
+		U_LOG_E("multi[#1007]: %s: queue drain did not finish in %.0f ms — leaking its fence", what,
+		        (double)budget_ns / 1e6);
+	} else {
+		vk->vkDestroyFence(vk->device, fence, NULL);
+	}
+	return ret;
+}
+
 // The per-session compositor helpers below (composite-into-atlas, swapchain
 // recreate, HUD, workspace chrome/overlay/cursor, and render_session_to_own_target)
 // implement the legacy one-NSWindow-per-client path. macOS now composites every
@@ -601,7 +682,7 @@ get_session_layer_view(struct multi_layer_entry *layer,
 // so this whole path is compiled only for the non-macOS OOP service (Android,
 // and Windows where it is unused in favor of the D3D11 monolith). Guarding it out
 // on macOS keeps the macOS binary free of the dead legacy path.
-#ifndef XRT_OS_MACOS
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Initialize intermediate composite resources for pre-display-processing layer compositing.
  * Creates a tiled atlas image, per-eye views, render pass, framebuffers,
@@ -1685,34 +1766,50 @@ composite_layers_to_intermediate(struct multi_compositor *mc,
  * @param mc The multi_compositor with per-session rendering
  * @param vk The Vulkan bundle
  */
-static void
+static bool
 recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 {
 	struct comp_target *ct = mc->session_render.target;
 	if (ct == NULL) {
-		return;
+		return false;
 	}
 
 	U_LOG_W("[per-session] Recreating swapchain (window resized)...");
 
-	// 1. Wait for ALL pending GPU work to complete
-	if (mc->session_render.fenced_buffer >= 0) {
-		vk->vkWaitForFences(vk->device, 1,
-		                    &mc->session_render.fences[mc->session_render.fenced_buffer],
-		                    VK_TRUE, UINT64_MAX);
-		mc->session_render.fenced_buffer = -1;
-	}
-	// Also wait for all fences to ensure no in-flight commands reference old swapchain
-	for (uint32_t i = 0; i < mc->session_render.buffer_count; i++) {
+	// 1. Wait for ALL pending GPU work to complete — bounded (#1007). Every
+	// per-buffer fence (they are created signalled, so idle ones return at
+	// once) in ONE wait-all; on expiry, leave the old swapchain untouched,
+	// keep the recreate flagged and skip this frame — never park the main
+	// loop (and with it every other client) on one client's GPU work.
+	uint32_t live = 0;
+	VkFence wait_set[16];
+	for (uint32_t i = 0; i < mc->session_render.buffer_count && live < ARRAY_SIZE(wait_set); i++) {
 		if (mc->session_render.fences[i] != VK_NULL_HANDLE) {
-			vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[i], VK_TRUE, UINT64_MAX);
+			wait_set[live++] = mc->session_render.fences[i];
 		}
 	}
+	VkResult wret =
+	    multi_wait_fences_bounded(vk, live, wait_set, MULTI_FENCE_DEADLINE_NS, "per-session recreate (fences)");
+	if (wret == VK_TIMEOUT) {
+		U_LOG_W("[per-session] recreate deferred: GPU work still in flight after %d ms (#1007)",
+		        (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+		mc->session_render.swapchain_needs_recreate = true;
+		return false;
+	}
+	mc->session_render.fenced_buffer = -1;
+
 	// Fences only cover render work; a present (vkQueuePresentKHR) can still be in
-	// flight holding a BufferQueue slot. Drain the whole device so destroying the
-	// old swapchain releases every buffer back to the queue — otherwise the new
-	// swapchain's first vkAcquireNextImageKHR can block forever on Android (#510).
-	vk->vkDeviceWaitIdle(vk->device);
+	// flight holding a BufferQueue slot. Drain the queue so destroying the old
+	// swapchain releases every buffer back to the queue — otherwise the new
+	// swapchain's first vkAcquireNextImageKHR can block forever on Android
+	// (#510). Was vkDeviceWaitIdle; now a bounded fence on an empty submit to
+	// the same queue (#1007) — the presents went to the main queue, so the
+	// fence orders after them.
+	wret = multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "per-session recreate (queue)");
+	if (wret == VK_TIMEOUT) {
+		mc->session_render.swapchain_needs_recreate = true;
+		return false;
+	}
 
 	uint32_t old_image_count = mc->session_render.buffer_count;
 
@@ -1741,7 +1838,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	if (!comp_target_has_images(ct)) {
 		U_LOG_E("[per-session] Failed to recreate swapchain images");
 		mc->session_render.swapchain_needs_recreate = false;
-		return;
+		return false;
 	}
 
 	uint32_t new_image_count = ct->image_count;
@@ -1782,7 +1879,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		if (!mc->session_render.cmd_buffers || !mc->session_render.fences || !mc->session_render.framebuffers) {
 			U_LOG_E("[per-session] Failed to allocate new arrays after resize");
 			mc->session_render.swapchain_needs_recreate = false;
-			return;
+			return false;
 		}
 
 		// Allocate new command buffers
@@ -1796,7 +1893,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 		if (vk_ret != VK_SUCCESS) {
 			U_LOG_E("[per-session] Failed to allocate new command buffers: %s", vk_result_string(vk_ret));
 			mc->session_render.swapchain_needs_recreate = false;
-			return;
+			return false;
 		}
 
 		// Create new fences (signaled)
@@ -1843,7 +1940,7 @@ recreate_session_swapchain(struct multi_compositor *mc, struct vk_bundle *vk)
 	mc->session_render.swapchain_needs_recreate = false;
 
 	U_LOG_W("[per-session] Swapchain recreated: %ux%u, %u images", ct->width, ct->height, new_image_count);
-
+	return true;
 }
 
 
@@ -2269,6 +2366,13 @@ session_render_hud_overlay(struct multi_compositor *mc,
  * cursor all blend RGBA over the same target format, so they reuse one
  * @ref vk_hud_blend instance (the field is named chrome_blend for historical
  * reasons; it backs all three). (#48)
+ *
+ * #1795: deliberately NOT made format-honest. The workspace registry these
+ * layers come from is only filled on macOS (ipc_server_handler.c registers
+ * chrome / cursor / overlays under XRT_OS_MACOS alone), and this per-session
+ * path is compiled out on macOS, so no controller surface reaches it today.
+ * The format-honest decoration blend lives on the macOS shared surface
+ * (shared_resolve_deco_target).
  */
 static bool
 ensure_workspace_blend(struct multi_compositor *mc, struct vk_bundle *vk)
@@ -2339,7 +2443,7 @@ workspace_blend_layer(struct multi_compositor *mc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_general);
 }
-#endif // !XRT_OS_MACOS
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 //! Display dims (meters) for this session, DP-first with system-info fallback
 //! (matches the HUD). Returns false if neither yields valid dims.
@@ -2363,7 +2467,7 @@ session_display_dims_m(struct multi_compositor *mc, float *out_w_m, float *out_h
 	return true;
 }
 
-#ifndef XRT_OS_MACOS
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Physical size, in meters, of THIS client's window surface (Tier-2, #59). The
  * display's pixel density is uniform, so window_meters = window_px ÷ display
@@ -2394,7 +2498,7 @@ session_window_dims_m(struct multi_compositor *mc, uint32_t fb_w, uint32_t fb_h,
 	*out_h_m = (float)fb_h / px_per_m_y;
 	return true;
 }
-#endif // !XRT_OS_MACOS
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 /*!
  * Public window-dims query for the workspace IPC layer (macOS get_window_pose).
@@ -2435,13 +2539,53 @@ comp_multi_workspace_get_client_window_dims(struct xrt_compositor *xc,
  * display sub-rect. See the header for the contract. Lives here (not
  * comp_multi_workspace.c) because it needs session_render + the macOS comp_target.
  */
+#ifdef COMP_MULTI_SHARED_SURFACE
+/*!
+ * The panel in its CURRENT orientation, in pixels and metres, for the shared
+ * surface's pose->pixel mapping and atlas tiles (#1006).
+ *
+ * `xrt_system_compositor_info` carries the panel in the vendor's NATURAL
+ * orientation (CNSDK: 2560x1600 / 0.260x0.163 m on an NP02J). On macOS and
+ * desktop Linux that is what the service window shows. On Android the overlay's
+ * target is the controller's surface, which follows device rotation — on the
+ * portrait-native NP02J it is 1600x2560 held portrait — so swap both pairs
+ * whenever the held orientation (published by the window-geometry feed,
+ * android_globals_get_display_landscape) disagrees with the natural one.
+ */
+static void
+shared_panel_dims(
+    const struct multi_system_compositor *msc, int32_t *out_px_w, int32_t *out_px_h, float *out_m_w, float *out_m_h)
+{
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	int32_t px_w = (int32_t)info->display_pixel_width;
+	int32_t px_h = (int32_t)info->display_pixel_height;
+	float m_w = info->display_width_m;
+	float m_h = info->display_height_m;
+#ifdef XRT_OS_ANDROID
+	bool landscape = false;
+	if (px_w > 0 && px_h > 0 && android_globals_get_display_landscape(&landscape) && landscape != (px_w >= px_h)) {
+		int32_t t = px_w;
+		px_w = px_h;
+		px_h = t;
+		float tm = m_w;
+		m_w = m_h;
+		m_h = tm;
+	}
+#endif
+	*out_px_w = px_w;
+	*out_px_h = px_h;
+	*out_m_w = m_w;
+	*out_m_h = m_h;
+}
+#endif // COMP_MULTI_SHARED_SURFACE
+
 bool
 comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
                                             const struct xrt_pose *pose,
                                             float width_m,
                                             float height_m)
 {
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	struct multi_compositor *mc = multi_compositor(xc);
 	if (mc == NULL || pose == NULL) {
 		return false;
@@ -2461,11 +2605,11 @@ comp_multi_workspace_set_client_window_pose(struct xrt_compositor *xc,
 
 	// Display geometry from the system compositor info (same fallback the D3D11
 	// service's slot_pose_to_pixel_rect uses).
-	const struct xrt_system_compositor_info *info = &mc->msc->base.info;
-	float disp_w_m = info->display_width_m;
-	float disp_h_m = info->display_height_m;
-	int32_t disp_px_w = (int32_t)info->display_pixel_width;
-	int32_t disp_px_h = (int32_t)info->display_pixel_height;
+	// The panel in its current orientation (#1006: an Android overlay follows
+	// device rotation; macOS / Linux get info's values unchanged).
+	float disp_w_m = 0.0f, disp_h_m = 0.0f;
+	int32_t disp_px_w = 0, disp_px_h = 0;
+	shared_panel_dims(mc->msc, &disp_px_w, &disp_px_h, &disp_w_m, &disp_h_m);
 	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f || disp_px_w <= 0 || disp_px_h <= 0) {
 		disp_px_w = 3024;
 		disp_px_h = 1964;
@@ -2535,7 +2679,7 @@ comp_multi_workspace_request_client_exit(struct xrt_compositor *target_xc)
 	return r == XRT_SUCCESS;
 }
 
-#ifndef XRT_OS_MACOS
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Composite the workspace controller's chrome (e.g. a title pill) over this
  * client's woven content, post-weave, as a flat alpha-blended 2D overlay (#48).
@@ -2832,7 +2976,11 @@ render_session_to_own_target(struct multi_compositor *mc,
 			mc->session_render.swapchain_needs_recreate = false;
 			return;
 		}
-		recreate_session_swapchain(mc, vk);
+		if (!recreate_session_swapchain(mc, vk)) {
+			// Deferred (GPU work still in flight, #1007) or failed: skip
+			// this frame; the flag says whether to try again next frame.
+			return;
+		}
 		// Re-read ct since create_images updates it in place
 		ct = mc->session_render.target;
 	}
@@ -3022,17 +3170,6 @@ render_session_to_own_target(struct multi_compositor *mc,
 		return;
 	}
 
-	// Wait for pending fence if exists (from previous frame using same buffer)
-	if (mc->session_render.fenced_buffer >= 0) {
-		VkResult fence_ret = vk->vkWaitForFences(vk->device, 1,
-		                                         &mc->session_render.fences[mc->session_render.fenced_buffer],
-		                                         VK_TRUE, UINT64_MAX);
-		if (fence_ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to wait for fence: %s", vk_result_string(fence_ret));
-		}
-		mc->session_render.fenced_buffer = -1;
-	}
-
 #ifdef XRT_OS_WINDOWS
 	// During drag of self-owned window, synchronize with WM_PAINT cycle.
 	if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
@@ -3042,6 +3179,44 @@ render_session_to_own_target(struct multi_compositor *mc,
 #endif
 
 black_canvas:; // force_black (minimized) jumps here, skipping all content/view setup
+
+	// Wait for the previous frame's fence (deferred wait, #663) — BOUNDED, with a
+	// per-client stall deadline (#1007). Placed after the black_canvas label so the
+	// minimized path, which also records into a per-buffer command buffer, honours
+	// it too (it used to jump straight past the wait).
+	//
+	//  - Healthy client: wait up to MULTI_FENCE_DEADLINE_NS in 100 ms slices.
+	//  - Deadline expired: mark the client STALLED, keep the fence pending (its
+	//    command buffer / atlas are still GPU-owned) and skip this frame — the
+	//    panel keeps the last presented image (#922 stale-frame reuse).
+	//  - While stalled: POLL only (zero budget), so one dead device or hung DP
+	//    costs the other clients nothing per frame; un-stall when it lands.
+	if (mc->session_render.fenced_buffer >= 0) {
+		const int64_t budget_ns = mc->session_render.gpu_stalled ? 0 : MULTI_FENCE_DEADLINE_NS;
+		VkResult fence_ret =
+		    multi_wait_fences_bounded(vk, 1, &mc->session_render.fences[mc->session_render.fenced_buffer],
+		                              budget_ns, "per-session previous frame");
+		if (fence_ret == VK_TIMEOUT) {
+			if (!mc->session_render.gpu_stalled) {
+				mc->session_render.gpu_stalled = true;
+				mc->session_render.gpu_stalled_since_ns = os_monotonic_get_ns();
+				U_LOG_W(
+				    "[per-session] client %p STALLED: GPU work not done after %d ms - skipping its "
+				    "frames until it lands (#1007)",
+				    (void *)mc, (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+			}
+			return;
+		}
+		if (mc->session_render.gpu_stalled) {
+			mc->session_render.gpu_stalled = false;
+			U_LOG_W("[per-session] client %p recovered after %.1f s stalled (#1007)", (void *)mc,
+			        (double)(os_monotonic_get_ns() - mc->session_render.gpu_stalled_since_ns) / 1e9);
+		}
+		if (fence_ret != VK_SUCCESS) {
+			U_LOG_E("[per-session] Failed to wait for fence: %s", vk_result_string(fence_ret));
+		}
+		mc->session_render.fenced_buffer = -1;
+	}
 
 	// Establish frame pacing so the per-session comp_target_swapchain has a
 	// valid current_frame_id before acquire/present. render_session_to_own_target
@@ -3074,10 +3249,23 @@ black_canvas:; // force_black (minimized) jumps here, skipping all content/view 
 #ifdef XRT_OS_ANDROID
 	ts_acq0 = os_monotonic_get_ns();
 #endif
+	// #1007: never park the main loop in vkAcquireNextImageKHR on one client's
+	// stuck consumer; VK_TIMEOUT / VK_NOT_READY below skip the frame.
+	ct->acquire_timeout_ns = MULTI_ACQUIRE_TIMEOUT_NS;
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
+	if (ret == VK_TIMEOUT || ret == VK_NOT_READY) {
+		static uint32_t acquire_timeouts = 0;
+		if ((acquire_timeouts++ % 60) == 0) {
+			U_LOG_W("[per-session] acquire timed out (%d ms) - skipping frame (#1007, x%u)",
+			        (int)(MULTI_ACQUIRE_TIMEOUT_NS / U_TIME_1MS_IN_NS), acquire_timeouts);
+		}
+		return;
+	}
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
 		U_LOG_W("[per-session] Swapchain out of date, recreating now");
-		recreate_session_swapchain(mc, vk);
+		if (!recreate_session_swapchain(mc, vk)) {
+			return; // deferred (#1007) or failed; flag set as needed
+		}
 		ct = mc->session_render.target;
 		mc->session_render.swapchain_needs_recreate = false;
 
@@ -3658,12 +3846,20 @@ submit_and_present:
 		// Hand the fence to the next frame's top-of-loop deferred wait.
 		mc->session_render.fenced_buffer = (int32_t)buffer_index;
 	} else {
-		ret = vk->vkWaitForFences(vk->device, 1, &mc->session_render.fences[buffer_index], VK_TRUE,
-		                          UINT64_MAX);
-		if (ret != VK_SUCCESS) {
-			U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+		// Bounded (#1007). On expiry, hand the fence to the next frame's
+		// top-of-loop wait (exactly the deferred-by-one form above), which
+		// applies the per-client stall deadline; present still goes ahead -
+		// it is GPU-ordered by render_complete.
+		ret = multi_wait_fences_bounded(vk, 1, &mc->session_render.fences[buffer_index],
+		                                MULTI_FENCE_DEADLINE_NS, "per-session render");
+		if (ret == VK_TIMEOUT) {
+			mc->session_render.fenced_buffer = (int32_t)buffer_index;
+		} else {
+			if (ret != VK_SUCCESS) {
+				U_LOG_E("[per-session] Failed to wait for render fence: %s", vk_result_string(ret));
+			}
+			mc->session_render.fenced_buffer = -1; // Fence already waited
 		}
-		mc->session_render.fenced_buffer = -1; // Fence already waited, no deferred wait needed
 	}
 
 #ifdef XRT_OS_ANDROID
@@ -3720,9 +3916,9 @@ submit_and_present:
 #endif
 
 }
-#endif // !XRT_OS_MACOS
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 /*
  * ============================================================================
  * Shared spatial surface (#59) — the macOS analogue of the Windows D3D11
@@ -3735,6 +3931,133 @@ submit_and_present:
  * per-eye parallax; M3 adds chrome/cursor/overlays floating above each window.
  * ============================================================================
  */
+
+/*!
+ * #1006 / R2: may the shared DP exist right now? Always on macOS / desktop
+ * Linux. On Android the vendor SDK may allow only ONE core per process (risk R2
+ * of the overlay plan), so the shared DP is created only once no per-session DP
+ * is alive in THIS process — a satellite's DP is in another process and does not
+ * count. A paused per-session DP still counts: it is cached, not released, until
+ * its client goes (leia-plugin#39).
+ */
+static bool
+shared_dp_allowed(struct multi_system_compositor *msc)
+{
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+	uint32_t alive = 0;
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
+		if (mc != NULL && mc->session_render.display_processor != NULL) {
+			alive++;
+		}
+	}
+	if (alive > 0) {
+		if (!msc->shared_dp_deferred_logged) {
+			msc->shared_dp_deferred_logged = true;
+			U_LOG_W(
+			    "[#1006] shared display processor DEFERRED: %u per-session DP(s) still alive in this "
+			    "process (R2: one vendor core per process) - compositing unwoven until they go",
+			    alive);
+		}
+		return false;
+	}
+	msc->shared_dp_deferred_logged = false;
+#else
+	(void)msc;
+#endif
+	return true;
+}
+
+/*!
+ * Create the one shared display processor if it does not exist yet and is
+ * allowed to (@ref shared_dp_allowed). Needs the shared command pool and target
+ * (for the format). Idempotent; cheap when the DP exists.
+ */
+static void
+shared_ensure_dp(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (msc->shared_dp != NULL || msc->shared_target == NULL || msc->shared_cmd_pool == VK_NULL_HANDLE) {
+		return;
+	}
+	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)msc->base.info.dp_factory_vk;
+	if (factory == NULL || !shared_dp_allowed(msc)) {
+		return;
+	}
+	xrt_result_t dp_ret = multi_dp_factory_create(factory,                                 //
+	                                              vk,                                      // vk_bundle
+	                                              (void *)(uintptr_t)msc->shared_cmd_pool, // cmd_pool
+	                                              NULL, // window_handle (service-owned)
+	                                              (int32_t)msc->shared_target->format, // target_format
+	                                              &msc->shared_dp);
+	if (dp_ret != XRT_SUCCESS) {
+		U_LOG_W("[#59] shared DP factory failed: %d (no weave)", dp_ret);
+		msc->shared_dp = NULL;
+	} else {
+		msc->shared_dp_visibility = MULTI_DP_VIS_UNKNOWN;
+		U_LOG_W("[#59] created shared display processor");
+	}
+}
+
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+/*!
+ * #1006 Android overlay deactivate: release the shared TARGET (the swapchain on
+ * the controller's surface) and everything sized to it, so a per-session target
+ * may claim the process-global window again without
+ * VK_ERROR_NATIVE_WINDOW_IN_USE_KHR. Keeps the DP (paused by the convergence
+ * pass, never destroyed — leia-plugin#39), the command pool it borrows and the
+ * atlas. The next activate rebuilds the target lazily.
+ */
+static void
+shared_target_release(struct multi_system_compositor *msc, struct vk_bundle *vk)
+{
+	if (!msc->shared_surface_initialized && msc->shared_target == NULL) {
+		return;
+	}
+	if (vk != NULL &&
+	    multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "shared_target_release") == VK_TIMEOUT) {
+		U_LOG_E("[#1006] shared target release: GPU still busy - leaking its per-image objects");
+		vk = NULL;
+	}
+	if (vk != NULL && msc->shared_fences != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_fences[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFence(vk->device, msc->shared_fences[i], NULL);
+			}
+		}
+	}
+	free(msc->shared_fences);
+	msc->shared_fences = NULL;
+	if (vk != NULL && msc->shared_cmd_buffers != NULL && msc->shared_cmd_pool != VK_NULL_HANDLE &&
+	    msc->shared_buffer_count > 0) {
+		vk->vkFreeCommandBuffers(vk->device, msc->shared_cmd_pool, msc->shared_buffer_count,
+		                         msc->shared_cmd_buffers);
+	}
+	free(msc->shared_cmd_buffers);
+	msc->shared_cmd_buffers = NULL;
+	if (vk != NULL && msc->shared_framebuffers != NULL) {
+		for (uint32_t i = 0; i < msc->shared_buffer_count; i++) {
+			if (msc->shared_framebuffers[i] != VK_NULL_HANDLE) {
+				vk->vkDestroyFramebuffer(vk->device, msc->shared_framebuffers[i], NULL);
+			}
+		}
+	}
+	free(msc->shared_framebuffers);
+	msc->shared_framebuffers = NULL;
+	if (vk != NULL && msc->shared_render_pass != VK_NULL_HANDLE) {
+		vk->vkDestroyRenderPass(vk->device, msc->shared_render_pass, NULL);
+		msc->shared_render_pass = VK_NULL_HANDLE;
+	}
+	msc->shared_buffer_count = 0;
+	msc->shared_fenced_buffer = -1;
+	msc->shared_gpu_stalled = false;
+	if (msc->shared_target != NULL && msc->target_service != NULL) {
+		comp_target_service_destroy(msc->target_service, &msc->shared_target);
+	}
+	msc->shared_surface_initialized = false;
+	msc->shared_window_visible = false;
+	U_LOG_W("[#1006] shared target released (overlay off); shared DP kept, paused");
+}
+#endif
 
 /*!
  * Lazily create the one shared full-screen target, its render rings, and the
@@ -3751,31 +4074,56 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 		U_LOG_E("[#59] no target service for shared surface");
 		return false;
 	}
-
-	// macOS: the service creates + owns the full-screen NSWindow; the handle arg
-	// is ignored (null_target_service_create_from_window_macos).
-	xrt_result_t ret = comp_target_service_create(msc->target_service, NULL, &msc->shared_target);
-	if (ret != XRT_SUCCESS || msc->shared_target == NULL) {
-		U_LOG_E("[#59] failed to create shared full-screen target: %d", ret);
+	// A failed window create (no X server / display) is retried with a back-off
+	// instead of every compositor frame, which flooded the log at panel rate.
+	if (msc->shared_init_retry_ns != 0 && os_monotonic_get_ns() < msc->shared_init_retry_ns) {
 		return false;
 	}
+
+	// macOS: the service creates + owns the full-screen NSWindow; the handle arg
+	// is ignored (null_target_service_create_from_window_macos). Desktop Linux
+	// (#710): the service owns an X11 window too, and the handle slot carries
+	// the panel placement (null_target_service_create_from_window_linux) — the
+	// panel origin lives on THIS info, filled from the plug-in after the null
+	// compositor was created.
+	void *window_arg = NULL;
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	struct comp_window_linux_placement place = {
+	    .screen_left = msc->base.info.display_screen_left,
+	    .screen_top = msc->base.info.display_screen_top,
+	    .width = msc->base.info.display_pixel_width,
+	    .height = msc->base.info.display_pixel_height,
+	};
+	window_arg = &place;
+#endif
+	xrt_result_t ret = comp_target_service_create(msc->target_service, window_arg, &msc->shared_target);
+	if (ret != XRT_SUCCESS || msc->shared_target == NULL) {
+		U_LOG_E("[#59] failed to create shared full-screen target: %d (retrying in 5 s)", ret);
+		msc->shared_init_retry_ns = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+		return false;
+	}
+	msc->shared_init_retry_ns = 0;
 	struct comp_target *ct = msc->shared_target;
 	U_LOG_W("[#59] created shared full-screen target %ux%u fmt=%d (%u images)", ct->width, ct->height,
 	        ct->format, ct->image_count);
 
 	uint32_t image_count = ct->image_count;
 
-	// Command pool + per-image command buffers + fences (signaled).
+	// Command pool + per-image command buffers + fences (signaled). The pool is
+	// lent to the DP (vk_cmd_pool), so it lives as long as the DP: an Android
+	// overlay deactivate releases the target but keeps the pool (#1006).
 	VkResult vr;
-	VkCommandPoolCreateInfo pool_info = {
-	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-	    .queueFamilyIndex = vk->main_queue->family_index,
-	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-	};
-	vr = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &msc->shared_cmd_pool);
-	if (vr != VK_SUCCESS) {
-		U_LOG_E("[#59] failed to create shared command pool: %d", vr);
-		return false;
+	if (msc->shared_cmd_pool == VK_NULL_HANDLE) {
+		VkCommandPoolCreateInfo pool_info = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .queueFamilyIndex = vk->main_queue->family_index,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		};
+		vr = vk->vkCreateCommandPool(vk->device, &pool_info, NULL, &msc->shared_cmd_pool);
+		if (vr != VK_SUCCESS) {
+			U_LOG_E("[#59] failed to create shared command pool: %d", vr);
+			return false;
+		}
 	}
 
 	msc->shared_cmd_buffers = U_TYPED_ARRAY_CALLOC(VkCommandBuffer, image_count);
@@ -3858,21 +4206,10 @@ shared_surface_init(struct multi_system_compositor *msc, struct vk_bundle *vk)
 		}
 	}
 
-	// The one display processor that weaves the combined atlas.
-	xrt_dp_factory_vk_fn_t factory = (xrt_dp_factory_vk_fn_t)msc->base.info.dp_factory_vk;
-	if (factory != NULL) {
-		xrt_result_t dp_ret = factory(vk,                                         // vk_bundle
-		                              (void *)(uintptr_t)msc->shared_cmd_pool,    // cmd_pool
-		                              NULL,                                        // window_handle (service-owned)
-		                              (int32_t)ct->format,                         // target_format
-		                              &msc->shared_dp);
-		if (dp_ret != XRT_SUCCESS) {
-			U_LOG_W("[#59] shared DP factory failed: %d (no weave)", dp_ret);
-			msc->shared_dp = NULL;
-		} else {
-			U_LOG_W("[#59] created shared display processor");
-		}
-	}
+	// The one display processor that weaves the combined atlas. Kept across
+	// an Android overlay deactivate/reactivate (paused, never destroyed — CNSDK
+	// release can hang, leia-plugin#39), so only create it once.
+	shared_ensure_dp(msc, vk);
 
 	msc->shared_surface_initialized = true;
 	U_LOG_W("[#59] shared surface initialized");
@@ -3893,9 +4230,18 @@ shared_surface_fini(struct multi_system_compositor *msc)
 	struct vk_bundle *vk = (msc->target_service != NULL) ? comp_target_service_get_vk(msc->target_service) : NULL;
 
 	// The render thread is stopped, but the last present's GPU work may still be
-	// in flight; wait before destroying anything it could reference.
+	// in flight; wait before destroying anything it could reference. Bounded
+	// (#1007, was vkDeviceWaitIdle): drain the main queue, which is where every
+	// shared-surface submit and present went. If it does not drain, LEAK the
+	// Vulkan objects (vk = NULL skips every destroy below) rather than free
+	// memory a wedged GPU may still touch.
 	if (vk != NULL) {
-		vk->vkDeviceWaitIdle(vk->device);
+		if (multi_drain_main_queue_bounded(vk, MULTI_FENCE_DEADLINE_NS, "shared_surface_fini") == VK_TIMEOUT) {
+			U_LOG_E(
+			    "[#59] shared_surface_fini: GPU still busy - leaking shared-surface Vulkan objects "
+			    "(#1007)");
+			vk = NULL;
+		}
 	}
 
 	// Display processor first (owns any vendor SDK handles); NULLs the pointer.
@@ -3914,6 +4260,20 @@ shared_surface_fini(struct multi_system_compositor *msc)
 		vk_hud_blend_fini(&msc->shared_chrome_blend, vk);
 		msc->shared_chrome_blend_initialized = false;
 	}
+	// #1795 honest-decoration target: same order (framebuffer before pipelines).
+	if (vk != NULL && msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+		msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_fb_view = VK_NULL_HANDLE;
+	}
+	if (vk != NULL && msc->shared_deco_blend_initialized) {
+		vk_hud_blend_fini(&msc->shared_deco_blend, vk);
+		msc->shared_deco_blend_initialized = false;
+	}
+	if (vk != NULL && msc->shared_deco_content_blend_initialized) {
+		comp_multi_content_blend_fini(&msc->shared_deco_content_blend, vk);
+		msc->shared_deco_content_blend_initialized = false;
+	}
 	// Task 9 content composite: owns its own render pass + pipeline (no fb).
 	if (vk != NULL && msc->shared_content_blend_initialized) {
 		comp_multi_content_blend_fini(&msc->shared_content_blend, vk);
@@ -3922,6 +4282,10 @@ shared_surface_fini(struct multi_system_compositor *msc)
 
 	// The one combined stereo atlas (view + image + memory).
 	if (vk != NULL && msc->shared_atlas_initialized) {
+		if (msc->shared_atlas_deco_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_deco_view, NULL);
+		msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_format = VK_FORMAT_UNDEFINED;
 		if (msc->shared_atlas_view != VK_NULL_HANDLE)
 			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
 		if (msc->shared_atlas_image != VK_NULL_HANDLE)
@@ -3976,6 +4340,107 @@ shared_surface_fini(struct multi_system_compositor *msc)
 	msc->shared_surface_initialized = false;
 }
 
+//! #1795: the `_SRGB` sibling of an 8-bit colour format (itself if already
+//! `_SRGB`), VK_FORMAT_UNDEFINED if it has none.
+static VkFormat
+shared_srgb_sibling(VkFormat f)
+{
+	switch (f) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
+	default: return VK_FORMAT_UNDEFINED;
+	}
+}
+
+static inline bool
+shared_format_is_srgb(VkFormat f)
+{
+	return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+/*!
+ * #1795: the `_SRGB` view format the decoration pass should render the atlas
+ * through, or VK_FORMAT_UNDEFINED when the atlas needs no separate view (it is
+ * `_SRGB` already) or must stay legacy (the ADR-044 hatch, an earlier failure,
+ * a format with no `_SRGB` sibling, or a sibling that cannot be a blended
+ * colour attachment on this device).
+ */
+static VkFormat
+shared_honest_deco_format(struct multi_system_compositor *msc, struct vk_bundle *vk, VkFormat atlas_fmt)
+{
+	if (u_color_legacy_unorm_encoded() || msc->shared_deco_honest_failed || shared_format_is_srgb(atlas_fmt)) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	VkFormat srgb = shared_srgb_sibling(atlas_fmt);
+	if (srgb == VK_FORMAT_UNDEFINED) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	VkFormatProperties props = {0};
+	vk->vkGetPhysicalDeviceFormatProperties(vk->physical_device, srgb, &props);
+	const VkFormatFeatureFlags need =
+	    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+	if ((props.optimalTilingFeatures & need) != need) {
+		return VK_FORMAT_UNDEFINED;
+	}
+	return srgb;
+}
+
+/*!
+ * #1795: create the atlas image in @p format, MUTABLE_FORMAT with
+ * {@p format, @p srgb} as its view-format list, so an `_SRGB` view of the
+ * encoded atlas is legal. Cleans up after itself on failure.
+ */
+static VkResult
+shared_create_mutable_atlas(struct vk_bundle *vk,
+                            VkExtent2D extent,
+                            VkFormat format,
+                            VkFormat srgb,
+                            VkImageUsageFlags usage,
+                            VkDeviceMemory *out_mem,
+                            VkImage *out_image)
+{
+	VkFormat view_formats[2] = {format, srgb};
+	VkImageFormatListCreateInfoKHR fmt_list = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR,
+	    .viewFormatCount = 2,
+	    .pViewFormats = view_formats,
+	};
+	VkImageCreateInfo ici = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+	    // The list is an optimisation hint; MUTABLE_FORMAT alone makes the view legal.
+	    .pNext = vk->has_KHR_image_format_list ? &fmt_list : NULL,
+	    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+	    .imageType = VK_IMAGE_TYPE_2D,
+	    .format = format,
+	    .extent = {extent.width, extent.height, 1},
+	    .mipLevels = 1,
+	    .arrayLayers = 1,
+	    .samples = VK_SAMPLE_COUNT_1_BIT,
+	    .tiling = VK_IMAGE_TILING_OPTIMAL,
+	    .usage = usage,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	};
+	VkImage image = VK_NULL_HANDLE;
+	VkResult ret = vk->vkCreateImage(vk->device, &ici, NULL, &image);
+	if (ret != VK_SUCCESS) {
+		return ret;
+	}
+	VkMemoryRequirements reqs = {0};
+	vk->vkGetImageMemoryRequirements(vk->device, image, &reqs);
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	ret = vk_alloc_and_bind_image_memory(vk, image, &reqs, NULL, __func__, &mem);
+	if (ret != VK_SUCCESS) {
+		vk->vkDestroyImage(vk->device, image, NULL);
+		return ret;
+	}
+	*out_mem = mem;
+	*out_image = image;
+	return VK_SUCCESS;
+}
+
 /*!
  * Ensure the one combined stereo atlas exists at (tile_columns*eye_w) × eye_h.
  */
@@ -3994,6 +4459,29 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 		return true;
 	}
 	if (msc->shared_atlas_initialized) {
+		// The atlas framebuffers are rebuilt lazily, keyed on the view HANDLE —
+		// but a freshly created view can come back with the very handle value
+		// of the one destroyed below, and then the key matches and the old
+		// framebuffer (old extent, destroyed attachment) is reused: garbage
+		// on screen. Only reachable when the atlas is RESIZED, which the macOS
+		// / Linux fixed window never does and an Android overlay does on
+		// rotation (#1006). So drop both framebuffers explicitly here.
+		if (msc->shared_atlas_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_fb, NULL);
+			msc->shared_atlas_fb = VK_NULL_HANDLE;
+		}
+		msc->shared_atlas_fb_view = VK_NULL_HANDLE;
+		if (msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		}
+		msc->shared_atlas_deco_fb_view = VK_NULL_HANDLE;
+		// The #1795 deco framebuffer is rebuilt lazily, keyed on the deco view
+		// (the same pattern as shared_atlas_fb).
+		if (msc->shared_atlas_deco_view != VK_NULL_HANDLE)
+			vk->vkDestroyImageView(vk->device, msc->shared_atlas_deco_view, NULL);
+		msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+		msc->shared_atlas_deco_format = VK_FORMAT_UNDEFINED;
 		if (msc->shared_atlas_view != VK_NULL_HANDLE)
 			vk->vkDestroyImageView(vk->device, msc->shared_atlas_view, NULL);
 		if (msc->shared_atlas_image != VK_NULL_HANDLE)
@@ -4004,9 +4492,29 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 	}
 
 	VkExtent2D extent = {(uint32_t)atlas_w, (uint32_t)atlas_h};
-	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	VkResult ret =
-	    vk_create_image_simple(vk, extent, format, usage, &msc->shared_atlas_memory, &msc->shared_atlas_image);
+	// COLOR_ATTACHMENT: the content and decoration passes render into the atlas
+	// through a framebuffer, which the usage never declared.
+	VkImageUsageFlags usage =
+	    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+	// #1795: an encoded (non-`_SRGB`) atlas is created MUTABLE with its `_SRGB`
+	// sibling so the decoration pass can blend in linear through that view.
+	VkFormat deco_fmt = shared_honest_deco_format(msc, vk, format);
+	VkResult ret = VK_ERROR_INITIALIZATION_FAILED;
+	if (deco_fmt != VK_FORMAT_UNDEFINED) {
+		ret = shared_create_mutable_atlas(vk, extent, format, deco_fmt, usage, &msc->shared_atlas_memory,
+		                                  &msc->shared_atlas_image);
+		if (ret != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: mutable atlas failed (%s); decorations stay legacy (encoded-space blend)",
+			        vk_result_string(ret));
+			msc->shared_deco_honest_failed = true;
+			deco_fmt = VK_FORMAT_UNDEFINED;
+		}
+	}
+	if (ret != VK_SUCCESS) {
+		ret = vk_create_image_simple(vk, extent, format, usage, &msc->shared_atlas_memory,
+		                             &msc->shared_atlas_image);
+	}
 	if (ret != VK_SUCCESS) {
 		U_LOG_E("[#59] failed to create combined atlas: %s", vk_result_string(ret));
 		return false;
@@ -4017,6 +4525,18 @@ shared_ensure_atlas(struct multi_system_compositor *msc,
 		U_LOG_E("[#59] failed to create combined atlas view: %s", vk_result_string(ret));
 		return false;
 	}
+	if (deco_fmt != VK_FORMAT_UNDEFINED) {
+		ret = vk_create_view(vk, msc->shared_atlas_image, VK_IMAGE_VIEW_TYPE_2D, deco_fmt, range,
+		                     &msc->shared_atlas_deco_view);
+		if (ret != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: `_SRGB` atlas view failed (%s); decorations stay legacy",
+			        vk_result_string(ret));
+			msc->shared_atlas_deco_view = VK_NULL_HANDLE;
+			msc->shared_deco_honest_failed = true;
+			deco_fmt = VK_FORMAT_UNDEFINED;
+		}
+	}
+	msc->shared_atlas_deco_format = deco_fmt;
 	msc->shared_atlas_w = atlas_w;
 	msc->shared_atlas_h = atlas_h;
 	msc->shared_eye_w = eye_w;
@@ -4281,16 +4801,131 @@ shared_ensure_content_blend(struct multi_system_compositor *msc, struct vk_bundl
 }
 
 /*!
+ * Where this frame's decorations (chrome / overlays / cursor) are drawn, and
+ * how their sources are read (#1795, ADR-044 §1).
+ */
+struct shared_deco_target
+{
+	struct vk_hud_blend *blend;               //!< Flat (axis-aligned) decorations.
+	struct comp_multi_content_blend *content; //!< Quad / stereo-SBS decorations.
+	VkFramebuffer fb;                         //!< Shared by both pipelines (render-pass compatible).
+	//! Sources are sampled as their DECLARED format and blended in linear
+	//! light into an `_SRGB` attachment. False = legacy: the flat path reads
+	//! raw bytes through R8G8B8A8_UNORM and blends in the atlas's encoded space.
+	bool honest;
+};
+
+//! #1795: one-time WARN naming the regime the decorations run under.
+static void
+shared_deco_log_once(struct multi_system_compositor *msc, const char *regime)
+{
+	if (msc->shared_deco_logged) {
+		return;
+	}
+	msc->shared_deco_logged = true;
+	U_LOG_W("[#59] #1795 workspace decorations: %s (atlas fmt=%d, deco view fmt=%d)", regime,
+	        msc->shared_atlas_format, msc->shared_atlas_deco_format);
+}
+
+/*!
+ * #1795: resolve the decoration target. Always succeeds when the legacy target
+ * (shared_chrome_blend over shared_atlas_fb) can be built; the honest target is
+ * used when the hatch is off and everything it needs exists. A failure while
+ * building the honest target is sticky and falls back to legacy for good, so
+ * there is one WARN, not one per frame.
+ */
+static bool
+shared_resolve_deco_target(struct multi_system_compositor *msc, struct vk_bundle *vk, struct shared_deco_target *out)
+{
+	if (!shared_ensure_chrome_blend(msc, vk)) {
+		return false;
+	}
+	out->blend = &msc->shared_chrome_blend;
+	// The quad pipeline is optional, as before: without it only quad / SBS
+	// decorations are skipped.
+	out->content = shared_ensure_content_blend(msc, vk) ? &msc->shared_content_blend : NULL;
+	out->fb = msc->shared_atlas_fb;
+	out->honest = false;
+
+	if (u_color_legacy_unorm_encoded()) {
+		shared_deco_log_once(msc, "LEGACY (DXR_COLOR_LEGACY_UNORM_ENCODED=1): encoded-space blend");
+		return true;
+	}
+	if (shared_format_is_srgb(msc->shared_atlas_format)) {
+		// The atlas attachment encodes on write already: sampling honestly is all.
+		shared_deco_log_once(msc, "format-honest (atlas is _SRGB)");
+		out->honest = true;
+		return true;
+	}
+	if (msc->shared_deco_honest_failed || msc->shared_atlas_deco_view == VK_NULL_HANDLE) {
+		shared_deco_log_once(msc, "LEGACY (no _SRGB view of the atlas): encoded-space blend");
+		return true;
+	}
+
+	VkFormat deco_fmt = msc->shared_atlas_deco_format;
+	if (!msc->shared_deco_blend_initialized) {
+		if (!vk_hud_blend_init(&msc->shared_deco_blend, vk, deco_fmt)) {
+			U_LOG_W("[#59] #1795: _SRGB decoration blend init failed; decorations stay legacy");
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_deco_blend_initialized = true;
+	}
+	if (!msc->shared_deco_content_blend_initialized) {
+		if (!comp_multi_content_blend_init(&msc->shared_deco_content_blend, vk, deco_fmt)) {
+			U_LOG_W("[#59] #1795: _SRGB decoration quad blend init failed; decorations stay legacy");
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_deco_content_blend_initialized = true;
+	}
+	if (msc->shared_atlas_deco_fb == VK_NULL_HANDLE ||
+	    msc->shared_atlas_deco_fb_view != msc->shared_atlas_deco_view) {
+		if (msc->shared_atlas_deco_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, msc->shared_atlas_deco_fb, NULL);
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_info = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = msc->shared_deco_blend.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &msc->shared_atlas_deco_view,
+		    .width = (uint32_t)msc->shared_atlas_w,
+		    .height = (uint32_t)msc->shared_atlas_h,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_info, NULL, &msc->shared_atlas_deco_fb) != VK_SUCCESS) {
+			U_LOG_W("[#59] #1795: _SRGB decoration framebuffer failed; decorations stay legacy");
+			msc->shared_atlas_deco_fb = VK_NULL_HANDLE;
+			msc->shared_deco_honest_failed = true;
+			return true;
+		}
+		msc->shared_atlas_deco_fb_view = msc->shared_atlas_deco_view;
+	}
+
+	shared_deco_log_once(msc, "format-honest (sources as declared, linear blend through an _SRGB atlas view)");
+	out->blend = &msc->shared_deco_blend;
+	out->content = &msc->shared_deco_content_blend;
+	out->fb = msc->shared_atlas_deco_fb;
+	out->honest = true;
+	return true;
+}
+
+/*!
  * Alpha-blend one decoration source image into the combined atlas (atlas must be
  * COLOR_ATTACHMENT_OPTIMAL on entry/exit). The dst rect is clamped to [clip_x0,
  * clip_x1) × [clip_y0, clip_y1) — the eye's tile — so a decoration can't bleed
  * into the other eye or off the atlas. The cross-process source rests in GENERAL.
+ * @p src_fmt is the source swapchain's declared format; it is read as that
+ * format when @p t is honest (#1795) and ignored on the legacy target.
  */
 static void
 shared_blend_into_atlas(struct multi_system_compositor *msc,
                         struct vk_bundle *vk,
                         VkCommandBuffer cmd,
+                        const struct shared_deco_target *t,
                         VkImage src_image,
+                        VkFormat src_fmt,
                         int dst_x,
                         int dst_y,
                         int dst_w,
@@ -4326,9 +4961,12 @@ shared_blend_into_atlas(struct multi_system_compositor *msc,
 	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
 	                         NULL, 0, NULL, 1, &to_src);
 
-	vk_hud_blend_draw_no_layout(&msc->shared_chrome_blend, vk, cmd, msc->shared_atlas_fb,
-	                            (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h, src_image, x0, y0,
-	                            (uint32_t)(x1 - x0), (uint32_t)(y1 - y0));
+	// #1795: VK_FORMAT_UNDEFINED keeps vk_hud_blend's legacy R8G8B8A8_UNORM view.
+	// The declared format is always a legal view (the image's own format).
+	vk_hud_blend_draw_no_layout_fmt(t->blend, vk, cmd, t->fb, (uint32_t)msc->shared_atlas_w,
+	                                (uint32_t)msc->shared_atlas_h, src_image,
+	                                t->honest ? src_fmt : VK_FORMAT_UNDEFINED, x0, y0, (uint32_t)(x1 - x0),
+	                                (uint32_t)(y1 - y0), false);
 
 	VkImageMemoryBarrier to_general = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -4363,7 +5001,10 @@ shared_composite_decorations(struct multi_system_compositor *msc,
                              float px_per_m_y,
                              uint32_t tile_columns)
 {
-	if (!shared_ensure_chrome_blend(msc, vk)) {
+	// #1795: legacy or format-honest target, resolved once per frame so every
+	// decoration blends in the same space.
+	struct shared_deco_target t;
+	if (!shared_resolve_deco_target(msc, vk, &t)) {
 		return;
 	}
 
@@ -4417,7 +5058,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			float ccz = e->pose_z + woff.z;
 
 			// One render pass over both eyes (barriers must wrap, not nest, the pass).
-			if (shared_ensure_content_blend(msc, vk)) {
+			if (t.content != NULL) {
 				VkImageMemoryBarrier to_read = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = 0,
@@ -4430,8 +5071,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0,
 				                         NULL, 1, &to_read);
-				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd,
-				                               msc->shared_atlas_fb, (uint32_t)msc->shared_atlas_w,
+				comp_multi_content_blend_begin(t.content, vk, cmd, t.fb, (uint32_t)msc->shared_atlas_w,
 				                               (uint32_t)msc->shared_atlas_h);
 				for (uint32_t eye = 0; eye < tile_columns; eye++) {
 					uint32_t ei = (eye < eye_pos->count) ? eye : (eye_pos->count - 1);
@@ -4453,14 +5093,14 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					    .use_src_alpha = 1.0f,
 					};
 					memcpy(pcq.corners, corners, sizeof(corners));
-					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd,
+					comp_multi_content_blend_draw_quad(t.content, vk, cmd,
 					                                   chrome_img, 0, sc->vkic.info.format,
 					                                   VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, &pcq,
 					                                   tile_x0, 0, (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
 				}
-				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				comp_multi_content_blend_end(t.content, vk, cmd);
 				VkImageMemoryBarrier to_general = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -4488,8 +5128,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 			                            eye_pos->eyes[ei].x, eye_pos->eyes[ei].y, eye_pos->eyes[ei].z,
 			                            eye_w, eye_h, px_per_m_x, px_per_m_y, &rx, &ry, &rw, &rh);
 			int tile_x0 = (int)eye * eye_w;
-			shared_blend_into_atlas(msc, vk, cmd, chrome_img, tile_x0 + rx, ry, rw, rh, tile_x0,
-			                        tile_x0 + eye_w, 0, eye_h);
+			shared_blend_into_atlas(msc, vk, cmd, &t, chrome_img, (VkFormat)sc->vkic.info.format,
+			                        tile_x0 + rx, ry, rw, rh, tile_x0, tile_x0 + eye_w, 0, eye_h);
 		}
 	}
 
@@ -4534,7 +5174,7 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				// src_uv + use_src_alpha) as a flat (W = 1) axis-aligned quad —
 				// the chrome-pill treatment, minus the tilt. Mirror of the D3D11
 				// service stereo_sbs src-rect split (comp_d3d11_service.cpp).
-				if (!shared_ensure_content_blend(msc, vk)) {
+				if (t.content == NULL) {
 					continue;
 				}
 				VkImageMemoryBarrier ov_to_read = {
@@ -4549,8 +5189,8 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 				vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1,
 				                         &ov_to_read);
-				comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
-				                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+				comp_multi_content_blend_begin(t.content, vk, cmd, t.fb, (uint32_t)msc->shared_atlas_w,
+				                               (uint32_t)msc->shared_atlas_h);
 				for (uint32_t eye = 0; eye < tile_columns; eye++) {
 					int tile_x0 = (int)eye * eye_w;
 					// Flat axis-aligned quad over the (clipped) overlay rect, in
@@ -4587,14 +5227,14 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					};
 #undef NDX
 #undef NDY
-					comp_multi_content_blend_draw_quad(&msc->shared_content_blend, vk, cmd, img, 0,
+					comp_multi_content_blend_draw_quad(t.content, vk, cmd, img, 0,
 					                                   sc->vkic.info.format, VK_NULL_HANDLE,
 					                                   VK_FORMAT_UNDEFINED, &pcq, tile_x0, 0,
 					                                   (uint32_t)eye_w, (uint32_t)eye_h,
 					                                   (uint32_t)msc->shared_atlas_w,
 					                                   (uint32_t)msc->shared_atlas_h);
 				}
-				comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+				comp_multi_content_blend_end(t.content, vk, cmd);
 				VkImageMemoryBarrier ov_to_general = {
 				    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 				    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
@@ -4612,8 +5252,9 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 
 			for (uint32_t eye = 0; eye < tile_columns; eye++) {
 				int tile_x0 = (int)eye * eye_w;
-				shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + base_x, base_y, ow, oh,
-				                        tile_x0, tile_x0 + eye_w, 0, eye_h);
+				shared_blend_into_atlas(msc, vk, cmd, &t, img, (VkFormat)sc->vkic.info.format,
+				                        tile_x0 + base_x, base_y, ow, oh, tile_x0, tile_x0 + eye_w, 0,
+				                        eye_h);
 			}
 		}
 	}
@@ -4635,8 +5276,9 @@ shared_composite_decorations(struct multi_system_compositor *msc,
 					int dy = pyg - (int)(cur.hot_y * (float)size_px);
 					for (uint32_t eye = 0; eye < tile_columns; eye++) {
 						int tile_x0 = (int)eye * eye_w;
-						shared_blend_into_atlas(msc, vk, cmd, img, tile_x0 + dx, dy, size_px,
-						                        size_px, tile_x0, tile_x0 + eye_w, 0, eye_h);
+						shared_blend_into_atlas(msc, vk, cmd, &t, img,
+						                        (VkFormat)sc->vkic.info.format, tile_x0 + dx, dy,
+						                        size_px, size_px, tile_x0, tile_x0 + eye_w, 0, eye_h);
 					}
 				}
 			}
@@ -4696,6 +5338,135 @@ shared_find_client_hud(const struct shared_client_render *e,
  * Composite every active client into the one combined atlas, weave once, present
  * once. The macOS shared-surface analogue of render_per_session_clients_locked.
  */
+//! Show / hide the one service-owned surface window (#61) — the only
+//! platform-specific call the shared surface makes.
+static void
+shared_set_window_visible(struct comp_target *ct, bool visible)
+{
+#if defined(XRT_OS_MACOS)
+	comp_window_macos_set_visible(ct, visible);
+#elif defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	comp_window_linux_set_visible(ct, visible);
+#else
+	(void)ct;
+	(void)visible;
+#endif
+}
+
+/*!
+ * Desktop Linux: hide the X pointer while the controller's cursor sprite is
+ * composited (it would double up), restore it otherwise — a bare IPC client with
+ * no controller keeps the OS pointer. macOS hides its pointer for the whole
+ * lifetime of the shown surface instead (comp_window_macos).
+ */
+static void
+shared_sync_os_cursor(struct multi_system_compositor *msc)
+{
+#if defined(XRT_HAVE_COMP_LINUX_WINDOW)
+	struct xrt_swapchain *cursor_xsc = NULL;
+	struct comp_multi_cursor_state cursor = {0};
+	bool sprite = comp_multi_workspace_get_cursor(&cursor_xsc, &cursor) && cursor.visible && cursor_xsc != NULL;
+	comp_window_linux_set_cursor_hidden(msc->shared_target, sprite);
+#else
+	(void)msc;
+#endif
+}
+
+/*!
+ * D-5 (#967): the shared-DP hardware 2D/3D channel. The ONE display processor
+ * owns the panel's lens, so it follows ONE client's wish: the focused workspace
+ * client when it is on the surface, else a lone client; with several unfocused
+ * clients the lens keeps its state. The wish is mc->hardware_display_3d, set
+ * by multi_compositor_request_display_mode from the IPC thread; applying it
+ * here, on the render thread under render_lock (#1005), keeps every DP call on
+ * the thread that weaves. Once the DP accepts a change the owner is told
+ * (XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE carries the REQUESTED state,
+ * #961). A DP without the slot is mode-neutral and counts as accepted.
+ */
+static void
+shared_converge_display_mode_locked(struct multi_system_compositor *msc,
+                                    const struct shared_client_render *order,
+                                    uint32_t order_count)
+{
+	if (msc->shared_dp == NULL || order_count == 0) {
+		return;
+	}
+	// The workspace controller is the display-mode authority while it is
+	// active (#967 D-5): its request, when it made one, decides; every
+	// composited client hears the result.
+	const int controller_wish = msc->shared_hw_3d_controller_wish;
+	if (controller_wish >= 0) {
+		const bool want_3d = controller_wish == 1;
+		if (msc->shared_hw_3d_applied == controller_wish) {
+			return;
+		}
+		struct xrt_display_processor *dp = msc->shared_dp;
+		const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+		const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+		msc->shared_hw_3d_applied = controller_wish;
+		U_LOG_W("[#967 D-5] shared surface hardware -> %s on the workspace controller's request (%s)",
+		        want_3d ? "3D" : "2D",
+		        !has_slot ? "mode-neutral DP" : (accepted ? "request_display_mode accepted" : "REJECTED"));
+		if (!accepted) {
+			return;
+		}
+		union xrt_session_event xse = {0};
+		xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+		xse.hardware_display_state_change.hardware_display_3d = want_3d;
+		for (uint32_t i = 0; i < order_count; i++) {
+			order[i].mc->hardware_display_3d = want_3d;
+			(void)multi_compositor_push_event(order[i].mc, &xse);
+		}
+		return;
+	}
+
+	struct multi_compositor *owner = NULL;
+	struct xrt_compositor *focused = comp_multi_workspace_get_focused_client();
+	for (uint32_t i = 0; i < order_count; i++) {
+		if (&order[i].mc->base.base == focused) {
+			owner = order[i].mc;
+			break;
+		}
+	}
+	if (owner == NULL && order_count == 1) {
+		owner = order[0].mc;
+	}
+	if (owner == NULL) {
+		return;
+	}
+	const bool want_3d = owner->hardware_display_3d;
+	if (msc->shared_hw_3d_applied == (want_3d ? 1 : 0)) {
+		return;
+	}
+	struct xrt_display_processor *dp = msc->shared_dp;
+	const bool has_slot = XRT_DP_HAS_SLOT(dp, request_display_mode) && dp->request_display_mode != NULL;
+	const bool accepted = has_slot ? xrt_display_processor_request_display_mode(dp, want_3d) : true;
+	if (!accepted) {
+		// Retried next frame only if the wish changes again (no per-frame spam).
+		U_LOG_W("[#967 D-5] shared display processor REJECTED hardware %s — panel state unchanged",
+		        want_3d ? "3D" : "2D");
+		msc->shared_hw_3d_applied = want_3d ? 1 : 0;
+		return;
+	}
+	const bool first = msc->shared_hw_3d_applied < 0;
+	msc->shared_hw_3d_applied = want_3d ? 1 : 0;
+	U_LOG_W("[#967 D-5] shared surface hardware -> %s (%s)", want_3d ? "3D" : "2D",
+	        has_slot ? "request_display_mode accepted" : "mode-neutral DP");
+	if (first && want_3d) {
+		return; // the DP's own default; nothing changed for the session to hear
+	}
+	union xrt_session_event xse = {0};
+	xse.hardware_display_state_change.type = XRT_SESSION_EVENT_HARDWARE_DISPLAY_STATE_CHANGE;
+	xse.hardware_display_state_change.hardware_display_3d = want_3d;
+	if (multi_compositor_push_event(owner, &xse) != XRT_SUCCESS) {
+		U_LOG_W("[#967 D-5] could not push the hardware-state event to the lens owner");
+	}
+}
+
+//! How long the shared surface holds back a client the workspace controller has
+//! not placed yet, before falling back to the full-panel rect.
+#define SHARED_UNPLACED_GRACE_NS (1000LL * 1000LL * 1000LL)
+
 static void
 render_shared_surface_locked(struct multi_system_compositor *msc, int64_t display_time_ns)
 {
@@ -4709,8 +5480,10 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Collect the clients to composite this frame (active, visible, with content).
 	struct shared_client_render order[MULTI_MAX_CLIENTS];
 	uint32_t order_count = 0;
-	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
-		struct multi_compositor *mc = msc->clients[k];
+	// #1005: the frame's snapshot, not msc->clients (list_and_timing_lock is
+	// not held here; render_lock is).
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
 		if (mc == NULL) {
 			continue;
 		}
@@ -4734,6 +5507,29 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			continue;
 		}
 
+		// Placement: the controller's window pose in meters (set_window_pose)
+		// drives per-eye projection (M2). Fall back to the full display px-rect
+		// for an unplaced lone app (M1 behavior, flat at the panel).
+		struct xrt_pose pose = XRT_POSE_IDENTITY;
+		float wm = 0.0f, hm = 0.0f;
+		const bool placed =
+		    comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm) && wm > 0.0f && hm > 0.0f;
+
+		// Under a workspace controller, a client's first frames can land before
+		// the controller's first set_window_pose; drawn at the M1 full-panel
+		// fallback they flash full screen, then snap into the tile (#2022
+		// follow-up). Hold such a client back until it is placed, bounded so a
+		// controller that never places a client still lets it show.
+		if (msc->workspace_active && !placed) {
+			const int64_t now_ns = os_monotonic_get_ns();
+			if (mc->ws_unplaced_since_ns == 0) {
+				mc->ws_unplaced_since_ns = now_ns;
+			}
+			if (now_ns - mc->ws_unplaced_since_ns < SHARED_UNPLACED_GRACE_NS) {
+				continue;
+			}
+		}
+
 		struct shared_client_render *e = &order[order_count++];
 		e->mc = mc;
 		e->layer = layer;
@@ -4745,12 +5541,7 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			vc = XRT_MAX_VIEWS;
 		e->view_count = vc;
 
-		// Placement: the controller's window pose in meters (set_window_pose)
-		// drives per-eye projection (M2). Fall back to the full display px-rect
-		// for an unplaced lone app (M1 behavior, flat at the panel).
-		struct xrt_pose pose = XRT_POSE_IDENTITY;
-		float wm = 0.0f, hm = 0.0f;
-		if (comp_multi_workspace_load_window_pose(&mc->base.base, &pose, &wm, &hm) && wm > 0.0f && hm > 0.0f) {
+		if (placed) {
 			e->placed = true;
 			e->pose_x = pose.position.x;
 			e->pose_y = pose.position.y;
@@ -4770,8 +5561,11 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		    wh <= 0) {
 			wx = 0;
 			wy = 0;
-			ww = msc->base.info.display_pixel_width;
-			wh = msc->base.info.display_pixel_height;
+			float unused_w_m = 0.0f, unused_h_m = 0.0f;
+			int32_t pw = 0, ph = 0;
+			shared_panel_dims(msc, &pw, &ph, &unused_w_m, &unused_h_m);
+			ww = pw;
+			wh = ph;
 		}
 		e->win_x = wx;
 		e->win_y = wy;
@@ -4788,18 +5582,29 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// Show the full-screen surface only while a workspace controller or content
 	// client is present; hide it (and skip rendering the empty backdrop) when the
 	// controller goes away so the macOS desktop returns. The service stays running
-	// as a daemon — Ctrl+Space respawns the controller, which re-shows the surface.
+	// as a daemon — the toggle hotkey respawns the controller, which re-shows the surface.
 	// Without this, toggling the shell off left the borderless full-screen window
 	// up showing its last (empty) frame as a black screen with no way to escape.
 	bool should_show = (order_count > 0) || msc->workspace_active;
 	if (!should_show && !msc->shared_surface_initialized) {
 		return; // nothing to show yet, never initialized
 	}
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+	// Android overlay (#1006): the target wraps the controller's surface from
+	// android_globals; don't try to build it while that surface is gone (the
+	// controller is backgrounded) — the convergence pass tracks validity.
+	if (!msc->shared_surface_initialized && msc->android_window_valid_state != 1) {
+		return;
+	}
+#endif
 	if (!shared_surface_init(msc, vk)) {
 		return;
 	}
+	// A DP held back at init (Android R2, #1006) is retried every frame, so it
+	// appears as soon as the last per-session DP in this process is gone.
+	shared_ensure_dp(msc, vk);
 	if (should_show != msc->shared_window_visible) {
-		comp_window_macos_set_visible(msc->shared_target, should_show);
+		shared_set_window_visible(msc->shared_target, should_show);
 		msc->shared_window_visible = should_show;
 		U_LOG_W("[#61] shared surface window %s (controller %s, %u client(s))",
 		        should_show ? "shown" : "hidden", msc->workspace_active ? "active" : "gone", order_count);
@@ -4807,6 +5612,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (!should_show) {
 		return; // idle: window hidden, desktop visible — don't render the backdrop
 	}
+	shared_sync_os_cursor(msc);
+
+	shared_converge_display_mode_locked(msc, order, order_count);
 
 	// Painter's sort (far first).
 	if (order_count > 1) {
@@ -4816,8 +5624,11 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	struct comp_target *ct = msc->shared_target;
 
 	// Per-eye tile = the display; combined atlas = 2 tiles (stereo) side by side.
-	int eye_w = (int)msc->base.info.display_pixel_width;
-	int eye_h = (int)msc->base.info.display_pixel_height;
+	int32_t panel_px_w = 0, panel_px_h = 0;
+	float panel_m_w = 0.0f, panel_m_h = 0.0f;
+	shared_panel_dims(msc, &panel_px_w, &panel_px_h, &panel_m_w, &panel_m_h);
+	int eye_w = (int)panel_px_w;
+	int eye_h = (int)panel_px_h;
 	if (eye_w <= 0 || eye_h <= 0) {
 		eye_w = (int)ct->width;
 		eye_h = (int)ct->height;
@@ -4844,6 +5655,18 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	if (msc->shared_dp != NULL) {
 		(void)xrt_display_processor_get_predicted_eye_positions(msc->shared_dp, &eye_pos);
 	}
+	// FRAME_TICK viewer (the DP's own eyes, before the nominal fallback below):
+	// same rule as the Windows service — held across a short dropout, invalid
+	// after ~30 frames so the controller sees "tracking lost", not a frozen eye.
+	if (eye_pos.valid && eye_pos.count >= 2) {
+		msc->shared_tick_viewer[0] = 0.5f * (eye_pos.eyes[0].x + eye_pos.eyes[1].x);
+		msc->shared_tick_viewer[1] = 0.5f * (eye_pos.eyes[0].y + eye_pos.eyes[1].y);
+		msc->shared_tick_viewer[2] = 0.5f * (eye_pos.eyes[0].z + eye_pos.eyes[1].z);
+		msc->shared_tick_viewer_valid = true;
+		msc->shared_tick_viewer_fail_count = 0;
+	} else if (msc->shared_tick_viewer_valid && ++msc->shared_tick_viewer_fail_count >= 30) {
+		msc->shared_tick_viewer_valid = false;
+	}
 	if (!eye_pos.valid || eye_pos.count < 2) {
 		float nom_y = (msc->base.info.nominal_viewer_y_m != 0.0f) ? msc->base.info.nominal_viewer_y_m : 0.0f;
 		float nom_z = (msc->base.info.nominal_viewer_z_m > 0.0f) ? msc->base.info.nominal_viewer_z_m : 0.6f;
@@ -4852,8 +5675,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 		eye_pos.count = 2;
 		eye_pos.valid = true;
 	}
-	float disp_w_m = msc->base.info.display_width_m;
-	float disp_h_m = msc->base.info.display_height_m;
+	float disp_w_m = panel_m_w;
+	float disp_h_m = panel_m_h;
 	if (disp_w_m <= 0.0f || disp_h_m <= 0.0f) {
 		disp_w_m = 0.301f;
 		disp_h_m = 0.196f;
@@ -4861,9 +5684,30 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	float px_per_m_x = (float)eye_w / disp_w_m;
 	float px_per_m_y = (float)eye_h / disp_h_m;
 
-	// Wait for the previous frame's fence on whatever buffer we'll reuse.
+	// Wait for the previous frame's fence on whatever buffer we'll reuse —
+	// bounded, with the same stall deadline as the per-session path (#1007): on
+	// expiry skip the frame (the panel keeps the last image) and only poll until
+	// the fence lands.
 	if (msc->shared_fenced_buffer >= 0) {
-		vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[msc->shared_fenced_buffer], VK_TRUE, UINT64_MAX);
+		const int64_t budget_ns = msc->shared_gpu_stalled ? 0 : MULTI_FENCE_DEADLINE_NS;
+		VkResult fret = multi_wait_fences_bounded(vk, 1, &msc->shared_fences[msc->shared_fenced_buffer],
+		                                          budget_ns, "shared previous frame");
+		if (fret == VK_TIMEOUT) {
+			if (!msc->shared_gpu_stalled) {
+				msc->shared_gpu_stalled = true;
+				msc->shared_gpu_stalled_since_ns = os_monotonic_get_ns();
+				U_LOG_W(
+				    "[#59] shared surface STALLED: GPU work not done after %d ms - skipping frames "
+				    "(#1007)",
+				    (int)(MULTI_FENCE_DEADLINE_NS / U_TIME_1MS_IN_NS));
+			}
+			return;
+		}
+		if (msc->shared_gpu_stalled) {
+			msc->shared_gpu_stalled = false;
+			U_LOG_W("[#59] shared surface recovered after %.1f s stalled (#1007)",
+			        (double)(os_monotonic_get_ns() - msc->shared_gpu_stalled_since_ns) / 1e9);
+		}
 		msc->shared_fenced_buffer = -1;
 	}
 
@@ -4877,9 +5721,35 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	}
 
 	uint32_t buffer_index = 0;
+	ct->acquire_timeout_ns = MULTI_ACQUIRE_TIMEOUT_NS; // #1007
 	VkResult ret = comp_target_acquire(ct, &buffer_index);
+	if (ret == VK_TIMEOUT || ret == VK_NOT_READY) {
+		static uint32_t shared_acquire_timeouts = 0;
+		if ((shared_acquire_timeouts++ % 60) == 0) {
+			U_LOG_W("[#59] shared acquire timed out - skipping frame (#1007, x%u)",
+			        shared_acquire_timeouts);
+		}
+		return;
+	}
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
-		U_LOG_W("[#59] shared acquire %s, skipping frame", vk_result_string(ret));
+		// Edge-logged, not per frame: a surface that is gone stays gone for
+		// as long as the controller is backgrounded (#1006 device test).
+		static VkResult last_skip = VK_SUCCESS;
+		if (ret != last_skip) {
+			U_LOG_W("[#59] shared acquire %s, skipping frames until it changes", vk_result_string(ret));
+			last_skip = ret;
+		}
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+		// Android overlay (#1006): the controller's surface is reborn on every
+		// background/resume, and the swapchain target asks its caller to
+		// rebuild (OUT_OF_DATE). The shared ring has no in-place recreate, so
+		// release the target and let the next frame rebuild it — and the
+		// framebuffers sized to it — against the surface that is live now.
+		if (ret == VK_ERROR_OUT_OF_DATE_KHR) {
+			last_skip = VK_SUCCESS;
+			shared_target_release(msc, vk);
+		}
+#endif
 		return;
 	}
 	if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
@@ -4948,7 +5818,16 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// corners + feathered edges. ONE render pass over the whole atlas so overlapping
 	// windows blend in painter (far→near, already-sorted) submission order; every
 	// content source image must therefore be SHADER_READ before the pass begins.
-	if (shared_ensure_content_blend(msc, vk)) {
+	//
+	// ADR-044 §1: the content pass draws into the same target as the decorations
+	// (#1795). Sources are sampled as their DECLARED format, so the target must
+	// encode on write: through the atlas's `_SRGB` view (or an `_SRGB` atlas).
+	// Rendering into the encoded atlas through its UNORM view stored the decoded
+	// (linear) values of an `_SRGB` client raw, one decode too dark. Under the
+	// legacy hatch the target is the UNORM atlas view, as before.
+	struct shared_deco_target content_target = {0};
+	if (shared_resolve_deco_target(msc, vk, &content_target) && content_target.content != NULL) {
+		struct comp_multi_content_blend *content_blend = content_target.content;
 		// Corner radius matches the shell focus ring (fh*0.045) so the content
 		// corners are concentric with it; feather is ~2 px of the window height,
 		// capped at the radius (Windows caps so feather_band = feather/ry ≤ 1).
@@ -5026,8 +5905,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 			                         uniq_n, pre);
 		}
 
-		comp_multi_content_blend_begin(&msc->shared_content_blend, vk, cmd, msc->shared_atlas_fb,
-		                               (uint32_t)msc->shared_atlas_w, (uint32_t)msc->shared_atlas_h);
+		comp_multi_content_blend_begin(content_blend, vk, cmd, content_target.fb, (uint32_t)msc->shared_atlas_w,
+		                               (uint32_t)msc->shared_atlas_h);
 		// Per client (far→near), per eye: project the window rect, clip it to the
 		// eye tile, remap the source sub-rect, and draw with rounded-rect coverage.
 		// M2: a placed window projects its center pose through each eye onto the
@@ -5064,6 +5943,14 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					glow_color[1] = st.focus_glow_color[1];
 					glow_color[2] = st.focus_glow_color[2];
 					glow_color[3] = st.focus_glow_color[3];
+					// The style colour is display-referred. An encoding target
+					// would encode it again, so hand the shader its linear value
+					// (a constant, like a clear colour; ADR-044 §2).
+					if (content_target.honest) {
+						for (int k = 0; k < 3; k++) {
+							glow_color[k] = u_color_srgb_decode(glow_color[k]);
+						}
+					}
 					if (st.edge_feather_meters > 0.0f && e->win_h_m > 0.0f) {
 						float sf = st.edge_feather_meters / e->win_h_m;
 						if (sf > edge_feather) {
@@ -5171,8 +6058,8 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 					memcpy(pcq.corners, corners, sizeof(corners));
 					SHARED_SET_HUD_PC(pcq);
 					comp_multi_content_blend_draw_quad(
-					    &msc->shared_content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt, &pcq,
-					    tile_x0_e, 0, (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
+					    content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt, &pcq, tile_x0_e, 0,
+					    (uint32_t)eye_w, (uint32_t)eye_h, (uint32_t)msc->shared_atlas_w,
 					    (uint32_t)msc->shared_atlas_h);
 					continue;
 				}
@@ -5228,13 +6115,13 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 				    .glow_color = {glow_color[0], glow_color[1], glow_color[2], glow_color[3]},
 				};
 				SHARED_SET_HUD_PC(pc);
-				comp_multi_content_blend_draw(&msc->shared_content_blend, vk, cmd, im, ai, fmt,
-				                              hud_img, hud_fmt, &pc, (int32_t)cdx0, (int32_t)cdy0,
+				comp_multi_content_blend_draw(content_blend, vk, cmd, im, ai, fmt, hud_img, hud_fmt,
+				                              &pc, (int32_t)cdx0, (int32_t)cdy0,
 				                              (uint32_t)(cdx1 - cdx0), (uint32_t)(cdy1 - cdy0));
 			}
 #undef SHARED_SET_HUD_PC
 		}
-		comp_multi_content_blend_end(&msc->shared_content_blend, vk, cmd);
+		comp_multi_content_blend_end(content_blend, vk, cmd);
 
 		// Restore the cross-process sources to GENERAL (their rest layout).
 		if (uniq_n > 0) {
@@ -5351,10 +6238,32 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 
 	// Cross-device shared memory has no GPU-level sync between app and compositor
 	// devices (same rationale as the per-session path) — wait before present.
-	vk->vkWaitForFences(vk->device, 1, &msc->shared_fences[buffer_index], VK_TRUE, UINT64_MAX);
-	msc->shared_fenced_buffer = -1;
+	// Bounded (#1007): on expiry hand the fence to the next frame's top-of-loop
+	// wait (which applies the stall deadline); present is GPU-ordered anyway.
+	if (multi_wait_fences_bounded(vk, 1, &msc->shared_fences[buffer_index], MULTI_FENCE_DEADLINE_NS,
+	                              "shared render") == VK_TIMEOUT) {
+		msc->shared_fenced_buffer = (int)buffer_index;
+	} else {
+		msc->shared_fenced_buffer = -1;
+	}
 
 	ret = comp_target_present(ct, vk->main_queue->queue, buffer_index, 0, display_time_ns, 0);
+
+	// One FRAME_TICK per rendered frame for the controller (coalesced by the
+	// IPC queue): it paces its per-frame work on these and casts its hit-test
+	// ray from the tracked viewer they carry.
+	if (msc->workspace_active) {
+		struct comp_multi_frame_tick tick = {
+		    .timestamp_ns = (uint64_t)os_monotonic_get_ns(),
+		    .viewer_x = msc->shared_tick_viewer[0],
+		    .viewer_y = msc->shared_tick_viewer[1],
+		    .viewer_z = msc->shared_tick_viewer[2],
+		    .viewer_valid = msc->shared_tick_viewer_valid,
+		};
+		comp_multi_workspace_get_pointer_px(&tick.cursor_x, &tick.cursor_y);
+		comp_multi_workspace_emit_frame_tick(&tick);
+	}
+
 	if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_ERROR_SURFACE_LOST_KHR) {
 		U_LOG_W("[#59] shared present %s", vk_result_string(ret));
 	} else if (ret != VK_SUCCESS && ret != VK_SUBOPTIMAL_KHR) {
@@ -5371,9 +6280,9 @@ render_shared_surface_locked(struct multi_system_compositor *msc, int64_t displa
 	// frozen/slow client simply re-shows its last frame, exactly like a real
 	// desktop window.
 }
-#endif // XRT_OS_MACOS
+#endif // COMP_MULTI_SHARED_SURFACE
 
-#ifndef XRT_OS_MACOS
+#ifdef COMP_MULTI_PER_SESSION_TARGET
 /*!
  * Render all per-session clients to their own targets.
  * Called after xrt_comp_layer_commit() for sessions with external window handles.
@@ -5393,8 +6302,11 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		return;
 	}
 
-	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
-		struct multi_compositor *mc = msc->clients[k];
+	// #1005: render_lock held, list_and_timing_lock NOT held. Iterate the
+	// frame's snapshot (render_set), never msc->clients directly, and only
+	// RECORD retires — the main loop applies them under the lock.
+	for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+		struct multi_compositor *mc = msc->render_set[k];
 
 		if (mc == NULL || !mc->session_render.initialized) {
 			continue;
@@ -5441,8 +6353,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		if (mc->session_render.owns_window && mc->session_render.own_window != NULL &&
 		    !comp_d3d11_window_is_valid(mc->session_render.own_window)) {
 			U_LOG_W("[per-session] Client %zu: skipping (window closed)", k);
-			int64_t now_ns = os_monotonic_get_ns();
-			multi_compositor_retire_delivered_locked(mc, now_ns);
+			msc->render_retire[k] = true;
 			continue;
 		}
 #endif
@@ -5451,8 +6362,7 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		{
 			extern bool oxr_macos_window_closed(void);
 			if (oxr_macos_window_closed()) {
-				int64_t now_ns = os_monotonic_get_ns();
-				multi_compositor_retire_delivered_locked(mc, now_ns);
+				msc->render_retire[k] = true;
 				continue;
 			}
 		}
@@ -5461,12 +6371,12 @@ render_per_session_clients_locked(struct multi_system_compositor *msc, int64_t d
 		// Render this session to its own target (black canvas + overlays if hidden)
 		render_session_to_own_target(mc, vk, display_time_ns, hidden);
 
-		// Retire the delivered frame for this session
-		int64_t now_ns = os_monotonic_get_ns();
-		multi_compositor_retire_delivered_locked(mc, now_ns);
+		// Retire the delivered frame for this session (applied by the main
+		// loop under list_and_timing_lock, #1005).
+		msc->render_retire[k] = true;
 	}
 }
-#endif // !XRT_OS_MACOS
+#endif // COMP_MULTI_PER_SESSION_TARGET
 
 
 
@@ -5500,19 +6410,40 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 		// old swapchain's BufferQueue connection (VK_ERROR_NATIVE_WINDOW_IN_USE_KHR storm)
 		// and pointlessly rebuilds a target no layers will reach. begin_session flips
 		// session_active back on and the next pass re-inits from the then-current surface.
-		bool skip_session_render_init = false;
-#ifdef XRT_OS_MACOS
 		// Shared spatial surface (#59): every client composites into ONE
 		// service-owned full-screen window, so the per-client NSWindow/target/DP
 		// is never created. The shared surface reads each client's delivered
-		// frames directly (deliver_any_frames below still runs). This is the only
-		// macOS service render path now (the legacy per-NSWindow path is removed).
-		skip_session_render_init = true;
+		// frames directly (deliver_any_frames below still runs). On macOS /
+		// desktop Linux this is always the case; on Android only while the
+		// workspace overlay is active (#1006) — otherwise per-session as before.
+		bool skip_session_render_init = multi_shared_surface_active(msc);
+#ifdef XRT_OS_ANDROID
+		// No live output surface in this process: creating the per-session
+		// target cannot succeed (init_post_vulkan has no window), and retrying
+		// it every frame floods the log — seen when a workspace overlay ends
+		// before the main-service client's own surface is back (#1006). The
+		// convergence pass that just ran tracks validity; retry once it is live.
+		if (msc->android_window_valid_state != 1) {
+			skip_session_render_init = true;
+		}
 #endif
-		if (!skip_session_render_init && mc->state.session_active &&
-		    multi_compositor_has_session_render(mc) && !mc->session_render.initialized &&
-		    !mc->session_render.window_close_exit_sent) {
-			multi_compositor_init_session_render(mc);
+		if (!skip_session_render_init && mc->state.session_active && multi_compositor_has_session_render(mc) &&
+		    !mc->session_render.initialized && !mc->session_render.window_close_exit_sent &&
+		    os_monotonic_get_ns() >= mc->session_render.init_retry_after_ns) {
+			if (!multi_compositor_init_session_render(mc)) {
+				// Back off instead of retrying every frame (#1006): e.g. two
+				// main-service clients after a workspace overlay ends share the
+				// process-global window, and the second one's target creation
+				// fails until the first lets go — at panel rate that was a log
+				// flood and wasted work.
+				uint32_t n =
+				    mc->session_render.init_fail_count < 3 ? mc->session_render.init_fail_count : 3;
+				mc->session_render.init_fail_count++;
+				mc->session_render.init_retry_after_ns =
+				    os_monotonic_get_ns() + ((int64_t)1 << n) * U_TIME_1S_IN_NS; // 1, 2, 4, 8 s
+			} else {
+				mc->session_render.init_fail_count = 0;
+			}
 		}
 
 		// Even if it's not shown, make sure that frames are delivered.
@@ -5681,7 +6612,7 @@ transfer_layers_locked(struct multi_system_compositor *msc, int64_t display_time
 				// (blit into the target's 2D region, #568); the shared/
 				// downstream path has no consumer — drop quietly.
 				break;
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 			case XRT_LAYER_WINDOW_SPACE:
 				// Window-space HUD: composited INTO the macOS shared-surface
 				// content draw (binding 1 of comp_multi_content_blend, in
@@ -5793,7 +6724,7 @@ update_session_state_locked(struct multi_system_compositor *msc)
 	// (and wakes this thread). macOS-only: elsewhere effective_active ==
 	// active_count, so the state machine is unchanged.
 	uint64_t effective_active = msc->sessions.active_count;
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	if (msc->workspace_active) {
 		effective_active = 1;
 	}
@@ -6017,11 +6948,85 @@ android_window_transition_locked(struct multi_system_compositor *msc)
 			}
 			os_mutex_unlock(&mc->weave.mutex);
 		}
+		// #1006: in workspace overlay mode no per-session window is on screen —
+		// the controller's surface is, composited through the ONE shared DP — so
+		// every per-session DP in this process releases its lens vote (ADR-036
+		// D7) and re-asserts when the overlay ends.
+		const bool overlay = multi_shared_surface_active(msc);
 		multi_compositor_set_window_visible_locked(
-		    mc, visible && active && !weave_idle,
-		    !visible ? "surface lost"
-		             : (!active ? "session not active"
-		                        : (weave_idle ? "weave idle (#1278)" : "surface live, session active")));
+		    mc, visible && active && !weave_idle && !overlay,
+		    overlay ? "workspace overlay active (#1006)"
+		            : (!visible
+		                   ? "surface lost"
+		                   : (!active ? "session not active"
+		                              : (weave_idle ? "weave idle (#1278)" : "surface live, session active"))));
+	}
+
+	// #1006: the shared DP's lens vote follows "overlay applied AND the
+	// controller's surface is live" — the same convergent, edge-triggered rule
+	// as the per-session DPs above. Deactivate therefore PAUSES it (never
+	// destroys it, leia-plugin#39); a reactivate resumes it.
+	if (msc->shared_dp != NULL) {
+		const bool want_visible = multi_shared_surface_active(msc) && visible;
+		const int want = want_visible ? MULTI_DP_VIS_VISIBLE : MULTI_DP_VIS_HIDDEN;
+		if (msc->shared_dp_visibility != want) {
+			msc->shared_dp_visibility = want;
+			if (want_visible) {
+				U_LOG_W(
+				    "[#1006] shared DP: overlay on + surface live - resuming, re-asserting its lens "
+				    "preference");
+				xrt_display_processor_on_resume(msc->shared_dp);
+			} else {
+				U_LOG_W("[#1006] shared DP: %s - pausing, releasing its lens preference",
+				        multi_shared_surface_active(msc) ? "controller surface lost" : "overlay off");
+				xrt_display_processor_on_pause(msc->shared_dp);
+			}
+		}
+	}
+}
+
+/*!
+ * #1006 (ADR-036 D4): apply the requested Android workspace-overlay mode
+ * (`workspace_active`, set by the IPC activate/deactivate/controller-loss arms)
+ * on the RENDER THREAD, at the top of a frame, before the layer transfer — so
+ * one frame never mixes the two shapes. Called with render_lock held and
+ * list_and_timing_lock NOT held.
+ *
+ * - ON: frames go through render_shared_surface_locked; the shared target (the
+ *   controller's own surface, published to android_globals) and the shared DP
+ *   are created lazily there. The convergence pass that follows releases every
+ *   per-session DP's lens vote in this same frame.
+ * - OFF: release the shared target (so a per-session target can claim the
+ *   process-global window again) but keep the shared DP, paused by the
+ *   convergence pass; per-session rendering resumes.
+ */
+static void
+android_overlay_transition(struct multi_system_compositor *msc)
+{
+	const bool want = msc->workspace_active; // plain bool, written under oth by the IPC arms
+	if (want == msc->shared_mode_active) {
+		return;
+	}
+
+	if (want) {
+		uint32_t live_targets = 0;
+		os_mutex_lock(&msc->list_and_timing_lock);
+		for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+			struct multi_compositor *mc = msc->clients[k];
+			if (mc != NULL && mc->session_render.initialized && mc->session_render.target != NULL) {
+				live_targets++;
+			}
+		}
+		os_mutex_unlock(&msc->list_and_timing_lock);
+		msc->shared_mode_active = true;
+		U_LOG_W(
+		    "[#1006] workspace overlay ON: every main-service client composites into the controller's "
+		    "surface through ONE display processor; per-session DPs release their lens votes%s",
+		    live_targets > 0 ? " (WARNING: a per-session target still holds the window)" : "");
+	} else {
+		msc->shared_mode_active = false;
+		shared_target_release(msc, comp_target_service_get_vk(msc->target_service));
+		U_LOG_W("[#1006] workspace overlay OFF: per-session rendering resumes");
 	}
 }
 
@@ -6040,9 +7045,19 @@ multi_system_compositor_android_visibility_tick(struct xrt_system_compositor *xs
 	if (msc == NULL) {
 		return;
 	}
+	// #1005: the pass calls DP on_pause/on_resume, which must not overlap the
+	// render thread's process_atlas on the same DP — that is render_lock's
+	// job now that the frame no longer runs under list_and_timing_lock. If a
+	// frame is in flight the main loop runs this very pass itself, so a busy
+	// render_lock means "already covered": skip rather than block the IPC
+	// mainloop behind a frame.
+	if (os_mutex_trylock(&msc->render_lock) != 0) {
+		return;
+	}
 	os_mutex_lock(&msc->list_and_timing_lock);
 	android_window_transition_locked(msc);
 	os_mutex_unlock(&msc->list_and_timing_lock);
+	os_mutex_unlock(&msc->render_lock);
 }
 #endif // XRT_OS_ANDROID
 
@@ -6133,28 +7148,67 @@ multi_main_loop(struct multi_system_compositor *msc)
 
 		xrt_comp_begin_frame(xc, frame_id);
 
+		// #1005: render_lock covers this whole frame (transfer, commit, render,
+		// DP, present) so no client can be unlisted/destroyed and no session
+		// render torn down while the frame uses it. list_and_timing_lock is
+		// only held for the short bookkeeping sections below, so client
+		// create/destroy, pacing calls and the wait threads no longer wait for
+		// GPU work or present. Order: render_lock -> list_and_timing_lock.
+		os_mutex_lock(&msc->render_lock);
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(COMP_MULTI_PER_SESSION_TARGET)
+		// #1006: the overlay mode flips here, before the transfer decides
+		// whether any client gets a per-session target this frame.
+		android_overlay_transition(msc);
+#endif
+
 		// Make sure that the clients doesn't go away while we transfer layers.
 		os_mutex_lock(&msc->list_and_timing_lock);
 #ifdef XRT_OS_ANDROID
 		android_window_transition_locked(msc);
 #endif
 		transfer_layers_locked(msc, predicted_display_time_ns, frame_id);
+		// Snapshot the render set (#1005). Entries stay valid until we drop
+		// render_lock: destroy unlists only under render_lock.
+		for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+			msc->render_set[k] = msc->clients[k];
+			msc->render_retire[k] = false;
+		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
 
 		xrt_comp_layer_commit(xc, XRT_GRAPHICS_SYNC_HANDLE_INVALID);
 
 		// Render per-session clients to their own targets (Phase 4)
-		// These sessions were skipped in transfer_layers_locked and render separately
-		os_mutex_lock(&msc->list_and_timing_lock);
-#ifdef XRT_OS_MACOS
+		// These sessions were skipped in transfer_layers_locked and render
+		// separately. render_lock only — list_and_timing_lock is NOT held (#1005).
+#ifdef COMP_MULTI_SHARED_SURFACE
 		// Shared spatial surface (#59): composite every client into ONE
-		// full-screen window + combined atlas → one weave → one present. This is
-		// the only macOS service render path (the legacy per-NSWindow path is gone).
-		render_shared_surface_locked(msc, predicted_display_time_ns);
-#else
-		render_per_session_clients_locked(msc, predicted_display_time_ns);
+		// full-screen window + combined atlas → one weave → one present. The
+		// only path on macOS / desktop Linux; Android's workspace overlay mode
+		// (#1006) while a verified controller has it active.
+		if (multi_shared_surface_active(msc)) {
+			render_shared_surface_locked(msc, predicted_display_time_ns);
+		} else
 #endif
+		{
+#ifdef COMP_MULTI_PER_SESSION_TARGET
+			render_per_session_clients_locked(msc, predicted_display_time_ns);
+#endif
+		}
+
+		// Apply the retires the render recorded: they touch each client's
+		// pacer, which list_and_timing_lock guards (#1005).
+		os_mutex_lock(&msc->list_and_timing_lock);
+		for (size_t k = 0; k < ARRAY_SIZE(msc->render_set); k++) {
+			if (msc->render_retire[k] && msc->render_set[k] != NULL) {
+				multi_compositor_retire_delivered_locked(msc->render_set[k], os_monotonic_get_ns());
+			}
+			msc->render_set[k] = NULL;
+			msc->render_retire[k] = false;
+		}
 		os_mutex_unlock(&msc->list_and_timing_lock);
+
+		os_mutex_unlock(&msc->render_lock);
 
 #ifdef XRT_OS_ANDROID
 		// ADPF: close the loop — report how long this frame's work actually took
@@ -6191,7 +7245,10 @@ multi_main_loop(struct multi_system_compositor *msc)
 static void *
 thread_func(void *ptr)
 {
-	return (void *)(intptr_t)multi_main_loop((struct multi_system_compositor *)ptr);
+	struct multi_system_compositor *msc = (struct multi_system_compositor *)ptr;
+	int ret = multi_main_loop(msc);
+	msc->render_thread_done = true; // #1815
+	return (void *)(intptr_t)ret;
 }
 
 
@@ -6321,10 +7378,39 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 {
 	struct multi_system_compositor *msc = multi_system_compositor(xsc);
 
+#ifdef XRT_OS_MACOS
+	/*
+	 * #1815: the render thread dispatch_sync()s window work onto the main
+	 * queue (comp_window_macos), so a main-thread join (os_thread_helper_destroy
+	 * below) deadlocks whenever a frame is in flight: the service hung on
+	 * SIGTERM in teardown_all. Stop it here and keep the main run loop turning
+	 * until it has exited, then join. Bounded, so a wedged frame cannot hang
+	 * the exit forever.
+	 */
+	if (pthread_main_np() != 0) {
+		os_thread_helper_lock(&msc->oth);
+		bool was_running = msc->oth.running;
+		msc->oth.running = false;
+		os_thread_helper_signal_locked(&msc->oth);
+		os_thread_helper_unlock(&msc->oth);
+		if (was_running) {
+			const int64_t deadline = os_monotonic_get_ns() + (int64_t)5 * U_TIME_1S_IN_NS;
+			while (!msc->render_thread_done && os_monotonic_get_ns() < deadline) {
+				CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+			}
+			if (msc->render_thread_done) {
+				pthread_join(msc->oth.thread, NULL);
+			} else {
+				U_LOG_W("#1815: render thread still busy at destroy; not joined");
+			}
+		}
+	}
+#endif
+
 	// Destroy the render thread first, destroy also stops the thread.
 	os_thread_helper_destroy(&msc->oth);
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// Free the shared spatial surface resources (#59) now that the render thread
 	// is stopped but BEFORE the native compositor (which owns the Vulkan device)
 	// and the target service go away.
@@ -6336,6 +7422,17 @@ system_compositor_destroy(struct xrt_system_compositor *xsc)
 	xrt_comp_native_destroy(&msc->xcn);
 
 	os_mutex_destroy(&msc->list_and_timing_lock);
+	os_mutex_destroy(&msc->render_lock);
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+	// #2218 item 6: every client (and so every weave engine) is gone.
+	if (msc->weave_screens.mutex_initialized) {
+		os_mutex_destroy(&msc->weave_screens.mutex);
+		msc->weave_screens.mutex_initialized = false;
+	}
+	free(msc->weave_screens.list);
+	free(msc->weave_screens.info);
+#endif
 
 	free(msc);
 }
@@ -6366,7 +7463,7 @@ multi_system_compositor_update_session_status(struct multi_system_compositor *ms
 	os_thread_helper_unlock(&msc->oth);
 }
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 void
 comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool active)
 {
@@ -6376,10 +7473,26 @@ comp_multi_system_set_workspace_active(struct xrt_system_compositor *xsc, bool a
 	struct multi_system_compositor *msc = multi_system_compositor(xsc);
 	os_thread_helper_lock(&msc->oth);
 	msc->workspace_active = active;
+	if (!active) {
+		msc->shared_hw_3d_controller_wish = -1; // #967 D-5: authority returns to the clients
+	}
 	// Wake the render thread so it (re)starts the shared-surface session even with
 	// no active content app (#61: empty spatial desktop + DXR splash + launcher).
 	os_thread_helper_signal_locked(&msc->oth);
 	os_thread_helper_unlock(&msc->oth);
+}
+
+bool
+comp_multi_system_request_workspace_display_mode(struct xrt_system_compositor *xsc, bool hardware_3d)
+{
+	if (xsc == NULL) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsc);
+	msc->shared_hw_3d_controller_wish = hardware_3d ? 1 : 0;
+	U_LOG_W("[#967 D-5] workspace controller requests hardware %s for the shared display processor",
+	        hardware_3d ? "3D" : "2D");
+	return true;
 }
 #endif
 
@@ -6411,12 +7524,14 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	// Store the target service for per-session rendering (Phase 3)
 	msc->target_service = target_service;
 
-#ifdef XRT_OS_MACOS
+#ifdef COMP_MULTI_SHARED_SURFACE
 	// Shared spatial surface (#59) is the only macOS service render path: every
 	// client app composites into ONE full-screen window as a 3D spatial window
 	// (the macOS analogue of the Windows D3D11 monolith), instead of one NSWindow
 	// per app. The legacy per-NSWindow path has been removed.
 	msc->shared_fenced_buffer = -1;
+	msc->shared_hw_3d_applied = -1;
+	msc->shared_hw_3d_controller_wish = -1;
 	U_LOG_W("[#59] shared spatial surface (single full-screen window)");
 #endif
 
@@ -6424,6 +7539,10 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	msc->sessions.state = do_warm_start ? MULTI_SYSTEM_STATE_INIT_WARM_START : MULTI_SYSTEM_STATE_STOPPED;
 
 	os_mutex_init(&msc->list_and_timing_lock);
+	os_mutex_init(&msc->render_lock);
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+	msc->weave_screens.mutex_initialized = os_mutex_init(&msc->weave_screens.mutex) == 0;
+#endif
 
 	//! @todo Make the clients not go from IDLE to READY before we have completed a first frame.
 	// Make sure there is at least some sort of valid frame data here.
@@ -6443,6 +7562,101 @@ comp_multi_create_system_compositor(struct xrt_compositor_native *xcn,
 	return XRT_SUCCESS;
 }
 
+struct vk_bundle *
+comp_multi_system_get_vk(struct xrt_system_compositor *xsysc)
+{
+	// Only a multi system compositor is a multi_system_compositor. Identified
+	// by create_native_compositor, NOT destroy: target_instance hooks destroy
+	// (display hotplug, t_syscomp_destroy_hook) on the service's instance.
+	if (xsysc == NULL || xsysc->create_native_compositor != system_compositor_create_native_compositor) {
+		return NULL;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	return comp_target_service_get_vk(msc->target_service);
+}
+
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_MACOS)
+void
+comp_multi_system_set_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list)
+{
+	if (xsysc == NULL || list == NULL ||
+	    xsysc->create_native_compositor != system_compositor_create_native_compositor) {
+		return;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+	if (!msc->weave_screens.mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&msc->weave_screens.mutex);
+	if (msc->weave_screens.list == NULL) {
+		msc->weave_screens.list = U_TYPED_CALLOC(struct xrt_screen_list);
+		msc->weave_screens.info = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	}
+	if (msc->weave_screens.list == NULL || msc->weave_screens.info == NULL) {
+		free(msc->weave_screens.list);
+		free(msc->weave_screens.info);
+		msc->weave_screens.list = NULL;
+		msc->weave_screens.info = NULL;
+		os_mutex_unlock(&msc->weave_screens.mutex);
+		return;
+	}
+	// Bump only on a real change: the fallback timer re-probes every 10 s
+	// while the fallback plug-in is active, and a bump rebuilds every live
+	// engine's segment DPs.
+	// A refined EDID physical size alone (macOS, #2097) is kept but is not a
+	// new table: no generation bump, so no engine rebuilds a vendor weaver.
+	const bool first = msc->weave_screens.generation == 0;
+	const enum comp_weave_screens_change diff = comp_weave_screens_compare(msc->weave_screens.list, list);
+	const bool changed =
+	    first || (diff != COMP_WEAVE_SCREENS_SAME && diff != COMP_WEAVE_SCREENS_PHYSICAL_SIZE) ||
+	    comp_weave_screens_registry_changed(&msc->weave_screens.info->dp_registry, &xsysc->info.dp_registry);
+	if (changed || diff == COMP_WEAVE_SCREENS_PHYSICAL_SIZE) {
+		*msc->weave_screens.list = *list;
+		*msc->weave_screens.info = xsysc->info;
+	}
+	if (changed) {
+		msc->weave_screens.generation++;
+	}
+	const uint64_t gen = msc->weave_screens.generation;
+	os_mutex_unlock(&msc->weave_screens.mutex);
+	if (changed) {
+		// Lifecycle (start-up, a hotplug, a re-claim) — never per frame.
+		uint32_t with_vk = 0;
+		for (uint32_t e = 0; e < xsysc->info.dp_registry.entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+			if (xsysc->info.dp_registry.entries[e].dp_factory_vk != NULL) {
+				with_vk++;
+			}
+		}
+		U_LOG_W(
+		    "weave(#2218): screen table generation %llu — %u screen(s), %u with a Vulkan DP factory; "
+		    "XR_DXR_weave present-owner windows are woven %s",
+		    (unsigned long long)gen, list->count, with_vk,
+		    list->count >= 2 ? "by the DP of each screen they cover"
+		                     : "by the one DP (single screen: per-screen weaving off)");
+	}
+}
+
+uint64_t
+multi_system_weave_screens_snapshot(struct multi_system_compositor *msc,
+                                    uint64_t have_generation,
+                                    struct xrt_screen_list *out_list,
+                                    struct xrt_system_compositor_info *out_info)
+{
+	if (msc == NULL || !msc->weave_screens.mutex_initialized) {
+		return 0;
+	}
+	os_mutex_lock(&msc->weave_screens.mutex);
+	const uint64_t gen = msc->weave_screens.generation;
+	if (gen != 0 && gen != have_generation && msc->weave_screens.list != NULL && out_list != NULL &&
+	    out_info != NULL) {
+		*out_list = *msc->weave_screens.list;
+		*out_info = *msc->weave_screens.info;
+	}
+	os_mutex_unlock(&msc->weave_screens.mutex);
+	return gen;
+}
+#endif // XRT_OS_LINUX_DESKTOP || XRT_OS_MACOS
+
 bool
 multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool enable_3d)
 {
@@ -6451,6 +7665,8 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
 	}
 	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
 	bool any = false;
+	// #1005: the DP calls below must not overlap a frame's process_atlas.
+	os_mutex_lock(&msc->render_lock);
 	os_mutex_lock(&msc->list_and_timing_lock);
 	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
 		struct multi_compositor *mc = msc->clients[k];
@@ -6475,5 +7691,206 @@ multi_system_request_display_mode_any(struct xrt_system_compositor *xsysc, bool 
 		}
 	}
 	os_mutex_unlock(&msc->list_and_timing_lock);
+	os_mutex_unlock(&msc->render_lock);
 	return any;
 }
+
+
+/*
+ *
+ * Display status reads (ADR-051 D3) — desktop-Linux service.
+ *
+ */
+
+#if defined(COMP_MULTI_SHARED_SURFACE) && defined(XRT_OS_LINUX_DESKTOP)
+
+//! @p xsysc is a comp_multi system compositor (not the D3D11 service, not a test double).
+static bool
+status_is_multi_system(const struct xrt_system_compositor *xsysc)
+{
+	// create_native_compositor, not destroy: target_instance may wrap destroy
+	// (the display hotplug sweep's t_syscomp_destroy_hook).
+	return xsysc != NULL && xsysc->create_native_compositor == system_compositor_create_native_compositor;
+}
+
+//! A desktop-absolute window rect into window metrics against @p info's panel.
+static void
+status_fill_window_metrics(const struct xrt_system_compositor_info *info,
+                           int32_t win_x,
+                           int32_t win_y,
+                           uint32_t win_w,
+                           uint32_t win_h,
+                           struct xrt_window_metrics *out)
+{
+	U_ZERO(out);
+	if (win_w == 0 || win_h == 0) {
+		return;
+	}
+	out->window_pixel_width = win_w;
+	out->window_pixel_height = win_h;
+	out->window_screen_left = win_x;
+	out->window_screen_top = win_y;
+	out->window_orientation = (struct xrt_quat){0.0f, 0.0f, 0.0f, 1.0f};
+	out->display_pixel_width = info->display_pixel_width;
+	out->display_pixel_height = info->display_pixel_height;
+	out->display_width_m = info->display_width_m;
+	out->display_height_m = info->display_height_m;
+	out->display_screen_left = info->display_screen_left;
+	out->display_screen_top = info->display_screen_top;
+	// Square-pixel pitch from the native dims; unknown size = pixels only (as
+	// multi_compositor_get_window_metrics' weave branch reports it).
+	if (info->display_pixel_width > 0 && info->display_width_m > 0.0f && info->display_pixel_height > 0) {
+		const float pitch = info->display_width_m / (float)info->display_pixel_width;
+		const float cx = (float)(win_x - info->display_screen_left) + (float)win_w * 0.5f;
+		const float cy = (float)(win_y - info->display_screen_top) + (float)win_h * 0.5f;
+		out->window_width_m = (float)win_w * pitch;
+		out->window_height_m = (float)win_h * pitch;
+		out->window_center_offset_x_m = (cx - (float)info->display_pixel_width * 0.5f) * pitch;
+		out->window_center_offset_y_m = -((cy - (float)info->display_pixel_height * 0.5f) * pitch);
+	}
+	out->valid = true;
+}
+
+bool
+multi_compositor_status_get_client(struct xrt_system_compositor *xsysc,
+                                   const struct xrt_compositor *xc,
+                                   struct multi_compositor_status_client *out)
+{
+	U_ZERO(out);
+	if (!status_is_multi_system(xsysc) || xc == NULL) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+
+	bool found = false;
+	bool weave_geom = false;
+	int32_t wx = 0, wy = 0;
+	uint32_t ww = 0, wh = 0;
+	bool shared_dp = false;
+	bool shared_3d = false;
+
+	// Plain fields only, under list_and_timing_lock (the lock the render
+	// thread holds while it latches `delivered` and composites): the client
+	// cannot leave clients[] while we look at it.
+	os_mutex_lock(&msc->list_and_timing_lock);
+	for (size_t k = 0; k < ARRAY_SIZE(msc->clients); k++) {
+		struct multi_compositor *mc = msc->clients[k];
+		if (mc == NULL || &mc->base.base != xc) {
+			continue;
+		}
+		found = true;
+
+		// Its delivered projection layer, the same pick render_shared_surface_locked makes.
+		if (mc->delivered.active) {
+			for (uint32_t i = 0; i < mc->delivered.layer_count; i++) {
+				const enum xrt_layer_type t = mc->delivered.layers[i].data.type;
+				if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH ||
+				    t == XRT_LAYER_ZONE_3D) {
+					out->view_count = mc->delivered.layers[i].data.view_count;
+					break;
+				}
+			}
+		}
+
+		// XR_DXR_weave present-owner state: written under weave.mutex by the
+		// client's submits; read here unlocked, the same torn-read trade
+		// multi_compositor_get_window_metrics makes (a stale rect for one read).
+		out->weave_owner = mc->weave.window_bound || mc->weave.dp != NULL || mc->weave.have_geometry;
+		if (out->weave_owner) {
+			out->has_dp = mc->weave.dp != NULL;
+			out->woven = out->has_dp && mc->weave.woven_serial > 0 && !mc->weave.hw_2d_confirmed &&
+			             !mc->weave.mono_active;
+			if (mc->weave.have_geometry && mc->weave.win_w > 0 && mc->weave.win_h > 0) {
+				weave_geom = true;
+				wx = mc->weave.win_x;
+				wy = mc->weave.win_y;
+				ww = mc->weave.win_w;
+				wh = mc->weave.win_h;
+			}
+		}
+		break;
+	}
+	shared_dp = msc->shared_dp != NULL;
+	shared_3d = msc->shared_hw_3d_applied == 1;
+	os_mutex_unlock(&msc->list_and_timing_lock);
+
+	if (!found) {
+		return false;
+	}
+
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	if (out->weave_owner) {
+		if (weave_geom) {
+			status_fill_window_metrics(info, wx, wy, ww, wh, &out->window);
+		}
+		return true;
+	}
+
+	// A shared-surface client. Placement and minimized state come from the
+	// workspace registry (pointer-keyed, its own leaf lock; read after the
+	// list lock is released, never nested).
+	struct xrt_compositor *key = (struct xrt_compositor *)xc;
+	out->shared_surface = true;
+	out->in_composite = out->view_count > 0 && !comp_multi_workspace_is_window_hidden(key);
+	out->has_dp = out->in_composite && shared_dp;
+	out->woven = out->has_dp && shared_3d;
+	if (out->in_composite) {
+		// The rect render_shared_surface_locked composites the client at:
+		// its placed px rect on the panel, else the whole panel.
+		int32_t px = 0, py = 0, pw = 0, ph = 0;
+		if (!comp_multi_workspace_load_window_px_rect(key, &px, &py, &pw, &ph) || pw <= 0 || ph <= 0) {
+			px = 0;
+			py = 0;
+			pw = (int32_t)info->display_pixel_width;
+			ph = (int32_t)info->display_pixel_height;
+		}
+		if (pw > 0 && ph > 0) {
+			status_fill_window_metrics(info, info->display_screen_left + px, info->display_screen_top + py,
+			                           (uint32_t)pw, (uint32_t)ph, &out->window);
+		}
+	}
+	return true;
+}
+
+bool
+multi_compositor_status_get_shared_dp(struct xrt_system_compositor *xsysc,
+                                      struct multi_compositor_status_shared_dp *out)
+{
+	U_ZERO(out);
+	if (!status_is_multi_system(xsysc)) {
+		return false;
+	}
+	struct multi_system_compositor *msc = multi_system_compositor(xsysc);
+
+	os_mutex_lock(&msc->list_and_timing_lock);
+	struct xrt_display_processor *dp = msc->shared_dp;
+	out->hardware_3d = msc->shared_hw_3d_applied == 1;
+	os_mutex_unlock(&msc->list_and_timing_lock);
+
+	const struct xrt_system_compositor_info *info = &msc->base.info;
+	out->panel_left = info->display_screen_left;
+	out->panel_top = info->display_screen_top;
+	out->panel_width = info->display_pixel_width;
+	out->panel_height = info->display_pixel_height;
+
+	if (dp == NULL) {
+		return true;
+	}
+	out->present = true;
+
+	// Passive vendor reads, outside every compositor lock. shared_dp lives
+	// until the system compositor is destroyed.
+	struct xrt_eye_positions eyes = {0};
+	out->eyes_answered = xrt_display_processor_get_predicted_eye_positions(dp, &eyes);
+	out->is_tracking = out->eyes_answered && eyes.valid && eyes.is_tracking;
+	// shared_dp comes from the Vulkan DP factory (dp_factory_vk): its vtable
+	// is the VK variant, whose struct_size gates the appended slot.
+	uint32_t state = 0;
+	if (xrt_display_processor_vk_get_backend_state((struct xrt_display_processor_vk *)dp, &state)) {
+		out->backend_known = true;
+		out->backend_state = state;
+	}
+	return true;
+}
+
+#endif // COMP_MULTI_SHARED_SURFACE && XRT_OS_LINUX_DESKTOP

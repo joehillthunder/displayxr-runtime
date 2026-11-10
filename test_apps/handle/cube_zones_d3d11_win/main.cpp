@@ -52,6 +52,7 @@
 #include "projection_depth.h"
 #include "text_overlay.h"
 #include "xr_session.h"
+#include "cursor_depth_zones.h" // XR_DXR_cursor_depth on display zones (runtime#1949)
 
 #include <algorithm>
 #include <chrono>
@@ -118,6 +119,15 @@ struct DisplayZone {
 };
 static DisplayZone g_zonesArr[kNumZones];
 
+// XR_DXR_cursor_depth (ADR-046, runtime#1949): the runtime draws the depth
+// cursor in the 3D zone under the pointer. The hint rides that zone's
+// zone-scoped locate (cursor_depth_zones.h, dxr::CursorDepth's Win32 adapter
+// hides the OS cursor over the client area exactly while willDraw).
+// DISPLAYXR_CURSOR_DEPTH=0 opts out; DISPLAYXR_CURSOR_DEPTH_DRAW=app keeps the
+// OS cursor (hint + placement only); DISPLAYXR_CURSOR_DEPTH_UV=u,v scripts a
+// WINDOW-normalised pointer.
+static dxr_zones_cursor::ZoneCursor g_zoneCursor;
+
 static const XrRect2Di kZoneARect        = {{0, 180}, {640, 540}};
 static const XrRect2Di kZoneBRect        = {{700, 180}, {520, 360}};
 static const XrRect2Di kZoneBOverlapRect = {{400, 300}, {520, 360}};
@@ -142,6 +152,17 @@ static const long kZonesActivationFrame = 10;
 static int g_wishMode = 0;
 static ID3D11RenderTargetView* g_wishRTV = nullptr; // runtime-owned (Tier-3 binding)
 static uint32_t g_wishW = 0, g_wishH = 0;
+
+// DXR_ZONES_FEATHER=<px> — chain XrDisplayZoneFeatherDXR (radiusPx) on every
+// zone at xrEndFrame, as the d3d12 sibling does. 0/unset = hard edges, the spec
+// default; the published wish stays binary regardless (runtime#800).
+static float ZonesFeatherRadiusPx() {
+    static const float r = []() {
+        const char* v = getenv("DXR_ZONES_FEATHER");
+        return (v != nullptr) ? (float)atof(v) : 0.0f;
+    }();
+    return r;
+}
 
 // DXR_ZONES_VALIDATE=1 — chain the validate bit on every frame-end info.
 static bool ZonesValidateEnabled() {
@@ -466,6 +487,9 @@ struct RenderState {
 // advertises one (INV-4.6); the CPU-authored bytes are display-referred, so
 // declaring them _SRGB keeps the compositor's decode→encode round-trip honest.
 static int64_t PickStripFormat(XrSessionManager& xr) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return (int64_t)DXGI_FORMAT_B8G8R8A8_UNORM;
     uint32_t n = 0;
     xrEnumerateSwapchainFormats(xr.session, 0, &n, nullptr);
     std::vector<int64_t> formats(n);
@@ -1006,10 +1030,23 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
     XrSessionManager& xr = *rs.xr;
     D3D11Renderer& renderer = *rs.renderer;
 
+    // XR_DXR_cursor_depth (#1949): pick the topmost 3D zone under the pointer.
+    {
+        XrRect2Di cursorRects[kNumZones];
+        float cursorRots[kNumZones];
+        for (uint32_t zi = 0; zi < kNumZones; zi++) {
+            cursorRects[zi] = g_zonesArr[zi].rect;
+            cursorRots[zi] = renderer.cubeRotation + g_zonesArr[zi].spinPhase;
+        }
+        g_zoneCursor.begin((int32_t)g_windowWidth, (int32_t)g_windowHeight, cursorRects, cursorRots, kNumZones);
+    }
+
     // Per-zone locate + submit data. The zone structs are chained at BOTH
     // points (locate and xrEndFrame) — same instances within the frame.
     XrDisplayZoneDXR zoneStructs[kNumZones];
     XrDisplayRigDXR rigStructs[kNumZones];
+    XrDisplayZoneFeatherDXR featherStructs[kNumZones];
+    const float featherPx = ZonesFeatherRadiusPx();
     std::vector<XrCompositionLayerProjectionView> projViews[kNumZones];
     uint32_t submitViewCounts[kNumZones] = {};
     // ADR-041: what each zone LAYER carries (>= submitViewCounts[zi]).
@@ -1026,7 +1063,14 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         rigStructs[zi].perspectiveFactor = z.perspectiveFactor;
 
         zoneStructs[zi] = {XR_TYPE_DISPLAY_ZONE_DXR};
-        zoneStructs[zi].next = &rigStructs[zi];
+        if (featherPx > 0.0f) {
+            featherStructs[zi] = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
+            featherStructs[zi].radiusPx = featherPx;
+            featherStructs[zi].next = &rigStructs[zi];
+            zoneStructs[zi].next = &featherStructs[zi];
+        } else {
+            zoneStructs[zi].next = &rigStructs[zi];
+        }
         zoneStructs[zi].zoneId = z.zoneId;
         zoneStructs[zi].rect = z.rect;
 
@@ -1040,7 +1084,13 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         uint32_t viewCountOutput = 0;
         XrView zoneViews[8];
         for (uint32_t vi = 0; vi < 8; vi++) zoneViews[vi] = {XR_TYPE_VIEW};
+        // XR_DXR_cursor_depth (#1949): the hint rides only the locate of the
+        // zone under the pointer; its canvas is the zone rect.
+        g_zoneCursor.chain(zi, locateInfo, viewState);
         XrResult lr = xrLocateViews(xr.session, &locateInfo, &viewState, 8, &viewCountOutput, zoneViews);
+        if (XR_SUCCEEDED(lr)) {
+            g_zoneCursor.afterLocate(zi, zoneViews, viewCountOutput);
+        }
         if (XR_FAILED(lr) || viewCountOutput == 0) {
             static bool warned = false;
             if (!warned) {
@@ -1244,6 +1294,8 @@ static void RenderZonesFrame(RenderState& rs, const XrFrameState& frameState) {
         XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
         xrReleaseSwapchainImage(z.swapchain, &ri);
     }
+
+    g_zoneCursor.end(); // pointer over no 3D zone: the OS cursor is the cursor
 
     // Layer list: [projA (zone A chained), projB (zone B chained), strip].
     XrCompositionLayerProjection projLayers[kNumZones];
@@ -1920,6 +1972,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+    // XR_DXR_cursor_depth (#1949): the depth cursor rides the zone under the pointer.
+    g_zoneCursor.initWin32(g_hasCursorDepthExt ? g_cursorDepthSpecVersion : 0, hwnd, 0.06f);
 
     // Create reference spaces
     if (!CreateSpaces(xr)) {

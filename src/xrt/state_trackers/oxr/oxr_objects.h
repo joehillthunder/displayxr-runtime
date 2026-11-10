@@ -18,6 +18,7 @@
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_compositor.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_screen.h"
 #include "xrt/xrt_vulkan_includes.h"
 #include "xrt/xrt_openxr_includes.h"
 #include "xrt/xrt_config_os.h"
@@ -28,13 +29,22 @@
 #include "util/u_index_fifo.h"
 #include "util/u_hashset.h"
 #include "util/u_hashmap.h"
+#include "util/u_screen_home.h"
 #include "util/u_device.h"
+#include "util/u_cursor_depth.h"
+#include "util/u_stereo_comfort.h"
+#include "util/u_tracking_any.h"
+#include "util/u_mono_auto_2d.h"
+
+#include "math/m_view_rig_point.h"
 
 #include "oxr_extension_support.h"
 #include "oxr_subaction.h"
 #include "oxr_defines.h"
 #include "oxr_frame_sync.h"
 #include "oxr_views_change.h"
+
+struct u_desktop_control; // XR_DXR_desktop_control (aux/desktop)
 
 #if defined(XRT_HAVE_D3D11) || defined(XRT_HAVE_D3D12)
 #include <dxgi.h>
@@ -134,6 +144,9 @@ struct oxr_body_tracker_fb;
 struct oxr_xdev_list;
 struct oxr_plane_detector_ext;
 struct oxr_local_3d_zone_ext;
+struct oxr_lift_stream_dxr;
+struct ipc_client_service_link;
+struct oxr_stereo_camera_stream_dxr;
 
 #define XRT_MAX_HANDLE_CHILDREN 256
 #define OXR_MAX_BINDINGS_PER_ACTION 32
@@ -998,6 +1011,28 @@ void
 oxr_session_push_rendering_mode_ipc(struct oxr_session *sess, uint32_t mode_index);
 
 /*!
+ * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h): call
+ * once per submitted frame, after the layers are verified. Classifies the
+ * frame, runs the hysteresis and, on an edge, asks the compositor to hold the
+ * panel in 2D (flat, no weave) or to release the hold. One WARN per edge.
+ */
+void
+oxr_session_mono_auto_2d_frame(struct oxr_logger *log,
+                               struct oxr_session *sess,
+                               const XrFrameEndInfo *frameEndInfo,
+                               uint64_t now_ns);
+
+/*!
+ * The app made an explicit display-mode choice: mark the session so auto-2D
+ * never engages again, and release it if it is engaged. With @p push_event the
+ * hardware-state event is sent when the release moves the panel back to 3D;
+ * the explicit-request callers that send their own event pass false.
+ * Returns true when auto-2D was engaged.
+ */
+bool
+oxr_session_mono_auto_2d_explicit(struct oxr_logger *log, struct oxr_session *sess, bool push_event);
+
+/*!
  * Push the session's eye-tracking control mode (MANAGED=0 / MANUAL=1) to the
  * display processor (#522). Best-effort policy hint; the DP enacts whatever the
  * vendor advertised. Routed in-process via the native compositor or
@@ -1019,6 +1054,14 @@ oxr_session_set_workspace_view_rig(struct oxr_logger *log, struct oxr_session *s
 
 XRT_CHECK_RESULT XrResult
 oxr_session_poll(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
+ * Multi-screen M3: take this frame's per-segment view routing (what the last
+ * SPLITTING xrLocateViews of the frame handed out; count 0 when none split)
+ * and reset the record for the next frame. Called once per xrEndFrame.
+ */
+void
+oxr_session_take_segment_view_routing(struct oxr_session *sess, struct xrt_segment_view_routing *out);
 
 XrResult
 oxr_session_locate_views(struct oxr_logger *log,
@@ -1097,6 +1140,42 @@ oxr_session_frame_begin(struct oxr_logger *log, struct oxr_session *sess);
 
 XrResult
 oxr_session_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo);
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): hand a depth-patch read request
+ * to the session's native compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot read submitted depth.
+ */
+bool
+oxr_session_cursor_depth_hand_request(struct oxr_session *sess, const struct u_cursor_depth_patch_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): can this session's
+ * compositor draw the cursor?
+ */
+bool
+oxr_session_cursor_draw_supported(struct oxr_session *sess);
+
+/*!
+ * XR_DXR_cursor_depth v5: hand a cursor draw request to the session's native
+ * compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot draw the cursor.
+ */
+bool
+oxr_session_cursor_draw_hand_request(struct oxr_session *sess, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): hand a disparity-measure
+ * request to the session's native compositor, for its next commit.
+ *
+ * @return false if this session's compositor cannot measure.
+ */
+bool
+oxr_session_cursor_measure_hand_request(struct oxr_session *sess, const struct u_cursor_measure_request *req);
+#endif
 
 XrResult
 oxr_session_hand_joints(struct oxr_logger *log,
@@ -1197,6 +1276,20 @@ oxr_space_xdev_pose_create(struct oxr_logger *log,
                            const struct xrt_pose *pose,
                            struct oxr_space **out_space);
 
+#ifdef OXR_HAVE_DXR_display_info
+/*!
+ * XR_DXR_display_info v22: a DISPLAY space for one enumerated display. In v22
+ * every display space resolves to the session's single display plane (the
+ * pose XrViewDisplayRawDXR::displayPlanePose reports); per-display poses
+ * arrive with per-screen DISPLAY poses (multi-screen M3).
+ */
+XrResult
+oxr_space_display_create(struct oxr_logger *log,
+                         struct oxr_session *sess,
+                         const XrDisplaySpaceCreateInfoDXR *createInfo,
+                         struct oxr_space **out_space);
+#endif
+
 XrResult
 oxr_space_locate(
     struct oxr_logger *log, struct oxr_space *spc, struct oxr_space *baseSpc, XrTime time, XrSpaceLocation *location);
@@ -1229,6 +1322,21 @@ oxr_space_locate_device(struct oxr_logger *log,
                         struct xrt_space_relation *out_relation);
 
 /*!
+ * The canvas scale a RIG_LOCAL device located in @p baseSpc still owes on top
+ * of the rigid placement @ref oxr_space_locate_device applies (ADR-034
+ * Amendment 7): a relation rigidly placed at `plane o L` becomes
+ * `plane o (s L)` by m_view_rig_scale_relation about @p out_origin (the
+ * plane's position in @p baseSpc) with @p out_scale = s. For a relation that
+ * is only composed AFTER the device is located — hand joints.
+ *
+ * Returns false (and @p out_scale = 1) when nothing is owed: no re-base for
+ * the session, s = 1, or a RIG_LOCAL base space (its own placement cancels).
+ */
+bool
+oxr_space_rig_local_scale(
+    struct oxr_logger *log, struct oxr_space *baseSpc, XrTime time, struct xrt_vec3 *out_origin, float *out_scale);
+
+/*!
  * #1502: the offset the space overseer must be handed for @p spc.
  *
  * This is the app's `poseInReferenceSpace` for every space but VIEW; for VIEW
@@ -1248,6 +1356,26 @@ oxr_space_ref_offset(struct oxr_space *spc, struct xrt_pose *out_offset);
  */
 void
 oxr_session_get_view_space_offset(struct oxr_session *sess, struct xrt_pose *out_offset);
+
+/*!
+ * Where this session places a RIG_LOCAL pose L (input-provider-discovery.md
+ * §4b.4): L lands at `out_plane o (s L)` in the head's tracking-origin space,
+ * s = @p out_scale.
+ *
+ * - The latest view locate chained a rig: @p out_plane is where that rig put
+ *   the display plane (oxr_session::rig_canvas::rig_plane_origin — the CANVAS
+ *   centre for a session that owns its canvas). Returns true.
+ * - No rig, a session that owns its canvas (external window, not a bridge
+ *   relay): the canvas pose on the physical plane (identity at the head's
+ *   tracking origin for these sessions). Returns false.
+ * - Otherwise identity. Returns false.
+ *
+ * @p out_scale is the canvas's RIG_LOCAL scale (m_view_rig_canvas_scale) for
+ * a session that owns its canvas, else 1. The canvas is the latest view
+ * locate's; before the first one, the session's own (in-process only).
+ */
+bool
+oxr_session_get_rig_local_plane(struct oxr_session *sess, struct xrt_pose *out_plane, float *out_scale);
 
 /*!
  * #1502: publish the session's VIEW-space eye-centroid offset (thread safe).
@@ -1328,6 +1456,51 @@ oxr_system_get_by_id(struct oxr_logger *log,
 
 XrResult
 oxr_system_get_properties(struct oxr_logger *log, struct oxr_system *sys, XrSystemProperties *properties);
+
+/*!
+ * Multi-screen M1: the system's screens (`xrt_instance::enumerate_displays`,
+ * in-process or over IPC). Never empty while the system has display info: an
+ * instance that cannot enumerate yields one screen synthesized from
+ * `xsysc->info`, flagged SYSTEM_DEFAULT.
+ */
+void
+oxr_system_get_screens(struct oxr_system *sys, struct xrt_screen_list *out_list);
+
+/*!
+ * #2305: a whole copy of the system compositor info (`xsysc->info`) that a
+ * display hotplug cannot tear. The claim sweep rewrites the info's DP registry
+ * and panel desktop rect in place on its own thread, so the copy is taken
+ * through `xrt_instance::get_display_snapshot`, under the lock the sweep
+ * holds; an instance without a live sweep gets a plain copy (nothing rewrites
+ * it there). False when the system has no compositor.
+ */
+bool
+oxr_system_get_info(struct oxr_system *sys, struct xrt_system_compositor_info *out_info);
+
+/*!
+ * Hand the session's in-process compositor the screens + the registry they
+ * were built from (one snapshot). Session create, and every display-topology
+ * change (ADR-047 Amendment 8).
+ */
+void
+oxr_session_push_screens(struct oxr_logger *log, struct oxr_session *sess, bool initial);
+
+/*!
+ * Per frame (xrBeginFrame): pick up a display-topology change — re-push the
+ * screens and queue XrEventDataDisplaysChangedDXR (ADR-047 Amendment 8).
+ */
+void
+oxr_session_poll_display_topology(struct oxr_logger *log, struct oxr_session *sess);
+
+#ifdef OXR_HAVE_DXR_display_info
+//! xrEnumerateDisplaysDXR (XR_DXR_display_info v22).
+XrResult
+oxr_system_enumerate_displays(struct oxr_logger *log,
+                              struct oxr_system *sys,
+                              uint32_t displayCapacityInput,
+                              uint32_t *displayCountOutput,
+                              XrDisplayDXR *displays);
+#endif
 
 /*!
  * #1486: is @p type one of the primary view configurations this system
@@ -1495,6 +1668,14 @@ oxr_event_push_XrEventDataEyeTrackingStateChanged(struct oxr_logger *log,
                                                   struct oxr_session *sess,
                                                   XrBool32 isTracking,
                                                   XrEyeTrackingModeDXR activeMode);
+
+/*!
+ * Push an `XrEventDataDisplaysChangedDXR` (XR_DXR_display_info v23, display
+ * hotplug — ADR-047 Amendment 8): the display list changed and has already
+ * been applied.
+ */
+XrResult
+oxr_event_push_XrEventDataDisplaysChangedDXR(struct oxr_logger *log, struct oxr_session *sess, uint32_t displayCount);
 
 #ifdef OXR_HAVE_DXR_depth_budget
 /*!
@@ -1805,6 +1986,7 @@ oxr_session_populate_gl_native(struct oxr_logger *log,
                                 void *gl_display,
                                 void *shared_texture_handle,
                                 bool transparent_background,
+                                uint64_t bound_display_id,
                                 struct oxr_session *sess);
 #endif
 
@@ -1819,6 +2001,7 @@ oxr_session_populate_gl_macos(struct oxr_logger *log,
                                void *window_handle,
                                void *shared_iosurface,
                                bool transparent_background,
+                               uint64_t bound_display_id,
                                struct oxr_session *sess);
 #endif
 
@@ -1913,6 +2096,7 @@ oxr_session_populate_vk_native(struct oxr_logger *log,
                                 bool window_is_wayland,
                                 void *shared_texture_handle,
                                 bool transparent_background,
+                                uint64_t bound_display_id,
                                 struct oxr_session *sess);
 #endif
 
@@ -2007,6 +2191,8 @@ oxr_session_populate_d3d11_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
+                                   uint64_t bound_display_id,
+                                   const void *texture_target_binding,
                                    struct oxr_session *sess);
 #endif
 
@@ -2032,6 +2218,7 @@ oxr_session_populate_d3d12_native(struct oxr_logger *log,
                                    void *window_handle,
                                    void *shared_texture_handle,
                                    bool transparent_background,
+                                   uint64_t bound_display_id,
                                    struct oxr_session *sess);
 #endif
 
@@ -2070,7 +2257,17 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   bool offscreen,
                                   void *shared_texture_handle,
                                   bool transparent_background,
+                                  uint64_t bound_display_id,
                                   struct oxr_session *sess);
+
+/*!
+ * ADR-050: hand the bound window's drag + resize to the Metal compositor
+ * (runtime-owned, phase-snapped, atomic), unless @p app_owned or the session
+ * is not eligible (offscreen / shared texture / workspace / sub-view binding,
+ * DXR_MACOS_NATIVE_DRAG=1).
+ */
+void
+oxr_session_metal_native_setup_window_placement(struct oxr_session *sess, bool app_owned);
 #endif
 
 #if defined(XRT_HAVE_METAL_NATIVE_COMPOSITOR) && defined(XR_USE_GRAPHICS_API_VULKAN)
@@ -2087,6 +2284,19 @@ oxr_session_populate_vk_with_metal_native(struct oxr_logger *log,
                                            void *shared_iosurface,
                                            bool transparent_background,
                                            struct oxr_session *sess);
+
+/*!
+ * macOS: should this Vulkan session be presented by the Metal native
+ * compositor instead of vk_native? True when ANY registered display plug-in
+ * offers a Metal factory but no Vulkan one, whether or not it claimed a display
+ * at start (a Metal-only vendor plug-in such as Leia SR on macOS: its panel may
+ * be hot-plugged later and only comp_metal segments on macOS), or when the
+ * active display processor is Metal-only. DXR_MACOS_VK_VIA_METAL=1|0 forces
+ * either way. Logs the
+ * decision once (WARN). False off macOS / without both compositors.
+ */
+bool
+oxr_vk_route_via_metal(struct oxr_system *sys);
 #endif
 
 #endif
@@ -2254,13 +2464,21 @@ struct oxr_system
 	 *
 	 * @ref view_config_view_counts is the count each TYPE reports
 	 * (PRIMARY_MONO 1, PRIMARY_STEREO always 2, PRIMARY_MULTIVIEW_DXR the
-	 * device max across rendering modes). It is NOT @ref view_count: that
-	 * one stays the DEVICE max and keeps sizing every internal array, the
-	 * IPC mirror and @ref views.
+	 * device max across rendering modes times XRT_MAX_SEGMENTS — one view set
+	 * per window segment, multi-screen M3). It is NOT @ref view_count: that
+	 * one stays the DEVICE max and keeps sizing every device-facing call and
+	 * the IPC mirror.
 	 */
 	uint32_t view_config_count;                   //!< 1 or 2.
 	XrViewConfigurationType view_config_types[2]; //!< Advertised types.
 	uint32_t view_config_view_counts[2];          //!< Views reported per type.
+	//! Multi-screen M3: the largest of @ref view_config_view_counts — how many
+	//! entries of @ref views (and the #1488 shadow) are filled.
+	uint32_t view_config_max_count;
+	//! Multi-screen M3: view sets a PRIMARY_MULTIVIEW_DXR session can carry
+	//! (oxr_segment_views_set_capacity), computed once at fill-in. 1 = never
+	//! split (every platform but desktop Linux with 2+ DP-backed screens).
+	uint32_t multiview_set_capacity;
 
 	/*!
 	 * #1486: DXR_VIEW_CONFIG_LEGACY=1, latched at @ref oxr_system_fill_in.
@@ -2334,6 +2552,15 @@ struct oxr_system
 	 */
 	int32_t vulkan_runtime_queue_family;
 	int32_t vulkan_runtime_queue_index;
+
+	/*!
+	 * #886: the runtime itself added VK_LAYER_DXR_queue_lock to the
+	 * VkInstanceCreateInfo at xrCreateVulkanInstanceKHR (vulkan_enable2, the
+	 * app had not named it, and the injected create succeeded). Lets the
+	 * compositor tell the "injected" route from "app-enabled" — the layer
+	 * only sees that it was NAMED, not by whom.
+	 */
+	bool vulkan_queue_lock_injected;
 
 	struct
 	{
@@ -2765,7 +2992,20 @@ struct oxr_session
 	bool is_d3d11_native_compositor;
 
 	//! True if using Metal native compositor (not multi_compositor).
+	//! Also true for a Vulkan app routed through comp_metal (see
+	//! is_vk_via_metal): the flag names the compositor behind xcn.
 	bool is_metal_native_compositor;
+
+	/*!
+	 * A Vulkan app presented by the Metal native compositor (macOS):
+	 * sess->xcn is comp_metal, sess->compositor its comp_vk_client wrapper.
+	 * Implies is_metal_native_compositor. Every compositor dispatch keys on
+	 * is_metal_native_compositor; this flag is read where a SWAPCHAIN is
+	 * handed to comp_metal outside the layer path (the app's are
+	 * client_vk_swapchain wrappers, see oxr_session_cursor_draw_hand_request,
+	 * #1948) and for diagnostics.
+	 */
+	bool is_vk_via_metal;
 
 	//! True if using D3D12 native compositor (not multi_compositor).
 	bool is_d3d12_native_compositor;
@@ -2776,8 +3016,139 @@ struct oxr_session
 	//! True if using GL native compositor (not multi_compositor).
 	bool is_gl_native_compositor;
 
+	/*!
+	 * An IN-PROCESS session's service link (ADR-049 + Amendment 1, ADR-061
+	 * decision 16): ONE sessionless service connection carrying its lift
+	 * calls and, when sharing is on, its share capability. Created on the
+	 * first lift call or at xrBeginSession (sharing), whichever comes first;
+	 * freed after the session's lift streams (its children). NULL on IPC
+	 * sessions, whose lift calls ride the session's own connection.
+	 */
+	struct ipc_client_service_link *service_link;
+
+	/*!
+	 * ADR-061 spec §5: the app chained XrSessionShareabilityDXR shareable =
+	 * XR_FALSE. Travels in the service link's registration for an in-process
+	 * session (an IPC session sends it at session create).
+	 */
+	bool app_share_opt_out;
+	//! ADR-061 arm 2: the session installed its service link as the process's share sink.
+	bool share_sink_installed;
+
+	/*!
+	 * XR_DXR_lift: the conversion module's maxViews as the last successful
+	 * xrGetLiftPropertiesDXR read it (0 = not read yet / not reported). Bounds
+	 * NVIEW viewCount at submit (#2005 G2, oxr_lift_rules.h).
+	 */
+	uint32_t lift_max_views;
+
+#ifndef XRT_OS_WINDOWS
+	/*!
+	 * XR_DXR_lift spec 4, ADR-053 P5 step E: the GPU image kinds (1 << kind)
+	 * the service's transport reported for this session's tasks at the last
+	 * xrEnumerateLiftTasksDXR (the union over tasks; CPU is not tracked). A
+	 * POSIX session offers a GPU kind only once the service took it: the
+	 * handshake Windows does per enumeration, remembered for submit / create.
+	 */
+	uint64_t lift_service_in_kinds;
+	uint64_t lift_service_export_kinds;
+#endif
+
+	/*!
+	 * XR_DXR_lift spec 4 (#2054): the session made a spec-4 call, so it is
+	 * opted into the task / provider events (a spec-3 app never receives an
+	 * event type it does not know). Set once, never cleared.
+	 */
+	bool lift_v4;
+	//! Last time xrPollEvent drained this session's conversion events (ns).
+	uint64_t lift_ev_poll_ns;
+
 	//! True if session was created with an external window handle (XR_DXR_win32_window_binding).
 	bool has_external_window;
+
+	//! XR_DXR_win32_window_binding v9 (ADR-060): the session was created with an
+	//! XrWin32TextureTargetBindingDXR honoured by its compositor (native D3D11).
+	bool texture_target_bound;
+
+	/*!
+	 * XrSessionDisplayBindingDXR (XR_DXR_display_info v22, multi-screen M1):
+	 * the display the app pinned the session to; 0 = runtime decides.
+	 */
+	uint64_t bound_display_id;
+
+	/*!
+	 * Display hotplug (ADR-047 Amendment 8): the display-topology generation
+	 * (`xrt_instance::get_display_generation`) whose screens this session last
+	 * handed its compositor. A frame that sees another re-pushes them.
+	 */
+	uint64_t display_generation;
+
+	/*!
+	 * #2305: the screen the session's own DP was made for (the system default
+	 * of its first screen list). Every hotplug re-push to a D3D11 / D3D12 /
+	 * GL / Vulkan compositor keeps SYSTEM_DEFAULT on it (u_screen_home_anchor),
+	 * so a bound weaver is never re-targeted or doubled by a re-push.
+	 */
+	struct u_screen_home display_home;
+	//! The last anchor outcome logged (one WARN per change, not per re-push).
+	int display_home_logged;
+	//! The screen list last handed to the compositor (heap; NULL before the
+	//! first push). A re-push while the home panel is unplugged keeps it for
+	//! a bounded wait (u_screen_home_keep_decide).
+	struct xrt_screen_list *display_last_pushed;
+	//! The compositor is being left on @ref display_last_pushed since
+	//! @ref display_keep_since_ns (os_monotonic_get_ns): the home panel is
+	//! unplugged. Checked once per frame against U_SCREEN_HOME_KEEP_BOUND_NS.
+	bool display_keeping;
+	uint64_t display_keep_since_ns;
+	//! The last list handed to the compositor had the home panel unplugged
+	//! (u_screen_home_away_next): the session DP may be the DP of the screen
+	//! the window was handed to, so its eyes count only under the segment
+	//! rule (oxr_segment_views_session_eyes_usable).
+	bool display_home_away;
+
+	/*!
+	 * #2305: the panel's desktop origin as the resolver published it with the
+	 * session's first screen list (start) and with the latest hotplug re-push
+	 * (now), panel-confirmed rects only. A DP that cached its origin at
+	 * creation keeps reporting the start one after a live arrangement change;
+	 * oxr_session_get_window_metrics rebases on the latest
+	 * (u_canvas_rebase_display_origin). Not for Metal (its own coordinates).
+	 * Written on the frame thread by oxr_session_push_screens.
+	 */
+	bool panel_origin_valid;
+	int32_t panel_origin_start_left;
+	int32_t panel_origin_start_top;
+	int32_t panel_origin_now_left;
+	int32_t panel_origin_now_top;
+
+	/*!
+	 * True when the session is bound to a display OTHER than the system
+	 * default and that display's size is known: @ref bound_display_info then
+	 * backs the session's display-scoped Kooima inputs (physical size,
+	 * nominal viewer). Which DP weaves is unchanged in M1.
+	 */
+	bool bound_display_overrides;
+	struct xrt_screen_info bound_display_info;
+
+	/*!
+	 * Multi-screen M3 (ADR-047 D3): which views of the app's last
+	 * xrLocateViews belong to which window segment. count 0 = one view set
+	 * for the whole window. Handed to the compositor with the next frame
+	 * (xrEndFrame), whose projection layer carries those views.
+	 */
+	struct xrt_segment_view_routing seg_route;
+	//! Last per-segment view layout logged (one INFO line per change).
+	struct xrt_segment_view_routing seg_route_logged;
+	/*!
+	 * Multi-screen over IPC (ADR-047 Amendment 3): this service session asked
+	 * the service to segment its window (compositor_segments_enable), so its
+	 * locates fetch the service's segment table and its frames send the
+	 * routing — only on a box whose service can segment at all.
+	 */
+	bool seg_ipc;
+	//! The routing last sent to the service (it is sent change-only).
+	struct xrt_segment_view_routing seg_route_sent;
 
 #ifdef XRT_OS_ANDROID
 	//! The last ANativeWindow this session published into `android_globals`
@@ -2888,11 +3259,69 @@ struct oxr_session
 	//! view poses like a handle app (display-local, no world_head_pos offset).
 	bool is_bridge_relay;
 
+	//! True for an in-process HOSTED session (the runtime owns the window)
+	//! of an app that enabled XR_DXR_display_info, when the process opted in
+	//! with DXR_HOSTED_RAW_VIEWS=1 (#2322). Such a session takes the RAW view
+	//! contract of an external-window session (ADR-024 Amendment 1): XrView.pose
+	//! is the display processor's eyes relative to the display plane, identity
+	//! orientation. For a Windows app under a translation layer that cannot
+	//! hand over a native window but does its own view math. Off by default:
+	//! a hosted session keeps render-ready views. Read through
+	//! oxr_session_views_display_relative(), never on its own.
+	bool hosted_raw_views;
+
 	//! XR_DXR_view_rig (#396 W7): per-session rig parse state. A rig chained
 	//! on a locate drives the view math for that locate (lifting the
 	//! external-window display-centric forcing); locates that chain nothing
 	//! keep the default behavior exactly.
 	struct oxr_view_rig_state view_rig;
+
+	/*!
+	 * XR_DXR_view_rig spec 4 (#2189): the canvas and PHYSICAL display plane the
+	 * most recent view locate resolved, for rig-scoped hand joints. Written by
+	 * every view locate that resolves one view set for the whole window (the
+	 * single-screen path, the majority segment of a stereo split); in service
+	 * mode from the SERVICE's reply for that locate (never re-derived here).
+	 * Joints are therefore consistent with the latest view locate on this
+	 * session. @ref plane_origin is the physical display plane in the head
+	 * device's tracking-origin space (before any rig pose replaces it), so a
+	 * joint locate in any base space re-expresses it through that device's
+	 * origin relation at the joint time.
+	 */
+	struct
+	{
+		struct os_mutex lock;
+		bool valid;
+		XrTime display_time; //!< the view locate's predicted display time
+		struct m_view_rig_canvas canvas;
+		struct xrt_pose plane_origin;
+		/*!
+		 * Where the rig chained on that same view locate puts the
+		 * display plane, in the tracking-origin space (unscaled) — the
+		 * display plane the SESSION sees once it declares a rig. For a
+		 * session that owns its canvas (external window) it is the
+		 * CANVAS centre through the rig (m_view_rig_canvas_plane), for
+		 * any other session the physical display point 0 through the rig.
+		 * RIG_LOCAL devices land on it (oxr_space.c,
+		 * rig_local_plane_correction). Cleared by a view locate that
+		 * chains no rig.
+		 */
+		bool rig_plane_valid;
+		struct xrt_pose rig_plane_origin;
+	} rig_canvas;
+
+	/*!
+	 * XR_DXR_view_rig spec 4 (#2189): the rig last chained on
+	 * XrHandJointsLocateInfoEXT — the same parse + clamps as @ref view_rig,
+	 * kept apart so a joint locate never changes what the views use. Never
+	 * read by the view path (and @ref view_rig never by the joint path): do
+	 * not unify them — they are written on different threads.
+	 */
+	struct oxr_view_rig_state joint_rig;
+
+	//! #2189: the last rig-joints verdict logged for this session (-1 = none yet,
+	//! 0 = joints stayed in base space, 1 = mapped) — a WARN on every change.
+	int32_t rig_joints_verdict;
 
 	/*!
 	 * #1502: the VIEW reference space's eye-centroid offset, expressed in the
@@ -2919,6 +3348,17 @@ struct oxr_session
 	 */
 	struct os_mutex view_space_offset_lock;
 	struct xrt_pose view_space_offset;
+
+#ifdef OXR_HAVE_DXR_desktop_control
+	/*!
+	 * XR_DXR_desktop_control (ADR-056): the session's common safety layer +
+	 * OS backend, created on first use (oxr_desktop_control.c) and destroyed
+	 * in session destroy BEFORE the session's events are removed. The mutex
+	 * guards only the lazy creation; the object is internally thread-safe.
+	 */
+	struct os_mutex desktop_control_mutex;
+	struct u_desktop_control *desktop_control;
+#endif
 
 #ifdef OXR_HAVE_DXR_depth_budget
 	//! XR_DXR_depth_budget: the session's transparency, remembered from
@@ -2959,6 +3399,162 @@ struct oxr_session
 		size_t cap[2];
 		uint32_t next; //!< Buffer the next copy goes into.
 	} content_mask;
+#endif
+
+#ifdef OXR_HAVE_DXR_cursor_depth
+	//! XR_DXR_cursor_depth (ADR-046): the cursor's disparity filter. Touched
+	//! only by a locate that chains an XrCursorDepthHintDXR - a session that
+	//! never sends a hint never steps it.
+	struct u_cursor_depth_filter cursor_depth_filter;
+#ifdef OXR_HAVE_DXR_stereo_comfort
+	//! XR_DXR_stereo_comfort: the last tracked eyes' mean distance from the
+	//! display plane (in-process locate), for a locate that chains no raw block.
+	float comfort_eye_z_m;
+	bool comfort_eye_tracked;
+#endif
+	//! XR_DXR_cursor_depth v3: HYBRID anchor state, beside the filter and
+	//! under the same rule (only a hinted locate touches it). Dropped
+	//! whenever the filter re-primes.
+	struct u_cursor_depth_anchor cursor_depth_anchor;
+
+	/*!
+	 * XR_DXR_cursor_depth v2, depth-layer source (ADR-046 Phase 3a).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthSourceDXR(SUBMITTED_DEPTH) on its hint. The compositor is
+	 * only ever handed a request on a frame that was armed.
+	 */
+	struct
+	{
+		//! Set by a locate that requested the source, cleared by the next xrEndFrame.
+		bool armed;
+		//! Cursor + footprint (canvas-normalised) from that locate.
+		float u, v, radius_u, radius_v;
+		//! Active view count of that locate: the outermost pair is [0] and [n-1].
+		uint32_t active_view_count;
+		//! Tag of the next request; 0 is never used, so a zeroed result never matches.
+		uint64_t next_tag;
+		//! What each in-flight request read, by tag % 8: the layer's own
+		//! space, poses, fovs and depth ranges (the compositor's poses are in
+		//! the runtime's space, not the app's, so they are not used).
+		struct
+		{
+			uint64_t tag;
+			XrSpace space;
+			struct u_cursor_depth_view view[U_CURSOR_DEPTH_PATCH_VIEWS];
+			struct u_cursor_depth_layer_depth depth[U_CURSOR_DEPTH_PATCH_VIEWS];
+		} frames[8];
+		bool announced;        //!< one-shot WARN on first activation
+		bool warned_no_reader; //!< one-shot WARN: compositor cannot read depth
+		bool warned_space;     //!< one-shot WARN: layer space != locate space
+		bool warned_no_layer;  //!< one-shot WARN: armed frame had no depth layer
+	} cursor_depth_source;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthSourceDXR(MEASURED_DISPARITY) on its hint with the pointer
+	 * over the canvas. One request per armed frame, so at most one
+	 * measurement per submitted frame.
+	 */
+	struct
+	{
+		//! Set by a locate that requested the measurement, cleared by the next xrEndFrame.
+		bool armed;
+		//! Cursor (canvas-normalised) and sprite height (canvas heights) from that locate.
+		float u, v, height;
+		//! Active view count of that locate: the outermost pair is [0] and [n-1].
+		uint32_t active_view_count;
+		//! Tag of the last request; 0 is never used, so a zeroed result never matches.
+		uint64_t next_tag;
+		bool announced;        //!< one-shot WARN on first activation
+		bool warned_no_reader; //!< one-shot WARN: compositor cannot measure
+	} cursor_measure;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: everything here stays zero, and xrEndFrame
+	 * pays one bool test (@ref armed), unless a locate chained
+	 * XrCursorDepthDrawInfoDXR on its hint and the placement was active. The
+	 * compositor is only ever handed a draw request on an armed frame.
+	 */
+	struct
+	{
+		//! Set by a locate whose placement is active and that asked for the
+		//! draw, cleared by the next xrEndFrame.
+		bool armed;
+		//! What that locate reported as willDraw; xrEndFrame draws only if set.
+		bool will_draw;
+		//! That locate's space; the projection layer must be in it.
+		XrSpace space;
+		//! Placement: hotspot point and display-plane orientation, in @ref space.
+		struct xrt_vec3 position;
+		struct xrt_quat orientation;
+		//! One sprite unit: the canvas height scaled by the placement's t.
+		float unit;
+		//! The placement's filtered disparity (drives the crosstalk
+		//! softening, u_cursor_draw_soften).
+		float disparity;
+		//! That locate's ACTIVE view count. A projection layer may carry more
+		//! views (an app submitting for the worst-case mode under
+		//! PRIMARY_MULTIVIEW_DXR); only the active ones are tiles, so the
+		//! request is capped to this.
+		uint32_t view_count;
+		//! The app's sprite, or NULL for the default look.
+		struct oxr_swapchain *image;
+		float hot_u, hot_v, size_m;
+		//! XR_DXR_display_zones (#1949): the arming locate was zone-scoped
+		//! (the hint rode the locate of the zone under the pointer); the
+		//! frame's zone layer with @ref zone_id carries the views to draw with.
+		bool zone_valid;
+		uint32_t zone_id;
+		//! Multi-screen M3 (ADR-047): the arming locate split the window per
+		//! screen and placed the cursor with the view set of the segment under
+		//! the pointer - views [segment_first_view, + view_count) of the
+		//! frame's projection layer, at segment_rect of segment_canvas
+		//! (window px).
+		bool segment_valid;
+		uint32_t segment_first_view;
+		struct xrt_rect segment_rect;
+		struct xrt_rect segment_canvas;
+		//! The last armed frame could not draw (projection layer in another
+		//! space, a zones frame without the hinted zone, no projection
+		//! layer): locates in the same
+		//! space report willDraw = false, and keep arming so xrEndFrame can
+		//! clear this once a frame is drawable again.
+		bool cannot_draw;
+		//! The last armed frame's placement did not map to cursor pixels in
+		//! the SUBMITTED views (u_cursor_draw_placement_drawable), or its
+		//! sprite had no released image: the next locate reports willDraw =
+		//! false, and xrEndFrame clears this once a frame is drawable again.
+		bool draw_failed;
+		/*!
+		 * #1952: what the compositor did with the last request handed to
+		 * it - drew, or refused for a reason only it can see (no display
+		 * info, a multi-screen routed frame, a sprite it cannot sample, a
+		 * failed default-look upload, ...). Written by the compositor during
+		 * xrt_comp_layer_commit through the request's report pointer, folded
+		 * into @ref refusal_latch right after it.
+		 */
+		struct u_cursor_draw_report report;
+		//! A request carrying @ref report was handed for this commit.
+		bool report_pending;
+		//! A compositor refusal latches willDraw = false until a commit
+		//! draws (or, report-only, would draw) again.
+		struct u_cursor_draw_latch refusal_latch;
+		bool announced;       //!< one-shot WARN on first activation
+		bool warned_undrawable; //!< one-shot WARN: placement maps to no cursor pixels
+		bool warned_backend;  //!< one-shot WARN: compositor cannot draw
+		bool warned_space;    //!< one-shot WARN: layer space != locate space
+		bool warned_no_layer; //!< one-shot WARN: armed frame had no projection layer
+		bool warned_image;    //!< one-shot WARN: sprite swapchain unusable
+		bool warned_zone;     //!< one-shot WARN: zones frame without the hinted zone
+	} cursor_draw;
 #endif
 
 #ifdef OXR_HAVE_DXR_display_zones
@@ -3006,6 +3602,9 @@ struct oxr_session
 		uint32_t last_h;
 		bool warned_export_miss;
 		bool warned_export_recovered;
+		//! XR_DXR_cursor_depth v8: the texture-carrier generation last handed
+		//! to the service (sent again only when it changes).
+		uint64_t cursor_tex_generation_sent;
 	} weave;
 #endif
 
@@ -3023,6 +3622,25 @@ struct oxr_session
 	//! True if display hardware is currently in 3D mode.
 	bool hardware_display_3d;
 
+	/*!
+	 * Auto hardware 2D while the session submits one flat picture for every
+	 * view (util/u_mono_auto_2d.h, oxr_session_mono_auto_2d_frame). While
+	 * engaged the panel is 2D but @ref hardware_display_3d keeps the
+	 * session's own choice: the compositor holds 2D over it and restores it
+	 * on release.
+	 */
+	struct u_mono_auto_2d mono_auto_2d;
+	//! The active rendering mode's view count at auto-2D ENTER: what
+	//! xrLocateViews keeps reporting while the hold is on (presentation-only).
+	uint32_t mono_auto_2d_view_count;
+	//! The app chose a display mode itself (xrRequestDisplayModeDXR or
+	//! xrRequestDisplayRenderingModeDXR): auto-2D stays out of its way for
+	//! the rest of the session.
+	bool display_mode_explicit;
+	//! The session's compositor cannot enact auto-2D (said once, then the
+	//! detector is off for the session).
+	bool mono_auto_2d_unsupported;
+
 	//! Active eye tracking mode (0=MANAGED, 1=MANUAL). Default: 0 (MANAGED).
 	uint32_t eye_tracking_mode;
 
@@ -3030,6 +3648,30 @@ struct oxr_session
 	//! Edge detection in the xrLocateViews path pushes
 	//! XrEventDataEyeTrackingStateChangedDXR on change.
 	int32_t last_is_tracking;
+
+	//! ADR-047 Amendment 7: the session-level isTracking is the OR over every
+	//! DP presenting for the session (own + other segments), debounced on a
+	//! screen hand-over (util/u_tracking_any.h). Advanced only by the locate
+	//! that publishes the session-level side effects.
+	struct u_tracking_any tracking_any;
+	//! Set by oxr_session_locate_views around the locates it makes: whether
+	//! any segment OTHER than the one whose eyes the side-effects locate uses
+	//! has a DP reporting a viewer, and how many such DPs answered (0 = the
+	//! window is on one screen: the single-screen rule, unchanged).
+	bool locate_others_tracked;
+	uint32_t locate_others_count;
+	//! Change-only log latch: the session reads tracked only through another
+	//! screen's DP (the rig's proof that Amendment 7 is live).
+	bool tracking_via_other;
+
+	//! XR_DXR_display_info v25: the app's last xrLocateViews chained
+	//! XrViewLocateFixedViewerDXR with fixedViewer set. Read by the runtime's
+	//! own per-frame locate (oxr_session_frame_view_cameras), which chains
+	//! nothing of the app's, so it asks for a viewer exactly when the app did.
+	bool locate_fixed_viewer;
+	//! What the service was last told about the above (IPC sessions only):
+	//! 0 = nothing yet, 1 = not fixed, 2 = fixed. Sent on change only.
+	uint8_t ipc_fixed_viewer_sent;
 
 	//! Cached rendering mode index for detecting compositor-driven mode changes.
 	uint32_t last_rendering_mode_index;
@@ -3238,6 +3880,18 @@ struct oxr_session
 	void *workspace_modal_cbt_hook;     //!< HHOOK, opaque to portable code.
 #endif
 };
+
+/*!
+ * True when this session's views are DISPLAY-PLANE-RELATIVE (the RAW contract,
+ * ADR-024 Amendment 1): its display plane is the identity at the head's
+ * tracking origin instead of the head device pose. External-window sessions,
+ * bridge relays, and hosted sessions that opted into raw views (#2322).
+ */
+static inline bool
+oxr_session_views_display_relative(const struct oxr_session *sess)
+{
+	return sess->has_external_window || sess->is_bridge_relay || sess->hosted_raw_views;
+}
 
 /*!
  * Returns XR_SUCCESS or XR_SESSION_LOSS_PENDING as appropriate.
@@ -3695,6 +4349,10 @@ struct oxr_space
 	struct
 	{
 		struct xrt_space *xs;
+		//! The device the pose space follows; NULL for a DISPLAY space
+		//! (whose plane is not a device pose). Read for the RIG_LOCAL
+		//! re-base in oxr_space.c.
+		struct xrt_device *xdev;
 	} xdev_pose;
 };
 
@@ -4332,6 +4990,228 @@ struct oxr_local_3d_zone_ext
 };
 #endif // OXR_HAVE_DXR_local_3d_zone
 
+#ifdef OXR_HAVE_DXR_lift
+/*!
+ * One XR_DXR_lift conversion stream (ADR-042). The conversion itself lives in
+ * the service (d3d11_lift.cpp); this is the handle, the service-side id, and
+ * the export latch for the stream's result texture + fence (the weave output
+ * pattern: handed out on the first acquire and on every reallocation).
+ *
+ * Parent type/handle is @ref oxr_session
+ *
+ * @obj{XrLiftStreamDXR}
+ * @extends oxr_handle_base
+ */
+struct oxr_lift_stream_dxr
+{
+	struct oxr_handle_base handle;
+	struct oxr_session *sess;
+	uint64_t id;   //!< service-side stream id
+	uint32_t mode; //!< XRT_DP_LIFT_MODE_* (one bit)
+	bool exported; //!< the caller holds the current export texture + fence
+	bool depth_requested; //!< XR_DXR_lift v3: created with XrLiftDepthRequestDXR
+	bool depth_exported;  //!< the caller holds the current depth texture + fence
+	//! In-process session (ADR-049): the lift link generation the stream was
+	//! created on. A stream of a dead generation died with that connection.
+	uint32_t link_gen;
+	//! The module's maxViews this stream validates viewCount against: latched
+	//! from the session at create, refreshed at submit once the session has
+	//! read a newer one (0 = unknown, the XR_LIFT_MAX_VIEWS_DXR ceiling).
+	uint32_t max_views;
+	bool v4;       //!< spec 4: created with XrLiftTaskStreamCreateInfoDXR
+	uint32_t task; //!< spec 4: its XrLiftTaskDXR (0 = a spec-3 mode stream)
+	bool export_cpu;   //!< spec 4: exportKind CPU (results read from a mapping)
+	void *cpu_view;    //!< the mapped CPU export (valid until the next acquire)
+	void *cpu_token;   //!< oxr_conv_cpu_map's token for cpu_view (POSIX mapping state)
+	uint64_t cpu_bytes;
+#ifndef XRT_OS_WINDOWS
+	//! Step E: exportKind IOSURFACE / OPAQUE_FD (an XrLiftImageKindDXR; 0 = not a GPU export).
+	uint32_t export_gpu_kind;
+#endif
+};
+
+//! Spec 4: at most this often does xrPollEvent ask the service for lift events.
+#define OXR_CONV_EVENT_POLL_NS (20ull * 1000ull * 1000ull)
+
+/*!
+ * Spec 4 (#2054): drain the conversion events of every session that opted in
+ * (made a spec-4 call) into the instance queue. Called by xrPollEvent.
+ */
+XrResult
+oxr_conv_poll_events(struct oxr_logger *log, struct oxr_instance *inst);
+
+XrResult
+oxr_event_push_XrEventDataLiftTaskStateChangedDXR(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  XrLiftTaskDXR task,
+                                                  XrLiftTaskStateDXR state,
+                                                  XrLiftTaskStateDXR previousState,
+                                                  XrLiftFailureReasonDXR failureReason,
+                                                  float progress);
+
+XrResult
+oxr_event_push_XrEventDataLiftProvidersChangedDXR(struct oxr_logger *log, struct oxr_session *sess);
+
+/*!
+ * Free an in-process session's lift-only service connection (ADR-049).
+ * Called from the session's destroy, after its lift streams (children) are
+ * gone. No-op for an IPC session or one that never used lift.
+ */
+void
+oxr_lift_session_fini(struct oxr_session *sess);
+
+/*!
+ * ADR-053 (#2005) conv_hint_interest: a session of an instance that enabled
+ * XR_DXR_lift tells the service once, at xrCreateSession, so the PrewarmOn =
+ * interest policy can warm the conversion tasks before the first lift call.
+ * IPC session: on its own connection. Eligible in-process session (ADR-049):
+ * starts the lift-only link's background connect, which sends the hint once
+ * connected. Never blocks, never fails the session.
+ */
+void
+oxr_lift_session_hint_interest(struct oxr_session *sess);
+#endif // OXR_HAVE_DXR_lift
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+/*!
+ * One XR_DXR_stereo_camera stream (ADR-043). The camera and its ring live in
+ * the service (ipc_server_stereo_camera.c); this is the handle and the
+ * service-side stream id, owned by the instance's IPC connection.
+ *
+ * Parent type/handle is @ref oxr_instance
+ *
+ * @obj{XrStereoCameraStreamDXR}
+ * @extends oxr_handle_base
+ */
+struct oxr_stereo_camera_stream_dxr
+{
+	struct oxr_handle_base handle;
+	struct oxr_instance *inst;
+	uint64_t id;        //!< service-side stream id
+	uint64_t camera_id; //!< service-side camera id
+	bool started;
+};
+
+//! R3: drain the service's queued camera events into the instance queue (xrPollEvent).
+XrResult
+oxr_stereo_camera_poll_events(struct oxr_logger *log, struct oxr_instance *inst);
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStateChanged(struct oxr_logger *log,
+                                                   struct oxr_instance *inst,
+                                                   uint64_t cameraId,
+                                                   XrStereoCameraStateDXR state);
+
+XrResult
+oxr_event_push_XrEventDataStereoCameraStreamEnded(struct oxr_logger *log,
+                                                  struct oxr_instance *inst,
+                                                  XrStereoCameraStreamDXR stream,
+                                                  XrStereoCameraStreamEndReasonDXR reason);
+
+XrResult
+oxr_event_push_XrEventDataStereoCamerasChanged(struct oxr_logger *log, struct oxr_instance *inst);
+#endif // OXR_HAVE_DXR_stereo_camera
+
+
+#ifdef OXR_HAVE_DXR_desktop_control
+//! Called from the desktop-control worker / consent thread (event queue is locked internally).
+XrResult
+oxr_event_push_XrEventDataDesktopControlStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state);
+
+XrResult
+oxr_event_push_XrEventDataDesktopActionCompleted(struct oxr_logger *log,
+                                                 struct oxr_session *sess,
+                                                 uint64_t actionId,
+                                                 XrResult result,
+                                                 const char *message);
+
+//! Spec v2: the CAPTURE scope's state changed.
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureStateChanged(struct oxr_logger *log,
+                                                     struct oxr_session *sess,
+                                                     XrDesktopControlStateDXR state);
+
+//! Spec v2: a capture completed. @p frameTime is already an XrTime.
+XrResult
+oxr_event_push_XrEventDataDesktopCaptureCompleted(struct oxr_logger *log,
+                                                  struct oxr_session *sess,
+                                                  uint64_t captureId,
+                                                  XrResult result,
+                                                  uint32_t width,
+                                                  uint32_t height,
+                                                  XrRect2Di sourceRect,
+                                                  XrTime frameTime,
+                                                  const char *message);
+
+//! Session destroy: stop the worker, drop queued actions (no events). Before the event drain.
+void
+oxr_desktop_control_session_fini(struct oxr_session *sess);
+#endif // OXR_HAVE_DXR_desktop_control
+
+#ifdef OXR_HAVE_DXR_input_providers
+//! Queue XrEventDataInputProvidersChangedDXR on @p inst (instance-scoped; any thread).
+XrResult
+oxr_event_push_XrEventDataInputProvidersChanged(struct oxr_logger *log,
+                                                struct oxr_instance *inst,
+                                                XrInputRoleFamilyFlagsDXR changed_families);
+#endif // OXR_HAVE_DXR_input_providers
+
+/*!
+ * ADR-034 Amendment 5 (#2181): the roles this client resolves just moved from
+ * @p old_roles to @p new_roles (xrSyncActions saw a newer generation). Raises
+ * XrEventDataInputProvidersChangedDXR naming the families that moved, when the
+ * app enabled XR_DXR_input_providers; a no-op otherwise (and when the very
+ * first roles arrive — nothing "changed" for an app that never enumerated).
+ * Called under `sys->sync_actions_mutex`; only queues an event.
+ */
+void
+oxr_input_providers_roles_changed(struct oxr_logger *log,
+                                  struct oxr_system *sys,
+                                  const struct xrt_system_roles *old_roles,
+                                  const struct xrt_system_roles *new_roles);
+
+
+#ifdef OXR_HAVE_DXR_win32_window_binding
+/*
+ * XR_DXR_win32_window_binding v9 — texture target binding (ADR-060),
+ * oxr_texture_target.c.
+ */
+//! The XrWin32TextureTargetBindingDXR chained on the window binding, or NULL.
+const XrWin32TextureTargetBindingDXR *
+oxr_texture_target_find_binding(const XrSessionCreateInfo *createInfo);
+//! Spec §3 create-time valid usage (no-op without a binding).
+XrResult
+oxr_texture_target_verify_create(struct oxr_logger *log, const XrSessionCreateInfo *createInfo);
+#ifdef XRT_HAVE_D3D11_NATIVE_COMPOSITOR
+struct comp_d3d11_texture_target_info;
+//! The compositor's create-time binding (zeroed = not bound when @p tb is NULL).
+void
+oxr_texture_target_fill_d3d11_info(struct oxr_system *sys,
+                                   const XrWin32TextureTargetBindingDXR *tb,
+                                   uint64_t bound_display_id,
+                                   struct comp_d3d11_texture_target_info *out);
+#endif
+//! xrEndFrame: validate + forward this frame's XrWin32TextureTargetFrameDXR.
+XrResult
+oxr_texture_target_frame_end(struct oxr_logger *log, struct oxr_session *sess, const XrFrameEndInfo *frameEndInfo);
+//! xrLocateViews: forward a chained XrWin32TextureTargetFrameDXR (frames this locate).
+void
+oxr_texture_target_locate(struct oxr_logger *log, struct oxr_session *sess, const XrViewLocateInfo *viewLocateInfo);
+//! xrLocateViews returned: the next metrics read falls back to the xrEndFrame target.
+void
+oxr_texture_target_locate_end(struct oxr_session *sess);
+//! After session creation: one WARN when a binding was given but nothing honours it.
+void
+oxr_texture_target_note_ignored(struct oxr_session *sess, const XrSessionCreateInfo *createInfo);
+//! xrWaitFrame: fill a chained XrWin32TextureTargetStateDXR.
+void
+oxr_texture_target_wait(struct oxr_session *sess, XrFrameState *frameState);
+//! xrGetSystemProperties: fill a chained XrSystemWin32TextureTargetPropertiesDXR.
+void
+oxr_texture_target_system_properties(struct oxr_system *sys, XrSystemProperties *properties);
+#endif
 
 #ifdef OXR_HAVE_EXT_user_presence
 XrResult

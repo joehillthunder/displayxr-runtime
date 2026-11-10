@@ -790,6 +790,16 @@ oxr_xrEnumerateDisplayRenderingModesDXR(XrSession session,
                                         uint32_t modeCapacityInput,
                                         uint32_t *modeCountOutput,
                                         XrDisplayRenderingModeInfoDXR *modes);
+//! OpenXR API function @ep{xrEnumerateDisplaysDXR} (spec v22, multi-screen M1)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDisplaysDXR(XrInstance instance,
+                           XrSystemId systemId,
+                           uint32_t displayCapacityInput,
+                           uint32_t *displayCountOutput,
+                           XrDisplayDXR *displays);
+//! OpenXR API function @ep{xrCreateDisplaySpaceDXR} (spec v22, multi-screen M1)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateDisplaySpaceDXR(XrSession session, const XrDisplaySpaceCreateInfoDXR *createInfo, XrSpace *space);
 //! OpenXR API function @ep{xrSetWorkspaceViewRigDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceViewRigDXR(XrSession session, const void *rig);
@@ -929,6 +939,22 @@ XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetWorkspaceClientStyleDXR(XrSession session,
                                  XrWorkspaceClientId clientId,
                                  const XrWorkspaceClientStyleDXR *style);
+//! OpenXR API function @ep{xrEnumerateWorkspaceScreensDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateWorkspaceScreensDXR(XrSession session,
+                                   uint32_t capacityInput,
+                                   uint32_t *countOutput,
+                                   XrWorkspaceScreenDXR *screens);
+//! OpenXR API function @ep{xrSetWorkspaceClientWindowPlacementDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           const XrWorkspaceWindowPlacementDXR *placement);
+//! OpenXR API function @ep{xrGetWorkspaceClientWindowPlacementDXR} (spec_version 25)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetWorkspaceClientWindowPlacementDXR(XrSession session,
+                                           XrWorkspaceClientId clientId,
+                                           XrWorkspaceWindowPlacementDXR *placement);
 #endif
 
 #ifdef OXR_HAVE_DXR_wayland_surface_binding
@@ -945,6 +971,10 @@ oxr_xrSetAndroidSurfaceDXR(XrSession session, const XrAndroidSurfaceBindingCreat
 //! OpenXR API function @ep{xrSetAndroidWindowGeometryDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrSetAndroidWindowGeometryDXR(XrSession session, const XrAndroidWindowGeometryDXR *geometry);
+
+//! OpenXR API function @ep{xrSubmitAndroidInputEventDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitAndroidInputEventDXR(XrSession session, const XrAndroidInputEventDXR *event);
 #endif
 
 #ifdef OXR_HAVE_DXR_atlas_capture
@@ -1076,6 +1106,171 @@ oxr_xrWeaveSetScreenFlatRegionsDXR(XrSession session, uint32_t rectCount, const 
 //! OpenXR API function @ep{xrWeaveExportIpcConnectionDXR}
 XRAPI_ATTR XrResult XRAPI_CALL
 oxr_xrWeaveExportIpcConnectionDXR(XrInstance instance, XrWeaveIpcConnectionDXR *connection);
+#endif
+
+#ifdef OXR_HAVE_DXR_lift
+//! OpenXR API function @ep{xrGetLiftPropertiesDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLiftPropertiesDXR(XrSession session, XrLiftPropertiesDXR *properties);
+
+//! OpenXR API function @ep{xrCreateLiftStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateLiftStreamDXR(XrSession session, const XrLiftStreamCreateInfoDXR *createInfo, XrLiftStreamDXR *stream);
+
+//! OpenXR API function @ep{xrDestroyLiftStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyLiftStreamDXR(XrLiftStreamDXR stream);
+
+//! OpenXR API function @ep{xrSubmitLiftFrameDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitLiftFrameDXR(XrLiftStreamDXR stream, const XrLiftFrameSubmitInfoDXR *submitInfo, uint64_t *frameId);
+
+//! OpenXR API function @ep{xrAcquireLiftResultDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireLiftResultDXR(XrLiftStreamDXR stream, XrLiftResultDXR *result);
+
+//! OpenXR API function @ep{xrAcquireLiftBlobDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireLiftBlobDXR(XrLiftStreamDXR stream, XrLiftBlobDXR *blob);
+
+//! OpenXR API function @ep{xrSetLiftStreamPriorityDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetLiftStreamPriorityDXR(XrLiftStreamDXR stream, XrLiftPriorityDXR priority);
+
+//! OpenXR API function @ep{xrGetLiftStreamStatsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetLiftStreamStatsDXR(XrLiftStreamDXR stream, XrLiftStreamStatsDXR *stats);
+
+//! OpenXR API function @ep{xrEnumerateLiftTasksDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTasksDXR(XrSession session,
+                            uint32_t capacityInput,
+                            uint32_t *countOutput,
+                            XrLiftTaskPropertiesDXR *tasks);
+
+//! OpenXR API function @ep{xrRequestLiftTaskWarmDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestLiftTaskWarmDXR(XrSession session, XrLiftTaskDXR task);
+
+//! OpenXR API function @ep{xrEnumerateLiftTaskCandidatesDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateLiftTaskCandidatesDXR(XrSession session,
+                                     XrLiftTaskDXR task,
+                                     uint32_t capacityInput,
+                                     uint32_t *countOutput,
+                                     XrLiftTaskCandidateDXR *candidates);
+#endif
+
+#ifdef OXR_HAVE_DXR_stereo_camera
+//! OpenXR API function @ep{xrEnumerateStereoCamerasDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateStereoCamerasDXR(XrInstance instance,
+                                XrSystemId systemId,
+                                uint32_t capacityInput,
+                                uint32_t *countOutput,
+                                XrStereoCameraPropertiesDXR *cameras);
+
+//! OpenXR API function @ep{xrGetStereoCameraCalibrationDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraCalibrationDXR(XrInstance instance, uint64_t cameraId, XrStereoCameraCalibrationDXR *calibration);
+
+//! OpenXR API function @ep{xrCreateStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCreateStereoCameraStreamDXR(XrInstance instance,
+                                  const XrStereoCameraStreamCreateInfoDXR *createInfo,
+                                  XrStereoCameraStreamDXR *stream);
+
+//! OpenXR API function @ep{xrDestroyStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrDestroyStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrStartStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrStartStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrStopStereoCameraStreamDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrStopStereoCameraStreamDXR(XrStereoCameraStreamDXR stream);
+
+//! OpenXR API function @ep{xrGetStereoCameraStreamInfoDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraStreamInfoDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamInfoDXR *info);
+
+//! OpenXR API function @ep{xrAcquireStereoCameraFrameDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrAcquireStereoCameraFrameDXR(XrStereoCameraStreamDXR stream, XrStereoCameraFrameDXR *frame);
+
+//! OpenXR API function @ep{xrGetStereoCameraStreamStatsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetStereoCameraStreamStatsDXR(XrStereoCameraStreamDXR stream, XrStereoCameraStreamStatsDXR *stats);
+#endif
+
+#ifdef OXR_HAVE_DXR_desktop_control
+//! OpenXR API function @ep{xrGetDesktopControlStateDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopControlStateDXR(XrSession session,
+                                XrDesktopControlStateDXR *state,
+                                XrDesktopControlCapabilityFlagsDXR *capabilities);
+
+//! OpenXR API function @ep{xrRequestDesktopControlDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrRequestDesktopControlDXR(XrSession session, const XrDesktopControlRequestInfoDXR *info);
+
+//! OpenXR API function @ep{xrEnumerateDesktopWindowsDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateDesktopWindowsDXR(XrSession session,
+                                 uint32_t windowCapacityInput,
+                                 uint32_t *windowCountOutput,
+                                 XrDesktopWindowDXR *windows);
+
+//! OpenXR API function @ep{xrGetDesktopPointerDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopPointerDXR(XrSession session, XrDesktopPickDXR *pick);
+
+//! OpenXR API function @ep{xrPickDesktopDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrPickDesktopDXR(XrSession session, XrOffset2Di point, XrDesktopPickDXR *pick);
+
+//! OpenXR API function @ep{xrGetDesktopTextAtDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopTextAtDXR(
+    XrSession session, XrOffset2Di point, uint32_t capacityInput, uint32_t *countOutput, char *buffer);
+
+//! OpenXR API function @ep{xrSubmitDesktopActionDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSubmitDesktopActionDXR(XrSession session, const XrDesktopActionDXR *action, uint64_t *actionId);
+
+//! OpenXR API function @ep{xrGetDesktopCaptureStateDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureStateDXR(XrSession session, XrDesktopControlStateDXR *state);
+
+//! OpenXR API function @ep{xrCaptureDesktopDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrCaptureDesktopDXR(XrSession session, const XrDesktopCaptureInfoDXR *info, uint64_t *captureId);
+
+//! OpenXR API function @ep{xrGetDesktopCaptureImageDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopCaptureImageDXR(
+    XrSession session, uint64_t captureId, uint32_t capacityInput, uint32_t *countOutput, uint8_t *rgba);
+
+//! OpenXR API function @ep{xrGetDesktopClipboardTextDXR} (spec v3)
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrGetDesktopClipboardTextDXR(
+    XrSession session, uint64_t actionId, uint32_t capacityInput, uint32_t *countOutput, char *buffer);
+#endif
+
+#ifdef OXR_HAVE_DXR_input_providers
+//! OpenXR API function @ep{xrEnumerateInputProvidersDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrEnumerateInputProvidersDXR(XrInstance instance,
+                                 XrSystemId systemId,
+                                 uint32_t providerCapacityInput,
+                                 uint32_t *providerCountOutput,
+                                 XrInputProviderPropertiesDXR *providers);
+
+//! OpenXR API function @ep{xrSetInputProviderPreferenceDXR}
+XRAPI_ATTR XrResult XRAPI_CALL
+oxr_xrSetInputProviderPreferenceDXR(XrSession session, const XrInputProviderPreferenceInfoDXR *info);
 #endif
 
 #ifdef OXR_HAVE_EXT_conformance_automation

@@ -20,7 +20,14 @@
 #import <IOSurface/IOSurface.h>
 
 #include "comp_metal_compositor.h"
+#include "comp_metal_segments.h" // multi-screen on macOS
+#include "comp_metal_placement.h" // runtime-owned window placement (ADR-050)
+#include "comp_metal_desktop_bg.h" // live desktop behind a transparent window (#2264)
+#include "comp_metal_alpha_probe.h" // lazy transparency (#2264)
+#include "comp_metal_bg_preview.h" // rear depth budget source (#2264)
+#include "util/comp_rear_budget.h" // XR_DXR_depth_budget runner
 
+#include "util/comp_cursor_look.h"
 #include "util/comp_layer_accum.h"
 // #1581 quad layers: the shared per-view camera (#1580) and the N-view
 // LEFT/RIGHT eye-visibility rule.
@@ -41,6 +48,7 @@
 #include "util/u_misc.h"
 #include "util/u_time.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_threading.h"
 
 #include "math/m_api.h"
@@ -48,6 +56,7 @@
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_color_encoding.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
 
@@ -64,6 +73,7 @@
 #endif
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -141,6 +151,9 @@ struct comp_metal_compositor
 	//! CAMetalLayer for presentation.
 	CAMetalLayer *metal_layer;
 
+	//! Times metal_sync_layer_scale found the layer at the wrong scale.
+	uint32_t layer_scale_fixes;
+
 	//! Render pipeline for atlas layer compositing.
 	id<MTLRenderPipelineState> projection_pipeline;
 
@@ -164,6 +177,42 @@ struct comp_metal_compositor
 
 	//! Render pipeline for fullscreen blit (atlas→target passthrough).
 	id<MTLRenderPipelineState> blit_pipeline;
+
+	/*!
+	 * ADR-044 / #1589 / #1610 — the format-honest compose target.
+	 *
+	 * The atlas stays `BGRA8Unorm` holding ENCODED bytes (what the DP, the
+	 * captures and the crop copy read). It is created with
+	 * `MTLTextureUsagePixelFormatView`, and @ref atlas_srgb_view is its
+	 * `BGRA8Unorm_sRGB` view: a frame that owes an encode or a blend renders
+	 * THROUGH that view, so the hardware decodes on read-for-blend, blends
+	 * in linear light and encodes on write. The view aliases the atlas's
+	 * own storage, so the "raw copy to the atlas" other backends need is
+	 * the identity here — the DP reads the very bytes the encode wrote,
+	 * through the UNORM atlas, with no conversion in between.
+	 *
+	 * Each atlas pipeline has a twin whose colour attachment is
+	 * `BGRA8Unorm_sRGB` (a pipeline's attachment format must match the
+	 * texture it renders into). nil under DXR_COLOR_LEGACY_UNORM_ENCODED.
+	 */
+	id<MTLTexture> atlas_srgb_view;
+	struct
+	{
+		id<MTLRenderPipelineState> projection;
+		id<MTLRenderPipelineState> proj_premult;
+		id<MTLRenderPipelineState> proj_straight;
+		id<MTLRenderPipelineState> quad_straight;
+		id<MTLRenderPipelineState> quad_premult;
+		id<MTLRenderPipelineState> quad_opaque;
+		id<MTLRenderPipelineState> local2d_premult;
+		id<MTLRenderPipelineState> local2d_unpremult;
+	} srgb_pipes;
+
+	//! One-shot "the compose target engaged" WARN (#1610 evidence line).
+	bool compose_target_logged;
+
+	//! Last atlas encoding declared to the primary DP (-1 = never).
+	int dp_atlas_encoding_latched;
 
 	//! Sampler state for texture sampling.
 	id<MTLSamplerState> sampler_linear;
@@ -233,6 +282,14 @@ struct comp_metal_compositor
 
 	//! Generic Metal display processor.
 	struct xrt_display_processor_metal *display_processor;
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the post-process_atlas cache, the HUD, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
+	 */
+	struct u_eye_history eye_hist;
 
 	//! Intermediate texture at content dims for DP input (crop from atlas).
 	id<MTLTexture> dp_input_texture;
@@ -306,6 +363,10 @@ struct comp_metal_compositor
 	//! input of the masked composite) + the weave snapshot it lerps against.
 	id<MTLTexture> local2d_scratch;
 	id<MTLTexture> weave_scratch;
+	//! `BGRA8Unorm_sRGB` view of @ref local2d_scratch — the Local2D flatten
+	//! renders through it (linear blend, encode on write); every reader
+	//! samples the UNORM scratch and so still sees ENCODED bytes (#1795).
+	id<MTLTexture> local2d_scratch_srgb;
 	uint32_t composite_w;               //!< Current scratch width (0 = not allocated)
 	uint32_t composite_h;               //!< Current scratch height
 
@@ -313,8 +374,30 @@ struct comp_metal_compositor
 	//! projection in list order), handed to the DP via set_background_2d so it
 	//! composites `backdrop over captured-desktop` under the 3D weave.
 	id<MTLTexture> backdrop_scratch;
+	id<MTLTexture> backdrop_scratch_srgb; //!< its `_sRGB` view (#1795, as local2d_scratch_srgb)
 	uint32_t backdrop_w;                //!< Current backdrop scratch width (0 = none)
 	uint32_t backdrop_h;
+
+	//! #2264 — the live desktop behind the window, for a transparent session
+	//! on a DP that cannot present alpha (it weaves the app OVER this, then
+	//! alpha-gates). NULL unless eligible (@ref metal_desktop_bg_init).
+	struct comp_metal_desktop_bg *desktop_bg;
+	//! Lazy transparency: is the content actually transparent right now?
+	//! Read off the atlas; capture runs only while it is.
+	struct comp_metal_alpha_probe *alpha_probe;
+	bool transparency_active;
+	uint32_t opaque_streak;
+	//! CGDirectDisplayID under the window's content (0 = unknown), per frame.
+	uint32_t desktop_display;
+	//! This frame's backdrop holds the live desktop (set by the flatten).
+	bool desktop_in_backdrop;
+
+	//! XR_DXR_depth_budget: the shared runner, fed from @ref bg_preview — a
+	//! downsample of the desktop crop above, since on macOS the runtime, not
+	//! the DP, owns the capture. NULL preview = no desktop source (the runner
+	//! then reports CLIPPED_NO_SOURCE, as before).
+	struct comp_rear_budget rear_budget;
+	struct comp_metal_bg_preview *bg_preview;
 
 	//! Pipelines for the Local2D flatten (premultiplied over / unpremultiplied
 	//! source) and the masked composite pass.
@@ -412,6 +495,154 @@ struct comp_metal_compositor
 
 	//! Per-frame capture intent. See u_capture_intent.h.
 	struct u_capture_intent capture_intent;
+
+	/*!
+	 * XR_DXR_cursor_depth v2, depth-layer source (ADR-046 Phase 3a).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained XrCursorDepthSourceDXR. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the readback buffers are allocated
+	 * on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_depth_patch_request req;
+		//! Shared readback buffers (2 views x 64 x 64 floats) and the command
+		//! buffer that fills each; polled for completion, never waited on.
+		id<MTLBuffer> buf[3];
+		id<MTLCommandBuffer> cb[3];
+		struct
+		{
+			uint64_t tag;
+			bool nearest_is_max;
+			bool has[U_CURSOR_DEPTH_PATCH_VIEWS];
+			int32_t x[U_CURSOR_DEPTH_PATCH_VIEWS], y[U_CURSOR_DEPTH_PATCH_VIEWS];
+			int32_t w[U_CURSOR_DEPTH_PATCH_VIEWS], h[U_CURSOR_DEPTH_PATCH_VIEWS];
+			struct xrt_rect sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+		} meta[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		//! Newest finished read; guarded by `mutex` (locate may be on another thread).
+		struct u_cursor_depth_patch_result result;
+	} cursor_depth;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained the measured-disparity source. layer_commit tests
+	 * `req.requested` and `in_flight` and does nothing else; the staging
+	 * buffers are allocated on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		//! Shared staging buffers (both views' copies) and the command buffer
+		//! that fills each; polled for completion, never waited on.
+		id<MTLBuffer> buf[3];
+		id<MTLCommandBuffer> cb[3];
+		struct
+		{
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format format;
+			uint32_t pitch;      //!< bytes per row of each view's copy
+			uint32_t view_bytes; //!< offset of view B's copy
+		} meta[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		//! The last measured patch (a paused video is not matched again).
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `mutex`.
+		struct u_cursor_measure_result result;
+		//! Cost diagnostics, logged at INFO every 120 measurements.
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		double stat_gpu_s, stat_gpu_max_s;
+	} cursor_measure;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero/nil for a session that never
+	 * chained XrCursorDepthDrawInfoDXR. layer_commit tests `req.requested`
+	 * and does nothing else; the shader library, pipelines and the default
+	 * sprite are built on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! Built lazily: [premultiplied?][_sRGB target?].
+		id<MTLRenderPipelineState> pipe[2][2];
+		//! The same with the crosstalk-softening fragment (ADR-046 B.7).
+		id<MTLRenderPipelineState> pipe_soft[2][2];
+		bool pipes_failed;
+		//! The default look's sprite (premultiplied, _sRGB, PixelFormatView),
+		//! uploaded from @ref look whenever its generation moves.
+		id<MTLTexture> default_tex;
+		uint64_t default_gen;
+		//! The shared default look (mirrored OS cursor, else the arrow).
+		struct comp_cursor_look look;
+		//! One-shot WARN: a routed frame and its request disagree.
+		bool warned_routed;
+		bool announced;
+		bool warned_zones;
+	} cursor_draw;
+
+	/*
+	 * Multi-screen on macOS (ADR-047 D2): a window whose content view spans
+	 * displays is woven per segment, each by its own display's DP
+	 * (comp_metal_segments). A window on the primary display only keeps the
+	 * single-DP path exactly.
+	 */
+	struct comp_metal_segments *segments;     //!< NULL until the first weave after set_screens
+	struct xrt_screen_list *seg_screens;      //!< heap copy, NULL = not handed over
+	struct xrt_system_compositor_info *seg_sys_info; //!< heap copy (the DP registry)
+	bool seg_rebuild;                         //!< a new list arrived: rebuild on the next weave
+	uint64_t seg_pinned_display_id;
+	//! What the session's own DP was made for, from the first list (display
+	//! hotplug, ADR-047 Amendment 8): it weaves that screen only while that
+	//! plug-in still owns it.
+	struct comp_segments_session_dp seg_session;
+	//! The session DP owned its screen after the last re-table (a regain re-sends the mode).
+	bool seg_session_owned;
+
+	//! M3: the table the last weave took (count 0 = one view set) and the
+	//! routing the last xrLocateViews handed out. Guarded by seg_pub_mutex
+	//! (the app thread's locate reads them; the commit writes them).
+	struct os_mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;
+	struct xrt_segment_view_routing seg_route;
+	//! Change-only logging of the routed layout.
+	uint32_t seg_route_logged_count;
+	uint32_t seg_route_logged_key[XRT_MAX_SEGMENTS * 6 + 2];
+
+	/*
+	 * Runtime-owned window placement on macOS (ADR-050): drag + resize are
+	 * the runtime's, phase-snapped by the DP and applied in the same CA
+	 * transaction as the frame woven for them. NULL = not eligible / opted
+	 * out (AppKit owns the window as before).
+	 */
+	struct comp_metal_placement *placement;
+	//! This commit's placement decision (valid while @ref placement_frame_valid).
+	struct comp_metal_placement_frame placement_frame;
+	bool placement_frame_valid;
+};
+
+//! Multi-screen M3: one segment's views placed in every tile (the mosaic).
+struct metal_seg_route
+{
+	uint32_t first_view;
+	uint32_t view_count;
+	int32_t x, y; //!< the segment's rect inside a tile, tile px
+	uint32_t w, h;
 };
 
 /*
@@ -430,6 +661,123 @@ static inline struct comp_metal_swapchain *
 metal_swapchain(struct xrt_swapchain *xsc)
 {
 	return (struct comp_metal_swapchain *)xsc;
+}
+
+/*!
+ * Multi-screen M3: turn the routing the last xrLocateViews handed out into
+ * per-segment tile rects on this frame's atlas layout. The Metal twin of
+ * d3d11_route_effective_layout: on any inconsistency (a segment's views past
+ * what the layer submitted, a degenerate rect) the routing is dropped for the
+ * frame (returns 0) and the tiles are painted unrouted.
+ */
+static uint32_t
+metal_route_layer(struct comp_metal_compositor *c,
+                  const struct xrt_segment_view_routing *r,
+                  uint32_t layer_view_count,
+                  uint32_t tiles,
+                  uint32_t tile_w,
+                  uint32_t tile_h,
+                  struct metal_seg_route out[XRT_MAX_SEGMENTS])
+{
+	if (r->count == 0 || r->count > XRT_MAX_SEGMENTS || tiles == 0 || tile_w == 0 || tile_h == 0) {
+		return 0;
+	}
+	const struct comp_seg_rect canvas = {
+	    r->canvas.offset.w,
+	    r->canvas.offset.h,
+	    (uint32_t)(r->canvas.extent.w > 0 ? r->canvas.extent.w : 0),
+	    (uint32_t)(r->canvas.extent.h > 0 ? r->canvas.extent.h : 0),
+	};
+	for (uint32_t k = 0; k < r->count; k++) {
+		// Across a 2D<->3D toggle the mode (tile count) can change between
+		// the locate and this commit: route the views the tiles can hold.
+		const uint32_t n = r->view_count[k] < tiles ? r->view_count[k] : tiles;
+		if (n == 0 || r->first_view[k] + n > layer_view_count || r->first_view[k] + n > XRT_MAX_VIEWS) {
+			return 0;
+		}
+		const struct comp_seg_rect seg = {
+		    r->rect[k].offset.w,
+		    r->rect[k].offset.h,
+		    (uint32_t)(r->rect[k].extent.w > 0 ? r->rect[k].extent.w : 0),
+		    (uint32_t)(r->rect[k].extent.h > 0 ? r->rect[k].extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (!comp_segments_tile_rect(&seg, &canvas, tile_w, tile_h, &tr)) {
+			return 0;
+		}
+		out[k].first_view = r->first_view[k];
+		out[k].view_count = n;
+		out[k].x = tr.x;
+		out[k].y = tr.y;
+		out[k].w = tr.w;
+		out[k].h = tr.h;
+	}
+
+	// One INFO line per routing change (a move, a resize, a mode switch).
+	uint32_t key[XRT_MAX_SEGMENTS * 6 + 2] = {0};
+	key[0] = tile_w;
+	key[1] = tile_h;
+	for (uint32_t k = 0; k < r->count; k++) {
+		key[2 + k * 6 + 0] = out[k].first_view;
+		key[2 + k * 6 + 1] = out[k].view_count;
+		key[2 + k * 6 + 2] = (uint32_t)out[k].x;
+		key[2 + k * 6 + 3] = (uint32_t)out[k].y;
+		key[2 + k * 6 + 4] = out[k].w;
+		key[2 + k * 6 + 5] = out[k].h;
+	}
+	if (r->count != c->seg_route_logged_count || memcmp(key, c->seg_route_logged_key, sizeof(key)) != 0) {
+		c->seg_route_logged_count = r->count;
+		memcpy(c->seg_route_logged_key, key, sizeof(key));
+		U_LOG_I("segments: per-segment views routed — %u segment(s), tile %ux%u; [0] views %u..+%u at %d,%d "
+		        "%ux%u; [1] views %u..+%u at %d,%d %ux%u",
+		        r->count, tile_w, tile_h, out[0].first_view, out[0].view_count, out[0].x, out[0].y, out[0].w,
+		        out[0].h, r->count > 1 ? out[1].first_view : 0, r->count > 1 ? out[1].view_count : 0,
+		        r->count > 1 ? out[1].x : 0, r->count > 1 ? out[1].y : 0, r->count > 1 ? out[1].w : 0,
+		        r->count > 1 ? out[1].h : 0);
+	}
+	return r->count;
+}
+
+/*!
+ * Multi-screen: the content view's frame in top-down global POINTS (origin =
+ * the main display's top-left — the CGDisplayBounds space the screen registry
+ * is in) and the drawable size. False when there is no on-screen view.
+ */
+static bool
+metal_seg_window(struct comp_metal_compositor *c, id<MTLTexture> target, struct comp_metal_seg_window *out)
+{
+	NSView *view = c->view;
+	NSWindow *win = view != nil ? view.window : nil;
+	NSArray<NSScreen *> *screens = [NSScreen screens];
+	if (win == nil || target == nil || screens.count == 0) {
+		return false;
+	}
+	if (c->placement_frame_valid) {
+		// Runtime-owned placement (ADR-050): the rect this present is woven
+		// for — already applied on the main-thread path, about to be applied
+		// (in the same transaction) on the deferred one.
+		const struct comp_metal_placement_frame *pf = &c->placement_frame;
+		out->frame_pt.x = (int32_t)floor(pf->content_x + 0.5);
+		out->frame_pt.y = (int32_t)floor(pf->content_y + 0.5);
+		out->frame_pt.w = (uint32_t)floor(pf->content_w + 0.5);
+		out->frame_pt.h = (uint32_t)floor(pf->content_h + 0.5);
+		out->drawable_w = (uint32_t)target.width;
+		out->drawable_h = (uint32_t)target.height;
+		return out->frame_pt.w > 0 && out->frame_pt.h > 0;
+	}
+	NSRect in_win = [view convertRect:view.bounds toView:nil];
+	NSRect in_screen = [win convertRectToScreen:in_win];
+	// AppKit global space is bottom-up from the main display's bottom edge;
+	// flip against the main display (screens[0]) height.
+	const CGFloat main_h = screens[0].frame.size.height;
+	const CGFloat top = main_h - (in_screen.origin.y + in_screen.size.height);
+	out->frame_pt.x = (int32_t)floor(in_screen.origin.x + 0.5);
+	out->frame_pt.y = (int32_t)floor(top + 0.5);
+	out->frame_pt.w = (uint32_t)floor(in_screen.size.width + 0.5);
+	out->frame_pt.h = (uint32_t)floor(in_screen.size.height + 0.5);
+	out->drawable_w = (uint32_t)target.width;
+	out->drawable_h = (uint32_t)target.height;
+	return out->frame_pt.w > 0 && out->frame_pt.h > 0;
 }
 
 //! #439: any active mask — explicit submitted, or implicit from the last
@@ -625,9 +973,10 @@ static NSString *const metal_shader_source = @
  */
 
 // Map an sRGB Metal pixel format to its plain UNORM sibling (identity
-// otherwise). Used to sample an app sRGB swapchain through a non-decoding view
-// so the compositor passes the app's display-referred bytes through to the DP
-// unchanged. Mirrors the GL/D3D/VK sRGB-passthrough fixes.
+// otherwise). The NON-decoding read of an `_SRGB` swapchain: the app's encoded
+// bytes come through unchanged. Only right where the write is a passthrough
+// too (the fast path, the legacy hatch, the zero-copy handoff) — see
+// metal_layer_source_view().
 static MTLPixelFormat
 metal_srgb_to_unorm(MTLPixelFormat format)
 {
@@ -636,6 +985,68 @@ metal_srgb_to_unorm(MTLPixelFormat format)
 	case MTLPixelFormatBGRA8Unorm_sRGB: return MTLPixelFormatBGRA8Unorm;
 	default: return format;
 	}
+}
+
+//! Does @p format hold ENCODED colour (ADR-044 §1: the format says what its
+//! bytes mean)? Every other colour format this compositor allocates —
+//! RGBA8/BGRA8 UNORM, RGB10A2Unorm, RGBA16Float — holds LINEAR values.
+static bool
+metal_format_is_srgb(MTLPixelFormat format)
+{
+	return format == MTLPixelFormatRGBA8Unorm_sRGB || format == MTLPixelFormatBGRA8Unorm_sRGB;
+}
+
+/*!
+ * THE one place a layer source's colour space is chosen (#1589) — the Metal
+ * twin of D3D12's layer_source_format() and GL's gl_bind_layer_source(). Every
+ * draw that samples an app swapchain gets its texture here, so no site can
+ * quietly keep the non-decoding read while its target encodes on write (which
+ * is one half of every failing GradientFormatsLinearVsNonLinear pair).
+ *
+ *  - @p honest (the draw renders through an `_sRGB` target): sample the source
+ *    AS DECLARED — an `_SRGB` swapchain decodes to linear, a UNORM / float one
+ *    is read as the linear values OpenXR says it holds.
+ *  - otherwise (the write is a passthrough): the non-decoding view, so the
+ *    app's bytes reach the atlas unchanged — the pre-#1589 behaviour, kept for
+ *    the fast path and the legacy hatch.
+ *
+ * Also pins an array swapchain to @p array_index (imageArrayIndex, the Metal
+ * analog of the D3D12 #656 fix). Returns a +1 reference (this file is MRR);
+ * the caller releases it once the draw is encoded — the command buffer holds
+ * its own reference to every texture it binds.
+ */
+static id<MTLTexture>
+metal_layer_source_view(id<MTLTexture> tex, uint32_t array_index, bool honest)
+{
+	const MTLPixelFormat fmt = honest ? tex.pixelFormat : metal_srgb_to_unorm(tex.pixelFormat);
+	id<MTLTexture> v = nil;
+	if (tex.textureType == MTLTextureType2DArray) {
+		v = [tex newTextureViewWithPixelFormat:fmt
+		                           textureType:MTLTextureType2D
+		                                levels:NSMakeRange(0, tex.mipmapLevelCount)
+		                                slices:NSMakeRange(array_index, 1)];
+	} else if (fmt != tex.pixelFormat) {
+		v = [tex newTextureViewWithPixelFormat:fmt];
+	}
+	return v != nil ? v : [tex retain];
+}
+
+/*!
+ * A display-referred clear colour for a target that may encode on write.
+ * Clear values are taken in the ATTACHMENT's space: on the `_sRGB` compose
+ * view they are linear, so the RGB is decoded on the CPU first (the way
+ * vk_native and the displayxr-common clear helpers do). Alpha is never
+ * converted. Never shader arithmetic — this is a constant.
+ */
+static MTLClearColor
+metal_display_referred_clear(double r, double g, double b, double a, bool target_encodes)
+{
+	if (target_encodes) {
+		r = u_color_srgb_decode((float)r);
+		g = u_color_srgb_decode((float)g);
+		b = u_color_srgb_decode((float)b);
+	}
+	return MTLClearColorMake(r, g, b, a);
 }
 
 static MTLPixelFormat
@@ -710,6 +1121,42 @@ iosurface_fourcc_to_metal_format(uint32_t fourcc)
 	case 'RGBA': return MTLPixelFormatRGBA8Unorm;
 	default:     return MTLPixelFormatBGRA8Unorm;
 	}
+}
+
+/*!
+ * The `BGRA8Unorm_sRGB`-attachment twin of the pipeline @p desc describes
+ * (ADR-044): identical shaders and blend state, so the only difference is that
+ * the fixed-function blender reads the target decoded, blends in linear light
+ * and writes encoded. @p desc is left as it was. nil under the legacy hatch
+ * (nothing ever composes then) or on failure, which the per-frame decision
+ * treats as "no compose target" — the frame then takes the passthrough path.
+ */
+static id<MTLRenderPipelineState>
+metal_srgb_twin(struct comp_metal_compositor *c, MTLRenderPipelineDescriptor *desc, const char *what)
+{
+	if (u_color_legacy_unorm_encoded()) {
+		return nil;
+	}
+	const MTLPixelFormat prev = desc.colorAttachments[0].pixelFormat;
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
+	NSError *err = nil;
+	id<MTLRenderPipelineState> p = [c->device newRenderPipelineStateWithDescriptor:desc error:&err];
+	desc.colorAttachments[0].pixelFormat = prev;
+	if (p == nil) {
+		U_LOG_E("Color (#1610) [metal]: failed to create the _sRGB-target %s pipeline: %s — frames that owe "
+		        "an encode will pass through instead",
+		        what, err != nil ? err.localizedDescription.UTF8String : "?");
+	}
+	return p;
+}
+
+//! Every `_sRGB`-target twin exists, so a frame may compose in linear light.
+static bool
+metal_srgb_pipes_ready(const struct comp_metal_compositor *c)
+{
+	return c->srgb_pipes.projection != nil && c->srgb_pipes.proj_premult != nil &&
+	       c->srgb_pipes.proj_straight != nil && c->srgb_pipes.quad_straight != nil &&
+	       c->srgb_pipes.quad_premult != nil && c->srgb_pipes.quad_opaque != nil;
 }
 
 static bool
@@ -795,6 +1242,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		proj_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->projection_pipeline = [c->device newRenderPipelineStateWithDescriptor:proj_desc error:&error];
+		c->srgb_pipes.projection = metal_srgb_twin(c, proj_desc, "projection");
 		[proj_desc release];
 		if (c->projection_pipeline == nil) {
 			U_LOG_E("Failed to create projection pipeline: %s",
@@ -830,6 +1278,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		pb_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->proj_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		c->srgb_pipes.proj_premult = metal_srgb_twin(c, pb_desc, "projection premultiplied");
 		if (c->proj_premult_pipeline == nil) {
 			U_LOG_E("Failed to create projection premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -839,6 +1288,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		pb_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
 		c->proj_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:pb_desc error:&error];
+		c->srgb_pipes.proj_straight = metal_srgb_twin(c, pb_desc, "projection straight-alpha");
 		[pb_desc release];
 		if (c->proj_straight_pipeline == nil) {
 			U_LOG_E("Failed to create projection straight-alpha pipeline: %s",
@@ -883,6 +1333,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		quad_desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
 		c->quad_straight_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_straight = metal_srgb_twin(c, quad_desc, "quad straight-alpha");
 		if (c->quad_straight_pipeline == nil) {
 			U_LOG_E("Failed to create quad straight-alpha pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -894,6 +1345,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		quad_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
 		c->quad_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_premult = metal_srgb_twin(c, quad_desc, "quad premultiplied");
 		if (c->quad_premult_pipeline == nil) {
 			U_LOG_E("Failed to create quad premultiplied pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -907,6 +1359,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		// base blit. The two differ only in the alpha the shader emits.
 		quad_desc.colorAttachments[0].blendingEnabled = NO;
 		c->quad_opaque_pipeline = [c->device newRenderPipelineStateWithDescriptor:quad_desc error:&error];
+		c->srgb_pipes.quad_opaque = metal_srgb_twin(c, quad_desc, "quad opaque");
 		[quad_desc release];
 		[quad_fs release];
 		[quad_vs release];
@@ -935,6 +1388,7 @@ compile_shaders(struct comp_metal_compositor *c)
 		l2d_desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
 
 		c->local2d_premult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		c->srgb_pipes.local2d_premult = metal_srgb_twin(c, l2d_desc, "Local2D premultiplied");
 		if (c->local2d_premult_pipeline == nil) {
 			U_LOG_E("Failed to create local-2D premult pipeline: %s",
 			        error.localizedDescription.UTF8String);
@@ -944,6 +1398,7 @@ compile_shaders(struct comp_metal_compositor *c)
 
 		l2d_desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
 		c->local2d_unpremult_pipeline = [c->device newRenderPipelineStateWithDescriptor:l2d_desc error:&error];
+		c->srgb_pipes.local2d_unpremult = metal_srgb_twin(c, l2d_desc, "Local2D unpremultiplied");
 		[l2d_desc release];
 		if (c->local2d_unpremult_pipeline == nil) {
 			U_LOG_E("Failed to create local-2D unpremult pipeline: %s",
@@ -1052,13 +1507,23 @@ create_atlas_texture(struct comp_metal_compositor *c,
 	                                width:atlas_width
 	                               height:atlas_height
 	                            mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	// PixelFormatView: the format-honest compose renders through a
+	// BGRA8Unorm_sRGB view of this same storage (ADR-044, see
+	// atlas_srgb_view). The atlas itself stays UNORM and ENCODED.
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	desc.storageMode = MTLStorageModePrivate;
 
 	c->atlas_texture = [c->device newTextureWithDescriptor:desc];
 	if (c->atlas_texture == nil) {
 		U_LOG_E("Failed to create atlas texture");
 		return false;
+	}
+	if (!u_color_legacy_unorm_encoded()) {
+		c->atlas_srgb_view = [c->atlas_texture newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+		if (c->atlas_srgb_view == nil) {
+			U_LOG_E("Color (#1610) [metal]: failed to create the atlas's _sRGB view — frames that owe an "
+			        "encode will pass through instead");
+		}
 	}
 
 	// Depth texture
@@ -1190,6 +1655,27 @@ create_window_on_main_thread(struct comp_metal_compositor *c, uint32_t width, ui
 		                                     dequeue:YES]) != nil) {
 			[NSApp sendEvent:event];
 		}
+
+		// Showing the window lets AppKit constrain its frame to the
+		// screen's visibleFrame (a window asked at the panel's full height
+		// comes back shorter by the menu bar + title bar). Re-read the
+		// content rect now: a drawable sized from the REQUESTED rect would
+		// be woven at one size and scaled into another, which breaks the
+		// lens phase. (layer_commit also re-syncs drawableSize from the
+		// view every frame; this keeps the layer honest from the start.)
+		const NSRect shown = [c->window contentRectForFrameRect:c->window.frame];
+		const CGFloat shown_scale = c->window.backingScaleFactor;
+		const CGSize want =
+		    CGSizeMake(round(shown.size.width * shown_scale), round(shown.size.height * shown_scale));
+		const CGSize had = c->metal_layer.drawableSize;
+		if (want.width != had.width || want.height != had.height) {
+			U_LOG_W("Hosted window constrained by the screen: content %ux%u pt asked, %.0fx%.0f pt "
+			        "shown — drawable %.0fx%.0f -> %.0fx%.0f px",
+			        width, height, shown.size.width, shown.size.height, had.width, had.height, want.width,
+			        want.height);
+			c->metal_layer.contentsScale = shown_scale;
+			c->metal_layer.drawableSize = want;
+		}
 	} else {
 		U_LOG_I("Offscreen mode — window created but hidden");
 	}
@@ -1217,6 +1703,78 @@ create_window(struct comp_metal_compositor *c, uint32_t width, uint32_t height,
 	}
 
 	return success;
+}
+
+/*!
+ * Keep the presenting CAMetalLayer 1:1 with the window's backing store.
+ *
+ * WindowServer composites a layer whose contentsScale differs from its
+ * window's backingScaleFactor by RESAMPLING the drawable (e.g. contentsScale 1
+ * on a 2x display with a bounds x 2 drawable: the drawable is scaled 0.5x and
+ * back). That is invisible on ordinary content and fatal to a lenticular
+ * weave, which is computed per physical subpixel: the resampled weave shows
+ * as red/teal bands. An app's own layer (makeBackingLayer) easily leaves
+ * contentsScale at 1, and AppKit only manages it for layers it creates, so
+ * the compositor owns it for every layer it presents into: contentsScale =
+ * the window's backingScaleFactor (set on the main thread), nearest
+ * magnification/minification as a guard, and drawableSize = bounds x
+ * contentsScale (layer_commit). One WARN names the app's value the first
+ * time it is wrong, so app authors learn; later corrections (backing / screen
+ * changes) are counted and logged at INFO.
+ *
+ * Callable from any thread; the read is cheap, the fix is dispatched.
+ */
+//! A contentsScale fix is queued on the main thread (process-wide: the block
+//! must not reference a compositor that may be destroyed before it runs).
+static _Atomic bool g_layer_scale_fix_pending = false;
+
+static void
+metal_sync_layer_scale(struct comp_metal_compositor *c, NSView *view, const char *when)
+{
+	CAMetalLayer *layer = c->metal_layer;
+	if (layer == nil || view == nil) {
+		return;
+	}
+	NSWindow *win = view.window;
+	const CGFloat want = win != nil && win.backingScaleFactor > 0 ? win.backingScaleFactor : 0.0;
+	if (want <= 0.0) {
+		return;
+	}
+	const CGFloat have = layer.contentsScale;
+	const bool filters_ok = [layer.magnificationFilter isEqualToString:kCAFilterNearest] &&
+	                        [layer.minificationFilter isEqualToString:kCAFilterNearest];
+	if (have == want && filters_ok) {
+		return;
+	}
+	if (atomic_exchange(&g_layer_scale_fix_pending, true)) {
+		return; // a fix is already queued; judge again once it has landed
+	}
+	if (have != want) {
+		c->layer_scale_fixes++;
+		if (c->layer_scale_fixes == 1) {
+			U_LOG_W("CAMetalLayer contentsScale %.2f != the window's backingScaleFactor %.2f (%s) — WindowServer "
+			        "would RESAMPLE every drawable (a lenticular weave turns into colour bands); setting it to "
+			        "%.2f. App authors: set layer.contentsScale = window.backingScaleFactor on a layer you "
+			        "create (makeBackingLayer) and on backing changes",
+			        have, want, when, want);
+		} else {
+			U_LOG_I("CAMetalLayer contentsScale %.2f -> %.2f (%s; correction #%u)", have, want, when,
+			        c->layer_scale_fixes);
+		}
+	}
+	[layer retain];
+	void (^fix)(void) = ^{
+		layer.contentsScale = want;
+		layer.magnificationFilter = kCAFilterNearest;
+		layer.minificationFilter = kCAFilterNearest;
+		atomic_store(&g_layer_scale_fix_pending, false);
+		[layer release];
+	};
+	if ([NSThread isMainThread]) {
+		fix();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), fix);
+	}
 }
 
 static bool
@@ -1266,9 +1824,11 @@ setup_external_window(struct comp_metal_compositor *c, NSView *external_view,
 		U_LOG_W("Transparent background enabled: external CAMetalLayer set isOpaque=NO");
 	}
 
-	// Ensure Retina backing scale is applied so drawables are at physical resolution
+	// Ensure Retina backing scale is applied so drawables are at physical
+	// resolution (and the layer is never resampled — metal_sync_layer_scale).
 	CGFloat scale = 1.0;
 	if (external_view.window != nil) {
+		metal_sync_layer_scale(c, external_view, "adopting the app's layer");
 		scale = external_view.window.backingScaleFactor;
 	} else {
 		scale = [NSScreen mainScreen].backingScaleFactor;
@@ -1436,6 +1996,11 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 	// IOSurface and allocate a plain array texture — the Metal native app gets
 	// the id<MTLTexture> directly via comp_metal_swapchain_get_texture().
 	const bool layered = info->array_size > 1;
+	// Depth swapchains (XR_KHR_composition_layer_depth): a depth format can
+	// neither be IOSurface-backed nor use shared storage on macOS, so it takes
+	// the GPU-private, no-IOSurface path the layered branch below uses. The
+	// compositor only ever reads one through a blit (ADR-046 3a cursor patch).
+	const bool is_depth = format == MTLPixelFormatDepth32Float;
 
 	for (uint32_t i = 0; i < msc->image_count; i++) {
 		MTLTextureDescriptor *desc = [MTLTextureDescriptor
@@ -1450,6 +2015,24 @@ metal_compositor_create_swapchain(struct xrt_compositor *xc,
 		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead |
 		             MTLTextureUsagePixelFormatView;
 		desc.storageMode = MTLStorageModeShared;
+
+		if (is_depth) {
+			desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+			desc.storageMode = MTLStorageModePrivate;
+			if (layered) {
+				desc.textureType = MTLTextureType2DArray;
+				desc.arrayLength = info->array_size;
+			}
+			msc->iosurfaces[i] = NULL;
+			msc->images[i] = [c->device newTextureWithDescriptor:desc];
+			if (msc->images[i] == nil) {
+				U_LOG_E("Failed to create depth swapchain image %u", i);
+				metal_swapchain_destroy(&msc->base.base);
+				return XRT_ERROR_ALLOCATION;
+			}
+			msc->base.images[i].handle = (xrt_graphics_buffer_handle_t)0;
+			continue;
+		}
 
 		if (layered) {
 			desc.textureType = MTLTextureType2DArray;
@@ -2147,6 +2730,95 @@ metal_window_backing_dims(struct comp_metal_compositor *c,
  * anchored), regardless of any xrSetSharedTextureOutputRectDXR call.
  * Mirrors d3d11_effective_canvas.
  */
+/*!
+ * Debug-only weave test pattern, DXR_DEBUG_ATLAS_PATTERN=lr_white_black.
+ *
+ * Returns a texture the size of the cropped DP input (cols x rows tiles of
+ * view_w x view_h) with tile 0 (the left view) pure white and every other tile
+ * pure black, opaque — handed to the DP in place of the app's atlas, so a
+ * weave can be judged on a known input inside the app's own process / route /
+ * window. Built once per size (CPU pattern, one buffer-to-texture blit),
+ * cached; nil when the knob is off (the default, zero cost). One WARN.
+ */
+static id<MTLTexture>
+metal_debug_atlas_pattern(struct comp_metal_compositor *c,
+                          id<MTLCommandBuffer> cmd_buf,
+                          uint32_t cols,
+                          uint32_t rows,
+                          uint32_t view_w,
+                          uint32_t view_h)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_DEBUG_ATLAS_PATTERN");
+		enabled = (e != NULL && strcmp(e, "lr_white_black") == 0) ? 1 : 0;
+		if (enabled) {
+			U_LOG_W("DXR_DEBUG_ATLAS_PATTERN=lr_white_black: the DP weaves a TEST PATTERN (left view white, "
+			        "right view black), not the app's content — debug only");
+		}
+	}
+	if (!enabled || cols == 0 || rows == 0 || view_w == 0 || view_h == 0) {
+		return nil;
+	}
+	static id<MTLTexture> tex = nil;
+	static id<MTLDevice> tex_device = nil;
+	static uint32_t tex_cols = 0, tex_rows = 0, tex_vw = 0, tex_vh = 0;
+	const uint32_t w = cols * view_w;
+	const uint32_t h = rows * view_h;
+	if (tex != nil && tex_device == c->device && tex_cols == cols && tex_rows == rows && tex_vw == view_w &&
+	    tex_vh == view_h) {
+		return tex;
+	}
+	[tex release];
+	tex = nil;
+
+	const size_t row_bytes = (size_t)w * 4;
+	id<MTLBuffer> buf = [c->device newBufferWithLength:row_bytes * h options:MTLResourceStorageModeShared];
+	if (buf == nil) {
+		return nil;
+	}
+	uint8_t *px = (uint8_t *)buf.contents;
+	for (uint32_t y = 0; y < h; y++) {
+		for (uint32_t x = 0; x < w; x++) {
+			const bool white = (x / view_w) == 0 && (y / view_h) == 0; // tile 0
+			uint8_t *p = px + (size_t)y * row_bytes + (size_t)x * 4;   // BGRA8
+			p[0] = p[1] = p[2] = white ? 255 : 0;
+			p[3] = 255;
+		}
+	}
+	MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                                                width:w
+	                                                                               height:h
+	                                                                            mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	desc.storageMode = MTLStorageModePrivate;
+	tex = [c->device newTextureWithDescriptor:desc];
+	if (tex == nil) {
+		[buf release];
+		return nil;
+	}
+	id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+	[blit copyFromBuffer:buf
+	           sourceOffset:0
+	      sourceBytesPerRow:row_bytes
+	    sourceBytesPerImage:row_bytes * h
+	             sourceSize:MTLSizeMake(w, h, 1)
+	              toTexture:tex
+	       destinationSlice:0
+	       destinationLevel:0
+	      destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+	[buf release]; // the command buffer retains it until the copy completes
+	tex_device = c->device;
+	tex_cols = cols;
+	tex_rows = rows;
+	tex_vw = view_w;
+	tex_vh = view_h;
+	U_LOG_W("DXR_DEBUG_ATLAS_PATTERN: pattern %ux%u (%ux%u tiles of %ux%u; tile 0 white, rest black)", w, h, cols,
+	        rows, view_w, view_h);
+	return tex;
+}
+
 static struct u_canvas_rect
 metal_effective_canvas(struct comp_metal_compositor *c,
                        id<MTLTexture> output_texture,
@@ -2471,6 +3143,20 @@ metal_update_zone_feather_mask(struct comp_metal_compositor *c,
 }
 
 /*!
+ * #1795 — does the Local2D flatten blend in linear light, each layer sampled as
+ * its declared format? Yes unless the shared escape hatch is on (or the
+ * `_sRGB`-target flatten pipelines failed to build). The flatten target is
+ * the scratch's `_sRGB` view; every reader of the scratch samples it UNORM and
+ * so still sees ENCODED bytes.
+ */
+static bool
+metal_local2d_honest(const struct comp_metal_compositor *c)
+{
+	return !u_color_legacy_unorm_encoded() && c->srgb_pipes.local2d_premult != nil &&
+	       c->srgb_pipes.local2d_unpremult != nil;
+}
+
+/*!
  * Ensure the window-sized 2D scratch + weave snapshot textures exist at w×h.
  */
 static bool
@@ -2480,6 +3166,8 @@ metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint
 		return true;
 	}
 
+	[c->local2d_scratch_srgb release];
+	c->local2d_scratch_srgb = nil;
 	[c->local2d_scratch release];
 	c->local2d_scratch = nil;
 	[c->weave_scratch release];
@@ -2492,8 +3180,11 @@ metal_ensure_composite_scratch(struct comp_metal_compositor *c, uint32_t w, uint
 	                                                       width:w
 	                                                      height:h
 	                                                   mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	c->local2d_scratch = [c->device newTextureWithDescriptor:desc];
+	if (c->local2d_scratch != nil && metal_local2d_honest(c)) {
+		c->local2d_scratch_srgb = [c->local2d_scratch newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
+	}
 
 	desc.usage = MTLTextureUsageShaderRead;
 	c->weave_scratch = [c->device newTextureWithDescriptor:desc];
@@ -2520,6 +3211,8 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 	if (c->backdrop_w == w && c->backdrop_h == h && c->backdrop_scratch != nil) {
 		return true;
 	}
+	[c->backdrop_scratch_srgb release];
+	c->backdrop_scratch_srgb = nil;
 	[c->backdrop_scratch release];
 	c->backdrop_scratch = nil;
 	c->backdrop_w = 0;
@@ -2530,11 +3223,14 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 	                                                       width:w
 	                                                      height:h
 	                                                   mipmapped:NO];
-	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+	desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
 	c->backdrop_scratch = [c->device newTextureWithDescriptor:desc];
 	if (c->backdrop_scratch == nil) {
 		U_LOG_E("Failed to allocate backdrop scratch texture (%ux%u)", w, h);
 		return false;
+	}
+	if (metal_local2d_honest(c)) {
+		c->backdrop_scratch_srgb = [c->backdrop_scratch newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 	}
 	c->backdrop_w = w;
 	c->backdrop_h = h;
@@ -2542,16 +3238,20 @@ metal_ensure_backdrop_scratch(struct comp_metal_compositor *c, uint32_t w, uint3
 }
 
 // #439 Phase 3 / #491 part 3 — draw one Local2D layer into the currently-bound
-// flatten render encoder (premultiplied / unpremultiplied "over", sRGB
-// passthrough). Dest rect clips to the w×h window scratch; clipped fractions
-// carry into the source UVs. Shared by the over-flatten (masked composite) and
-// the under-flatten (backdrop).
+// flatten render encoder (premultiplied / unpremultiplied "over"). Dest rect
+// clips to the w×h window scratch; clipped fractions carry into the source
+// UVs. Shared by the over-flatten (masked composite) and the under-flatten
+// (backdrop). @p honest (#1795): the encoder renders through the scratch's
+// `_sRGB` view, so the layer is sampled as its declared format and blended in
+// linear light; otherwise the legacy passthrough (non-decoding read into the
+// UNORM scratch).
 static void
 metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
                                 id<MTLRenderCommandEncoder> enc,
                                 struct comp_layer *layer,
                                 uint32_t w,
-                                uint32_t h)
+                                uint32_t h,
+                                bool honest)
 {
 	struct xrt_swapchain *sc = layer->sc_array[0];
 	if (sc == NULL) {
@@ -2593,18 +3293,8 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 		nr.h = 1.0f;
 	}
 
-	// sRGB passthrough (see projection pass).
-	id<MTLTexture> src_tex = msc->images[img_idx];
-	id<MTLTexture> src_view = nil;
-	{
-		MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-		if (unorm_fmt != src_tex.pixelFormat) {
-			src_view = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
-			if (src_view != nil) {
-				src_tex = src_view;
-			}
-		}
-	}
+	id<MTLTexture> src_view =
+	    metal_layer_source_view(msc->images[img_idx], layer->data.local_2d.sub.array_index, honest);
 
 	MTLViewport vp;
 	vp.originX = x0;
@@ -2616,8 +3306,12 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 	[enc setViewport:vp];
 
 	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
-	[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline : c->local2d_premult_pipeline];
-	[enc setFragmentTexture:src_tex atIndex:0];
+	if (honest) {
+		[enc setRenderPipelineState:unpremult ? c->srgb_pipes.local2d_unpremult : c->srgb_pipes.local2d_premult];
+	} else {
+		[enc setRenderPipelineState:unpremult ? c->local2d_unpremult_pipeline : c->local2d_premult_pipeline];
+	}
+	[enc setFragmentTexture:src_view atIndex:0];
 	[enc setFragmentSamplerState:c->sampler_linear atIndex:0];
 
 	struct {
@@ -2662,6 +3356,199 @@ metal_flatten_one_local2d_layer(struct comp_metal_compositor *c,
 	[src_view release];
 }
 
+/*
+ *
+ * #2264 — live desktop background for a transparent session on a DP that
+ * cannot present alpha. The capture itself lives in the out-of-process
+ * displayxr-desktop-capture helper (the one holder of the Screen Recording
+ * grant); this side decides when it is wanted and crops the panel frame to
+ * the window. See comp_metal_desktop_bg.h.
+ *
+ */
+
+//! Frames of fully opaque content before transparency counts as idle again
+//! (the Linux lazy-transparency hysteresis).
+#define METAL_TRANSPARENCY_IDLE_FRAMES 60
+
+static void
+metal_desktop_bg_init(struct comp_metal_compositor *c)
+{
+	// DXR_MACOS_DESKTOP_BG: unset = auto (a transparent session on a DP that
+	// is not alpha-native and takes a background), 0 = never, 1 = force (any
+	// DP — for exercising the capture with sim_display, which needs none).
+	const char *e = getenv("DXR_MACOS_DESKTOP_BG");
+	const bool forced_on = e != NULL && e[0] == '1';
+	const bool forced_off = e != NULL && e[0] == '0';
+	if (!c->transparent_background || c->offscreen || c->shared_iosurface != NULL || forced_off) {
+		return;
+	}
+	struct xrt_display_processor_metal *dp = c->display_processor;
+	const bool takes_bg = dp != NULL && XRT_DP_HAS_SLOT(dp, set_background_2d) && dp->set_background_2d != NULL;
+	const bool alpha_native = dp != NULL && xrt_display_processor_metal_is_alpha_native(dp);
+	if (!forced_on && (dp == NULL || alpha_native || !takes_bg)) {
+		U_LOG_I("desktop background: not needed (%s)",
+		        dp == NULL ? "no DP" : alpha_native ? "DP presents alpha natively" : "DP takes no background");
+		return;
+	}
+	c->desktop_bg = comp_metal_desktop_bg_create((__bridge void *)c->device);
+	c->alpha_probe = comp_metal_alpha_probe_create((__bridge void *)c->device);
+	c->bg_preview = comp_metal_bg_preview_create((__bridge void *)c->device);
+	U_LOG_W("desktop background: eligible (%s) — the live desktop behind the window is captured only while the "
+	        "content is transparent",
+	        forced_on ? "forced by DXR_MACOS_DESKTOP_BG=1" : "DP weaves without alpha");
+}
+
+//! The window's content rect in top-down global points (the CGDisplayBounds space).
+static bool
+metal_content_rect_points(struct comp_metal_compositor *c, CGRect *out)
+{
+	if (c->placement_frame_valid) {
+		*out = CGRectMake(c->placement_frame.content_x, c->placement_frame.content_y,
+		                  c->placement_frame.content_w, c->placement_frame.content_h);
+		return out->size.width > 0 && out->size.height > 0;
+	}
+	if (c->window == nil || c->view == nil) {
+		return false;
+	}
+	// AppKit-owned placement: read the frame (read-only, as the render path
+	// already does for backingScaleFactor) and flip to top-down.
+	NSRect r = [c->window convertRectToScreen:[c->view convertRect:c->view.bounds toView:nil]];
+	CGFloat main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
+	*out = CGRectMake(r.origin.x, main_h - (r.origin.y + r.size.height), r.size.width, r.size.height);
+	return r.size.width > 0 && r.size.height > 0;
+}
+
+/*!
+ * Per frame, before the backdrop flatten: read the previous probe, update the
+ * lazy-transparency state, probe this frame's atlas, and tell the capture
+ * client whether (and for which display) the desktop is wanted.
+ */
+static void
+metal_desktop_bg_probe(
+    struct comp_metal_compositor *c, id<MTLCommandBuffer> cmd_buf, id<MTLTexture> atlas, uint32_t w, uint32_t h)
+{
+	if (c->desktop_bg == NULL) {
+		return;
+	}
+	if (c->alpha_probe == NULL) {
+		c->transparency_active = true; // no probe: assume transparent (always-on)
+	} else {
+		uint32_t n = 0;
+		if (comp_metal_alpha_probe_read(c->alpha_probe, &n)) {
+			if (n > 0) {
+				if (!c->transparency_active) {
+					U_LOG_W("desktop background: content turned transparent — capture wanted");
+				}
+				c->transparency_active = true;
+				c->opaque_streak = 0;
+			} else if (c->transparency_active && ++c->opaque_streak >= METAL_TRANSPARENCY_IDLE_FRAMES) {
+				U_LOG_W("desktop background: content opaque for %u frames — capture released",
+				        METAL_TRANSPARENCY_IDLE_FRAMES);
+				c->transparency_active = false;
+				c->opaque_streak = 0;
+			}
+		}
+		comp_metal_alpha_probe_record(c->alpha_probe, (__bridge void *)cmd_buf, (__bridge void *)atlas,
+		                              MIN(w, (uint32_t)atlas.width), MIN(h, (uint32_t)atlas.height));
+	}
+
+	c->desktop_display = 0;
+	CGRect r;
+	if (metal_content_rect_points(c, &r)) {
+		CGDirectDisplayID id = 0;
+		uint32_t n = 0;
+		CGPoint mid = CGPointMake(CGRectGetMidX(r), CGRectGetMidY(r));
+		if (CGGetDisplaysWithPoint(mid, 1, &id, &n) == kCGErrorSuccess && n > 0) {
+			c->desktop_display = id;
+		}
+	}
+	comp_metal_desktop_bg_want(c->desktop_bg, c->transparency_active && c->desktop_display != 0,
+	                           c->desktop_display);
+}
+
+/*!
+ * The desktop under the window, as a copy region from the panel frame into a
+ * @p dst_w x @p dst_h backdrop (device pixels). False when there is none yet.
+ * @p out_full: the region covers the whole backdrop (no clear needed).
+ */
+static bool
+metal_desktop_bg_crop(struct comp_metal_compositor *c,
+                      id<MTLCommandBuffer> cmd_buf,
+                      uint32_t dst_w,
+                      uint32_t dst_h,
+                      id<MTLTexture> *out_tex,
+                      MTLOrigin *out_src,
+                      MTLOrigin *out_dst,
+                      MTLSize *out_size,
+                      bool *out_full)
+{
+	if (c->desktop_bg == NULL || !c->transparency_active || c->desktop_display == 0) {
+		return false;
+	}
+	CGRect r;
+	if (!metal_content_rect_points(c, &r)) {
+		return false;
+	}
+	uint32_t fw = 0, fh = 0;
+	id<MTLTexture> frame = (__bridge id<MTLTexture>)comp_metal_desktop_bg_acquire(
+	    c->desktop_bg, (__bridge void *)cmd_buf, c->desktop_display, &fw, &fh);
+	if (frame == nil || fw == 0 || fh == 0) {
+		return false;
+	}
+	CGRect b = CGDisplayBounds(c->desktop_display);
+	static bool geo_logged = false;
+	if (!geo_logged) {
+		geo_logged = true;
+		U_LOG_W("desktop background: crop window %.0f,%.0f %.0fx%.0f pt from display %u bounds %.0f,%.0f %.0fx%.0f "
+		        "(frame %ux%u px) into %ux%u",
+		        r.origin.x, r.origin.y, r.size.width, r.size.height, c->desktop_display, b.origin.x, b.origin.y,
+		        b.size.width, b.size.height, fw, fh, dst_w, dst_h);
+	}
+	if (b.size.width <= 0 || b.size.height <= 0) {
+		return false;
+	}
+	// Panel frame px per point; equals the window's backing scale on the panel.
+	const double sx = fw / b.size.width;
+	const double sy = fh / b.size.height;
+	const int64_t ox = llround((r.origin.x - b.origin.x) * sx);
+	const int64_t oy = llround((r.origin.y - b.origin.y) * sy);
+	const int64_t x0 = MAX(ox, 0), y0 = MAX(oy, 0);
+	const int64_t x1 = MIN(ox + (int64_t)dst_w, (int64_t)fw), y1 = MIN(oy + (int64_t)dst_h, (int64_t)fh);
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	*out_tex = frame;
+	*out_src = MTLOriginMake((NSUInteger)x0, (NSUInteger)y0, 0);
+	*out_dst = MTLOriginMake((NSUInteger)(x0 - ox), (NSUInteger)(y0 - oy), 0);
+	*out_size = MTLSizeMake((NSUInteger)(x1 - x0), (NSUInteger)(y1 - y0), 1);
+	*out_full = out_dst->x == 0 && out_dst->y == 0 && out_size->width == dst_w && out_size->height == dst_h;
+	return true;
+}
+
+/*!
+ * XR_DXR_depth_budget on macOS: one tick per APP frame (this compositor has no
+ * repaint path), after the flatten. Same shape as vk_rear_budget_tick, except
+ * that the preview comes from the runtime's own desktop capture instead of a
+ * DP slot — the Leia Metal DP captures nothing; the runtime does (#2264).
+ *
+ * No desktop in this frame's backdrop (content opaque, capture not up yet,
+ * window off every display) = no preview, which the runner reads as "no
+ * source" rather than as a neutral background.
+ */
+static void
+metal_rear_budget_tick(struct comp_metal_compositor *c)
+{
+	if (!comp_rear_budget_is_running(&c->rear_budget)) {
+		return;
+	}
+	const uint64_t now_ns = os_monotonic_get_ns();
+	struct xrt_dp_background_preview pv;
+	xrt_dp_background_preview_init(&pv);
+	const bool polled = comp_rear_budget_should_poll(&c->rear_budget, now_ns);
+	const bool got = polled && c->desktop_in_backdrop && comp_metal_bg_preview_get(c->bg_preview, &pv);
+	comp_rear_budget_tick(&c->rear_budget, got ? &pv : NULL, polled, c->transparent_background, now_ns);
+}
+
 // #491 part 3 — flatten this frame's 2D-UNDER Local2D layers (before the
 // projection in list order) into backdrop_scratch PRE-weave and return it (+
 // region dims) so the caller hands it to the DP via set_background_2d (the DP
@@ -2678,7 +3565,19 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 {
 	*out_w = 0;
 	*out_h = 0;
-	if (!c->local_2d_last_frame || dst_w == 0 || dst_h == 0) {
+	c->desktop_in_backdrop = false;
+	if (dst_w == 0 || dst_h == 0) {
+		return nil;
+	}
+
+	// #2264: the live desktop behind the window goes UNDER everything else.
+	id<MTLTexture> desk = nil;
+	MTLOrigin desk_src, desk_dst;
+	MTLSize desk_size;
+	bool desk_full = false;
+	const bool have_desk =
+	    metal_desktop_bg_crop(c, cmd_buf, dst_w, dst_h, &desk, &desk_src, &desk_dst, &desk_size, &desk_full);
+	if (!c->local_2d_last_frame && !have_desk) {
 		return nil;
 	}
 
@@ -2691,17 +3590,17 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 			break;
 		}
 	}
-	if (proj_idx < 0) {
+	if (proj_idx < 0 && !have_desk) {
 		return nil;
 	}
 	bool have_under = false;
-	for (int32_t i = 0; i < proj_idx; i++) {
+	for (int32_t i = 0; c->local_2d_last_frame && i < proj_idx; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_LOCAL_2D) {
 			have_under = true;
 			break;
 		}
 	}
-	if (!have_under) {
+	if (!have_under && !have_desk) {
 		return nil;
 	}
 
@@ -2711,9 +3610,43 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 		return nil;
 	}
 
+	// #1795: through the `_sRGB` view when honest (the clear is (0,0,0,0),
+	// a fixed point of the transfer function, so it needs no decode).
+	const bool honest = c->backdrop_scratch_srgb != nil && metal_local2d_honest(c);
+	if (have_desk) {
+		// Both are BGRA8Unorm holding sRGB-ENCODED bytes, so a straight copy
+		// keeps the encoding the Local2D pass below and the DP expect.
+		if (!desk_full) {
+			MTLRenderPassDescriptor *clr = [MTLRenderPassDescriptor renderPassDescriptor];
+			clr.colorAttachments[0].texture = c->backdrop_scratch;
+			clr.colorAttachments[0].loadAction = MTLLoadActionClear;
+			clr.colorAttachments[0].storeAction = MTLStoreActionStore;
+			clr.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+			[[cmd_buf renderCommandEncoderWithDescriptor:clr] endEncoding];
+		}
+		id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+		[blit copyFromTexture:desk
+		          sourceSlice:0
+		          sourceLevel:0
+		         sourceOrigin:desk_src
+		           sourceSize:desk_size
+		            toTexture:c->backdrop_scratch
+		     destinationSlice:0
+		     destinationLevel:0
+		    destinationOrigin:desk_dst];
+		[blit endEncoding];
+		c->desktop_in_backdrop = true;
+		// Depth-budget source: the desktop alone, before any Local2D layer is
+		// drawn over it — what a DP preview is on the other platforms.
+		if (comp_rear_budget_is_running(&c->rear_budget)) {
+			comp_metal_bg_preview_record(c->bg_preview, (__bridge void *)cmd_buf,
+			                             (__bridge void *)c->backdrop_scratch, w, h);
+		}
+	}
+
 	MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-	pass.colorAttachments[0].texture = c->backdrop_scratch;
-	pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+	pass.colorAttachments[0].texture = honest ? c->backdrop_scratch_srgb : c->backdrop_scratch;
+	pass.colorAttachments[0].loadAction = have_desk ? MTLLoadActionLoad : MTLLoadActionClear;
 	pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 	pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
@@ -2723,19 +3656,78 @@ metal_flatten_backdrop_2d(struct comp_metal_compositor *c,
 		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
 			continue;
 		}
-		metal_flatten_one_local2d_layer(c, enc, layer, w, h);
+		metal_flatten_one_local2d_layer(c, enc, layer, w, h, honest);
 	}
 	[enc endEncoding];
 
 	static bool logged = false;
-	if (!logged) {
+	if (!logged && have_under) {
 		logged = true;
 		U_LOG_W("Metal #491 part3: flattened 2D-under backdrop %ux%u (handed to DP set_background_2d)", w, h);
+	}
+	static bool desk_logged = false;
+	if (!desk_logged && have_desk) {
+		desk_logged = true;
+		U_LOG_W("desktop background: first live-desktop backdrop %ux%u (crop %lux%lu from panel frame, handed to "
+		        "DP set_background_2d)",
+		        w, h, (unsigned long)desk_size.width, (unsigned long)desk_size.height);
 	}
 
 	*out_w = w;
 	*out_h = h;
 	return c->backdrop_scratch;
+}
+
+/*!
+ * `touch /tmp/dxr_backdrop_trigger`: the next frame's DP background (desktop +
+ * 2D-under, what set_background_2d receives) is written to
+ * /tmp/dxr_backdrop.png — the #2264 counterpart of /tmp/dxr_atlas_trigger,
+ * written from the command buffer's completion so the frame never stalls.
+ */
+static void
+metal_backdrop_dump_if_triggered(
+    struct comp_metal_compositor *c, id<MTLCommandBuffer> cmd_buf, id<MTLTexture> tex, uint32_t w, uint32_t h)
+{
+	const char *trigger = "/tmp/dxr_backdrop_trigger";
+	struct stat st;
+	if (tex == nil || w == 0 || h == 0 || stat(trigger, &st) != 0) {
+		return;
+	}
+	unlink(trigger);
+	const size_t pitch = (size_t)w * 4;
+	const size_t bytes = pitch * h;
+	id<MTLBuffer> stg = [c->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+	if (stg == nil) {
+		return;
+	}
+	id<MTLBlitCommandEncoder> bl = [cmd_buf blitCommandEncoder];
+	[bl copyFromTexture:tex
+	                 sourceSlice:0
+	                 sourceLevel:0
+	                sourceOrigin:MTLOriginMake(0, 0, 0)
+	                  sourceSize:MTLSizeMake(w, h, 1)
+	                    toBuffer:stg
+	           destinationOffset:0
+	      destinationBytesPerRow:pitch
+	    destinationBytesPerImage:bytes];
+	[bl endEncoding];
+	[cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> done) {
+	  (void)done;
+	  const uint8_t *src = (const uint8_t *)stg.contents;
+	  uint8_t *out = malloc(bytes);
+	  if (out != NULL) {
+		  for (size_t i = 0; i < bytes; i += 4) {
+			  out[i + 0] = src[i + 2];
+			  out[i + 1] = src[i + 1];
+			  out[i + 2] = src[i + 0];
+			  out[i + 3] = src[i + 3];
+		  }
+		  stbi_write_png("/tmp/dxr_backdrop.png", (int)w, (int)h, 4, out, (int)pitch);
+		  free(out);
+		  U_LOG_W("desktop background: wrote /tmp/dxr_backdrop.png (%ux%u)", w, h);
+	  }
+	  [stg release];
+	}];
 }
 
 /*!
@@ -2895,10 +3887,12 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 		return false;
 	}
 
-	// Step 4 — fill the 2D scratch.
+	// Step 4 — fill the 2D scratch. #1795: through its `_sRGB` view when
+	// honest; the (0,0,0,0) clear is a fixed point, so it needs no decode.
 	{
+		const bool honest = c->local2d_scratch_srgb != nil && metal_local2d_honest(c);
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		pass.colorAttachments[0].texture = c->local2d_scratch;
+		pass.colorAttachments[0].texture = honest ? c->local2d_scratch_srgb : c->local2d_scratch;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
@@ -2918,7 +3912,7 @@ metal_composite_local_2d(struct comp_metal_compositor *c,
 			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 				continue; // under-layer (backdrop) — handled pre-weave
 			}
-			metal_flatten_one_local2d_layer(c, enc, layer, w, h);
+			metal_flatten_one_local2d_layer(c, enc, layer, w, h, honest);
 		}
 
 		[enc endEncoding];
@@ -3119,29 +4113,946 @@ metal_sync_zone_mask_to_dp(struct comp_metal_compositor *c)
  * per-draw constants as well as bind the pipeline returned here.
  */
 static id<MTLRenderPipelineState>
-metal_proj_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+metal_proj_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode, bool srgb_target)
 {
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->proj_premult_pipeline;
-	case COMP_LAYER_BLEND_STRAIGHT: return c->proj_straight_pipeline;
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return srgb_target ? c->srgb_pipes.proj_premult : c->proj_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return srgb_target ? c->srgb_pipes.proj_straight : c->proj_straight_pipeline;
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
-	default: return c->projection_pipeline;
+	default: return srgb_target ? c->srgb_pipes.projection : c->projection_pipeline;
 	}
 }
 
 //! The QUAD-shader pipeline for one shared blend mode; same OPAQUE_COVER
-//! caveat as @ref metal_proj_pipeline_for.
+//! caveat as @ref metal_proj_pipeline_for. @p srgb_target picks the twin whose
+//! attachment is the atlas's `_sRGB` view (ADR-044).
 static id<MTLRenderPipelineState>
-metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode)
+metal_quad_pipeline_for(struct comp_metal_compositor *c, enum comp_layer_blend_mode mode, bool srgb_target)
 {
 	switch (mode) {
-	case COMP_LAYER_BLEND_PREMULTIPLIED: return c->quad_premult_pipeline;
-	case COMP_LAYER_BLEND_STRAIGHT: return c->quad_straight_pipeline;
+	case COMP_LAYER_BLEND_PREMULTIPLIED: return srgb_target ? c->srgb_pipes.quad_premult : c->quad_premult_pipeline;
+	case COMP_LAYER_BLEND_STRAIGHT: return srgb_target ? c->srgb_pipes.quad_straight : c->quad_straight_pipeline;
 	case COMP_LAYER_BLEND_REPLACE:
 	case COMP_LAYER_BLEND_OPAQUE_COVER:
-	default: return c->quad_opaque_pipeline;
+	default: return srgb_target ? c->srgb_pipes.quad_opaque : c->quad_opaque_pipeline;
 	}
+}
+
+/*!
+ * #1484 / ADR-044 §4 — state the atlas encoding to the primary DP, on change
+ * only (the plug-in may log every switch; this is a per-frame path). Every
+ * in-process Metal frame hands the DP ENCODED bytes — the compose target
+ * encodes on write, the passthrough paths carry the app's encoded bytes — so
+ * this declares the slot's own default, explicitly, the way vk_native does.
+ */
+static void
+metal_dp_assert_atlas_encoding(struct comp_metal_compositor *c, enum xrt_atlas_encoding enc)
+{
+	if (c->display_processor == NULL || c->dp_atlas_encoding_latched == (int)enc) {
+		return;
+	}
+	xrt_display_processor_metal_set_atlas_encoding(c->display_processor, enc);
+	U_LOG_W("Color (#1484) [metal]: atlas encoding declared to the DP: %s",
+	        enc == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED");
+	c->dp_atlas_encoding_latched = (int)enc;
+}
+
+/*
+ *
+ * XR_DXR_cursor_depth v2 - depth-layer source (ADR-046 Phase 3a)
+ *
+ * A requested frame copies a cursor-sized patch (<= 64x64) of the two
+ * outermost views' submitted depth into a small shared buffer on its own
+ * command buffer. A later commit sees that command buffer completed (a status
+ * poll, never a wait), reduces the patch to its nearest texel on the CPU and
+ * publishes it. Nothing here runs unless the state tracker handed a request.
+ *
+ */
+
+#define METAL_CURSOR_DEPTH_SLOT_BYTES                                                                                  \
+	((NSUInteger)U_CURSOR_DEPTH_PATCH_VIEWS * U_CURSOR_DEPTH_PATCH_MAX_DIM * U_CURSOR_DEPTH_PATCH_MAX_DIM *          \
+	 sizeof(float))
+
+//! Harvest every finished read; publish the newest. Never blocks on the GPU.
+static void
+metal_cursor_depth_harvest(struct comp_metal_compositor *c)
+{
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_depth.cb); s++) {
+		id<MTLCommandBuffer> cb = c->cursor_depth.cb[s];
+		if (cb == nil) {
+			continue;
+		}
+		const MTLCommandBufferStatus st = cb.status;
+		if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) {
+			continue; // still in flight: look again next commit
+		}
+		[cb release];
+		c->cursor_depth.cb[s] = nil;
+		c->cursor_depth.in_flight--;
+		if (st != MTLCommandBufferStatusCompleted) {
+			continue;
+		}
+
+		struct u_cursor_depth_patch_result res = {0};
+		res.tag = c->cursor_depth.meta[s].tag;
+		const float *base = (const float *)c->cursor_depth.buf[s].contents;
+		for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+			if (!c->cursor_depth.meta[s].has[i]) {
+				continue;
+			}
+			const int32_t w = c->cursor_depth.meta[s].w[i];
+			const int32_t h = c->cursor_depth.meta[s].h[i];
+			const float *texels = base + (size_t)i * U_CURSOR_DEPTH_PATCH_MAX_DIM * U_CURSOR_DEPTH_PATCH_MAX_DIM;
+			int32_t px, py;
+			float raw;
+			if (!u_cursor_depth_reduce_patch(texels, w, h, w, c->cursor_depth.meta[s].nearest_is_max, &px, &py,
+			                                 &raw)) {
+				continue;
+			}
+			const struct xrt_rect *sub = &c->cursor_depth.meta[s].sub[i];
+			res.view[i].valid = true;
+			res.view[i].su = ((float)(c->cursor_depth.meta[s].x[i] + px) + 0.5f - (float)sub->offset.w) /
+			                 (float)sub->extent.w;
+			res.view[i].sv = ((float)(c->cursor_depth.meta[s].y[i] + py) + 0.5f - (float)sub->offset.h) /
+			                 (float)sub->extent.h;
+			if (c->source_is_gl) {
+				res.view[i].sv = 1.0f - res.view[i].sv; // GL content is bottom-up
+			}
+			res.view[i].raw_depth = raw;
+			res.valid = true;
+		}
+
+		os_mutex_lock(&c->mutex);
+		if (res.tag > c->cursor_depth.result.tag) {
+			c->cursor_depth.result = res;
+		}
+		os_mutex_unlock(&c->mutex);
+	}
+}
+
+//! Encode this frame's patch copies, if a slot is free. Never waits for one.
+static void
+metal_cursor_depth_sample(struct comp_metal_compositor *c, const struct u_cursor_depth_patch_request *req)
+{
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+
+	const uint32_t s = c->cursor_depth.next_slot;
+	if (c->cursor_depth.cb[s] != nil) {
+		return; // the GPU is three reads behind: skip a frame rather than stall
+	}
+	c->cursor_depth.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_depth.cb);
+
+	if (c->cursor_depth.buf[s] == nil) {
+		// First real request: the only allocation this feature ever makes.
+		c->cursor_depth.buf[s] = [c->device newBufferWithLength:METAL_CURSOR_DEPTH_SLOT_BYTES
+		                                                options:MTLResourceStorageModeShared];
+		if (c->cursor_depth.buf[s] == nil) {
+			return;
+		}
+	}
+
+	// Created only once there is a copy to encode: an uncommitted command
+	// buffer would hold one of the queue's (app-owned, 64-deep) slots forever.
+	id<MTLCommandBuffer> cb = nil;
+	id<MTLBlitCommandEncoder> blit = nil;
+
+	c->cursor_depth.meta[s].tag = req->tag;
+	c->cursor_depth.meta[s].nearest_is_max = req->nearest_is_max;
+	bool any = false;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		c->cursor_depth.meta[s].has[i] = false;
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count) {
+			continue;
+		}
+		struct xrt_swapchain *d_xsc = comp_layer_get_depth_swapchain(layer, vi);
+		if (d_xsc == NULL) {
+			continue;
+		}
+		const struct xrt_sub_image *sub = &layer->data.depth.d[vi].sub;
+		struct comp_metal_swapchain *msc = metal_swapchain(d_xsc);
+		if (sub->image_index >= msc->image_count || msc->images[sub->image_index] == nil) {
+			continue;
+		}
+		id<MTLTexture> tex = msc->images[sub->image_index];
+		if (tex.pixelFormat != MTLPixelFormatDepth32Float) {
+			continue; // the only depth format this compositor advertises
+		}
+		int32_t x, y, w, h;
+		// GL content is stored bottom-up: find the patch in storage rows
+		// (the harvest flips the found texel back to top-down).
+		struct u_cursor_depth_patch_request stored = *req;
+		if (c->source_is_gl) {
+			stored.v = 1.0f - stored.v;
+		}
+		if (!u_cursor_depth_patch_rect(&stored, sub->rect.offset.w, sub->rect.offset.h, sub->rect.extent.w,
+		                               sub->rect.extent.h, &x, &y, &w, &h)) {
+			continue;
+		}
+		if (x < 0 || y < 0 || (NSUInteger)(x + w) > tex.width || (NSUInteger)(y + h) > tex.height) {
+			continue;
+		}
+		if (blit == nil) {
+			cb = [c->command_queue commandBuffer];
+			blit = cb != nil ? [cb blitCommandEncoder] : nil;
+			if (blit == nil) {
+				return;
+			}
+		}
+		[blit copyFromTexture:tex
+		                 sourceSlice:(tex.textureType == MTLTextureType2DArray) ? sub->array_index : 0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)y, 0)
+		                  sourceSize:MTLSizeMake((NSUInteger)w, (NSUInteger)h, 1)
+		                    toBuffer:c->cursor_depth.buf[s]
+		           destinationOffset:(NSUInteger)i * U_CURSOR_DEPTH_PATCH_MAX_DIM *
+		                             U_CURSOR_DEPTH_PATCH_MAX_DIM * sizeof(float)
+		      destinationBytesPerRow:(NSUInteger)w * sizeof(float)
+		    destinationBytesPerImage:(NSUInteger)w * (NSUInteger)h * sizeof(float)];
+		c->cursor_depth.meta[s].has[i] = true;
+		c->cursor_depth.meta[s].x[i] = x;
+		c->cursor_depth.meta[s].y[i] = y;
+		c->cursor_depth.meta[s].w[i] = w;
+		c->cursor_depth.meta[s].h[i] = h;
+		c->cursor_depth.meta[s].sub[i] = sub->rect;
+		any = true;
+	}
+	if (!any) {
+		return; // nothing encoded, no command buffer was created
+	}
+	[blit endEncoding];
+	[cb commit];
+	c->cursor_depth.cb[s] = [cb retain];
+	c->cursor_depth.in_flight++;
+
+	if (!c->cursor_depth.announced) {
+		c->cursor_depth.announced = true;
+		U_LOG_W("cursor_depth: Metal compositor reading a %ux%u-max depth patch per view for the cursor "
+		        "(ADR-046 3a, first request)",
+		        (unsigned)U_CURSOR_DEPTH_PATCH_MAX_DIM, (unsigned)U_CURSOR_DEPTH_PATCH_MAX_DIM);
+	}
+}
+
+void
+comp_metal_compositor_set_cursor_depth_request(struct xrt_compositor *xc,
+                                               const struct u_cursor_depth_patch_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_depth.req = *req;
+}
+
+bool
+comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct u_cursor_depth_patch_result *out)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->mutex);
+	*out = c->cursor_depth.result;
+	os_mutex_unlock(&c->mutex);
+	return out->valid;
+}
+
+
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit the two outermost views' footprint patches are
+ * blitted out of the app's projection swapchain into a shared buffer, on
+ * their own command buffer, encoded on the app's queue after its rendering.
+ * A later commit sees that command buffer completed (a status poll, never a
+ * wait), runs the shared CPU matcher over the copy and publishes the answer.
+ *
+ */
+
+static enum u_cursor_measure_format
+metal_cursor_measure_format(MTLPixelFormat f)
+{
+	switch (f) {
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case MTLPixelFormatRGBA16Float: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case MTLPixelFormatRGB10A2Unorm: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+//! Harvest every finished copy, match it, publish the newest. Never blocks on the GPU.
+static void
+metal_cursor_measure_harvest(struct comp_metal_compositor *c)
+{
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.cb); s++) {
+		id<MTLCommandBuffer> cb = c->cursor_measure.cb[s];
+		if (cb == nil) {
+			continue;
+		}
+		const MTLCommandBufferStatus st = cb.status;
+		if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) {
+			continue; // still in flight: look again next commit
+		}
+		const double gpu_s = cb.GPUEndTime - cb.GPUStartTime;
+		[cb release];
+		c->cursor_measure.cb[s] = nil;
+		c->cursor_measure.in_flight--;
+		if (st != MTLCommandBufferStatusCompleted) {
+			continue;
+		}
+
+		const uint8_t *base = (const uint8_t *)c->cursor_measure.buf[s].contents;
+		const struct u_cursor_measure_patch pa = {base, c->cursor_measure.meta[s].pitch,
+		                                          c->cursor_measure.meta[s].format};
+		const struct u_cursor_measure_patch pb = {base + c->cursor_measure.meta[s].view_bytes,
+		                                          c->cursor_measure.meta[s].pitch, c->cursor_measure.meta[s].format};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		if (!u_cursor_measure_run(&c->cursor_measure.meta[s].req, &c->cursor_measure.meta[s].plan, &pa, &pb,
+		                          &c->cursor_measure.cache, &res)) {
+			continue;
+		}
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+
+		os_mutex_lock(&c->mutex);
+		if (res.tag > c->cursor_measure.result.tag) {
+			c->cursor_measure.result = res;
+		}
+		os_mutex_unlock(&c->mutex);
+
+		// Cost evidence (ADR-046 Amendment 3), throttled: never per frame.
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		c->cursor_measure.stat_cpu_max_ns =
+		    cpu_ns > c->cursor_measure.stat_cpu_max_ns ? cpu_ns : c->cursor_measure.stat_cpu_max_ns;
+		if (gpu_s > 0.0 && gpu_s < 1.0) {
+			c->cursor_measure.stat_gpu_s += gpu_s;
+			c->cursor_measure.stat_gpu_max_s =
+			    gpu_s > c->cursor_measure.stat_gpu_max_s ? gpu_s : c->cursor_measure.stat_gpu_max_s;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			const double n = (double)c->cursor_measure.stat_n;
+			U_LOG_I(
+			    "cursor_measure: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms, GPU copy cb avg "
+			    "%.3f ms max %.3f ms; last: %s %.2f px (sub_w %.0f, %ux%u work px x%d, matched %u, L-R "
+			    "rejected %u, ncc %.3f)",
+			    c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			    (double)c->cursor_measure.stat_cpu_ns / n * 1e-6,
+			    (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, c->cursor_measure.stat_gpu_s / n * 1e3,
+			    c->cursor_measure.stat_gpu_max_s * 1e3, res.confident ? "confident" : "no content",
+			    res.disparity_px, res.sub_w, c->cursor_measure.meta[s].plan.work_w,
+			    c->cursor_measure.meta[s].plan.work_h, c->cursor_measure.meta[s].plan.factor, res.matched,
+			    res.lr_rejected, res.ncc);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+			c->cursor_measure.stat_gpu_s = c->cursor_measure.stat_gpu_max_s = 0.0;
+		}
+	}
+}
+
+//! Encode this frame's two patch copies, if a slot is free. Never waits for one.
+static void
+metal_cursor_measure_sample(struct comp_metal_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+	id<MTLTexture> tex[U_CURSOR_DEPTH_PATCH_VIEWS];
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		if (vi >= layer->data.view_count || layer->sc_array[vi] == NULL) {
+			return;
+		}
+		struct comp_metal_swapchain *msc = metal_swapchain(layer->sc_array[vi]);
+		sub[i] = &layer->data.proj.v[vi].sub;
+		if (sub[i]->image_index >= msc->image_count || msc->images[sub[i]->image_index] == nil) {
+			return;
+		}
+		tex[i] = msc->images[sub[i]->image_index];
+	}
+	// The two views must be measured in the same pixel grid.
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h ||
+	    tex[0].pixelFormat != tex[1].pixelFormat) {
+		return;
+	}
+	const enum u_cursor_measure_format fmt = metal_cursor_measure_format(tex[0].pixelFormat);
+	if (fmt == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure: Metal swapchain format %lu is not read by the matcher - no content "
+			        "(one-time warning)",
+			        (unsigned long)tex[0].pixelFormat);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, c->source_is_gl, &plan)) {
+		return;
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const int32_t x = sub[i]->rect.offset.w + plan.x;
+		const int32_t y = sub[i]->rect.offset.h + plan.y;
+		if (x < 0 || y < 0 || (NSUInteger)(x + plan.w) > tex[i].width || (NSUInteger)(y + plan.h) > tex[i].height) {
+			return;
+		}
+	}
+
+	const uint32_t s = c->cursor_measure.next_slot;
+	if (c->cursor_measure.cb[s] != nil) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	const uint32_t pitch = (uint32_t)plan.w * u_cursor_measure_format_bytes(fmt);
+	const uint32_t view_bytes = pitch * (uint32_t)plan.h;
+	const NSUInteger need = (NSUInteger)view_bytes * U_CURSOR_DEPTH_PATCH_VIEWS;
+	if (c->cursor_measure.buf[s] == nil || c->cursor_measure.buf[s].length < need) {
+		// First real request (or a larger patch): the only allocation this
+		// feature makes.
+		[c->cursor_measure.buf[s] release];
+		c->cursor_measure.buf[s] = [c->device newBufferWithLength:need options:MTLResourceStorageModeShared];
+		if (c->cursor_measure.buf[s] == nil) {
+			return;
+		}
+	}
+	id<MTLCommandBuffer> cb = [c->command_queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = cb != nil ? [cb blitCommandEncoder] : nil;
+	if (blit == nil) {
+		return; // never seen in practice; the command buffer is not committed
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		[blit copyFromTexture:tex[i]
+		                 sourceSlice:(tex[i].textureType == MTLTextureType2DArray) ? sub[i]->array_index : 0
+		                 sourceLevel:0
+		                sourceOrigin:MTLOriginMake((NSUInteger)(sub[i]->rect.offset.w + plan.x),
+		                                           (NSUInteger)(sub[i]->rect.offset.h + plan.y), 0)
+		                  sourceSize:MTLSizeMake((NSUInteger)plan.w, (NSUInteger)plan.h, 1)
+		                    toBuffer:c->cursor_measure.buf[s]
+		           destinationOffset:(NSUInteger)i * view_bytes
+		      destinationBytesPerRow:pitch
+		    destinationBytesPerImage:view_bytes];
+	}
+	[blit endEncoding];
+	[cb commit];
+	c->cursor_measure.cb[s] = [cb retain];
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_measure.cb);
+	c->cursor_measure.meta[s].req = *req;
+	c->cursor_measure.meta[s].plan = plan;
+	c->cursor_measure.meta[s].format = fmt;
+	c->cursor_measure.meta[s].pitch = pitch;
+	c->cursor_measure.meta[s].view_bytes = view_bytes;
+
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure: Metal compositor copying a %dx%d px patch per view (%u bytes) for the "
+		        "measured-disparity cursor (ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h, view_bytes);
+	}
+}
+
+void
+comp_metal_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_metal_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->mutex);
+	*out = c->cursor_measure.result;
+	os_mutex_unlock(&c->mutex);
+	return out->valid;
+}
+
+/*
+ * XR_DXR_depth_budget - thin wrappers over the shared runner, so oxr keeps
+ * calling one symbol per backend and knows nothing about comp_rear_budget.
+ */
+void
+comp_metal_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	comp_rear_budget_set_requested(&c->rear_budget, requested);
+	comp_rear_budget_arm(&c->rear_budget, c->transparent_background);
+}
+
+void
+comp_metal_compositor_set_content_bounds(
+    struct xrt_compositor *xc, float u0, float v0, float u1, float v1, uint64_t now_ns)
+{
+	if (xc == NULL) {
+		return;
+	}
+	comp_rear_budget_set_content_bounds(&metal_comp(xc)->rear_budget, u0, v0, u1, v1, now_ns);
+}
+
+void
+comp_metal_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns)
+{
+	if (xc == NULL) {
+		return;
+	}
+	comp_rear_budget_set_content_mask(&metal_comp(xc)->rear_budget, cells, w, h, stride, margin_normalized,
+	                                  now_ns);
+}
+
+bool
+comp_metal_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out)
+{
+	if (xc == NULL || out == NULL) {
+		return false;
+	}
+	return comp_rear_budget_get(&metal_comp(xc)->rear_budget, out);
+}
+
+
+/*
+ *
+ * XR_DXR_cursor_depth v5 - the runtime draws the cursor (ADR-046 Amendment 2 B)
+ *
+ * After the app's layers are composited into the atlas and before the display
+ * processor, one sprite per view: a textured, alpha-blended quad, depth test
+ * off, at the corners the state tracker's per-view map gives (projected with
+ * the projection layer's own submitted poses and fovs). Everything here is
+ * built on the first real request; a session that never asks pays one bool
+ * test per commit.
+ *
+ */
+
+// Its own tiny library, compiled on the first request only (not in
+// metal_shader_source, which every session compiles).
+static NSString *const metal_cursor_shader_source = @
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct CursorOut {\n"
+    "    float4 position [[position]];\n"
+    "    float2 uv;\n"
+    "};\n"
+    "// corners[k]: xy = tile-normalised position (origin top-left, y down),\n"
+    "// zw = texture uv. A 4-vertex triangle strip.\n"
+    "struct CursorConstants {\n"
+    "    float4 corners[4];\n"
+    "};\n"
+    "vertex CursorOut cursor_vertex(uint vid [[vertex_id]],\n"
+    "                               constant CursorConstants &cc [[buffer(0)]]) {\n"
+    "    float4 c = cc.corners[vid % 4];\n"
+    "    CursorOut out;\n"
+    "    out.position = float4(c.x * 2.0 - 1.0, 1.0 - c.y * 2.0, 0.0, 1.0);\n"
+    "    out.uv = c.zw;\n"
+    "    return out;\n"
+    "}\n"
+    "fragment float4 cursor_fragment(CursorOut in [[stage_in]],\n"
+    "                                texture2d<float> tex [[texture(0)]],\n"
+    "                                sampler smp [[sampler(0)]]) {\n"
+    "    return tex.sample(smp, in.uv);\n"
+    "}\n"
+    "// ADR-046 Amendment 2 B.7: the lifted cursor, softened against crosstalk.\n"
+    "// p.xy = blur radius in sprite uv, p.z = opacity, p.w = 1 for a STRAIGHT-\n"
+    "// alpha sprite. The quad is padded by the radius; a tap outside 0..1 is\n"
+    "// transparent. 13 taps: centre, 4 at r/2, 8 at r (Gaussian, sigma 0.6 r),\n"
+    "// accumulated premultiplied so a straight sprite's clear texels add no\n"
+    "// colour.\n"
+    "struct CursorSoften {\n"
+    "    float4 p;\n"
+    "};\n"
+    "static float4 cursor_tap(texture2d<float> tex, sampler smp, float2 uv, bool straight) {\n"
+    "    float4 s = tex.sample(smp, uv);\n"
+    "    if (straight) { s.rgb *= s.a; }\n"
+    "    return (uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0) ? s : float4(0.0);\n"
+    "}\n"
+    "fragment float4 cursor_fragment_soft(CursorOut in [[stage_in]],\n"
+    "                                     texture2d<float> tex [[texture(0)]],\n"
+    "                                     sampler smp [[sampler(0)]],\n"
+    "                                     constant CursorSoften &cs [[buffer(0)]]) {\n"
+    "    const bool straight = cs.p.w > 0.5;\n"
+    "    const float2 r = cs.p.xy;\n"
+    "    float4 acc = cursor_tap(tex, smp, in.uv, straight);\n"
+    "    float wsum = 1.0;\n"
+    "    if (r.x > 0.0 || r.y > 0.0) {\n"
+    "        const float wi = 0.7066;\n"
+    "        const float wo = 0.2494;\n"
+    "        const float2 inner[4] = {float2(0.5, 0.0), float2(-0.5, 0.0), float2(0.0, 0.5), float2(0.0, -0.5)};\n"
+    "        for (int k = 0; k < 4; k++) {\n"
+    "            acc += wi * cursor_tap(tex, smp, in.uv + inner[k] * r, straight);\n"
+    "        }\n"
+    "        for (int k = 0; k < 8; k++) {\n"
+    "            const float a = 0.3927 + 0.7854 * float(k);\n"
+    "            acc += wo * cursor_tap(tex, smp, in.uv + float2(cos(a), sin(a)) * r, straight);\n"
+    "        }\n"
+    "        wsum += 4.0 * wi + 8.0 * wo;\n"
+    "    }\n"
+    "    acc /= wsum;\n"
+    "    if (straight) {\n"
+    "        const float3 rgb = acc.a > 1e-5 ? acc.rgb / acc.a : float3(0.0);\n"
+    "        return float4(rgb, acc.a * cs.p.z);\n"
+    "    }\n"
+    "    return acc * cs.p.z;\n"
+    "}\n";
+
+//! Straight vs premultiplied blending, into the UNORM atlas or its _sRGB view.
+static bool
+metal_cursor_ensure_pipelines(struct comp_metal_compositor *c)
+{
+	if (c->cursor_draw.pipe[0][0] != nil && c->cursor_draw.pipe_soft[0][0] != nil) {
+		return true;
+	}
+	if (c->cursor_draw.pipes_failed) {
+		return false;
+	}
+	c->cursor_draw.pipes_failed = true; // cleared on success; never retried per frame
+
+	NSError *error = nil;
+	id<MTLLibrary> lib = [c->device newLibraryWithSource:metal_cursor_shader_source options:nil error:&error];
+	if (lib == nil) {
+		U_LOG_E("cursor_draw: shader compile failed: %s",
+		        error != nil ? error.localizedDescription.UTF8String : "?");
+		return false;
+	}
+	id<MTLFunction> vs = [lib newFunctionWithName:@"cursor_vertex"];
+	id<MTLFunction> fs = [lib newFunctionWithName:@"cursor_fragment"];
+	id<MTLFunction> fs_soft = [lib newFunctionWithName:@"cursor_fragment_soft"];
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = vs;
+	desc.fragmentFunction = fs;
+	desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+	desc.colorAttachments[0].blendingEnabled = YES;
+	desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+	desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	bool ok = vs != nil && fs != nil && fs_soft != nil;
+	for (uint32_t soft = 0; ok && soft < 2; soft++) {
+		desc.fragmentFunction = soft ? fs_soft : fs;
+		for (uint32_t premul = 0; ok && premul < 2; premul++) {
+			desc.colorAttachments[0].sourceRGBBlendFactor =
+			    premul ? MTLBlendFactorOne : MTLBlendFactorSourceAlpha;
+			for (uint32_t srgb = 0; ok && srgb < 2; srgb++) {
+				desc.colorAttachments[0].pixelFormat =
+				    srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+				id<MTLRenderPipelineState> *slot =
+				    soft ? &c->cursor_draw.pipe_soft[premul][srgb] : &c->cursor_draw.pipe[premul][srgb];
+				[*slot release];
+				*slot = [c->device newRenderPipelineStateWithDescriptor:desc error:&error];
+				if (*slot == nil) {
+					U_LOG_E("cursor_draw: pipeline creation failed: %s",
+					        error != nil ? error.localizedDescription.UTF8String : "?");
+					ok = false;
+				}
+			}
+		}
+	}
+	[desc release];
+	[fs_soft release];
+	[fs release];
+	[vs release];
+	[lib release];
+	if (ok) {
+		c->cursor_draw.pipes_failed = false;
+	}
+	return ok;
+}
+
+//! Upload premultiplied, sRGB-encoded RGBA8 as the default-look sprite.
+static bool
+metal_cursor_set_default_tex(struct comp_metal_compositor *c, const uint8_t *rgba, uint32_t w, uint32_t h)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB
+	                                                                              width:w
+	                                                                             height:h
+	                                                                          mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> tex = [c->device newTextureWithDescriptor:td];
+	if (tex == nil) {
+		return false;
+	}
+	[tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:rgba bytesPerRow:(NSUInteger)w * 4];
+	[c->cursor_draw.default_tex release];
+	c->cursor_draw.default_tex = tex;
+	return true;
+}
+
+/*!
+ * The default look (Amendment 2 A.6), shared with the Vulkan and GL
+ * compositors (comp_cursor_look): the mirrored OS cursor when the commit runs
+ * on the main thread, else the last snapshot, else the classic arrow. The
+ * texture is re-uploaded only when the look's image changes.
+ */
+static bool
+metal_cursor_update_default(struct comp_metal_compositor *c, float backing_scale)
+{
+	if (!comp_cursor_look_update(&c->cursor_draw.look, backing_scale)) {
+		return c->cursor_draw.default_tex != nil;
+	}
+	if (c->cursor_draw.default_tex == nil || c->cursor_draw.default_gen != c->cursor_draw.look.generation) {
+		if (!metal_cursor_set_default_tex(c, c->cursor_draw.look.rgba, c->cursor_draw.look.w,
+		                                  c->cursor_draw.look.h)) {
+			return c->cursor_draw.default_tex != nil;
+		}
+		c->cursor_draw.default_gen = c->cursor_draw.look.generation;
+	}
+	return true;
+}
+
+/*!
+ * Draw the requested cursor into every tile of the open atlas encoder.
+ */
+static void
+metal_cursor_draw(struct comp_metal_compositor *c,
+                  id<MTLRenderCommandEncoder> encoder,
+                  const struct u_cursor_draw_request *req,
+                  uint32_t atlas_cols,
+                  uint32_t atlas_rows,
+                  uint32_t atlas_view_w,
+                  uint32_t atlas_view_h,
+                  bool compose_linear,
+                  uint32_t canvas_px_w,
+                  uint32_t canvas_px_h,
+                  uint32_t zones_target_w,
+                  uint32_t zones_target_h,
+                  bool routed)
+{
+	// Multi-screen M3: a routed frame's tiles are per-segment mosaics, and its
+	// request carries the view set of the segment under the pointer. A frame
+	// and a request that disagree about that draw nothing.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
+	if (req->segment_valid != routed) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+		if (!c->cursor_draw.warned_routed) {
+			c->cursor_draw.warned_routed = true;
+			U_LOG_W("cursor_draw: %s - cursor not drawn (one-time warning)",
+			        routed ? "multi-screen routed frame without a segment request"
+			               : "segment request on a frame that is not routed");
+		}
+		return;
+	}
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed, and clip to the zone.
+	// A segment request's are segment-normalised - re-express them at the
+	// segment's rect of the tile, exactly where its layer views are placed
+	// (comp_segments_tile_rect, as metal_route_layer), and clip to it.
+	struct u_cursor_draw_request zreq = *req;
+	float clip[4];
+	if (req->segment_valid) {
+		const struct comp_seg_rect seg = {
+		    req->segment_rect.offset.w,
+		    req->segment_rect.offset.h,
+		    (uint32_t)(req->segment_rect.extent.w > 0 ? req->segment_rect.extent.w : 0),
+		    (uint32_t)(req->segment_rect.extent.h > 0 ? req->segment_rect.extent.h : 0),
+		};
+		const struct comp_seg_rect canvas = {
+		    req->segment_canvas.offset.w,
+		    req->segment_canvas.offset.h,
+		    (uint32_t)(req->segment_canvas.extent.w > 0 ? req->segment_canvas.extent.w : 0),
+		    (uint32_t)(req->segment_canvas.extent.h > 0 ? req->segment_canvas.extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (atlas_view_w == 0 || atlas_view_h == 0 ||
+		    !comp_segments_tile_rect(&seg, &canvas, atlas_view_w, atlas_view_h, &tr) ||
+		    !u_cursor_draw_into_subrect(&zreq, (float)tr.x / (float)atlas_view_w,
+		                                (float)tr.y / (float)atlas_view_h, (float)tr.w / (float)atlas_view_w,
+		                                (float)tr.h / (float)atlas_view_h, clip)) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+			return;
+		}
+	} else if (!u_cursor_draw_into_zone(&zreq, zones_target_w, zones_target_h, clip)) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
+		return;
+	}
+	req = &zreq;
+	// The panel px that 0..1 of the (now tile-normalised) views span: the
+	// window for a zone request, the segment for a segment request, else the
+	// canvas (ADR-046 B.7 ghost offset).
+	const float tile_px_w = (float)(req->zone_valid      ? zones_target_w
+	                                : req->segment_valid ? (uint32_t)req->segment_rect.extent.w
+	                                                     : canvas_px_w);
+	const float tile_px_h = (float)(req->zone_valid      ? zones_target_h
+	                                : req->segment_valid ? (uint32_t)req->segment_rect.extent.h
+	                                                     : canvas_px_h);
+	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
+
+	if (!metal_cursor_ensure_pipelines(c)) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_PIPELINE);
+		return;
+	}
+	// Panel pixel pitch (metres per backing pixel) and the OS point.
+	if (c->sys_info == NULL || c->sys_info->display_pixel_height == 0 || !(c->sys_info->display_height_m > 0.0f) ||
+	    canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
+		return;
+	}
+	const float m_per_px = c->sys_info->display_height_m / (float)c->sys_info->display_pixel_height;
+	float backing_scale = 1.0f;
+	if (c->metal_layer != nil && c->metal_layer.contentsScale > 0.0) {
+		backing_scale = (float)c->metal_layer.contentsScale;
+	}
+	const float m_per_pt = m_per_px * backing_scale;
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	id<MTLTexture> src = nil;
+	float aspect, hot_u, hot_v, size_m;
+	bool premul;
+	bool flip_v = false;
+	if (req->image != NULL) {
+		struct comp_metal_swapchain *msc = metal_swapchain(req->image);
+		if (req->image_index >= msc->image_count || msc->images[req->image_index] == nil ||
+		    msc->info.height == 0) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+			return;
+		}
+		// Sampled as declared on the _sRGB path, non-decoding on the
+		// passthrough path - the same rule as every other layer source.
+		src = metal_layer_source_view(msc->images[req->image_index], 0, compose_linear);
+		aspect = (float)msc->info.width / (float)msc->info.height;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * m_per_pt;
+		premul = false; // spec: the app's sprite is STRAIGHT alpha
+		flip_v = c->source_is_gl;
+	} else {
+		if (!metal_cursor_update_default(c, backing_scale)) {
+			u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+			return;
+		}
+		src = metal_layer_source_view(c->cursor_draw.default_tex, 0, compose_linear);
+		aspect = c->cursor_draw.look.aspect;
+		hot_u = c->cursor_draw.look.hot_u;
+		hot_v = c->cursor_draw.look.hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : c->cursor_draw.look.height_pt * m_per_pt;
+		premul = true; // CGBitmapContext output
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units
+	if (src == nil) {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+		return;
+	}
+
+	// ADR-046 B.7: soften with lift against crosstalk - blur and opacity
+	// both exactly off on the glass (ghost 0, d 0), so an on-glass frame
+	// takes the crisp pipeline, bit-identical to the unsoftened draw.
+	// The blur cap follows the DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	const bool soft = soften.blur_px > 0.0f || soften.alpha < 1.0f;
+	if (soft) {
+		[encoder setRenderPipelineState:c->cursor_draw.pipe_soft[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	} else {
+		[encoder setRenderPipelineState:c->cursor_draw.pipe[premul ? 1 : 0][compose_linear ? 1 : 0]];
+	}
+	[encoder setDepthStencilState:c->depth_stencil_state_disabled];
+	[encoder setFragmentTexture:src atIndex:0];
+	[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
+
+	const uint32_t tiles = atlas_cols * atlas_rows;
+	const uint32_t n = req->view_count < tiles ? req->view_count : tiles;
+	if (!c->cursor_draw.announced && !req->report_only) {
+		c->cursor_draw.announced = true;
+		// The views actually drawn (= atlas tiles in use), not the locate's
+		// view count: a 2-view app on a 4-view-capable display draws 2.
+		U_LOG_W("cursor_draw: Metal compositor drawing the cursor (%s, %.1f mm tall, %u view(s); ADR-046 "
+		        "Amendment 2 B, one-time notice)",
+		        req->image != NULL ? "app sprite" : "default look", size_m * 1000.0f, n);
+	}
+	const uint32_t att_w = (uint32_t)c->atlas_texture.width;
+	const uint32_t att_h = (uint32_t)c->atlas_texture.height;
+	uint32_t drawn = 0;
+	for (uint32_t i = 0; i < n; i++) {
+		const uint32_t ox = (i % atlas_cols) * atlas_view_w;
+		const uint32_t oy = (i / atlas_cols) * atlas_view_h;
+		if (ox >= att_w || oy >= att_h) {
+			continue;
+		}
+		MTLViewport vp = {(double)ox, (double)oy, (double)atlas_view_w, (double)atlas_view_h, 0.0, 1.0};
+		[encoder setViewport:vp];
+		// The scissor is mandatory: a cursor at a tile edge must not spill
+		// into the neighbour view (the DP would weave it into the wrong eye),
+		// nor - in a zones frame - out of its zone (#1949).
+		const uint32_t tw = (ox + atlas_view_w > att_w) ? (att_w - ox) : atlas_view_w;
+		const uint32_t th = (oy + atlas_view_h > att_h) ? (att_h - oy) : atlas_view_h;
+		const uint32_t cx0 = (uint32_t)lroundf(clip[0] * (float)atlas_view_w);
+		const uint32_t cy0 = (uint32_t)lroundf(clip[1] * (float)atlas_view_h);
+		uint32_t cx1 = (uint32_t)lroundf((clip[0] + clip[2]) * (float)atlas_view_w);
+		uint32_t cy1 = (uint32_t)lroundf((clip[1] + clip[3]) * (float)atlas_view_h);
+		cx1 = cx1 < tw ? cx1 : tw;
+		cy1 = cy1 < th ? cy1 : th;
+		if (cx1 <= cx0 || cy1 <= cy0) {
+			continue;
+		}
+		drawn++;
+		if (req->report_only) {
+			continue; // #1952: the app shows its OS cursor this frame
+		}
+		MTLScissorRect sr = {ox + cx0, oy + cy0, cx1 - cx0, cy1 - cy0};
+		[encoder setScissorRect:sr];
+
+		float xy[4][2];
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, xy);
+		// Padded by the blur radius (a no-op at radius 0), hotspot unmoved.
+		struct u_cursor_soften_quad sq;
+		u_cursor_draw_soften_quad(xy, tile_px_w, tile_px_h, soft ? soften.blur_px : 0.0f, &sq);
+		struct
+		{
+			float corners[4][4];
+		} cc;
+		for (int k = 0; k < 4; k++) {
+			cc.corners[k][0] = sq.corners[k][0];
+			cc.corners[k][1] = sq.corners[k][1];
+			cc.corners[k][2] = sq.uv[k][0];
+			cc.corners[k][3] = flip_v ? 1.0f - sq.uv[k][1] : sq.uv[k][1];
+		}
+		[encoder setVertexBytes:&cc length:sizeof(cc) atIndex:0];
+		if (soft) {
+			const float p[4] = {sq.radius_uv[0], sq.radius_uv[1], soften.alpha, premul ? 0.0f : 1.0f};
+			[encoder setFragmentBytes:p length:sizeof(p) atIndex:0];
+		}
+		[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	}
+	[src release];
+	if (drawn > 0) {
+		u_cursor_draw_report_drew(req);
+	} else {
+		u_cursor_draw_report_refused(req, U_CURSOR_DRAW_REFUSAL_NO_TILES);
+	}
+
+	// Hand the encoder back with a full-attachment scissor.
+	MTLScissorRect full = {0, 0, att_w, att_h};
+	[encoder setScissorRect:full];
+}
+
+void
+comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	c->cursor_draw.req = *req;
 }
 
 static xrt_result_t
@@ -3154,15 +5065,77 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	// lands) or end of frame (POST_COMPOSE).
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
 
+	// XR_DXR_cursor_depth v2 (ADR-046 3a). ZERO COST UNLESS REQUESTED: two
+	// field tests, both false for every session that never chained
+	// XrCursorDepthSourceDXR - no copy, no buffer, no command buffer. The
+	// request covers this commit only and is consumed here.
+	if (c->cursor_depth.req.requested || c->cursor_depth.in_flight > 0) {
+		metal_cursor_depth_harvest(c);
+		if (u_cursor_depth_patch_should_sample(&c->cursor_depth.req)) {
+			metal_cursor_depth_sample(c, &c->cursor_depth.req);
+		}
+		c->cursor_depth.req.requested = false;
+	}
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source - no copy, no buffer, no command
+	// buffer. The copy is encoded here, before this commit's own work, on the
+	// app's queue: after the app's rendering into the views, and before the
+	// compositor draws anything (the cursor sprite never reaches the copy).
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		metal_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			metal_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
+	}
+
+	// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	// REQUESTED: one field test, false for every session that never chained
+	// XrCursorDepthDrawInfoDXR. The request covers this commit only.
+	struct u_cursor_draw_request cursor_req;
+	bool cursor_pending = false;
+	if (c->cursor_draw.req.requested) {
+		cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		// #1952: a refusal is reported (the request's report starts out as
+		// "never reached the cursor pass", so an early-out frame refused too).
+		if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
+			cursor_pending = true;
+		}
+	}
+
 	// Frame timing for HUD
 	uint64_t now_ns = os_monotonic_get_ns();
 	float dt = (c->last_frame_ns > 0) ? (float)(now_ns - c->last_frame_ns) / 1e9f : 0.016f;
 	c->last_frame_ns = now_ns;
 
+	// Runtime-owned placement (ADR-050): decide where this present goes and,
+	// on the main thread, open the CA transaction and apply the pending move
+	// / resize BEFORE the drawable is taken, so the frame is woven for the
+	// window's new origin and size and lands with it.
+	c->placement_frame_valid = false;
+	if (c->placement != NULL && c->shared_texture == nil && c->metal_layer != nil) {
+		c->placement_frame_valid =
+		    comp_metal_placement_begin_present(c->placement, (__bridge void *)c->metal_layer, &c->placement_frame);
+	}
+
 	// Update CAMetalLayer drawable size on window resize
 	if (c->metal_layer != nil && c->view != nil) {
+		// contentsScale == backingScaleFactor, re-checked every frame (a
+		// screen / backing change, or an app resetting its own layer).
+		metal_sync_layer_scale(c, c->view, "frame");
 		NSRect backing = [c->view convertRectToBacking:c->view.bounds];
 		CGSize newSize = CGSizeMake(backing.size.width, backing.size.height);
+		if (c->placement_frame_valid) {
+			// The placement's content rect is the authority (the view itself
+			// is resized only on the main thread, possibly after this).
+			newSize = CGSizeMake(round(c->placement_frame.content_w * c->placement_frame.scale),
+			                     round(c->placement_frame.content_h * c->placement_frame.scale));
+		}
 		if (c->metal_layer.drawableSize.width != newSize.width ||
 		    c->metal_layer.drawableSize.height != newSize.height) {
 			c->metal_layer.drawableSize = newSize;
@@ -3188,6 +5161,11 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				        c->metal_layer.drawableSize.width, c->metal_layer.drawableSize.height,
 				        (void *)c->view.window, c->view.window != nil ? (int)[c->view.window isVisible] : -1);
 			}
+			if (c->placement_frame_valid) {
+				// Close the transaction (the move, if any, still lands).
+				comp_metal_placement_end_present(c->placement, NULL, NULL, &c->placement_frame);
+				c->placement_frame_valid = false;
+			}
 			return XRT_SUCCESS; // Non-fatal, skip this frame
 		}
 		static int s_first_drawable_logged = 0;
@@ -3202,6 +5180,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	id<MTLCommandBuffer> cmd_buf = [c->command_queue commandBuffer];
 	if (cmd_buf == nil) {
 		U_LOG_E("Failed to create command buffer");
+		if (c->placement_frame_valid) {
+			comp_metal_placement_end_present(c->placement, NULL, NULL, &c->placement_frame);
+			c->placement_frame_valid = false;
+		}
 		return XRT_SUCCESS;
 	}
 
@@ -3318,11 +5300,82 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// HUD is rendered after weave, before present (see below)
 
+	// Multi-screen M3: the routing the app's last xrLocateViews handed out
+	// (per-segment view sets). Only a whole-window drawable frame is ever
+	// segmented, so only such a frame is routed; a routed frame is a mosaic
+	// the compositor must paint, so it never zero-copies.
+	struct xrt_segment_view_routing seg_route_in;
+	memset(&seg_route_in, 0, sizeof(seg_route_in));
+	if (c->seg_screens != NULL && c->shared_texture == nil && !eff_canvas.valid && !mask_active) {
+		os_mutex_lock(&c->seg_pub_mutex);
+		seg_route_in = c->seg_route;
+		os_mutex_unlock(&c->seg_pub_mutex);
+		if (seg_route_in.count > XRT_MAX_SEGMENTS) {
+			seg_route_in.count = 0;
+		}
+	}
+
+	/*
+	 * ADR-044 / #1589 / #1610 — does this frame owe an encode or a blend?
+	 *
+	 * The swapchain FORMAT says what its bytes mean: `_SRGB` holds encoded
+	 * colour, UNORM / float hold linear values. A frame whose tile is
+	 * painted by exactly one full-tile projection layer out of `_SRGB`
+	 * swapchains owes neither, and takes the passthrough path verbatim (the
+	 * atlas is byte-identical to the pre-#1589 runtime). Every other frame
+	 * renders through the atlas's `_sRGB` view: sources sampled as declared,
+	 * blended in linear light, encoded once on write. The decision is the
+	 * SHARED predicate's; this scan only gathers its inputs.
+	 *
+	 * Local2D layers do not count: they never paint the atlas (they flatten
+	 * post-weave, honestly on their own — metal_local2d_honest()).
+	 */
+	const bool color_legacy = u_color_legacy_unorm_encoded();
+	uint32_t color_layers = 0;
+	bool color_base_is_projection = false;
+	bool color_all_srgb = true;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		const enum xrt_layer_type t = l->data.type;
+		const bool is_proj = t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH;
+		const bool per_view = is_proj || t == XRT_LAYER_ZONE_3D;
+		if (!per_view && t != XRT_LAYER_QUAD && t != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+		color_layers++;
+		color_base_is_projection = is_proj;
+		const uint32_t n = per_view ? l->data.view_count : 1;
+		for (uint32_t v = 0; v < n && v < XRT_MAX_VIEWS; v++) {
+			struct xrt_swapchain *sc = l->sc_array[v];
+			if (sc == NULL) {
+				continue;
+			}
+			struct comp_metal_swapchain *msc = metal_swapchain(sc);
+			if (msc->image_count == 0 || msc->images[0] == nil ||
+			    !metal_format_is_srgb(msc->images[0].pixelFormat)) {
+				color_all_srgb = false;
+			}
+		}
+	}
+	const bool color_fast =
+	    u_color_compose_fast_path(color_legacy, color_layers, color_base_is_projection, color_all_srgb);
+	// A missing view / twin pipeline (allocation failure) degrades to the
+	// passthrough path rather than drawing through a mismatched pipeline.
+	const bool compose_linear = !color_fast && c->atlas_srgb_view != nil && metal_srgb_pipes_ready(c);
+	if (compose_linear && !c->compose_target_logged) {
+		c->compose_target_logged = true;
+		U_LOG_W("Color (#1610) [metal]: compose target engaged — BGRA8Unorm_sRGB view of the BGRA8Unorm "
+		        "atlas (%u layer(s), all sources _SRGB: %s); the atlas stays ENCODED",
+		        color_layers, color_all_srgb ? "yes" : "no");
+	}
+
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
 	id<MTLTexture> zc_texture = nil;
 
-	if (c->layer_accum.layer_count == 1) {
+	// A frame carrying a runtime-drawn cursor composes into the atlas: the
+	// cursor is drawn there, never into the app's own image.
+	if (c->layer_accum.layer_count == 1 && seg_route_in.count == 0 && !cursor_pending) {
 		struct comp_layer *layer = &c->layer_accum.layers[0];
 		if (layer->data.type == XRT_LAYER_PROJECTION ||
 		    layer->data.type == XRT_LAYER_PROJECTION_DEPTH) {
@@ -3377,8 +5430,33 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 						if (u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs,
 						                           msc->info.width, msc->info.height, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zero_copy = true;
-							zc_texture = msc->images[img_idx];
+							/*
+							 * #1589: zero-copy hands the DP bytes it is
+							 * told are ENCODED, and owns no pass in which
+							 * to encode. Only an `_SRGB` swapchain's bytes
+							 * are — a UNORM / float one holds LINEAR values
+							 * (ADR-021 §6), so it takes the atlas path,
+							 * where the compose target does the encode. A
+							 * colour precondition on
+							 * u_tiling_can_zero_copy()'s RESULT, never a
+							 * second tiling rule (ADR-030).
+							 */
+							const bool color_needs_encode =
+							    !metal_format_is_srgb(msc->images[img_idx].pixelFormat) &&
+							    !color_legacy;
+							if (color_needs_encode) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W("[ZC] refused: reason=color_needs_encode — a "
+									        "UNORM/float swapchain is scene-linear and "
+									        "owes the sRGB encode, which only the compose "
+									        "path can apply (#1589)");
+								}
+							} else {
+								zero_copy = true;
+								zc_texture = msc->images[img_idx];
+							}
 						}
 					}
 				}
@@ -3398,10 +5476,14 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	uint32_t atlas_cols = c->tile_columns;
 	uint32_t atlas_rows = c->tile_rows;
 
-	// Step 1: Render layers into atlas texture (skip if zero-copy)
+	// Step 1: Render layers into atlas texture (skip if zero-copy).
+	// ADR-044: a frame that owes an encode or a blend renders through the
+	// atlas's `_sRGB` view (encode on write, linear blending); the fast
+	// path writes the UNORM atlas directly, as before.
+	id<MTLTexture> atlas_target = compose_linear ? c->atlas_srgb_view : c->atlas_texture;
 	if (!zero_copy && c->atlas_texture != nil && c->layer_accum.layer_count > 0) {
 		MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-		pass.colorAttachments[0].texture = c->atlas_texture;
+		pass.colorAttachments[0].texture = atlas_target;
 		pass.colorAttachments[0].loadAction = MTLLoadActionClear;
 		pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 		// Clear to (0,0,0,0) when the app requested transparent background so
@@ -3412,9 +5494,10 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// zone layers into the window-spanning atlas — the unzoned area
 		// must weave to nothing (transparent) so the MODE_ZONES composite
 		// (and any #803 feather ramp) blends toward the desktop.
-		pass.colorAttachments[0].clearColor = (c->transparent_background || zones_frame)
-		    ? MTLClearColorMake(0.0, 0.0, 0.0, 0.0)
-		    : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+		// Display-referred, decoded on the CPU when the target encodes.
+		pass.colorAttachments[0].clearColor =
+		    metal_display_referred_clear(0.0, 0.0, 0.0, (c->transparent_background || zones_frame) ? 0.0 : 1.0,
+		                                 compose_linear);
 		pass.depthAttachment.texture = c->depth_texture;
 		pass.depthAttachment.loadAction = MTLLoadActionClear;
 		pass.depthAttachment.storeAction = MTLStoreActionDontCare;
@@ -3524,7 +5607,50 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					atlas_view_h = c->view_height;
 				}
 			}
-			for (uint32_t eye = 0; eye < view_count; eye++) {
+
+			// Multi-screen M3: per-segment views. Each segment's local view
+			// j lands in tile j at that segment's rect inside the tile (the
+			// mosaic), so cropping a segment out of every tile yields its
+			// own views. Any inconsistency drops the routing for the frame.
+			struct metal_seg_route routes[XRT_MAX_SEGMENTS];
+			uint32_t route_count = 0;
+			if (!is_zone && seg_route_in.count > 0 && view_count > 1) {
+				route_count = metal_route_layer(c, &seg_route_in, layer->data.view_count,
+				                                atlas_cols * atlas_rows, atlas_view_w, atlas_view_h, routes);
+			}
+			bool route_mode_set[XRT_MAX_VIEWS] = {false};
+			enum comp_layer_blend_mode route_mode[XRT_MAX_VIEWS];
+			uint32_t draw_count = view_count;
+			if (route_count > 0) {
+				draw_count = 0;
+				for (uint32_t k = 0; k < route_count; k++) {
+					draw_count += routes[k].view_count;
+				}
+			}
+			for (uint32_t draw = 0; draw < draw_count; draw++) {
+				// Unrouted: draw = eye = tile. Routed: walk segment k's
+				// views; `eye` is the layer view, `tile_i` its tile.
+				uint32_t eye = draw;
+				uint32_t tile_i = draw;
+				const struct metal_seg_route *rt = NULL;
+				if (route_count > 0) {
+					uint32_t d = draw;
+					for (uint32_t k = 0; k < route_count; k++) {
+						if (d < routes[k].view_count) {
+							rt = &routes[k];
+							break;
+						}
+						d -= routes[k].view_count;
+					}
+					if (rt == NULL) {
+						continue;
+					}
+					tile_i = d;
+					eye = rt->first_view + d;
+				}
+				if (eye >= XRT_MAX_VIEWS) {
+					continue;
+				}
 				// How this draw composites (#1621), resolved BEFORE the
 				// draw can bail out so "which layer is the tile's base"
 				// is a pure function of the layer LIST, not of a
@@ -3535,15 +5661,24 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// it marks the tile (a projection layer after it blends
 				// over it) but bypasses the first-layer gate.
 				enum comp_layer_blend_mode mode;
-				if (eye < XRT_MAX_VIEWS && is_zone) {
-					comp_layer_tile_mark_composited(&tiles[eye]);
+				if (tile_i < XRT_MAX_VIEWS && is_zone) {
+					comp_layer_tile_mark_composited(&tiles[tile_i]);
 					mode = (layer->data.flags &
 					        XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0
 					           ? COMP_LAYER_BLEND_STRAIGHT
 					           : COMP_LAYER_BLEND_PREMULTIPLIED;
+				} else if (rt != NULL && tile_i < XRT_MAX_VIEWS) {
+					// The segments are disjoint: each is the layer's first
+					// write into its part of the tile, so the blend mode is
+					// decided once per tile and shared by its segments.
+					if (!route_mode_set[tile_i]) {
+						route_mode_set[tile_i] = true;
+						route_mode[tile_i] = comp_layer_tile_blend_mode(&tiles[tile_i], layer->data.flags);
+					}
+					mode = route_mode[tile_i];
 				} else {
 					mode = comp_layer_tile_blend_mode(
-					    eye < XRT_MAX_VIEWS ? &tiles[eye] : NULL, layer->data.flags);
+					    tile_i < XRT_MAX_VIEWS ? &tiles[tile_i] : NULL, layer->data.flags);
 				}
 
 				struct xrt_swapchain *sc = layer->sc_array[eye];
@@ -3557,37 +5692,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					continue;
 				}
 
-				id<MTLTexture> src_tex = msc->images[img_idx];
-				if (src_tex == nil) {
+				if (msc->images[img_idx] == nil) {
 					continue;
-				}
-				// Select the array slice (imageArrayIndex) AND apply sRGB->UNORM
-				// passthrough in one view. Under single-pass-instanced the app
-				// submits an arraySize>1 texture with per-view slice 0/1; a plain
-				// 2D bind samples slice 0 for both eyes (flat output). A 2D view
-				// pinned to the slice binds correctly to the texture2d<float>
-				// shader — the Metal analog of the D3D12 #656 fix (mirrors
-				// D3D11/GL/VK). The sRGB->UNORM sample avoids the GPU
-				// auto-decoding sRGB->linear; the DP wants display-referred bytes
-				// (no-op for UNORM).
-				{
-					MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-					if (src_tex.textureType == MTLTextureType2DArray) {
-						uint32_t array_index = layer->data.proj.v[eye].sub.array_index;
-						id<MTLTexture> v = [src_tex
-						    newTextureViewWithPixelFormat:view_fmt
-						                      textureType:MTLTextureType2D
-						                           levels:NSMakeRange(0, src_tex.mipmapLevelCount)
-						                           slices:NSMakeRange(array_index, 1)];
-						if (v != nil) {
-							src_tex = v;
-						}
-					} else if (view_fmt != src_tex.pixelFormat) {
-						id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:view_fmt];
-						if (v != nil) {
-							src_tex = v;
-						}
-					}
 				}
 
 				// Use sub-image norm_rect to sample correct region of source texture
@@ -3605,12 +5711,19 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// per its own mode_3d from request_display_mode.
 				MTLViewport vp;
 				{
-					uint32_t tile_x = eye % atlas_cols;
-					uint32_t tile_y = eye / atlas_cols;
+					uint32_t tile_x = tile_i % atlas_cols;
+					uint32_t tile_y = tile_i / atlas_cols;
 					vp.originX = tile_x * atlas_view_w;
 					vp.originY = tile_y * atlas_view_h;
 					vp.width = atlas_view_w;
 					vp.height = atlas_view_h;
+					if (rt != NULL) {
+						// M3 mosaic: the segment's rect inside the tile.
+						vp.originX += rt->x;
+						vp.originY += rt->y;
+						vp.width = rt->w;
+						vp.height = rt->h;
+					}
 				}
 				if (is_zone) {
 					// XR_DXR_display_zones: scale the zone rect
@@ -3645,9 +5758,15 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				// the shared mode resolved above; depth stays disabled
 				// for zone draws — a later overlapping zone must neither
 				// be depth-rejected nor overwrite (D3D11 parity).
-				[encoder setRenderPipelineState:metal_proj_pipeline_for(c, mode)];
+				[encoder setRenderPipelineState:metal_proj_pipeline_for(c, mode, compose_linear)];
 				[encoder setDepthStencilState:(is_zone ? c->depth_stencil_state_disabled
 				                                       : c->depth_stencil_state)];
+				// The slice (imageArrayIndex — single-pass-instanced submits
+				// one array texture, slices 0/1) and the colour space in one
+				// view: as declared into the `_sRGB` target, non-decoding on
+				// the passthrough path (metal_layer_source_view).
+				id<MTLTexture> src_tex = metal_layer_source_view(
+				    msc->images[img_idx], layer->data.proj.v[eye].sub.array_index, compose_linear);
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
 
@@ -3702,6 +5821,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 				// Draw fullscreen triangle
 				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+				[src_tex release];
 			}
 		}
 
@@ -3722,7 +5842,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			cmd_buf = [c->command_queue commandBuffer];
 
 			MTLRenderPassDescriptor *ws_pass = [MTLRenderPassDescriptor renderPassDescriptor];
-			ws_pass.colorAttachments[0].texture = c->atlas_texture;
+			ws_pass.colorAttachments[0].texture = atlas_target;
 			ws_pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
 			ws_pass.colorAttachments[0].storeAction = MTLStoreActionStore;
 			ws_pass.depthAttachment.texture = c->depth_texture;
@@ -3848,39 +5968,16 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					if (img_idx >= qmsc->image_count) {
 						continue;
 					}
-					id<MTLTexture> src_tex = qmsc->images[img_idx];
-					if (src_tex == nil) {
+					if (qmsc->images[img_idx] == nil) {
 						continue;
 					}
-
-					// Sample through a UNORM view so the GPU does NOT decode
-					// sRGB. The atlas is UNORM holding sRGB-ENCODED bytes, and
-					// zones/Local2D already blend in that encoded space; a
-					// quad that linearized here would blend against encoded
-					// neighbours and come out wrong. Array slice handled the
-					// same way as the projection pass.
-					{
-						MTLPixelFormat view_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-						if (src_tex.textureType == MTLTextureType2DArray) {
-							uint32_t ai = q->sub.array_index;
-							id<MTLTexture> v = [src_tex
-							    newTextureViewWithPixelFormat:view_fmt
-							                      textureType:MTLTextureType2D
-							                           levels:NSMakeRange(
-							                                      0,
-							                                      src_tex.mipmapLevelCount)
-							                           slices:NSMakeRange(ai, 1)];
-							if (v != nil) {
-								src_tex = v;
-							}
-						} else if (view_fmt != src_tex.pixelFormat) {
-							id<MTLTexture> v =
-							    [src_tex newTextureViewWithPixelFormat:view_fmt];
-							if (v != nil) {
-								src_tex = v;
-							}
-						}
-					}
+					// A quad always shares a frame with other layers, so it
+					// is never on the fast path: sampled as declared and
+					// blended in linear light into the `_sRGB` target (the
+					// legacy hatch keeps the old non-decoding read). Array
+					// slice handled the same way as the projection pass.
+					id<MTLTexture> src_tex =
+					    metal_layer_source_view(qmsc->images[img_idx], q->sub.array_index, compose_linear);
 
 					// MVP exactly as the D3D11 renderer's render_quad_layer:
 					// model = pose * scale(size.x, size.y, 1), view from the
@@ -3955,7 +6052,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					const enum comp_layer_blend_mode mode = comp_layer_blend_mode(data->flags);
 					comp_layer_blend_fold_opaque_cover(mode, qc.color_scale, qc.color_bias);
 
-					[encoder setRenderPipelineState:metal_quad_pipeline_for(c, mode)];
+					[encoder setRenderPipelineState:metal_quad_pipeline_for(c, mode, compose_linear)];
 					[encoder setDepthStencilState:c->depth_stencil_state_disabled];
 					[encoder setFragmentTexture:src_tex atIndex:0];
 					[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
@@ -3964,6 +6061,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 					[encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip
 					            vertexStart:0
 					            vertexCount:4];
+					[src_tex release];
 				}
 			}
 
@@ -4003,20 +6101,32 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 			if (img_idx >= msc->image_count) {
 				continue;
 			}
-			id<MTLTexture> src_tex = msc->images[img_idx];
-			if (src_tex == nil) {
+			if (msc->images[img_idx] == nil) {
 				continue;
 			}
-			// sRGB passthrough (see projection pass): sample through a UNORM view.
-			{
-				MTLPixelFormat unorm_fmt = metal_srgb_to_unorm(src_tex.pixelFormat);
-				if (unorm_fmt != src_tex.pixelFormat) {
-					id<MTLTexture> v = [src_tex newTextureViewWithPixelFormat:unorm_fmt];
-					if (v != nil) {
-						src_tex = v;
-					}
-				}
-			}
+			// Like a quad, a window-space layer is never on the fast path:
+			// sampled as its DECLARED format and blended in linear light into
+			// the `_sRGB` target (ADR-044 §7: the vk_native #1795 behaviour).
+			// An `_SRGB` HUD of encoded bytes reads back its bytes; a UNORM
+			// one is linear and is encoded once.
+			id<MTLTexture> src_tex = metal_layer_source_view(msc->images[img_idx], ws->sub.array_index, compose_linear);
+
+			// #1788: window-space layers BLEND over the projection content,
+			// same rule as D3D11/D3D12, vk_native and GL (#1786/#1787):
+			// SOURCE_ALPHA_BIT clear means premultiplied bytes (colour src
+			// ONE), set means straight (colour src SOURCE_ALPHA); colour dst
+			// and the alpha "over" (ONE / ONE_MINUS_SOURCE_ALPHA) are shared,
+			// so atlas alpha survives for transparent sessions (#225/#1784).
+			// The blended projection pipelines carry exactly those factors.
+			// Deliberately NOT comp_layer_blend_mode() (#1599): see the
+			// comment in comp_d3d11_renderer.cpp's window-space draw. And
+			// never projection_pipeline — its REPLACE is for the base blit.
+			bool ws_premultiplied =
+			    (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+			id<MTLRenderPipelineState> ws_pipeline =
+			    metal_proj_pipeline_for(c,
+			                            ws_premultiplied ? COMP_LAYER_BLEND_PREMULTIPLIED : COMP_LAYER_BLEND_STRAIGHT,
+			                            compose_linear);
 
 			// Source UV sub-rect (default to full texture if not specified)
 			struct xrt_normalized_rect nr = ws->sub.norm_rect;
@@ -4060,7 +6170,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				}
 				[encoder setViewport:vp];
 
-				[encoder setRenderPipelineState:c->projection_pipeline];
+				[encoder setRenderPipelineState:ws_pipeline];
 				[encoder setDepthStencilState:c->depth_stencil_state];
 				[encoder setFragmentTexture:src_tex atIndex:0];
 				[encoder setFragmentSamplerState:c->sampler_linear atIndex:0];
@@ -4104,6 +6214,36 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 				[encoder setVertexBytes:&constants length:sizeof(constants) atIndex:0];
 				[encoder setFragmentBytes:&constants length:sizeof(constants) atIndex:0];
 				[encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			}
+			[src_tex release];
+		}
+
+		// XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): the runtime-drawn
+		// cursor, LAST - over the projection, quad and window-space layers,
+		// never occluded - and before the display processor. Inside this
+		// encoder, so the /tmp/dxr_atlas_trigger dump below shows it.
+		if (cursor_pending) {
+			// A zones frame draws only a zone request (the state tracker
+			// sends nothing else there) and vice versa; belt and braces.
+			if (zones_frame != cursor_req.zone_valid) {
+				u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
+				if (!c->cursor_draw.warned_zones) {
+					c->cursor_draw.warned_zones = true;
+					U_LOG_W("cursor_draw: zones frame / zone request mismatch - cursor not drawn "
+					        "(one-time warning)");
+				}
+			} else {
+				uint32_t canvas_px_w = 0, canvas_px_h = 0;
+				if (eff_canvas.valid && eff_canvas.w > 0 && eff_canvas.h > 0) {
+					canvas_px_w = eff_canvas.w;
+					canvas_px_h = eff_canvas.h;
+				} else if (output_texture != nil) {
+					canvas_px_w = (uint32_t)output_texture.width;
+					canvas_px_h = (uint32_t)output_texture.height;
+				}
+				metal_cursor_draw(c, encoder, &cursor_req, atlas_cols, atlas_rows, atlas_view_w, atlas_view_h,
+				                  compose_linear, canvas_px_w, canvas_px_h, zones_target_w, zones_target_h,
+				                  seg_route_in.count > 0);
 			}
 		}
 
@@ -4161,8 +6301,13 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		}
 	}
 
-	// Step 2: Process atlas through display processor, or simple blit fallback
-	id<MTLTexture> atlas_src = zero_copy ? zc_texture : c->atlas_texture;
+	// Step 2: Process atlas through display processor, or simple blit fallback.
+	// Zero-copy hands the DP the app's own image. The DP is told the atlas is
+	// ENCODED and samples whatever it is handed, so an `_SRGB` image must
+	// reach it through its non-decoding view: decoding on that read would
+	// land linear values under an ENCODED stamp (ADR-044 §4).
+	id<MTLTexture> zc_raw_view = (zero_copy && zc_texture != nil) ? metal_layer_source_view(zc_texture, 0, false) : nil;
+	id<MTLTexture> atlas_src = zero_copy ? zc_raw_view : c->atlas_texture;
 	if (c->display_processor != NULL && atlas_src != nil) {
 		// Crop atlas to content dims before passing to DP.
 		// The DP expects texture dimensions to match content exactly.
@@ -4205,17 +6350,33 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 			// Blit content region from atlas into intermediate texture
 			id<MTLBlitCommandEncoder> blit = [cmd_buf blitCommandEncoder];
+			// Clamp to the atlas: a window larger than the display the atlas
+			// was sized for (a runtime-owned resize past the screen, a window
+			// spanning displays) must not read past it — the Metal debug layer
+			// asserts on that and the overflow is undefined otherwise.
 			[blit copyFromTexture:atlas_src
 			          sourceSlice:0
 			          sourceLevel:0
 			         sourceOrigin:MTLOriginMake(0, 0, 0)
-			           sourceSize:MTLSizeMake(content_w, content_h, 1)
+			           sourceSize:MTLSizeMake(MIN(content_w, (uint32_t)atlas_src.width),
+			                                  MIN(content_h, (uint32_t)atlas_src.height), 1)
 			            toTexture:c->dp_input_texture
 			     destinationSlice:0
 			     destinationLevel:0
 			    destinationOrigin:MTLOriginMake(0, 0, 0)];
 			[blit endEncoding];
 			dp_src = c->dp_input_texture;
+		}
+
+		// Debug only (DXR_DEBUG_ATLAS_PATTERN=lr_white_black): the DP weaves a
+		// fixed pattern instead of the app's content — tile 0 (left view) pure
+		// white, every other tile pure black, opaque.
+		{
+			id<MTLTexture> pattern = metal_debug_atlas_pattern(c, cmd_buf, atlas_cols, atlas_rows,
+			                                                  atlas_view_w, atlas_view_h);
+			if (pattern != nil) {
+				dp_src = pattern;
+			}
 		}
 
 		// DP target: full output_texture dims. The canvas sub-rect is
@@ -4231,13 +6392,115 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		// before process_atlas. (Code-only on Windows — macOS CI gates the
 		// compile; visual needs a Mac+Leia eyeball.)
 		{
+			metal_desktop_bg_probe(c, cmd_buf, dp_src, atlas_cols * atlas_view_w, atlas_rows * atlas_view_h);
 			uint32_t bd_w = 0, bd_h = 0;
 			id<MTLTexture> bd_tex =
 			    metal_flatten_backdrop_2d(c, cmd_buf, dp_target_w, dp_target_h, &bd_w, &bd_h);
+			metal_backdrop_dump_if_triggered(c, cmd_buf, bd_tex, bd_w, bd_h);
+			metal_rear_budget_tick(c);
 			xrt_display_processor_metal_set_background_2d(c->display_processor,
 			                                              (__bridge void *)bd_tex, bd_w, bd_h);
 		}
 
+		/*
+		 * Multi-screen (ADR-047 D2 on macOS): does this window span displays?
+		 * Only for a whole-window drawable frame (a zones / Local2D / mask
+		 * frame, an output rect or the shared-IOSurface path keeps the
+		 * single-DP path). A window on the primary display only also stays
+		 * single-DP, exactly as before.
+		 */
+		bool seg_split = false;
+		struct comp_metal_seg_window seg_win;
+		memset(&seg_win, 0, sizeof(seg_win));
+		if (c->seg_screens != NULL && c->shared_texture == nil && drawable != nil && !eff_canvas.valid &&
+		    !mask_active && metal_seg_window(c, output_texture, &seg_win)) {
+			if (c->seg_rebuild || c->segments == NULL) {
+				// The app thread reads c->segments for eyes (M3): change it under the lock.
+				// A new list (a display hotplug) re-tables the live manager in place,
+				// so a segment DP whose screen is still listed the same way survives.
+				os_mutex_lock(&c->seg_pub_mutex);
+				const bool fresh = c->segments == NULL;
+				if (fresh) {
+					c->segments = comp_metal_segments_create((__bridge void *)c->device,
+					                                         (__bridge void *)c->command_queue);
+				}
+				if (c->segments != NULL && (fresh || c->seg_rebuild)) {
+					comp_metal_segments_set_screens(c->segments, c->seg_screens, c->seg_sys_info,
+					                                c->seg_pinned_display_id, &c->seg_session);
+					// Display hotplug: the session DP got its panel back unchanged
+					// (same serial, place and OS handle) — its window-bound weaver is
+					// kept, so tell it the session's 2D/3D mode again (the lens of a
+					// replugged panel comes up in its default state).
+					const bool owns = comp_metal_segments_session_owns(c->segments);
+					if (!fresh && owns && !c->seg_session_owned && c->display_processor != NULL) {
+						U_LOG_W("segments: the session DP owns its screen again (same panel replugged) — "
+						        "kept its weaver, re-sent the display mode (3D=%d)",
+						        (int)c->hardware_display_3d);
+						(void)xrt_display_processor_metal_request_display_mode(c->display_processor,
+						                                                       c->hardware_display_3d);
+					}
+					c->seg_session_owned = owns;
+				}
+				c->seg_rebuild = false;
+				os_mutex_unlock(&c->seg_pub_mutex);
+			}
+			if (comp_metal_segments_enabled(c->segments)) {
+				const uint32_t mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
+				                                ? c->xdev->hmd->active_rendering_mode_index
+				                                : 0;
+				seg_split = comp_metal_segments_update(c->segments, &seg_win, mode_index);
+				// Every segment DP follows the session's 2D/3D mode, like the primary.
+				comp_metal_segments_set_display_mode(c->segments, c->hardware_display_3d);
+			}
+		}
+
+		/*
+		 * M3: publish the table this weave took, for the next xrLocateViews
+		 * to frame per-segment views from (count 0 = one view set).
+		 */
+		if (c->seg_screens != NULL) {
+			struct xrt_segment_metrics m;
+			memset(&m, 0, sizeof(m));
+			if (seg_split) {
+				(void)comp_metal_segments_get_metrics(c->segments, c->display_processor != NULL, &m);
+			}
+			os_mutex_lock(&c->seg_pub_mutex);
+			m.generation = c->seg_pub.generation;
+			struct xrt_segment_metrics prev = c->seg_pub;
+			prev.generation = m.generation;
+			if (memcmp(&prev, &m, sizeof(m)) != 0) {
+				m.generation++;
+			}
+			c->seg_pub = m;
+			os_mutex_unlock(&c->seg_pub_mutex);
+		}
+
+		if (seg_split) {
+			struct comp_metal_segments_frame sf;
+			memset(&sf, 0, sizeof(sf));
+			sf.command_buffer = (__bridge void *)cmd_buf;
+			sf.src_texture = (__bridge void *)dp_src;
+			sf.view_width = atlas_view_w;
+			sf.view_height = atlas_view_h;
+			sf.tile_columns = atlas_cols;
+			sf.tile_rows = atlas_rows;
+			sf.target_texture = (__bridge void *)output_texture;
+			sf.target_width = dp_target_w;
+			sf.target_height = dp_target_h;
+			sf.transparent_background = c->transparent_background;
+			sf.primary_dp = c->display_processor;
+			sf.primary_present_origin = c->placement_frame_valid;
+			comp_metal_segments_record(c->segments, &sf);
+		} else {
+		// Runtime-owned placement (ADR-050): the DP is told the APPLIED
+		// origin of the window this frame lands in. A DP that polls its own
+		// view position must let this call win.
+		if (c->placement_frame_valid) {
+			xrt_display_processor_metal_set_present_origin(c->display_processor,
+			                                               c->placement_frame.present_origin_x,
+			                                               c->placement_frame.present_origin_y);
+		}
+		metal_dp_assert_atlas_encoding(c, XRT_ATLAS_ENCODING_ENCODED);
 		// Effective canvas (#439): while a mask is active this is the
 		// full client-window rect — the DP weaves every pixel the mask
 		// can select (Phase-2 rule).
@@ -4257,6 +6520,7 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    eff_canvas.valid ? eff_canvas.y : 0,
 		    eff_canvas.valid ? eff_canvas.w : 0,
 		    eff_canvas.valid ? eff_canvas.h : 0);
+		}
 	} else {
 		// No display processor: simple blit passthrough.
 		MTLRenderPassDescriptor *blit_pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -4288,6 +6552,9 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 		    fresh_eyes.valid) {
 			c->cached_eye_pos = fresh_eyes;
 			c->have_cached_eye_pos = true;
+			// N6 Part 1 (#2144): the per-frame answer feeds the ring, keyed
+			// by the time it was asked.
+			u_eye_history_push(&c->eye_hist, &fresh_eyes, (int64_t)os_monotonic_get_ns());
 		}
 	}
 
@@ -4330,10 +6597,20 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 	}
 
 	// Present and commit
-	if (drawable != nil) {
-		[cmd_buf presentDrawable:drawable];
+	if (c->placement_frame_valid) {
+		// presentsWithTransaction: commit, wait until scheduled, present
+		// explicitly, close the transaction that moved the window (or hand
+		// both to the main thread) — comp_metal_placement_end_present.
+		[cmd_buf commit];
+		comp_metal_placement_end_present(c->placement, (__bridge void *)cmd_buf, (__bridge void *)drawable,
+		                                 &c->placement_frame);
+		c->placement_frame_valid = false;
+	} else {
+		if (drawable != nil) {
+			[cmd_buf presentDrawable:drawable];
+		}
+		[cmd_buf commit];
 	}
-	[cmd_buf commit];
 
 	// For shared texture mode, wait for GPU completion so the IOSurface
 	// is fully written before the app reads it.
@@ -4353,6 +6630,8 @@ metal_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handl
 
 	// Reset layer accumulator
 	c->layer_accum.layer_count = 0;
+
+	[zc_raw_view release];
 
 	return XRT_SUCCESS;
 }
@@ -4376,6 +6655,9 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// run loop's pool drains after the compositor is already freed.
 	@autoreleasepool {
 
+	// 0. Give the window's drag / resize back to AppKit (ADR-050).
+	comp_metal_placement_destroy(&c->placement);
+
 	// 1. GPU drain — wait for all in-flight command buffers to finish
 	//    before releasing any resources they may reference.
 	if (c->command_queue != nil) {
@@ -4391,6 +6673,19 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	// 3. Release DP crop texture
 	[c->dp_input_texture release];
 	c->dp_input_texture = nil;
+
+	// 3b. Multi-screen: segment DPs + crop textures, before the primary DP.
+	comp_metal_segments_destroy(&c->segments);
+	free(c->seg_screens);
+	c->seg_screens = NULL;
+	free(c->seg_sys_info);
+	c->seg_sys_info = NULL;
+
+	// 3c. Live desktop background (#2264): drop the capture first.
+	comp_metal_desktop_bg_destroy(&c->desktop_bg);
+	comp_metal_alpha_probe_destroy(&c->alpha_probe);
+	comp_metal_bg_preview_destroy(&c->bg_preview);
+	comp_rear_budget_fini(&c->rear_budget);
 
 	// 4. Destroy display processor — first withdrawing this client's zone
 	// contribution from the vendor's union (#224 P4 clear-on-teardown edge).
@@ -4437,10 +6732,14 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->implicit_mask_tex = nil;
 	free(c->implicit_mask_bytes);
 	c->implicit_mask_bytes = NULL;
+	[c->local2d_scratch_srgb release];
+	c->local2d_scratch_srgb = nil;
 	[c->local2d_scratch release];
 	c->local2d_scratch = nil;
 	[c->weave_scratch release];
 	c->weave_scratch = nil;
+	[c->backdrop_scratch_srgb release];
+	c->backdrop_scratch_srgb = nil;
 	[c->backdrop_scratch release]; // #491 part 3
 	c->backdrop_scratch = nil;
 	[c->local2d_premult_pipeline release];
@@ -4460,8 +6759,37 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->hud_blit_pipeline = nil;
 
 	// 6. Release Metal resources (MRR — explicit release)
+	[c->atlas_srgb_view release]; // a view: released before the atlas it aliases
+	c->atlas_srgb_view = nil;
 	[c->atlas_texture release];
 	c->atlas_texture = nil;
+	// XR_DXR_cursor_depth 3a readback slots (nil unless ever requested); the
+	// GPU drain above has already retired their command buffers.
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_depth.buf); s++) {
+		[c->cursor_depth.cb[s] release];
+		c->cursor_depth.cb[s] = nil;
+		[c->cursor_depth.buf[s] release];
+		c->cursor_depth.buf[s] = nil;
+	}
+	// XR_DXR_cursor_depth v7 staging slots (nil unless ever requested).
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.buf); s++) {
+		[c->cursor_measure.cb[s] release];
+		c->cursor_measure.cb[s] = nil;
+		[c->cursor_measure.buf[s] release];
+		c->cursor_measure.buf[s] = nil;
+	}
+	// XR_DXR_cursor_depth v5 draw resources (nil unless ever requested).
+	for (uint32_t p = 0; p < 2; p++) {
+		for (uint32_t s = 0; s < 2; s++) {
+			[c->cursor_draw.pipe[p][s] release];
+			c->cursor_draw.pipe[p][s] = nil;
+			[c->cursor_draw.pipe_soft[p][s] release];
+			c->cursor_draw.pipe_soft[p][s] = nil;
+		}
+	}
+	[c->cursor_draw.default_tex release];
+	c->cursor_draw.default_tex = nil;
+	comp_cursor_look_fini(&c->cursor_draw.look);
 	[c->depth_texture release];
 	c->depth_texture = nil;
 	[c->projection_pipeline release];
@@ -4476,6 +6804,16 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 	c->quad_premult_pipeline = nil;
 	[c->quad_opaque_pipeline release];
 	c->quad_opaque_pipeline = nil;
+	// ADR-044 _sRGB-target twins (all nil under the legacy hatch).
+	[c->srgb_pipes.projection release];
+	[c->srgb_pipes.proj_premult release];
+	[c->srgb_pipes.proj_straight release];
+	[c->srgb_pipes.quad_straight release];
+	[c->srgb_pipes.quad_premult release];
+	[c->srgb_pipes.quad_opaque release];
+	[c->srgb_pipes.local2d_premult release];
+	[c->srgb_pipes.local2d_unpremult release];
+	memset(&c->srgb_pipes, 0, sizeof(c->srgb_pipes));
 	[c->blit_pipeline release];
 	c->blit_pipeline = nil;
 	[c->sampler_linear release];
@@ -4520,7 +6858,9 @@ metal_compositor_destroy(struct xrt_compositor *xc)
 
 	} // @autoreleasepool — all autoreleased ObjC objects drained here
 
+	os_mutex_destroy(&c->seg_pub_mutex);
 	os_mutex_destroy(&c->mutex);
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	free(c);
 }
@@ -4808,6 +7148,7 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 
 	mcp_capture_init(&c->mcp_capture);
 	mcp_capture_install(&c->mcp_capture);
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 
 	int ret = os_mutex_init(&c->mutex);
 	if (ret != 0) {
@@ -4973,6 +7314,11 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 		        atlas_w, atlas_h, pixel_width, pixel_height);
 	}
 
+	// ADR-044: state the colour regime once (the evidence line a capture is
+	// judged against), and that no atlas encoding has been declared yet.
+	u_color_log_state_once("metal");
+	c->dp_atlas_encoding_latched = -1;
+
 	// Compile shaders
 	if (!compile_shaders(c)) {
 		os_mutex_destroy(&c->mutex);
@@ -4999,7 +7345,12 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 			U_LOG_W("Display processor creation failed, continuing without it");
 		}
 	}
+	comp_rear_budget_init(&c->rear_budget, "metal");
+	metal_desktop_bg_init(c);
 	c->hardware_display_3d = true; // Start in 3D mode (session begin will confirm)
+
+	// Multi-screen: the published segment table + routing (M3).
+	os_mutex_init(&c->seg_pub_mutex);
 
 	// Create HUD overlay for runtime-owned windows
 	if (c->owns_window) {
@@ -5067,7 +7418,35 @@ comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 		return false;
 	}
 
-	return xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	const bool ok = xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	if (ok && out_eye_pos->valid) {
+		// N6 Part 1 (#2144): keyed by the time it was asked.
+		u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+	}
+	return ok;
+}
+
+bool
+comp_metal_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_metal_compositor *c = metal_comp(xc);
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	const bool has = xrt_display_processor_metal_has_eye_positions_at(c->display_processor);
+	if (has && xrt_display_processor_metal_get_eye_positions_at(c->display_processor, target_ns, out_eye_pos) &&
+	    out_eye_pos->valid) {
+		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
+	return comp_metal_compositor_get_predicted_eye_positions(xc, out_eye_pos) && out_eye_pos->valid;
 }
 
 bool
@@ -5200,6 +7579,187 @@ comp_metal_compositor_request_display_mode(struct xrt_compositor *xc, bool enabl
 	// Delegate to display processor (may be a no-op for sim_display)
 	xrt_display_processor_metal_request_display_mode(c->display_processor, enable_3d);
 	return true;
+}
+
+/*!
+ * Snap provider for the runtime-owned placement (ADR-050): the DP of the
+ * screen holding the content origin — the primary (session) DP, or a
+ * segment's per-screen DP when the origin sits on another 3D screen. Runs on
+ * the commit thread (begin_present), the same thread that creates and
+ * destroys segment DPs, so no lock is needed.
+ */
+static bool
+metal_placement_snap(void *userdata,
+                     double probe_x,
+                     double probe_y,
+                     int32_t origin_x,
+                     int32_t origin_y,
+                     int32_t target_x,
+                     int32_t target_y,
+                     int32_t *out_x,
+                     int32_t *out_y)
+{
+	struct comp_metal_compositor *c = (struct comp_metal_compositor *)userdata;
+	struct xrt_display_processor_metal *dp = c->display_processor;
+	if (c->segments != NULL && comp_metal_segments_enabled(c->segments)) {
+		dp = comp_metal_segments_snap_dp_at(c->segments, c->display_processor, probe_x, probe_y);
+	}
+	if (dp == NULL) {
+		return false;
+	}
+	return xrt_display_processor_metal_snap_window_rect(dp, origin_x, origin_y, target_x, target_y, out_x, out_y);
+}
+
+void
+comp_metal_compositor_setup_window_placement(struct xrt_compositor *xc, bool app_owned)
+{
+	if (xc == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	if (c->placement != NULL) {
+		return;
+	}
+	const char *why = NULL;
+	if (!comp_metal_placement_eligible((__bridge void *)c->view, c->offscreen, c->shared_iosurface != NULL,
+	                                   app_owned, &why)) {
+		U_LOG_W("macOS window placement: AppKit-owned (%s)", why != NULL ? why : "not eligible");
+		return;
+	}
+	c->placement = comp_metal_placement_create((__bridge void *)c->view, metal_placement_snap, c);
+}
+
+bool
+comp_metal_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                       int32_t origin_x,
+                                       int32_t origin_y,
+                                       int32_t target_x,
+                                       int32_t target_y,
+                                       int32_t *out_x,
+                                       int32_t *out_y)
+{
+	if (out_x == NULL || out_y == NULL) {
+		return false;
+	}
+	*out_x = target_x;
+	*out_y = target_y;
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	// Pure query against the session's own DP (the app-owned-placement
+	// route, xrWeaveSnapWindowRectDXR). Not the segment DPs: those are
+	// created and destroyed on the commit thread and this runs on the app's.
+	return xrt_display_processor_metal_snap_window_rect(c->display_processor, origin_x, origin_y, target_x,
+	                                                    target_y, out_x, out_y);
+}
+
+void
+comp_metal_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id)
+{
+	if (xc == NULL || list == NULL || info == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == NULL || info_copy == NULL) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	*info_copy = *info;
+
+	// The first list says what the session's own DP was made for: the
+	// system-default screen and the plug-in that won it (ADR-047 Amendment 8).
+	struct comp_segments_session_dp session = c->seg_session;
+	if (!session.valid) {
+		for (uint32_t i = 0; i < list->count && i < XRT_SCREEN_LIST_MAX && !session.valid; i++) {
+			if ((list->screens[i].flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) == 0) {
+				continue;
+			}
+			for (uint32_t e = 0; e < info->dp_registry.entry_count && e < XRT_DP_REGISTRY_MAX_ENTRIES; e++) {
+				const struct xrt_dp_registry_entry *re = &info->dp_registry.entries[e];
+				if (re->monitor_id == list->screens[i].id) {
+					session.valid = true;
+					session.monitor_id = re->monitor_id;
+					snprintf(session.plugin_id, sizeof(session.plugin_id), "%s", re->plugin_id);
+					snprintf(session.serial, sizeof(session.serial), "%s", re->serial);
+					session.desktop = (struct comp_seg_rect){re->screen_left, re->screen_top,
+					                                         re->pixel_width, re->pixel_height};
+					session.platform_id = re->platform_id;
+					U_LOG_I("segments: the session DP serves screen 0x%016llx ('%s', plug-in '%s')",
+					        (unsigned long long)re->monitor_id, list->screens[i].device_name, re->plugin_id);
+					break;
+				}
+			}
+		}
+	}
+
+	// The weave (layer_commit, app thread) rebuilds the manager on its next
+	// frame, never here. The commit and this setter both run on the app's
+	// thread in practice; the seg_pub lock covers the locate-side readers.
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_rebuild = true;
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
+	c->seg_pinned_display_id = pinned_display_id;
+	if (!c->seg_session.valid && session.valid) {
+		c->seg_session_owned = true;
+	}
+	c->seg_session = session;
+	// ...and nothing may frame views from the old table meanwhile.
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
+}
+
+bool
+comp_metal_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the session's
+	// own DP, every other display from its segment DP (guarded against the
+	// weave destroying it: the manager is swapped under this same lock).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			s->have_eyes = c->display_processor != NULL &&
+			               xrt_display_processor_metal_get_predicted_eye_positions(c->display_processor,
+			                                                                      &s->eyes) &&
+			               s->eyes.valid;
+		} else {
+			s->have_eyes = comp_metal_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return out->count > 0;
+}
+
+void
+comp_metal_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct comp_metal_compositor *c = metal_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_route = *routing;
+	os_mutex_unlock(&c->seg_pub_mutex);
 }
 
 void

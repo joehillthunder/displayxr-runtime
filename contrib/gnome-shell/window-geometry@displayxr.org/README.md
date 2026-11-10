@@ -174,11 +174,22 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
 
 ## D-Bus surface
 
+**Rule: other apps' windows are read-only here.** Every member that changes a
+window acts on the caller's own window only, and no member that controls
+another app's window will be added — not even behind a flag. An app that must
+act on other windows uses `XR_DXR_desktop_control` (ADR-056), which asks the
+user through the RemoteDesktop portal. See the spec, §12.4. Since version 18
+other apps' window **titles** go only to a caller authorised for them (the
+DisplayXR runtime while the user's grant lasts); see version 18 below and the
+spec, §12.5.
+
 - Service `org.displayxr.WindowGeometry`, object
   `/org/displayxr/WindowGeometry`, interface `org.displayxr.WindowGeometry1`.
 - `GetWindows() -> (s)`: JSON snapshot of all normal windows.
 - `WindowsChanged(s)`: same JSON, emitted (coalesced per redraw) on any
-  position/size/focus/lifetime change.
+  position/size/focus/lifetime change — except a move of a window in move
+  sync, which is emitted at once (a coalesced emit reached the runtime only
+  every other frame).
 - Version 2: object `/org/displayxr/CaptureExclusion`, interface
   `org.displayxr.CaptureExclusion1` — `Exclude(u pid) -> (u windows)` (pid 0 =
   the caller; only your own PID), `Release(u pid)`, `GetState() -> (s)`. The
@@ -199,6 +210,184 @@ systemctl --user unset-environment DISPLAYXR_DEBUG   # then log out/in again
   at the end of every drag that had a table. A table may now arrive
   mid-grab, and the next piece is requested ahead of the drag. Every window
   in the geometry snapshot gains `lattice_drop`. See the spec, §8.5.
+- Version 9, no interface change: which table entry a drag move lands on.
+  Instead of the plain nearest entry, a move lands on the entry that keeps the
+  window closest to the drag line; it may lead or lag the pointer by up to
+  6 device px to do so. `DISPLAYXR_LATTICE_NEAREST=1` in the shell's
+  environment restores plain nearest, for A/B comparison. See the spec, §8.8.
+- Version 9, same interface: **move sync** (#1748) — `EnableMoveSync(u pid) -> (b)`,
+  capability bit 3 (value 8), GNOME 45+ only (the GNOME 40–44 entry point
+  answers false and leaves the bit clear). While the caller's window is moved
+  — by mutter's grab (title bar, Super+drag) or by the pointer drag below —
+  its actor is painted only where the frame on screen was woven for: the
+  runtime tags each commit with a 1x1 synchronised subsurface at the woven
+  position, and the extension places the actor there before every paint. Such
+  a window needs no drag lattice (`SetDragLattice*` refuses it), and the
+  snapshot gains `move_sync`. The DisplayXR runtime registers by default
+  whenever the extension offers it (`DXR_WL_MOVE_SYNC=0` opts out) and
+  registers again whenever the extension comes back (a shell restart, a re-enable;
+  the lock screen too before version 14). See
+  the spec, §9. Measurement hook: `DISPLAYXR_STAMP_AUDIT=1` in the shell's
+  environment, with the runtime's `DXR_WL_ORIGIN_STAMP=1` (which overwrites
+  pixels — never in a real session).
+- Version 9, same interface: the **pointer drag** —
+  `BeginPointerDrag(u pid, u button) -> (b started)`, `EndPointerDrag(u pid)`,
+  capability bit 2 (value 4). The extension moves the caller's window with the
+  pointer while `button` is held, with no grab, and stops the moment the button
+  is up. It exists because mutter's own move grab (`xdg_toplevel.move`) ends
+  only on the release of button 1, so an app's right-button content drag kept
+  following the pointer after the release. The drag table applies to it as to
+  a compositor drag, and it is reported like one (`moving`,
+  `DragLatticeDone`). See the spec, §8.9.
+- Version 10, no interface change: the move-sync hold is **tag-gated**,
+  capability bit 4 (value 16, only ever set with bit 3). `EnableMoveSync` is
+  per process, but a window is now held only while a tag subsurface is
+  *mapped*: a synced process that shows nothing woven (a browser on a 2D page)
+  drags as a plain window, with no stall; a tag appearing mid-drag starts the
+  hold then; a tag going away ends it on that frame, the actor snapping to the
+  window. An app that always keeps its tag mapped (every in-process DisplayXR
+  app) behaves exactly as with version 9. See the spec, §9.9.
+- Version 11, no interface change: the snapshot says **which space its
+  coordinates are in**. mutter has two monitor layout modes. In LOGICAL
+  (fractional scaling; mutter 50's default) the stage is logical px. In PHYSICAL
+  (Ubuntu 24.04 / GNOME 46 at an integer scale, out of the box) the stage
+  *is* device px. There `monitor.scale` is 2 for a 3840x2160 monitor at 200 %,
+  and its rect is still 3840x2160. The snapshot gains a top-level
+  `layout_mode` (`"logical"` / `"physical"`) and `monitor.device_scale`, the
+  factor that converts stage px to device px (the stage view's scale: the
+  monitor scale in LOGICAL, 1 in PHYSICAL). A consumer must convert by
+  `device_scale`, never by `scale`. Both are left out when they cannot be told
+  (every monitor at scale 1, where the two modes agree). The drag-lattice
+  choice and the stamp audit weigh device px by the same factor. The schema
+  stays `version: 1`, because no field changed meaning. See the spec, §4.1.
+- Version 12, no interface change: the move-sync tag is decoded against the
+  window's **main surface found by its texture** (`MetaWindowActor.get_texture()`
+  is the toplevel surface actor's content), no longer against the largest
+  surface actor. Under libdecor-gtk — GLFW 3.4's and SDL2/SDL3's stock
+  decorations on GNOME — the shadow subsurface is larger than the content, so
+  versions 9–11 decoded every tag against the shadow, resolved nothing, and
+  timed out on every title-bar drag (stale frames, visible 3D stutter; found
+  on the LeiaSR OpenGL example). Apps that draw their own chrome, the test
+  apps and the browser among them, were never affected. See the spec, §9.2.
+- Version 13, new interface: the **workspace hotkey**,
+  `org.displayxr.WorkspaceHotkey1` at `/org/displayxr/WorkspaceHotkey` —
+  `Configure(s accelerator, s unit) -> (b pending)`, `Suspend(b, u timeoutMs)`,
+  `GetState() -> (s)`, signal `Activated(u timestamp)`. A client hands the
+  extension one global accelerator (GTK syntax) and, optionally, a systemd
+  *user* unit. The extension grabs it with `Meta.Display.grab_accelerator`
+  (Wayland and X11 GNOME alike), caches it in
+  `$XDG_STATE_HOME/displayxr/workspace-hotkey.json` so it survives the client's
+  exit and a shell restart, and emits `Activated` on every press. A press while
+  the client's bus connection is gone also starts the unit and is handed back
+  as `pending` by the client's next `Configure` (within 30 s). The DisplayXR
+  service uses it for the workspace-controller launch chord: it pushes the
+  combo from `service.json` and its own unit (`displayxr.service`), and since
+  that service is socket-activated and exits when idle, the extension is what
+  lets the chord start it. (A running controller gets the press forwarded by
+  the service; `Activated` is informational for it.) Nothing is grabbed until
+  a client configures — but when the set of workspace-controller manifests
+  (`*/DisplayXR/WorkspaceControllers/*.json`, `/usr/share/displayxr/
+  WorkspaceControllers/*.json`, …) differs from the one recorded at the last
+  `Configure`, checked 5 s after enable and on any change in those
+  directories, the extension starts the unit once so a freshly installed
+  controller is armed without the service having run since. See
+  `docs/specs/runtime/workspace-controller-registration.md` § Linux.
+- Version 14, no interface change: the extension **stays enabled on the lock
+  screen** (`"session-modes": ["user", "unlock-dialog"]`, displayxr-runtime#2071).
+  Before it, GNOME disabled the extension at every lock — on a laptop, every
+  suspend — so the bus name vanished and a weaving window that lived across
+  the suspend lost its placement / phase anchor (seen once as inverted 3D
+  after resume). On the lock screen the geometry snapshot, `WindowsChanged`,
+  capture exclusion, window placement / move sync and the `WorkspaceHotkey1`
+  object keep running; the workspace hotkey's **grab** does not — it is
+  released while locked (a press there is never acted on, and the manifest
+  bootstrap waits for the unlock) and re-taken on unlock (`GetState` reports
+  `locked`). The extension draws nothing, so it adds nothing to the lock
+  screen. The runtime additionally re-syncs whenever the bus name reappears
+  (`wl_geom: publisher reappeared — re-syncing geometry (#2071)`), so an
+  older extension still recovers a correct phase after unlock.
+- Version 15, same `WindowPlacement1` interface: the caller's **own window
+  state** — `SetKeepAbove(u pid, b above) -> (b ok)` (capability bit 5, value
+  32), `ActivateWindow(u pid) -> (b ok)` (bit 6, 64), `SetMinimized(u pid, b
+  minimized) -> (b ok)` (bit 7, 128). What an app does to its own window with
+  EWMH on X11 and a Wayland client has no protocol for: keep it above other
+  windows, bring it to the front with focus (from the background, minimized or
+  another workspace), minimize and restore it. MoveWindow's gate and window
+  choice (only your own window; the call must come from your own process);
+  refused during a grab of that window or an extension pointer drag, and on the lock screen. Keep-above
+  the extension set is undone when the caller's bus connection goes away and
+  when the extension is disabled — never a user's own "Always on Top". No
+  maximize: it fights an app that places its own window. Every window in the
+  geometry snapshot gains `minimized` and `above`, so an app reads its window's
+  state back, including what the user changed from the dock or the window menu
+  (`WindowsChanged` follows both). See the spec, §11.
+- Version 16, `WindowGeometry1`: `GetPointer() -> (s json)` — where the pointer
+  is and what is under it: `{"version": 1, "x", "y", "layout_mode", "over":
+  "window" | "desktop" | "shell" | "outside", "window": <a snapshot entry> | null,
+  "window_type"}` (`window_type`: mutter's `Meta.WindowType` number). A Wayland
+  client only learns the pointer while it is over its own surface, so an app
+  could not answer "what is under my mouse?". The hit is what mutter's pick finds
+  there, so stacking, a click-through window (empty input region) and shell UI on
+  top count as they do for a click; the desktop background and a desktop-icons
+  window (Ubuntu's) are `desktop`. `GetWindowAt(i x, i y) -> (s json)` answers the
+  same for any stage point; a point on no monitor is `outside`. `GetAllWindows()
+  -> (s json)` is `GetWindows`' snapshot with the app's dialogs and utility windows
+  too, each with its `window_type`. Read-only, like
+  `GetWindows`; while the screen is locked both answer only
+  `{"version": 1, "locked": true}`. Every window entry gains `id` (mutter's window
+  id: unsigned 64-bit, often above INT32_MAX — read it as int64 or double),
+  `maximized` and `fullscreen`, and, for a transient window such as a popup menu,
+  `parent_id`. See the spec, §12.
+- Version 17, `WindowPlacement1`: **`ActivateWindow`'s focus policy.** It takes
+  focus only when the user's latest key press or click went to the app and the
+  user has not left it since (Alt+Tab, Super+H, the dock, a click elsewhere);
+  the app minimizing itself through `SetMinimized` does not count as the user
+  leaving, and a newly created window of the app earns nothing. Otherwise focus
+  stays where it is, the window stays minimized if it was, and the reply is
+  `false`; mutter flags the window as demanding attention if it is covered,
+  minimized or on another workspace (GNOME shows "… is ready") — what GNOME
+  does for any app that asks from the background. Version 15 took focus even while the user
+  typed in another app. Not covered: an app summoned by a global shortcut while
+  the user is in another app (the press is stamped on that app's window). Same
+  method, no new capability bit. See the spec, §11.6.
+- Version 18, `WindowGeometry1`: **window titles only for an authorised
+  caller** — `SetTitleAccess(u pid, b allow) -> (b titles)`. Following the
+  maintainer's direction on DisplayXR/displayxr-unity#389, the extension stops
+  handing other apps' window titles to callers that have not been authorised.
+  `GetWindows`, `GetAllWindows`, `GetPointer`, `GetWindowAt` and
+  `CaptureExclusion1.GetState` put `title` in a window entry only for a bus
+  connection that called `SetTitleAccess(0, true)`; for every other caller the
+  key is absent (`""` still means an untitled window). `WindowsChanged` reaches
+  every listener, so it never carries titles, and no caller gets a title while
+  the screen is locked. `pid` names the caller (0 or its own PID, from the bus
+  daemon); the access is for that one connection, is refused on the lock
+  screen, and ends with `SetTitleAccess(0, false)`, with the connection or with
+  the extension. The DisplayXR runtime asks for it on its desktop-control
+  connection while the user's grant (`XR_DXR_desktop_control`) is GRANTED and
+  hands it back when the grant ends. **Behaviour change:** a runtime older than
+  this one never asks, so its desktop control sees no titles from this version
+  (and its text-at-a-point reads, which find a window by its title, come back
+  empty); an older extension simply has no `SetTitleAccess` and keeps giving
+  titles to everyone. See the spec, §12.5.
+- Version 19, no interface change: a window entry's `monitor` gains
+  **`work_area`**, `[x, y, w, h]` in stage coordinates (the same space as the
+  monitor's `x`, `y`, `w`, `h`): the part of that monitor that the top bar and a
+  dock that stays visible leave to windows (mutter's work area, on the window's
+  workspace). Absent when it cannot be told. An app that places its own window
+  (the Unity plug-in's side-step steps into a corner, DisplayXR/displayxr-unity#399)
+  uses it to keep the window out from under the top bar and the dock. A change
+  of the work area alone (the dock switched to auto-hide or back) also emits
+  `WindowsChanged`. Additive; the schema stays `version: 1`. See the spec, §4.2.
+
+Verify the extension survives the lock screen (version 14+): lock from another
+terminal (`loginctl lock-session`) or a remote shell, then
+
+```bash
+gnome-extensions info window-geometry@displayxr.org | grep -E 'State|Version'   # ACTIVE, 14
+gdbus call --session --dest org.displayxr.WindowGeometry \
+  --object-path /org/displayxr/WindowGeometry \
+  --method org.displayxr.WindowGeometry1.GetWindows    # still answers while locked
+```
 
 Verify capture exclusion is live:
 
@@ -206,6 +395,14 @@ Verify capture exclusion is live:
 gdbus call --session --dest org.displayxr.WindowGeometry \
   --object-path /org/displayxr/CaptureExclusion \
   --method org.displayxr.CaptureExclusion1.GetState
+```
+
+Inspect the workspace hotkey (version 13+):
+
+```bash
+gdbus call --session --dest org.displayxr.WindowGeometry \
+  --object-path /org/displayxr/WorkspaceHotkey \
+  --method org.displayxr.WorkspaceHotkey1.GetState
 ```
 
 Schema and coordinate-space notes are documented at the top of
@@ -226,9 +423,12 @@ the same geometry to serve its own non-DisplayXR apps). The full contract is in
   the ecosystem.
 - **Exactly one installed owner** — a D-Bus well-known name is singly owned, so
   a second publisher binds nothing and silently strands consumers. Any package
-  shipping it declares `Provides:` + `Conflicts:` + `Replaces:` on the virtual
-  package `displayxr-window-geometry-publisher`, and consumers depend on that
-  virtual name rather than on any vendor's package.
+  shipping this extension `Provides:` the virtual package
+  `displayxr-window-geometry-publisher` and declares `Provides:` +
+  `Conflicts:` + `Replaces:` on `displayxr-window-geometry-publisher-gnome`.
+  Consumers depend on the generic name rather than on any vendor's package; a
+  publisher for another compositor (KWin) uses its own suffix and installs
+  alongside.
 - **Ship the whole file set** — `metadata.json`, `lib.js` and **both** entry
   points (`extension.js`, `extension-gnome42.js`) — and select between them by
   the running shell's version, as described under *Two entry points*. Shipping

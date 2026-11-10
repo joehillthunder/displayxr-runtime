@@ -54,7 +54,22 @@ FetchContent_Declare(
     # table is built on the worker, from the new grid snap provider
     # (set_snap_grid_provider + DxrWeaveSnap::grid_callback, XR_DXR_weave
     # spec >= 11; displayxr-common#62/#63, runtime#1723).
-    GIT_TAG v2.24.0
+    # v2.27.0: window-space / HUD swapchains prefer the _SRGB sibling of
+    # R8G8B8A8 (dxr::ChooseWindowSpaceSwapchainFormat; ADR-044 §7,
+    # displayxr-common#72) — a UNORM HUD of encoded bytes was encoded twice.
+    # v2.29.0: dxr::CursorDepth (common/cursor_depth.h) — the app-side helper for the runtime-drawn
+    # depth cursor (ADR-046 Amendment 2); v2.28.0 brought the shared Vulkan frame ring.
+    # v2.30.0: dxr::ModeSwitch::step() (common/mode_switch.h), the one-call smooth
+    # 2D<->3D sequencer every platform's apps use (displayxr-common#73).
+    # v2.30.1: the Wayland geometry payload is read by structure, in any key order
+    # (displayxr-common#76) — a KWin publisher's sorted keys crashed the old parser (#1928).
+    # v2.31.2: u_wayland_geom.h gains u_wl_window_device_rect, the publisher's
+    # buffer_device (displayxr-common#81, #1991); the aux guard needs the same bytes.
+    # v2.32.0: DxrLinuxWindowDesc::start_hidden — the window is never mapped or made
+    # fullscreen in a workspace session (displayxr-common#80, #2022); includes #78/#81.
+    # v2.32.1: macOS — no depth cursor while the app is inactive; AppKit ignores
+    #   +[NSCursor hide] there, which gave a double cursor (displayxr-common#83).
+    GIT_TAG v2.32.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)

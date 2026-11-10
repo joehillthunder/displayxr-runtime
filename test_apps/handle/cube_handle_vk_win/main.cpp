@@ -102,14 +102,106 @@ static DWORD g_savedWindowStyle = 0;
 //                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT.
 static bool g_l2dPanel = false;
 static bool g_l2dMask = false;
+// #2342: DXR_LOCAL2D_MASK=3 additionally acquires the Tier-3 render target and
+// draws one app-authored stroke into it (a 3D bar down the left edge, outside
+// both rect islands) — the authored mask that has to reach the compositor as a
+// PLANE, mirroring cube_handle_d3d11_win's #918 review F1 mode.
+static bool g_l2dMaskTier3 = false;
 static bool g_l2dPanel2 = false;
+
+/*!
+ * #2342: the Tier-3 stroke, Vulkan flavour
+ * (XrLocal3DZoneRenderTargetVulkanDXR). The runtime hands the R8 image in
+ * COLOR_ATTACHMENT_OPTIMAL (it is not a transfer destination), so the stroke is
+ * a one-attachment render pass that LOADs the existing mask and
+ * vkCmdClearAttachments a bar to M=1. Same-queue order is the contract; one-off
+ * at activation (submitImmediate).
+ */
+static void DrawTier3StrokeVk(VkRenderer *renderer) {
+  if (g_zone.pfnAcquire == nullptr) {
+    LOG_ERROR("[mask] Tier-3 requested but xrAcquireLocal3DZoneRenderTargetDXR "
+              "is unavailable");
+    return;
+  }
+  XrLocal3DZoneRenderTargetVulkanDXR rtb = {
+      (XrStructureType)XR_TYPE_LOCAL_3D_ZONE_RENDER_TARGET_VULKAN_DXR};
+  XrResult ar = g_zone.pfnAcquire(g_zone.mask, (void *)&rtb);
+  if (XR_FAILED(ar) || rtb.imageView == nullptr) {
+    LOG_ERROR("[mask] xrAcquireLocal3DZoneRenderTargetDXR failed (0x%x)",
+              (unsigned)ar);
+    return;
+  }
+  VkAttachmentDescription ad = {};
+  ad.format = VK_FORMAT_R8_UNORM;
+  ad.samples = VK_SAMPLE_COUNT_1_BIT;
+  ad.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+  ad.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+  ad.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+  ad.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  ad.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  ad.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+  VkAttachmentReference ar0 = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+  VkSubpassDescription sp = {};
+  sp.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+  sp.colorAttachmentCount = 1;
+  sp.pColorAttachments = &ar0;
+  VkRenderPassCreateInfo rpci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+  rpci.attachmentCount = 1;
+  rpci.pAttachments = &ad;
+  rpci.subpassCount = 1;
+  rpci.pSubpasses = &sp;
+  VkRenderPass rp = VK_NULL_HANDLE;
+  VkFramebuffer fb = VK_NULL_HANDLE;
+  VkImageView view = (VkImageView)rtb.imageView;
+  if (vkCreateRenderPass(renderer->device, &rpci, nullptr, &rp) != VK_SUCCESS) {
+    LOG_ERROR("[mask] Tier-3 stroke: render pass create failed");
+    return;
+  }
+  VkFramebufferCreateInfo fci = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fci.renderPass = rp;
+  fci.attachmentCount = 1;
+  fci.pAttachments = &view;
+  fci.width = rtb.width;
+  fci.height = rtb.height;
+  fci.layers = 1;
+  if (vkCreateFramebuffer(renderer->device, &fci, nullptr, &fb) != VK_SUCCESS) {
+    vkDestroyRenderPass(renderer->device, rp, nullptr);
+    LOG_ERROR("[mask] Tier-3 stroke: framebuffer create failed");
+    return;
+  }
+  const VkRect2D bar = {
+      {(int32_t)(rtb.width / 16), (int32_t)(rtb.height / 3)},
+      {rtb.width / 8 - rtb.width / 16, rtb.height * 2 / 3 - rtb.height / 3}};
+  renderer->ring.submitImmediate([&](VkCommandBuffer cmd) {
+    VkRenderPassBeginInfo rbi = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rbi.renderPass = rp;
+    rbi.framebuffer = fb;
+    rbi.renderArea = {{0, 0}, {rtb.width, rtb.height}};
+    vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment ca = {};
+    ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca.colorAttachment = 0;
+    ca.clearValue.color.float32[0] = 1.0f;
+    VkClearRect cr = {bar, 0, 1};
+    vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+    vkCmdEndRenderPass(cmd);
+  });
+  vkDestroyFramebuffer(renderer->device, fb, nullptr);
+  vkDestroyRenderPass(renderer->device, rp, nullptr);
+  LOG_INFO("[mask] Tier-3 stroke drawn into the %ux%u authored mask (bar %d,%d "
+           "%ux%u)",
+           rtb.width, rtb.height, bar.offset.x, bar.offset.y, bar.extent.width,
+           bar.extent.height);
+}
 // #491 part 3 — a Local2D backdrop submitted BEFORE the projection (an UNDER
 // layer). 0 = off, 2 = opaque checker, 3 = semi-transparent (desktop shows
 // through). DXR_LOCAL2D_BACKDROP=1 ⟹ opaque (2); =2 ⟹ semi-transparent (3).
 static int g_l2dBackdropVariant = 0;
 static bool g_l2dActive = false; // set once panels (+ optional mask) are live
 static long g_l2dFrameCounter = 0;
-static const long g_l2dActivationFrame = 10;
+// DXR_LOCAL2D_ACTIVATION_FRAME=N overrides (#2317 P2a: a mid-session move of
+// the hub off DIRECT ingress, after N projection-only frames).
+static long g_l2dActivationFrame = 10;
 
 // A window-anchored Local2D panel swapchain (static content: filled once, then
 // referenced every frame). The image rests in SHADER_READ_ONLY_OPTIMAL so the
@@ -374,7 +466,26 @@ static uint32_t FindMemoryTypeIdx(VkPhysicalDevice phys, uint32_t typeBits, VkMe
     return UINT32_MAX;
 }
 
-static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, VkCommandPool cmdPool,
+// Prefer the _SRGB format for Local2D panels when the session advertises it
+// (ADR-044 / INV-4.6): the CPU-authored bytes are display-referred, so a
+// UNORM declaration would have a format-honest compositor encode them twice.
+static int64_t PickPanelFormat(XrSession session, int64_t srgb, int64_t unorm) {
+    // A/B knob, same switch as displayxr-common's swapchains (#1795).
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    if (enc != nullptr && strcmp(enc, "unorm") == 0) return unorm;
+    uint32_t n = 0;
+    xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+    std::vector<int64_t> formats(n);
+    if (n > 0) {
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+    }
+    for (int64_t f : formats) {
+        if (f == srgb) return f;
+    }
+    return unorm;
+}
+
+static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer,
                                   uint32_t w, uint32_t h, int variant, L2DPanel& out) {
     if (w == 0 || h == 0) {
         return false;
@@ -382,7 +493,7 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, Vk
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                      XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
-    sci.format = (int64_t)VK_FORMAT_B8G8R8A8_UNORM;
+    sci.format = PickPanelFormat(xr.session, (int64_t)VK_FORMAT_B8G8R8A8_SRGB, (int64_t)VK_FORMAT_B8G8R8A8_UNORM);
     sci.sampleCount = 1;
     sci.width = w;
     sci.height = h;
@@ -496,49 +607,34 @@ static bool CreateAndFillL2DPanel(XrSessionManager& xr, VkRenderer* renderer, Vk
     vkUnmapMemory(renderer->device, stagingMem);
 
     // Copy staging → image, then transition to SHADER_READ_ONLY for sampling.
-    VkCommandBufferAllocateInfo cbai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbai.commandPool = cmdPool;
-    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbai.commandBufferCount = 1;
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    vkAllocateCommandBuffers(renderer->device, &cbai, &cmd);
-    VkCommandBufferBeginInfo cbi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &cbi);
+    // One-off (static content, filled once): the ring's sanctioned blocking path.
+    renderer->ring.submitImmediate([&](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = img;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
 
-    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = 0;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = img;
-    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
+        VkBufferImageCopy region = {};
+        region.bufferRowLength = w;
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageOffset = {0, 0, 0};
+        region.imageExtent = {w, h, 1};
+        vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-    VkBufferImageCopy region = {};
-    region.bufferRowLength = w;
-    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {w, h, 1};
-    vkCmdCopyBufferToImage(cmd, staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
-                         nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(renderer->graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(renderer->graphicsQueue);
-    vkFreeCommandBuffers(renderer->device, cmdPool, 1, &cmd);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                             nullptr, 0, nullptr, 1, &b);
+    });
     vkDestroyBuffer(renderer->device, staging, nullptr);
     vkFreeMemory(renderer->device, stagingMem, nullptr);
 
@@ -556,7 +652,6 @@ static void RenderThreadFunc(
     uint32_t hudHeight,
     VkBuffer hudStagingBuffer,
     void* hudStagingMapped,
-    VkCommandPool hudCmdPool,
     std::vector<XrSwapchainImageVulkanKHR>* hudSwapchainImages)
 {
     LOG_INFO("[RenderThread] Started");
@@ -754,6 +849,21 @@ static void RenderThreadFunc(
                             viewState.next = &rawProbe;
                         }
 
+                        // Multi-screen M3/M6 (ADR-041 + XR_DXR_display_info
+                        // v22): how many located views are live this frame,
+                        // and which of them belong to which display when the
+                        // window spans displays — chained in front of whatever
+                        // the rig probe put there. Same as cube_handle_d3d11_win
+                        // and cube_handle_vk_linux.
+                        XrViewActivityStateDXR viewActivity = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+                        XrViewDisplayBindingDXR viewBindingStorage[4] = {};
+                        XrViewDisplayBindingsDXR viewBindings = {XR_TYPE_VIEW_DISPLAY_BINDINGS_DXR};
+                        viewBindings.bindingCapacityInput = 4;
+                        viewBindings.bindings = viewBindingStorage;
+                        viewBindings.next = viewState.next;
+                        viewActivity.next = &viewBindings;
+                        viewState.next = &viewActivity;
+
                         // XR_DXR_view_rig (#396 W7): drive the runtime rig
                         // matching the app's current mode (C selects the rig)
                         // with the app's tunables — the runtime owns the window
@@ -798,6 +908,45 @@ static void RenderThreadFunc(
                         }
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
                         LOG_INFO("[FRAME] Raw LocateViews done");
+
+                        // Multi-screen M3/M6: with the window spanning displays
+                        // the runtime hands out one view set per display; render
+                        // ALL of them (the sum is activeViewCount), each set's
+                        // local view j into tile j at that display's segment
+                        // rect (placed below once the tile size is known).
+                        const bool routedViews =
+                            !monoMode && xr->viewConfigType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR &&
+                            viewBindings.bindingCountOutput > 0 && viewBindings.bindingCountOutput <= 4;
+                        if (routedViews) {
+                            int routedEyes = 0;
+                            for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                const int end =
+                                    (int)(viewBindingStorage[b].firstView + viewBindingStorage[b].viewCount);
+                                if (end > routedEyes) routedEyes = end;
+                            }
+                            if (routedEyes > (int)locatedCount) routedEyes = (int)locatedCount;
+                            if (routedEyes > 0) eyeCount = routedEyes;
+                        }
+                        {
+                            // Log the bindings when they change (one line, never per frame).
+                            static std::string lastBindings;
+                            std::string now = routedViews ? "routed" : "single";
+                            for (uint32_t b = 0; routedViews && b < viewBindings.bindingCountOutput; b++) {
+                                const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                                char buf[160];
+                                snprintf(buf, sizeof(buf), " [display 0x%llx views %u..%u at %d,%d %dx%d]",
+                                         (unsigned long long)vb.displayId, vb.firstView,
+                                         vb.firstView + vb.viewCount - 1, vb.segmentRect.offset.x,
+                                         vb.segmentRect.offset.y, vb.segmentRect.extent.width,
+                                         vb.segmentRect.extent.height);
+                                now += buf;
+                            }
+                            if (now != lastBindings) {
+                                LOG_INFO("view sets: %s (activeViewCount=%u, rendering %d)", now.c_str(),
+                                         viewActivity.activeViewCount, eyeCount);
+                                lastBindings = now;
+                            }
+                        }
 
                         // Capture the runtime's resolved CANVAS size (the window
                         // client area in meters) into g_inputState so next frame's
@@ -927,6 +1076,39 @@ static void RenderThreadFunc(
                         if (AcquireSwapchainImage(*xr, imageIndex)) {
                             LOG_INFO("[FRAME] Acquired image %u", imageIndex);
 
+                            // Multi-screen M3/M6: per-view placement under routing —
+                            // the display's segment rect (window px) scaled into the
+                            // tile, edges rounded independently so two segments
+                            // sharing a seam share the tile column (as
+                            // cube_handle_d3d11_win / cube_handle_vk_linux do).
+                            struct ViewPlace {
+                                uint32_t tile;
+                                int32_t x, y;
+                                uint32_t w, h;
+                                bool set;
+                            };
+                            ViewPlace viewPlace[8] = {};
+                            if (routedViews && windowW > 0 && windowH > 0) {
+                                const float fx = (float)renderW / (float)windowW;
+                                const float fy = (float)renderH / (float)windowH;
+                                for (uint32_t b = 0; b < viewBindings.bindingCountOutput; b++) {
+                                    const XrViewDisplayBindingDXR& vb = viewBindingStorage[b];
+                                    const int32_t x0 = (int32_t)lroundf((float)vb.segmentRect.offset.x * fx);
+                                    const int32_t y0 = (int32_t)lroundf((float)vb.segmentRect.offset.y * fy);
+                                    const int32_t x1 = (int32_t)lroundf(
+                                        (float)(vb.segmentRect.offset.x + vb.segmentRect.extent.width) * fx);
+                                    const int32_t y1 = (int32_t)lroundf(
+                                        (float)(vb.segmentRect.offset.y + vb.segmentRect.extent.height) * fy);
+                                    const uint32_t sw = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+                                    const uint32_t sh = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+                                    for (uint32_t j = 0; j < vb.viewCount && j < tileColumns * tileRows; j++) {
+                                        const uint32_t i = vb.firstView + j;
+                                        if (i >= 8) break;
+                                        viewPlace[i] = {j, x0, y0, sw, sh, true};
+                                    }
+                                }
+                            }
+
                             // Build per-eye render params for single-pass rendering
                             std::vector<EyeRenderParams> eyeParams(eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
@@ -935,10 +1117,19 @@ static void RenderThreadFunc(
                                 uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
+                                uint32_t vpW = renderW;
+                                uint32_t vpH = renderH;
+                                if (routedViews && eye < 8 && viewPlace[eye].set) {
+                                    // Routed: this view's own segment of its tile.
+                                    vpX = (viewPlace[eye].tile % tileColumns) * renderW + (uint32_t)viewPlace[eye].x;
+                                    vpY = (viewPlace[eye].tile / tileColumns) * renderH + (uint32_t)viewPlace[eye].y;
+                                    vpW = viewPlace[eye].w;
+                                    vpH = viewPlace[eye].h;
+                                }
                                 eyeParams[eye].viewportX = vpX;
                                 eyeParams[eye].viewportY = vpY;
-                                eyeParams[eye].width = renderW;
-                                eyeParams[eye].height = renderH;
+                                eyeParams[eye].width = vpW;
+                                eyeParams[eye].height = vpH;
                                 if (useAppProjection) {
                                     int vi = monoMode ? 0 : eye;
                                     eyeParams[eye].viewMatrix = ColumnMajorToXMMatrix(stereoViews[vi].view_matrix);
@@ -959,17 +1150,15 @@ static void RenderThreadFunc(
                                 useAppProjection ? 1.0f : inputSnapshot.viewParams.scaleFactor);
 
                             for (int eye = 0; eye < eyeCount; eye++) {
-                                uint32_t tileX = monoMode ? 0 : (eye % tileColumns);
-                                uint32_t tileY = monoMode ? 0 : (eye / tileColumns);
-                                uint32_t vpX = tileX * renderW;
-                                uint32_t vpY = tileY * renderH;
+                                // The rect each view was rendered into (its tile,
+                                // or under routing its segment of the tile).
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)vpX, (int32_t)vpY};
+                                    (int32_t)eyeParams[eye].viewportX, (int32_t)eyeParams[eye].viewportY};
                                 projectionViews[eye].subImage.imageRect.extent = {
-                                    (int32_t)renderW,
-                                    (int32_t)renderH
+                                    (int32_t)eyeParams[eye].width,
+                                    (int32_t)eyeParams[eye].height
                                 };
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = monoMode ? monoPose : rawViews[eye < (int)viewCount ? eye : 0].pose;
@@ -1082,67 +1271,50 @@ static void RenderThreadFunc(
                                     UnmapHud(*hud);
                                 }
 
-                                // Copy staging buffer to HUD swapchain image
-                                VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                allocInfo.commandPool = hudCmdPool;
-                                allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                allocInfo.commandBufferCount = 1;
-
-                                VkCommandBuffer cmdBuf;
-                                vkAllocateCommandBuffers(renderer->device, &allocInfo, &cmdBuf);
-
-                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
+                                // Copy staging buffer to HUD swapchain image. The HUD
+                                // text (perf line) changes every frame and the shared
+                                // staging buffer is rewritten next frame, so this stays
+                                // a blocking upload — via the ring's one sanctioned
+                                // blocking path (no per-frame cmd alloc). HUD is hidden
+                                // by default (Shift+Tab).
                                 VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
-
-                                // Barrier: UNDEFINED -> TRANSFER_DST
-                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                barrier.srcAccessMask = 0;
-                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.image = hudImg;
-                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                // Copy buffer to image
-                                VkBufferImageCopy region = {};
-                                region.bufferRowLength = hudWidth;
-                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                region.imageOffset = {0, 0, 0};
-                                region.imageExtent = {hudWidth, hudHeight, 1};
-                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
-                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                vkEndCommandBuffer(cmdBuf);
-
-                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                submitInfo.commandBufferCount = 1;
-                                submitInfo.pCommandBuffers = &cmdBuf;
                                 LOG_INFO("[FRAME] HUD: Submitting GPU commands...");
-                                vkQueueSubmit(renderer->graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                LOG_INFO("[FRAME] HUD: vkQueueWaitIdle...");
-                                vkQueueWaitIdle(renderer->graphicsQueue);
-                                LOG_INFO("[FRAME] HUD: GPU done");
+                                renderer->ring.submitImmediate([&](VkCommandBuffer cmdBuf) {
+                                    // Barrier: UNDEFINED -> TRANSFER_DST
+                                    VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                                    barrier.srcAccessMask = 0;
+                                    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                                    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                                    barrier.image = hudImg;
+                                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                                    vkCmdPipelineBarrier(cmdBuf,
+                                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-                                vkFreeCommandBuffers(renderer->device, hudCmdPool, 1, &cmdBuf);
+                                    // Copy buffer to image
+                                    VkBufferImageCopy region = {};
+                                    region.bufferRowLength = hudWidth;
+                                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                                    region.imageOffset = {0, 0, 0};
+                                    region.imageExtent = {hudWidth, hudHeight, 1};
+                                    vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
+                                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+                                    // Barrier: TRANSFER_DST -> COLOR_ATTACHMENT
+                                    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                                    barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                                    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                                    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                                    vkCmdPipelineBarrier(cmdBuf,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
+                                });
+                                LOG_INFO("[FRAME] HUD: GPU done");
 
                                 LOG_INFO("[FRAME] HUD: Releasing swapchain image...");
                                 ReleaseHudSwapchainImage(*xr);
@@ -1189,7 +1361,7 @@ static void RenderThreadFunc(
                             g_panel1Rect.offset = {(int32_t)(winW / 16), (int32_t)(winH * 9 / 16)};
                         }
                         g_panel1Rect.extent = {(int32_t)pw, (int32_t)ph};
-                        bool ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, p1variant, g_panel1);
+                        bool ok = CreateAndFillL2DPanel(*xr, renderer, pw, ph, p1variant, g_panel1);
 
                         // #491 part 3 — a large backdrop submitted BEFORE the
                         // projection (an UNDER layer): the flat 2D plane the
@@ -1201,7 +1373,7 @@ static void RenderThreadFunc(
                             g_backdropRect.offset = {(int32_t)(winW / 2 - bw / 2),
                                                      (int32_t)(winH / 2 - bh / 2)};
                             g_backdropRect.extent = {(int32_t)bw, (int32_t)bh};
-                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, bw, bh,
+                            ok = CreateAndFillL2DPanel(*xr, renderer, bw, bh,
                                                        g_l2dBackdropVariant, g_backdrop);
                         }
 
@@ -1211,7 +1383,7 @@ static void RenderThreadFunc(
                             g_panel2Rect.offset = {g_panel1Rect.offset.x + (int32_t)(pw / 2),
                                                    g_panel1Rect.offset.y - (int32_t)(ph / 4)};
                             g_panel2Rect.extent = {(int32_t)pw, (int32_t)ph};
-                            ok = CreateAndFillL2DPanel(*xr, renderer, hudCmdPool, pw, ph, 1, g_panel2);
+                            ok = CreateAndFillL2DPanel(*xr, renderer, pw, ph, 1, g_panel2);
                         }
 
                         if (ok && g_l2dMask && g_zone.available && g_zone.pfnCreate &&
@@ -1229,8 +1401,13 @@ static void RenderThreadFunc(
                                 islands[0].extent = {(int32_t)(winW * 7 / 16), (int32_t)(winH / 2)};
                                 islands[1].offset = {(int32_t)(winW / 16), (int32_t)(winH / 16)};
                                 islands[1].extent = {(int32_t)(winW / 4), (int32_t)(winH / 4)};
-                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(g_zone.mask, 2, islands)) &&
-                                     XR_SUCCEEDED(g_zone.pfnSubmit(g_zone.mask));
+                                ok = XR_SUCCEEDED(g_zone.pfnSetRects(
+                                    g_zone.mask, 2, islands));
+                                if (ok && g_l2dMaskTier3) {
+                                  DrawTier3StrokeVk(renderer);
+                                }
+                                ok = ok && XR_SUCCEEDED(
+                                               g_zone.pfnSubmit(g_zone.mask));
                             }
                         }
 
@@ -1392,9 +1569,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         const char* e = getenv("DXR_LOCAL2D_PANEL");
         if (e && *e == '1') g_l2dPanel = true;
         e = getenv("DXR_LOCAL2D_MASK");
-        if (e && *e == '1') g_l2dMask = true;
+        if (e && (*e == '1' || *e == '3')) {
+          g_l2dMask = true;
+          g_l2dMaskTier3 = (*e == '3'); // #2342
+        }
         e = getenv("DXR_LOCAL2D_PANEL2");
         if (e && *e == '1') g_l2dPanel2 = true;
+        e = getenv("DXR_LOCAL2D_ACTIVATION_FRAME");
+        if (e != nullptr && *e != 0) {
+            const long f = strtol(e, nullptr, 10);
+            if (f > 0) g_l2dActivationFrame = f;
+        }
         // #491 part 3 — DXR_LOCAL2D_BACKDROP=1 ⟹ opaque backdrop (variant 2);
         // =2 ⟹ semi-transparent backdrop (variant 3, desktop shows through).
         // Either implies the Local2D panel path is active.
@@ -1591,7 +1776,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     VkBuffer hudStagingBuffer = VK_NULL_HANDLE;
     VkDeviceMemory hudStagingMemory = VK_NULL_HANDLE;
     void* hudStagingMapped = nullptr;
-    VkCommandPool hudCmdPool = VK_NULL_HANDLE;
 
     if (hudOk) {
         // Staging buffer
@@ -1636,17 +1820,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             }
         }
 
-        // Command pool for HUD copy operations
-        if (hudOk) {
-            VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-            poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            poolInfo.queueFamilyIndex = queueFamilyIndex;
-            if (vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &hudCmdPool) != VK_SUCCESS) {
-                LOG_WARN("Failed to create HUD command pool");
-                hudOk = false;
-            }
-        }
-
         if (hudOk) {
             LOG_INFO("HUD Vulkan resources created (%ux%u)", hudWidth, hudHeight);
         }
@@ -1667,7 +1840,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     std::thread renderThread(RenderThreadFunc, hwnd, &xr, &vkRenderer,
         hudOk ? &hudRenderer : nullptr, hudWidth, hudHeight,
-        hudStagingBuffer, hudStagingMapped, hudCmdPool,
+        hudStagingBuffer, hudStagingMapped,
         hudOk ? &hudSwapImages : nullptr);
 
     MSG msg = {};
@@ -1684,7 +1857,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("");
     LOG_INFO("=== Shutting down ===");
 
-    if (hudCmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, hudCmdPool, nullptr);
+    // Drain in-flight ring frames before freeing anything they may reference.
+    vkRenderer.ring.waitAll();
     if (hudStagingBuffer != VK_NULL_HANDLE) {
         vkUnmapMemory(vkDevice, hudStagingMemory);
         vkDestroyBuffer(vkDevice, hudStagingBuffer, nullptr);

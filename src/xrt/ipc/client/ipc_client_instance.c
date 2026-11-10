@@ -30,6 +30,7 @@
 #include "client/ipc_client.h"
 #include "client/ipc_client_interface.h"
 #include "client/ipc_client_connection.h"
+#include "client/ipc_client_stereo_camera.h"
 
 #include "ipc_client_generated.h"
 
@@ -216,6 +217,19 @@ err_destroy:
 	return xret;
 }
 
+/*!
+ * xrt_instance::enumerate_displays (multi-screen M1): the service's screen
+ * list, so `xrEnumerateDisplaysDXR` under IPC matches the in-process answer.
+ */
+static xrt_result_t
+ipc_client_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	struct ipc_client_instance *ii = ipc_client_instance(xinst);
+
+	xrt_result_t xret = ipc_call_system_enumerate_displays(&ii->ipc_c, out_list);
+	IPC_CHK_ALWAYS_RET(&ii->ipc_c, xret, "ipc_call_system_enumerate_displays");
+}
+
 static xrt_result_t
 ipc_client_instance_get_prober(struct xrt_instance *xinst, struct xrt_prober **out_xp)
 {
@@ -228,6 +242,9 @@ static void
 ipc_client_instance_destroy(struct xrt_instance *xinst)
 {
 	struct ipc_client_instance *ii = ipc_client_instance(xinst);
+
+	free(ii->base.stereo_camera);
+	ii->base.stereo_camera = NULL;
 
 	// service considers us to be connected until fd is closed
 	ipc_client_connection_fini(&ii->ipc_c);
@@ -272,6 +289,7 @@ ipc_instance_create(const struct xrt_instance_info *i_info, struct xrt_instance 
 	ii->base.create_system = ipc_client_instance_create_system;
 	ii->base.get_prober = ipc_client_instance_get_prober;
 	ii->base.destroy = ipc_client_instance_destroy;
+	ii->base.enumerate_displays = ipc_client_instance_enumerate_displays;
 
 #ifdef XRT_OS_WINDOWS
 	timeBeginPeriod(1);
@@ -333,6 +351,9 @@ ipc_instance_create(const struct xrt_instance_info *i_info, struct xrt_instance 
 	ii->xdev_count = count;
 
 	ii->base.startup_timestamp = ii->ipc_c.ism->startup_timestamp;
+
+	// XR_DXR_stereo_camera (ADR-043): cameras are reached over this connection.
+	ii->base.stereo_camera = ipc_client_stereo_camera_client_create(&ii->ipc_c);
 
 	*out_xinst = &ii->base;
 

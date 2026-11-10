@@ -52,7 +52,8 @@ enum comp_dp_api
 };
 
 /*!
- * Sentinel monitor id meaning "don't care — use the primary entry". Phase 3a
+ * Sentinel monitor id meaning "don't care — use the primary entry" (the active
+ * plug-in's monitor, see @ref xrt_dp_registry_primary_entry). Phase 3a
  * call sites pass this (single display → one entry); Phase 3b passes the real
  * per-window monitor id once split-weave routing exists.
  */
@@ -114,8 +115,10 @@ comp_dp_factory_for_window(const struct xrt_system_compositor_info *info,
 		return scalar;
 	}
 
-	// Pick the entry: an exact monitor match, else the primary (entries[0]).
-	const struct xrt_dp_registry_entry *chosen_entry = &info->dp_registry.entries[0];
+	// Pick the entry: an exact monitor match, else the primary — the active
+	// plug-in's monitor, not blindly entries[0] (multi-monitor, see helper).
+	const struct xrt_dp_registry_entry *chosen_entry =
+	    xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
 	if (monitor_id != COMP_DP_PRIMARY_MONITOR) {
 		for (uint32_t i = 0; i < info->dp_registry.entry_count; i++) {
 			if (info->dp_registry.entries[i].monitor_id == monitor_id) {
@@ -160,6 +163,51 @@ comp_dp_factory_for_window(const struct xrt_system_compositor_info *info,
 
 	// Registry-chosen factory wins when present; scalar is the safety net.
 	return (chosen != NULL) ? chosen : scalar;
+}
+
+/*!
+ * #2218: the factory for an in-process SESSION. A session bound to a display
+ * (XrSessionDisplayBindingDXR, @ref xrt_session_info::bound_display_id) takes
+ * that monitor's registry entry via @ref comp_dp_factory_for_window — an app
+ * pinned to another vendor's screen is woven by that vendor. An unbound session
+ * keeps the scalar `dp_factory_<api>`, byte for byte what shipped.
+ */
+static inline void *
+comp_dp_factory_for_session(const struct xrt_system_compositor_info *info,
+                            uint64_t bound_display_id,
+                            enum comp_dp_api api)
+{
+	if (info == NULL) {
+		return NULL;
+	}
+	if (bound_display_id != 0) {
+		return comp_dp_factory_for_window(info, bound_display_id, api);
+	}
+	return comp_dp_scalar_for_api(info, api);
+}
+
+/*!
+ * ADR-060: the registry ENTRY an in-process session's screen is woven from — the
+ * bound display's when @p bound_display_id is set, else the primary entry
+ * (@ref xrt_dp_registry_primary_entry). For callers that need more than the
+ * factory: the per-screen factory, the claim hints and the screen rect (the
+ * windowless texture-target DP). NULL when the registry has none.
+ */
+static inline const struct xrt_dp_registry_entry *
+comp_dp_entry_for_session(const struct xrt_system_compositor_info *info, uint64_t bound_display_id)
+{
+	if (info == NULL) {
+		return NULL;
+	}
+	if (bound_display_id != 0) {
+		for (uint32_t i = 0; i < info->dp_registry.entry_count; i++) {
+			if (info->dp_registry.entries[i].monitor_id == bound_display_id) {
+				return &info->dp_registry.entries[i];
+			}
+		}
+		return NULL;
+	}
+	return xrt_dp_registry_primary_entry(&info->dp_registry, info->active_plugin_id);
 }
 
 #ifdef __cplusplus

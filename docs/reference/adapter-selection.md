@@ -208,17 +208,35 @@ the iGPU; otherwise leave it alone and let the split keep the dGPU rendering.
 
 | path | auto-engages? | `reason=` when it does not |
 |---|---|---|
-| In-process **D3D11** (`_handle`, `_hosted`) | yes | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `dp_refused_scanout` (the plug-in declined a weaver on the scanout adapter — asked inside Stage A, so the split never engages, ADR-037 §3a) · `killed_by_env` |
+| In-process **D3D11** `_handle` | yes — on a cross-adapter box through the D3D11 hub by default (#2363, ADR-059; `hub placement: hub=1`). `DXR_HUB=0` puts the session back on the tier's own split | the hub's refusals print `hub placement: hub=0 reason=<token>` (`transparent_background`, `shared_texture_session`, `no_shared_fence`, `atlas_encoding_requested`, `disabled_by_env`, …) and the own split takes the session, with the tokens of the next row |
+| In-process **D3D11** `_hosted`, and any session the hub refuses | yes (the tier's own split; the hub refuses a runtime-owned window as `hosted_window`) | `no_hwnd` (offscreen) · `shared_texture_session` (`_texture`) · `render_unresolvable` · `scanout_unresolvable` · `same_adapter` · `stage_a_failed` · `dp_refused_scanout` (the plug-in declined a weaver on the scanout adapter — asked inside Stage A, so the split never engages, ADR-037 §3a) · `killed_by_env` |
 | **D3D11 service** (`_ipc`, any client API) | yes, per presenter | `presenter_ineligible,weave_on_ingest` (`CLIENT_TEXTURE` / self-presenting — the client owns the present, ADR-037 §7, and its display processor follows it onto the render device, #1172) · `legacy_standalone` · `no_panel_dimensions` · `same_adapter` · `stage_a_failed` · `killed_by_env` |
-| In-process **D3D12** (Unity, Unreal), projection-only | yes | as D3D11, plus `layers_unsupported` (a zones / Local2D / mask frame retires the split for the session) and `dp_refused_scanout` (ADR-037 §3a) |
-| In-process **Vulkan** | **no** | `api_unsupported` — rung 2, everything on the render adapter |
-| In-process **OpenGL** | **no** | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
+| In-process **D3D12** (Unity, Unreal) | yes — on a hybrid box through the D3D11 hub by default (the #1264 reroute, #2375; `hub placement: hub=1 … reason=hybrid_reroute_default_on`). `DXR_SPLIT_D3D12_HYBRID_REROUTE=0`, `DXR_SPLIT_D3D12_ROUTE=own`, or `DXR_HUB=0` with the route knob unset, keep the tier's own split | as D3D11, plus `dp_refused_scanout` (ADR-037 §3a). A hub refusal prints `hub placement: hub=0 reason=<token>` and the own split takes the session. (`layers_unsupported` is retired: the D3D12 split carries every layer kind.) |
+| In-process **Vulkan** (Windows) | yes (#1178, v2.12.1/v2.13.0) — the VK tier's split *is* the D3D11 hub: the atlas renders into a same-adapter D3D11 deposit (`vk_native/comp_vk_native_deposit.cpp`), which `hub_d3d11/comp_hub_d3d11.cpp` reads in place on one adapter or takes across the cross-adapter bridge. `DXR_HUB` is not read; `DXR_WEAVE_ON_SCANOUT=0` kills it | `no_timeline_semaphore` (app's `VkDevice` lacks `VK_KHR_timeline_semaphore`) · `no_hwnd` · the common gate tokens; `api_unsupported` only on non-Windows builds (ADR-037 §3) |
+| In-process **OpenGL** | **no** by default; **yes under `DXR_HUB=1`** (#2317 P3, the D3D11 hub) | `api_unsupported` — and ADR-037 §5: OpenGL exposes no device-*selection* API at all (it does usually expose the adapter's *identity* — see below) |
 | Metal / Android | n/a | single-adapter; the rule degenerates |
 
-Vulkan and OpenGL take rung 2 **unconditionally**, and neither can reach a
-half-engaged state: nothing in either compositor consults a scanout adapter,
-allocates a bridge, or creates a second device. They log the placement line and
-render exactly as before.
+By default OpenGL takes rung 2 and cannot reach a half-engaged state: nothing
+in the GL compositor consults a scanout adapter, allocates a bridge, or creates
+a second device. It logs the placement line and renders exactly as before.
+
+**Under `DXR_HUB=1` (#2317 P3)** GL still cannot be *told* which adapter to use,
+so the shim *reads* it: the GL context's LUID from `GL_DEVICE_LUID_EXT`, else an
+unambiguous `GL_VENDOR` / `GL_RENDERER` match. The ADR-037 §2 fallback is a
+guess and is refused as `gl_no_luid`. The GL atlas then renders into a D3D11
+deposit created **on that adapter** — `GL_EXT_memory_object_win32` +
+`GL_EXT_semaphore_win32` (`import=memory_object sync=fence`, zero copies), else
+`WGL_NV_DX_interop2` through a non-shared transit texture
+(`import=nv_dx_interop sync=lock_copy`, one GPU copy) — and the D3D11 hub
+weaves and presents on the scanout adapter: DIRECT when GL is already there,
+comp_xbridge across adapters. A create-time round-trip probe verifies the
+import (`gl_deposit_unverified`). Other refusals: `gl_no_interop`,
+`gl_no_clip_control`, `gl_deposit_failed`; a Local2D / zones / authored-mask
+frame retires the hub (`planes_unsupported_gl`). To put a GL app on one
+adapter, pin the exe with `UserGpuPreferences` — `DXR_D3D_FORCE_GPU` does not
+move GL. Vulkan (Windows) has a split as of #1178 — see ADR-037 §3; the
+`DXR_VK_DEPOSIT` section below documents its first rung (VK-0) and predates the
+split, so its "Not a split" / `api_unsupported` wording describes that rung only.
 
 #### `DXR_VK_DEPOSIT` — the first rung of the Vulkan ladder (#1178, VK-0)
 
@@ -348,7 +366,7 @@ Neither variable has to be *guessed at*. Two places report the answer:
 
   **Since #1252 the provenance also names WHICH source forced it** —
   `env-forced:` (an environment variable), `user-forced:` (the per-user store
-  the Control Panel writes) or `machine-forced:`
+  the Dashboard writes) or `machine-forced:`
   (`HKLM\Software\DisplayXR\Settings`). The variable is resolved through that
   chain with the environment still winning, so nothing that set it before
   changed meaning; the prefix simply stops the line claiming "env" for a value
@@ -400,7 +418,7 @@ Neither variable has to be *guessed at*. Two places report the answer:
 
   **`killed_by_env` no longer implies an environment variable (#1252).** The
   kill switch is resolved through the settings chain — environment, then the
-  per-user store the Control Panel writes, then the machine default — so a log
+  per-user store the Dashboard writes, then the machine default — so a log
   can read `killed_by_env` on a box where nothing sets `DXR_WEAVE_ON_SCANOUT` in
   any environment. The token keeps its name because shipped field logs and this
   doc are grepped for it; run `displayxr-cli perf list` to see which source

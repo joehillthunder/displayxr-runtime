@@ -15,6 +15,7 @@
  */
 
 #include "os_display_edid.h"
+#include "os_display_edid_parse.h"
 
 #include <windows.h>
 #include <setupapi.h>
@@ -59,22 +60,52 @@ monitor_enum_proc(HMONITOR hMonitor, HDC hdcMonitor, LPRECT lprcMonitor, LPARAM 
 /*!
  * Read EDID from a device registry key.
  * Returns true if EDID was found and manufacturer/product IDs extracted.
+ * @p out_serial is EDID bytes 12-15, 0 for a short or headerless blob.
  */
 static bool
-read_edid_from_regkey(HKEY hKey, uint16_t *out_manufacturer_id, uint16_t *out_product_id)
+read_edid_from_regkey(HKEY hKey,
+                      uint16_t *out_manufacturer_id,
+                      uint16_t *out_product_id,
+                      uint32_t *out_serial,
+                      uint32_t *out_width_mm,
+                      uint32_t *out_height_mm)
 {
-	BYTE edid_buf[256];
-	DWORD edid_size = sizeof(edid_buf);
+	// Size the buffer from the value: an EDID with more than one extension
+	// block (e.g. Samsung Odyssey 3D, 384 bytes) does not fit a fixed 256-byte
+	// buffer, and RegQueryValueExA then fails with ERROR_MORE_DATA and reads
+	// nothing, so the monitor silently drops out of the list.
+	DWORD edid_size = 0;
 	DWORD type = 0;
-
-	LONG ret = RegQueryValueExA(hKey, "EDID", NULL, &type, edid_buf, &edid_size);
+	LONG ret = RegQueryValueExA(hKey, "EDID", NULL, &type, NULL, &edid_size);
 	if (ret != ERROR_SUCCESS || edid_size < 16) {
+		return false;
+	}
+
+	BYTE *edid_buf = (BYTE *)malloc(edid_size);
+	if (edid_buf == NULL) {
+		return false;
+	}
+	ret = RegQueryValueExA(hKey, "EDID", NULL, &type, edid_buf, &edid_size);
+	if (ret != ERROR_SUCCESS || edid_size < 16) {
+		free(edid_buf);
 		return false;
 	}
 
 	// EDID bytes 8-9: manufacturer ID, bytes 10-11: product ID
 	*out_manufacturer_id = *(uint16_t *)&edid_buf[8];
 	*out_product_id = *(uint16_t *)&edid_buf[10];
+
+	// Physical size (first detailed timing's mm, else base-block cm); 0 = unknown.
+	// A short or headerless blob still yields the ids above, just no size.
+	struct os_display_edid_parsed parsed;
+	*out_width_mm = 0;
+	*out_height_mm = 0;
+	*out_serial = 0;
+	if (os_display_edid_parse(edid_buf, edid_size, &parsed)) {
+		os_display_edid_parsed_mm(&parsed, out_width_mm, out_height_mm);
+		*out_serial = parsed.serial_number;
+	}
+	free(edid_buf);
 	return true;
 }
 
@@ -310,6 +341,19 @@ enumerate_via_displayconfig(struct os_display_edid_list *out_list, const struct 
 			}
 		}
 
+		// Skip a monitor the SetupAPI pass already resolved, so this pass
+		// can fill gaps next to it instead of only running when it found none.
+		bool already_listed = false;
+		for (uint32_t i = 0; mon->hmonitor != NULL && i < out_list->count; i++) {
+			if (out_list->monitors[i].hmonitor == mon->hmonitor) {
+				already_listed = true;
+				break;
+			}
+		}
+		if (already_listed) {
+			continue;
+		}
+
 		out_list->count++;
 		out_list->diag_displayconfig_count++;
 	}
@@ -378,7 +422,11 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 	{
 		uint16_t mfr_id;
 		uint16_t prod_id;
-		char hwid[64]; // Extracted hardware ID (e.g., "AUO2E9A")
+		uint32_t serial;   // EDID serial, 0 = none
+		uint32_t width_mm; // EDID physical size, 0 = unknown
+		uint32_t height_mm;
+		char hwid[64];       // Extracted hardware ID (e.g., "AUO2E9A")
+		char driver_key[64]; // Device's driver key, as it ends a GDI DeviceID; "" = unknown
 	} setupdi_devices[OS_DISPLAY_EDID_MAX_MONITORS];
 	uint32_t setupdi_count = 0;     // devices that yielded a readable EDID blob
 	uint32_t setupdi_enumerated = 0; // monitor-class devices enumerated at all
@@ -400,7 +448,8 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		}
 
 		uint16_t mfr_id = 0, prod_id = 0;
-		bool got_edid = read_edid_from_regkey(hKey, &mfr_id, &prod_id);
+		uint32_t serial = 0, width_mm = 0, height_mm = 0;
+		bool got_edid = read_edid_from_regkey(hKey, &mfr_id, &prod_id, &serial, &width_mm, &height_mm);
 		RegCloseKey(hKey);
 
 		if (!got_edid) {
@@ -416,8 +465,17 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		if (setupdi_count < OS_DISPLAY_EDID_MAX_MONITORS) {
 			setupdi_devices[setupdi_count].mfr_id = mfr_id;
 			setupdi_devices[setupdi_count].prod_id = prod_id;
+			setupdi_devices[setupdi_count].serial = serial;
+			setupdi_devices[setupdi_count].width_mm = width_mm;
+			setupdi_devices[setupdi_count].height_mm = height_mm;
 			extract_hardware_id(instance_id, setupdi_devices[setupdi_count].hwid,
 			                    sizeof(setupdi_devices[setupdi_count].hwid));
+			char *driver_key = setupdi_devices[setupdi_count].driver_key;
+			if (!SetupDiGetDeviceRegistryPropertyA(dev_info, &dev_info_data, SPDRP_DRIVER, NULL,
+			                                       (PBYTE)driver_key,
+			                                       sizeof(setupdi_devices[setupdi_count].driver_key), NULL)) {
+				driver_key[0] = '\0';
+			}
 			setupdi_count++;
 		}
 	}
@@ -439,8 +497,26 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			continue;
 		}
 
+		// Two monitors of one model share a hardware ID but not a serial. The
+		// driver key ending the GDI DeviceID names the exact device; without
+		// it, the first device of that model is the best there is.
+		const char *gdi_driver_key = strchr(out_list->diag_gdi_device_ids[g], '{');
+		int32_t matched = -1;
 		for (uint32_t s = 0; s < setupdi_count; s++) {
 			if (_stricmp(gdi_hwids[g], setupdi_devices[s].hwid) != 0) {
+				continue;
+			}
+			if (gdi_driver_key != NULL && _stricmp(gdi_driver_key, setupdi_devices[s].driver_key) == 0) {
+				matched = (int32_t)s;
+				break;
+			}
+			if (matched < 0) {
+				matched = (int32_t)s;
+			}
+		}
+
+		for (uint32_t s = 0; s < setupdi_count; s++) {
+			if ((int32_t)s != matched) {
 				continue;
 			}
 
@@ -452,6 +528,9 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 			struct os_display_edid_monitor *mon = &out_list->monitors[out_list->count];
 			mon->manufacturer_id = setupdi_devices[s].mfr_id;
 			mon->product_id = setupdi_devices[s].prod_id;
+			mon->serial_number = setupdi_devices[s].serial;
+			mon->physical_width_mm = setupdi_devices[s].width_mm;
+			mon->physical_height_mm = setupdi_devices[s].height_mm;
 			mon->screen_left = gdi_ctx.rects[g].left;
 			mon->screen_top = gdi_ctx.rects[g].top;
 			mon->pixel_width = (uint32_t)(gdi_ctx.rects[g].right - gdi_ctx.rects[g].left);
@@ -472,9 +551,10 @@ os_display_edid_enumerate(struct os_display_edid_list *out_list)
 		}
 	}
 
-	// Durable fallback: the registry EDID blob was missing or uncorrelated
-	// on this box. Resolve panels straight from the OS display topology.
-	if (out_list->count == 0) {
+	// Durable fallback: a registry EDID blob was missing, unreadable or
+	// uncorrelated for at least one monitor. Resolve the rest straight from
+	// the OS display topology (monitors already listed are skipped).
+	if (out_list->count < gdi_ctx.count) {
 		enumerate_via_displayconfig(out_list, &gdi_ctx);
 	}
 

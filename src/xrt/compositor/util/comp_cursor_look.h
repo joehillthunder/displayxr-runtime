@@ -1,0 +1,172 @@
+// Copyright 2026, The DisplayXR Project and its contributors
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  The runtime-drawn cursor's default look, shared by every compositor.
+ * @author David Fattal
+ * @ingroup comp_util
+ *
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 A.6 / B): when the app hands
+ * the runtime no sprite, the runtime draws its DEFAULT LOOK - the current OS
+ * cursor's shape where the runtime can read it, else the classic arrow
+ * (u_cursor_draw_arrow_rgba: 12 x 19, white fill, dark outline, tip =
+ * hotspot).
+ *
+ * This module owns the CPU side of that choice, so the Metal, Vulkan and GL
+ * compositors cannot drift apart on it: which look, its pixels (premultiplied,
+ * sRGB-encoded RGBA8, top row first), its aspect, hotspot and size in OS
+ * points. A compositor only uploads the pixels whenever @ref
+ * comp_cursor_look::generation changes and samples them.
+ *
+ * OS-cursor mirroring: macOS ([NSCursor currentCursor], read only when the
+ * commit runs on the main thread - AppKit is main-thread-only;
+ * comp_cursor_look_macos.m) and Windows (GetCursorInfo + DrawIconEx over
+ * black and white, at the panel's DPI; comp_cursor_look_win.c). Desktop
+ * Linux cannot read another client's cursor, so it loads the user's cursor
+ * theme instead - its "left_ptr", through a dlopen()ed libXcursor
+ * (comp_cursor_look_linux.c, #2102). Elsewhere, and whenever the shape
+ * cannot be read, the look is the arrow.
+ * `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow everywhere.
+ *
+ * ZERO COST UNLESS REQUESTED (ADR-046 section 0): nothing here runs, and
+ * nothing is allocated, until a compositor is handed a draw request with no
+ * app sprite.
+ */
+
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*!
+ * The default look's current image. Zero-initialise; release with
+ * comp_cursor_look_fini().
+ */
+struct comp_cursor_look
+{
+	//! Premultiplied, sRGB-encoded RGBA8, top row first (w * h * 4 bytes).
+	uint8_t *rgba;
+	uint32_t w, h;
+	//! Width / height.
+	float aspect;
+	//! Hotspot, normalised (origin top-left, v down).
+	float hot_u, hot_v;
+	//! Height in OS points (the arrow: U_CURSOR_DRAW_DEFAULT_POINTS).
+	float height_pt;
+	//! Bumped every time the pixels change: re-upload when it moves.
+	uint64_t generation;
+	//! The mirrored OS cursor (platform object, retained), NULL for the arrow.
+	void *os_cursor;
+	//! Windows and Linux: the backing scale the mirrored image was made at
+	//! (Windows: DPI / 96); Windows: a cursor that could not be read (not
+	//! retried every frame).
+	float os_scale;
+	void *os_failed;
+	//! Windows: the last OS cursor found to draw nothing (a toolkit's "hidden"
+	//! cursor); treated as hidden instead of mirrored.
+	void *os_blank;
+	//! Linux: a backing scale the theme image could not be loaded at (0 = none),
+	//! so that scale is not retried every frame.
+	float os_failed_scale;
+};
+
+/*!
+ * Refresh the default look for this commit: re-read the OS cursor when the
+ * platform allows it here, else keep the last image, else the arrow.
+ *
+ * @param backing_scale The output's backing pixels per OS point (raster
+ *        resolution of a mirrored OS cursor); <= 0 picks the platform's.
+ * @return false only if no image could be produced at all.
+ */
+bool
+comp_cursor_look_update(struct comp_cursor_look *look, float backing_scale);
+
+/*!
+ * Backing pixels per OS point of the main screen (macOS), the system DPI / 96
+ * (Windows), Xft.dpi / 96 from the X resource database (desktop Linux; a
+ * compositor that knows its window's monitor scale passes that instead), 1
+ * elsewhere. macOS: read on the main thread and cached; off the main thread before the first read, 2 on
+ * macOS. The panel's metres per OS point is its pixel pitch times this.
+ */
+float
+comp_cursor_look_backing_scale(void);
+
+//! Free the image and release a mirrored OS cursor.
+void
+comp_cursor_look_fini(struct comp_cursor_look *look);
+
+/*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): rasterise a CALLER-SUPPLIED
+ * OS cursor handle into @p look, the same way the default look mirrors the
+ * current OS cursor (Windows: an HCURSOR, DrawIconEx over black and white at
+ * the user's pointer size x @p backing_scale - u_cursor_os_height_px_win() -
+ * with SM_CYCURSOR and the image's own size as floors). Re-rasterises only
+ * when the handle or the scale changes.
+ *
+ * @return false when the handle cannot be read (a dead handle fails
+ *         GetIconInfo) or on a platform without OS cursor handles; @p look
+ *         then keeps its last image, never a wrong one.
+ */
+bool
+comp_cursor_look_from_os_cursor(struct comp_cursor_look *look, uint64_t os_cursor, float backing_scale);
+
+struct u_cursor_draw_request;
+
+/*!
+ * Verification hook (#1952): should every compositor refuse this request?
+ * DXR_CURSOR_DRAW_REFUSE=1 refuses always; DXR_CURSOR_DRAW_REFUSE_PERIOD_MS=N
+ * refuses during the first half of every N ms (a square wave, to watch
+ * willDraw flip both ways in one run). Both read once. When it refuses it
+ * reports U_CURSOR_DRAW_REFUSAL_FORCED on @p req and returns true: the caller
+ * then draws nothing. Called only for a consumed request (zero cost otherwise).
+ */
+bool
+comp_cursor_draw_debug_refuse(const struct u_cursor_draw_request *req);
+
+struct u_cursor_soften_params;
+
+/*!
+ * The crosstalk-softening knobs (ADR-046 Amendment 2 B.7), read from the
+ * environment once, on the first call (one WARN line with the values):
+ * DXR_CURSOR_SOFTEN=off|alpha|blur|both (default both),
+ * DXR_CURSOR_SOFTEN_BLUR_K, DXR_CURSOR_SOFTEN_BLUR_MAX_PX,
+ * DXR_CURSOR_SOFTEN_ALPHA_MIN, DXR_CURSOR_SOFTEN_FULL_D
+ * (u_cursor_soften_params_parse). Called only on a cursor frame.
+ */
+const struct u_cursor_soften_params *
+comp_cursor_soften_params(void);
+
+
+/*
+ *
+ * Internal - the platform half (comp_cursor_look_macos.m on Apple,
+ * comp_cursor_look_win.c on Windows, comp_cursor_look_linux.c on desktop
+ * Linux).
+ *
+ */
+
+/*!
+ * Mirror the current OS cursor into @p look if the platform can read it now
+ * and it is not already the mirrored one.
+ *
+ * @return true if @p look now holds the OS cursor (changed or not), false if
+ *         it could not be read here (the caller falls back).
+ */
+bool
+comp_cursor_look_platform_mirror(struct comp_cursor_look *look, float backing_scale);
+
+//! Release a mirrored platform cursor object.
+void
+comp_cursor_look_platform_release(void *os_cursor);
+
+//! @copydoc comp_cursor_look_backing_scale
+float
+comp_cursor_look_platform_backing_scale(void);
+
+#ifdef __cplusplus
+}
+#endif

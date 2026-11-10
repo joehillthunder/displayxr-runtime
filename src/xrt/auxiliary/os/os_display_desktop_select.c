@@ -33,7 +33,19 @@
  * both are per-monitor facts the OS also knows (RandR reports each monitor's
  * rect and its EDID mm). The rule order is in @ref
  * os_display_desktop_info_for_panel: a reported position beats everything, then
- * a unique PIXEL-size match, then the primary fallback.
+ * the monitor whose CONNECTOR runs the panel's native mode, then a unique
+ * PIXEL-size match in the placement space, then the primary fallback.
+ *
+ * ## Why the connector's mode comes before the placement-space size (#1831)
+ *
+ * The placement space is not the hardware on a scaled X11 desktop. Under
+ * XWayland, Mutter scales the whole X screen by one integer, the ceiling of the
+ * largest monitor scale, so a 3840x2160 panel at 150 % is a 5120x2880 RandR
+ * rect: the size rule misses it and the primary fallback silently weaves for
+ * the laptop. Worse, a different monitor's scaled rect can read exactly the
+ * panel's size and win. The connector's device mode (Mutter DisplayConfig,
+ * else DRM sysfs, joined by connector name) is the same number the plug-in
+ * reports, at any scale.
  *
  * Physical size is a tie-breaker only, never a rule of its own. Matching on
  * millimetres alone would place windows on a monitor whose pixel size differs
@@ -112,11 +124,224 @@ os_display_desktop_rule_str(enum os_display_desktop_rule rule)
 {
 	switch (rule) {
 	case OS_DISPLAY_DESKTOP_RULE_ORIGIN: return "origin";
+	case OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE: return "connector match";
 	case OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH: return "size match";
 	case OS_DISPLAY_DESKTOP_RULE_PRIMARY_FALLBACK: return "primary fallback";
+	case OS_DISPLAY_DESKTOP_RULE_CLAIM: return "plug-in claim";
 	case OS_DISPLAY_DESKTOP_RULE_UNRESOLVED:
 	default: return "unresolved";
 	}
+}
+
+int32_t
+os_display_desktop_select_by_size(const struct os_display_desktop_info *mons,
+                                  uint32_t count,
+                                  const struct os_display_panel_hint *hint,
+                                  struct os_display_panel_match *out_match)
+{
+	struct os_display_panel_match match = {0};
+	match.rule = OS_DISPLAY_DESKTOP_RULE_UNRESOLVED;
+	match.monitor_count = count;
+	if (out_match != NULL) {
+		*out_match = match;
+	}
+
+	if (mons == NULL || count == 0 || hint == NULL || hint->pixel_width == 0 || hint->pixel_height == 0) {
+		return -1;
+	}
+	if (count > OS_DISPLAY_DESKTOP_MAX_MONITORS) {
+		count = OS_DISPLAY_DESKTOP_MAX_MONITORS;
+	}
+
+	// Metres -> mm, rounded. 0 stays 0 ("unknown").
+	const uint32_t panel_w_mm = hint->width_m > 0.0f ? (uint32_t)(hint->width_m * 1000.0f + 0.5f) : 0;
+	const uint32_t panel_h_mm = hint->height_m > 0.0f ? (uint32_t)(hint->height_m * 1000.0f + 0.5f) : 0;
+
+	uint32_t cand[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	uint32_t cand_count = 0;
+
+	// Rule 2 (#1831): the connector is RUNNING the panel's native mode. The
+	// device mode is the one number that means the same thing on both sides
+	// at every desktop scale — the plug-in reports hardware pixels, and so
+	// does the connector — where the X11 rect of a fractionally-scaled output
+	// is device x ceil(scale) / scale and matches nothing.
+	for (uint32_t i = 0; i < count; i++) {
+		if (mons[i].native_width == hint->pixel_width && mons[i].native_height == hint->pixel_height) {
+			cand[cand_count++] = i;
+		}
+	}
+	enum os_display_desktop_rule rule = OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE;
+
+	// Rule 3: the monitor's rect in the placement space IS the panel's
+	// native resolution — the only evidence on platforms with no device
+	// mode. Compared in the caller's DPI space, the space a plug-in reports
+	// in (see the field docs on os_display_desktop_info). A monitor whose
+	// device mode IS known and is something else is not the panel, however
+	// its rect happens to read: under XWayland a 2880x1800 laptop at 125 %
+	// with the X screen at 2x reads 4608x2880, and a different laptop could
+	// read exactly a panel's 3840x2160.
+	if (cand_count == 0) {
+		rule = OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH;
+		for (uint32_t i = 0; i < count; i++) {
+			const bool native_known = mons[i].native_width > 0 && mons[i].native_height > 0;
+			if (native_known) {
+				continue;
+			}
+			if (mons[i].width_in_caller_dpi == hint->pixel_width &&
+			    mons[i].height_in_caller_dpi == hint->pixel_height) {
+				cand[cand_count++] = i;
+			}
+		}
+	}
+
+	if (cand_count == 0) {
+		return -1;
+	}
+
+	const uint32_t pick = cand_count == 1 ? cand[0] : disambiguate(mons, cand, cand_count, panel_w_mm, panel_h_mm);
+	match.rule = rule;
+	match.candidate_count = cand_count;
+	if (out_match != NULL) {
+		*out_match = match;
+	}
+	return (int32_t)pick;
+}
+
+static bool
+claim_contains(const struct os_display_panel_claim *c, int32_t x, int32_t y)
+{
+	return c->width > 0 && c->height > 0 && x >= c->left && y >= c->top &&
+	       (int64_t)x < (int64_t)c->left + (int64_t)c->width && (int64_t)y < (int64_t)c->top + (int64_t)c->height;
+}
+
+static bool
+hint_has_origin(const struct os_display_panel_hint *hint)
+{
+	// (0, 0) is "no preference" unless the plug-in vouched for it (#2577).
+	return hint != NULL && (hint->origin_valid || hint->screen_left != 0 || hint->screen_top != 0);
+}
+
+bool
+os_display_desktop_origin_on_claim(const struct os_display_panel_claim *claims,
+                                   uint32_t count,
+                                   const struct os_display_panel_hint *hint)
+{
+	if (claims == NULL || !hint_has_origin(hint)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		if (claim_contains(&claims[i], hint->screen_left, hint->screen_top)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+int32_t
+os_display_desktop_select_claim(const struct os_display_panel_claim *claims,
+                                uint32_t count,
+                                const struct os_display_panel_hint *hint,
+                                bool *out_overrides_origin)
+{
+	if (out_overrides_origin != NULL) {
+		*out_overrides_origin = false;
+	}
+	if (claims == NULL || count == 0) {
+		return -1;
+	}
+
+	// The plug-in's origin is on a monitor it claims: the two sources agree,
+	// and the origin rule keeps the answer it always gave.
+	if (os_display_desktop_origin_on_claim(claims, count, hint)) {
+		return -1;
+	}
+
+	const bool have_origin = hint_has_origin(hint);
+	bool any_verified = false;
+	for (uint32_t i = 0; i < count; i++) {
+		any_verified = any_verified || claims[i].verified;
+	}
+
+	// An origin on none of the claimed monitors is the plug-in contradicting
+	// itself. Only an SDK-verified claim outranks it; an EDID-table match is
+	// no stronger evidence than the origin the same plug-in computed.
+	if (have_origin && !any_verified) {
+		return -1;
+	}
+
+	// Several claimed monitors (two panels of one vendor): a verified one,
+	// then the panel's own pixel size, then a verified panel AT the reported
+	// (0, 0) origin, then the added (non-primary) monitor — a 3D panel is a
+	// second screen on most rigs — then registry order.
+	//
+	// The (0, 0) term (#2577): (0, 0) is both "no origin" and the desktop
+	// origin, so it cannot settle the agree case above. But when the primary
+	// monitor is itself a verified panel sitting there, a plug-in that reads
+	// its origin from EDID (Windows) reported exactly that monitor, and the
+	// session's own DP weaves it. Letting "non-primary" win then hands the
+	// panel rect, window placement and the head screen to the OTHER panel,
+	// while the head DP still weaves the first — no segment DP is ever built
+	// for the second screen. Verified claims only: an EDID-table match at the
+	// origin is a laptop screen as often as a panel (#430's shape).
+	//
+	// A plug-in that sets the origin-valid bit never needs this term: its
+	// (0, 0) is an origin, so with a panel there the agree case above already
+	// returned. The term stays for plug-ins built before the bit.
+	const bool origin_unset = !have_origin;
+	int32_t best = -1;
+	int best_score = -1;
+	for (uint32_t i = 0; i < count; i++) {
+		const struct os_display_panel_claim *c = &claims[i];
+		if (have_origin && !c->verified) {
+			continue;
+		}
+		const bool size_match = hint != NULL && hint->pixel_width > 0 && hint->pixel_height > 0 &&
+		                        c->width == hint->pixel_width && c->height == hint->pixel_height;
+		const bool verified_at_origin = origin_unset && c->verified && claim_contains(c, 0, 0);
+		const int score = (c->incumbent ? 16 : 0) + (c->verified ? 8 : 0) + (size_match ? 4 : 0) +
+		                  (verified_at_origin ? 2 : 0) + (!c->is_primary ? 1 : 0);
+		if (score > best_score) {
+			best = (int32_t)i;
+			best_score = score;
+		}
+	}
+
+	if (best >= 0 && have_origin && out_overrides_origin != NULL) {
+		*out_overrides_origin = true;
+	}
+	return best;
+}
+
+bool
+os_display_desktop_info_for_device(void *platform_handle,
+                                   const char *device_name,
+                                   struct os_display_desktop_info *out_info)
+{
+	if (out_info == NULL) {
+		return false;
+	}
+	memset(out_info, 0, sizeof(*out_info));
+
+	// The handle is the identity wherever the platform has one (Windows): it
+	// is the same monitor in every DPI context, where a coordinate is not.
+	if (platform_handle != NULL && os_display_desktop_info_for_handle(platform_handle, out_info)) {
+		return true;
+	}
+
+	if (device_name == NULL || device_name[0] == '\0') {
+		return false;
+	}
+
+	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
+	const uint32_t count = os_display_desktop_enumerate(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
+	for (uint32_t i = 0; i < count && i < OS_DISPLAY_DESKTOP_MAX_MONITORS; i++) {
+		if (strcmp(mons[i].device_name, device_name) == 0) {
+			*out_info = mons[i];
+			return true;
+		}
+	}
+	memset(out_info, 0, sizeof(*out_info));
+	return false;
 }
 
 bool
@@ -142,8 +367,9 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 
 	// Rule 1: a position the plug-in actually reported. (0, 0) is defined as
 	// "no preference", so it is NOT a position — that is the whole reason the
-	// size rules below exist.
-	if (h.screen_left != 0 || h.screen_top != 0) {
+	// size rules below exist — unless the plug-in set the origin-valid bit:
+	// then it is the monitor at the desktop origin (#2577).
+	if (hint_has_origin(&h)) {
 		match.rule = OS_DISPLAY_DESKTOP_RULE_ORIGIN;
 		bool ok = os_display_desktop_info_at(h.screen_left, h.screen_top, out_info);
 		if (!ok) {
@@ -157,36 +383,16 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 
 	struct os_display_desktop_info mons[OS_DISPLAY_DESKTOP_MAX_MONITORS];
 	uint32_t count = os_display_desktop_enumerate(mons, OS_DISPLAY_DESKTOP_MAX_MONITORS);
-	match.monitor_count = count;
 
-	// Metres -> mm, rounded. 0 stays 0 ("unknown").
-	uint32_t panel_w_mm = h.width_m > 0.0f ? (uint32_t)(h.width_m * 1000.0f + 0.5f) : 0;
-	uint32_t panel_h_mm = h.height_m > 0.0f ? (uint32_t)(h.height_m * 1000.0f + 0.5f) : 0;
-
-	if (count > 0 && h.pixel_width > 0 && h.pixel_height > 0) {
-		// Rule 2: the monitor's mode IS the panel's native resolution.
-		// Compared in the caller's DPI space, the space a plug-in reports
-		// in — see the field docs on os_display_desktop_info.
-		uint32_t cand[OS_DISPLAY_DESKTOP_MAX_MONITORS];
-		uint32_t cand_count = 0;
-		for (uint32_t i = 0; i < count; i++) {
-			if (mons[i].width_in_caller_dpi == h.pixel_width &&
-			    mons[i].height_in_caller_dpi == h.pixel_height) {
-				cand[cand_count++] = i;
-			}
+	// Rules 2 and 3: the panel's hardware mode, then its size in the
+	// placement space.
+	int32_t pick = os_display_desktop_select_by_size(mons, count, &h, &match);
+	if (pick >= 0) {
+		*out_info = mons[pick];
+		if (out_match != NULL) {
+			*out_match = match;
 		}
-
-		if (cand_count > 0) {
-			uint32_t pick =
-			    cand_count == 1 ? cand[0] : disambiguate(mons, cand, cand_count, panel_w_mm, panel_h_mm);
-			*out_info = mons[pick];
-			match.rule = OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH;
-			match.candidate_count = cand_count;
-			if (out_match != NULL) {
-				*out_match = match;
-			}
-			return true;
-		}
+		return true;
 	}
 
 	// No rule between here and the fallback. A monitor matching only in
@@ -195,7 +401,7 @@ os_display_desktop_info_for_panel(const struct os_display_panel_hint *hint,
 	// and physical size alone does not identify a panel well enough to move a
 	// window on (see the file comment for the measurement that settled this).
 
-	// Rule 3: the monitor at the desktop origin — i.e. exactly what this
+	// Rule 4: the monitor at the desktop origin — i.e. exactly what this
 	// resolver did before any of the above existed, which is what keeps the
 	// Windows path (no enumeration, so it arrives straight here whenever the
 	// plug-in reported no position) bit-for-bit unchanged.

@@ -108,6 +108,11 @@ jobs:
         with:
           submodules: recursive
           lfs: true
+          # History + tags: cmake/DisplayXRVersion.cmake versions the build from
+          # `git describe` (#1790). A shallow clone cannot reach the last vX.Y.Z
+          # tag from a main/PR commit, which is how a main build came to report
+          # "v1.6.0 '0967ae7d'" and the Unity plug-in picked UNORM swapchains.
+          fetch-depth: 0
 
       - name: Doc-only PR — skipping heavy build steps
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -117,6 +122,41 @@ jobs:
       # in its link line (ADR-019). Vendor drv_* implementations ship from
       # separate repos as plug-in DLLs (see DisplayXR/displayxr-leia-plugin
       # and docs/guides/vendor-plugin-onboarding.md).
+
+      # vcpkg binary cache (#1773). Without one, every run rebuilds every port
+      # from source and re-downloads every upstream archive, so any upstream
+      # host outage (SourceForge vs pthreads, 2026-10) is a hard CI stop.
+      # run-vcpkg@v11 defaults VCPKG_BINARY_SOURCES to `x-gha`, a backend
+      # vcpkg has removed (it only logs a warning), so nothing was cached.
+      # run-vcpkg leaves an already-set VCPKG_BINARY_SOURCES alone, so set a
+      # `files` provider here and persist it with actions/cache.
+      #
+      # vcpkg keys each package by its own ABI hash (port files, triplet,
+      # compiler, deps), so a stale entry can never be used for the wrong
+      # build. The cache key only decides what gets saved: vcpkg commit +
+      # triplet + runner image (compiler) + manifest/overlay hash. A miss
+      # falls back to the newest entry for the same vcpkg commit + triplet
+      # (restore-keys), and every package whose ABI still matches is reused.
+      - name: Configure vcpkg binary cache
+        id: vcpkg-bincache
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'vcpkg-bincache'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          Add-Content -Path $env:GITHUB_ENV -Value "VCPKG_BINARY_SOURCES=clear;files,$dir,readwrite"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "dir=$dir"
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "image=$env:ImageOS-$env:ImageVersion"
+
+      - name: Restore vcpkg binary cache
+        id: vcpkg-bincache-restore
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.vcpkg-bincache.outputs.dir }}
+          key: vcpkg-bin-x64-windows-5d90b0d5-${{ steps.vcpkg-bincache.outputs.image }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'cmake/vcpkg-overlay-ports/**', 'cmake/vcpkg-overlay-triplets/**') }}
+          restore-keys: |
+            vcpkg-bin-x64-windows-5d90b0d5-
 
       - name: Restore from cache and setup vcpkg executable and data files.
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -167,54 +207,8 @@ jobs:
           Invoke-WebRequest -Uri $openxrUrl -OutFile openxr_loader.zip
           Expand-Archive -Path openxr_loader.zip -DestinationPath openxr_sdk -Force
 
-      # Sync CMakeLists.txt VERSION to the most recent vX.Y.Z tag on every
-      # run. The installer's OutFile name comes from CMake's project(VERSION),
-      # which is wired through installer/CMakeLists.txt → NSIS as
-      # `DisplayXRSetup-${VERSION}.exe`. Without this, the source-tree
-      # VERSION drives the filename on PR / main builds — easy to drift if
-      # /release ever forgets to bump it before tagging
-      # (cf. displayxr-shell-pvt#33, where source pinned at 1.2.3 while the
-      # latest tag was v1.3.0, producing `DisplayXRShellSetup-1.2.3.exe`
-      # in every PR artifact).
-      #
-      # `git describe --tags --abbrev=0 --match 'v[0-9]*'` resolves to the
-      # exact tag on tag pushes and the most recent matching tag on every
-      # other commit, so the same step covers PRs, main pushes, and tag
-      # pushes. /release can stop manually bumping CMakeLists.txt — CI is
-      # authoritative.
-      - name: Sync CMake VERSION from latest vX.Y.Z tag
-        if: needs.DetectChanges.outputs.docs_only != 'true'
-        shell: pwsh
-        run: |
-          # actions/checkout's default fetch-depth is 1 and skips tags; pull
-          # in just the tag refs (no extra commit history) so describe works.
-          git fetch --depth=1 origin '+refs/tags/*:refs/tags/*' 2>$null
-
-          $tag = (git describe --tags --abbrev=0 --match 'v[0-9]*' 2>$null)
-          if (-not $tag) {
-            Write-Host "No vX.Y.Z tag reachable — leaving CMakeLists.txt unchanged"
-            exit 0
-          }
-          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') {
-            Write-Host "Latest tag '$tag' is not vX.Y.Z — leaving CMakeLists.txt unchanged"
-            exit 0
-          }
-          $ver = $Matches[1]
-          Write-Host "Patching CMakeLists.txt VERSION to $ver (from tag $tag, ref=$env:GITHUB_REF)"
-          # Line-by-line rewrite avoids .NET regex's `$1`-followed-by-digit
-          # parser ambiguity (e.g. `$1.2.4` → it tries `$11` first); see the
-          # shell-pvt sibling step for the original encounter.
-          $out = Get-Content CMakeLists.txt | ForEach-Object {
-            if ($_ -match '^(\s*)VERSION\s+\d+\.\d+\.\d+(\s*)$') {
-              "$($Matches[1])VERSION $ver$($Matches[2])"
-            } else {
-              $_
-            }
-          }
-          Set-Content -Path CMakeLists.txt -Value $out -Encoding UTF8
-          Select-String -Path CMakeLists.txt -Pattern '^\s*VERSION\s+\d+\.\d+\.\d+\s*$' | Select-Object -First 1
-
       - name: Generate
+        id: generate
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           cmake -S . -B build -G "Ninja Multi-Config" `
@@ -227,6 +221,19 @@ jobs:
             -DXRT_FEATURE_HYBRID_MODE=ON `
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk" `
             -DBUILD_NUM="${{ github.run_number }}"
+
+      # Save right after the last vcpkg install (Generate adds the `gui`
+      # feature's ports), not at job end, so a later compile or test failure
+      # still keeps the packages. Only after a successful Generate, so a
+      # half-installed set is never stored under the exact key (an exact hit
+      # skips the save, so it would never be completed). An exact-key hit
+      # already holds everything.
+      - name: Save vcpkg binary cache
+        if: always() && steps.generate.outcome == 'success' && steps.vcpkg-bincache-restore.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.vcpkg-bincache.outputs.dir }}
+          key: ${{ steps.vcpkg-bincache-restore.outputs.cache-primary-key }}
 
       - name: Build
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -257,6 +264,58 @@ jobs:
             exit 1
           }
           Write-Host "PASS: runtime DLL has zero SimulatedReality imports (ADR-019 §2.1 holds)."
+          # ADR-054 N4: the trunk is more than the runtime DLL. The service and
+          # the CLI host every class loader too, and a vendor or a reference
+          # component (sim_display, sim_input, sim_conversion, the Ultraleap
+          # provider and its LeapC.dll) must reach them only through a loader,
+          # never through the import table or the link line. Two views, both
+          # asserted: what each binary imports (dumpbin /dependents) and what
+          # each binary's link edge named (the Release LINK_LIBRARIES in the
+          # Ninja Multi-Config impl file), because a static library drags in no
+          # import and shows only on the link line.
+          # displayxr-tracking-host (tracking-provider-discovery §4a) loads providers
+          # only through the tracking loader, exactly like the service.
+          $trunk = @("_package/bin/DisplayXRClient.dll", "_package/bin/displayxr-service.exe", "_package/bin/displayxr-cli.exe", "_package/bin/displayxr-tracking-host.exe")
+          $forbiddenDeps = "SimulatedReality|LeapC|DisplayXR-Sim|DisplayXR-Ultraleap|DisplayXR-LeiaSR|DimencoWeaving"
+          $forbiddenLibs = "drv_sim_display\.lib|drv_leia|drv_ultraleap|SimulatedReality|LeapC|drv_sim_input|drv_sim_conversion|drv_sim_tracking"
+          $ninjaFile = "build/CMakeFiles/impl-Release.ninja"
+          if (-not (Test-Path $ninjaFile)) {
+            Write-Host "::error::$ninjaFile missing — the guard cannot see the Release link edges."
+            exit 1
+          }
+          $ninja = Get-Content $ninjaFile -Raw
+          foreach ($bin in $trunk) {
+            if (-not (Test-Path $bin)) {
+              Write-Host "::error::$bin missing — build did not produce expected artifact."
+              exit 1
+            }
+            $deps = & dumpbin /dependents $bin 2>&1 | Select-String -Pattern '^\s+\S+\.dll\s*$' | ForEach-Object { $_.Line.Trim() }
+            $bad = $deps | Where-Object { $_ -match $forbiddenDeps }
+            if ($bad) {
+              Write-Host "::error::ADR-054 §1 regression — $bin imports a component or vendor DLL: $($bad -join ', ')"
+              exit 1
+            }
+            $leaf = [System.IO.Path]::GetFileName($bin)
+            # The edge header is `build <dir>\Release\<leaf>[ <more outputs>]: <rule> ...`,
+            # followed by its indented variables up to the next blank line. The
+            # file is CRLF on Windows, so the blank line is `\r?\n\r?\n`.
+            $m = [regex]::Match($ninja, "(?ms)^build [^\n]*?\\Release\\$([regex]::Escape($leaf))[ :][^\n]*\n(.*?)\r?\n\r?\n")
+            if (-not $m.Success) {
+              Write-Host "::error::could not find the $leaf link edge in $ninjaFile — the guard cannot see its link line."
+              exit 1
+            }
+            $linkLine = ($m.Groups[1].Value -split "`n" | Where-Object { $_ -match 'LINK_LIBRARIES' }) -join ' '
+            if ($linkLine.Length -eq 0) {
+              Write-Host "::error::the $leaf link edge has no LINK_LIBRARIES line — the guard cannot see its link line."
+              exit 1
+            }
+            $badLibs = ($linkLine -split ' ' | Where-Object { $_ -match $forbiddenLibs } | Sort-Object -Unique)
+            if ($badLibs) {
+              Write-Host "::error::ADR-054 §1 regression — $leaf links a component or vendor library: $($badLibs -join ', ')"
+              exit 1
+            }
+            Write-Host "PASS: $leaf imports no component/vendor DLL and links no drv_*/vendor library."
+          }
           # Also assert that the plug-in DLL we expect IS shipped — guards
           # against a CMake regression that silently drops the plug-in.
           $plugin = "_package/bin/plugins/DisplayXR-SimDisplay.dll"
@@ -282,6 +341,19 @@ jobs:
             exit 1
           }
           Write-Host "PASS: sim-input provider built and exports xrtInputPluginNegotiate."
+          # And the conversion-provider reference (ADR-053 / #2002; required
+          # since ADR-054 §2.3: every class ships a reference implementation).
+          $convPlugin = "_package/bin/plugins/DisplayXR-SimConversion.dll"
+          if (-not (Test-Path $convPlugin)) {
+            Write-Host "::error::$convPlugin missing — sim-conversion provider did not build."
+            exit 1
+          }
+          $convExports = & dumpbin /exports $convPlugin 2>&1 | Select-String -Pattern "xrtConversionPluginNegotiate"
+          if (-not $convExports) {
+            Write-Host "::error::$convPlugin missing xrtConversionPluginNegotiate export (ADR-053 contract — exactly one symbol)."
+            exit 1
+          }
+          Write-Host "PASS: sim-conversion provider built and exports xrtConversionPluginNegotiate."
 
       # Unit tests. `tests/` has carried ~20 Catch2 suites that CI BUILT and never
       # RAN -- `grep -rn ctest .github/workflows/` returned nothing before this
@@ -344,6 +416,36 @@ jobs:
           reg add $inputKey /v Binary /t REG_SZ /d "$inputPlugin" /f | Out-Null
           reg add $inputKey /v ProbeOrder /t REG_DWORD /d 200 /f | Out-Null
           reg add $inputKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Input" /f | Out-Null
+          # ADR-053 / #1999: register the sim conversion provider too, exactly as
+          # `register_dev_plugin.bat conv sim` does (ProbeOrder 250, FALLBACK
+          # band; Version written last). The DLL is mandatory since #2002
+          # landed (the vendor-identifier step above already fails on its
+          # absence); ADR-054 §2.3 makes a shipped reference part of what a
+          # class IS, so a missing one is a build regression, not a skip.
+          $convKey = "HKLM\Software\DisplayXR\ConversionProviders\sim-conversion"
+          $convPlugin = (Resolve-Path "_package/bin/plugins/DisplayXR-SimConversion.dll").Path
+          reg add $convKey /v Binary /t REG_SZ /d "$convPlugin" /f | Out-Null
+          reg add $convKey /v ProbeOrder /t REG_DWORD /d 250 /f | Out-Null
+          reg add $convKey /v DisplayName /t REG_SZ /d "DisplayXR Sim Conversion" /f | Out-Null
+          # #2006: the sim provider's probe declines unless setting ENABLE = 1
+          # (spec §7.2: "CI registers sim-conversion with ENABLE = 1"); without
+          # it the selftest lists the row but never validates a descriptor.
+          reg add "$convKey\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+          reg add $convKey /v Version /t REG_SZ /d "ci" /f | Out-Null
+          $convRegistered = $true
+          Write-Host "Registered sim-conversion provider: $convPlugin"
+          # ADR-054 N4b PR B: the provenance gate ENFORCES by default on Windows and
+          # this runner is elevated (the dev override is refused there), so allowlist
+          # the three just-built, unsigned DLLs the way the runtime installer /
+          # register_dev_plugin.bat do. Rows removed in the finally block.
+          $allowRoot = "HKLM\Software\DisplayXR\Trust\Allowlist"
+          $allowlisted = @()
+          foreach ($dll in @($plugin, $inputPlugin, $convPlugin)) {
+            $h = (Get-FileHash -Path $dll -Algorithm SHA256).Hash.ToLower()
+            reg add $allowRoot /v $h /t REG_SZ /d "ci $(Split-Path $dll -Leaf)" /f | Out-Null
+            $allowlisted += $h
+          }
+          Write-Host "Allowlisted $($allowlisted.Count) plug-in digest(s) (ADR-054 N4b)."
           # Registration is no longer enough: since ADR-034 Amendment 1
           # sim-input's probe() declines unless DXR_SIM_INPUT is set, so that a
           # stray registration on a dev box can't put synthetic controllers in
@@ -393,6 +495,21 @@ jobs:
                   $code = 1
                 } else {
                   Write-Host "PASS: input-provider gate — $($inputCheck.detail)"
+                }
+                # ADR-053 / #2006: with sim-conversion registered, the
+                # conversion_providers check must have SEEN it (enumerate ->
+                # negotiate -> describe, no model load). Same guard as the
+                # registration above.
+                # TODO(#2002): drop the $convRegistered guard once the sim
+                # provider always builds -- then count >= 1 is unconditional.
+                if ($convRegistered) {
+                  $convCount = $selfObj.conversion_providers.count
+                  if ($null -eq $convCount -or [int]$convCount -lt 1) {
+                    Write-Host "::error::conversion_providers.count is '$convCount' with sim-conversion registered (#2006)."
+                    $code = 1
+                  } else {
+                    Write-Host "PASS: conversion-provider gate - count $convCount"
+                  }
                 }
               }
             }
@@ -467,6 +584,8 @@ jobs:
           } finally {
             reg delete $key /f | Out-Null
             reg delete $inputKey /f | Out-Null
+            if ($convRegistered) { reg delete $convKey /f | Out-Null }
+            foreach ($h in $allowlisted) { reg delete $allowRoot /v $h /f 2>$null | Out-Null }
             Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
           }
           if ($code -ne 0) {
@@ -475,9 +594,447 @@ jobs:
           }
           Write-Host "PASS: headless self-test + per-display claim resolution succeeded."
 
+      # ADR-054 N4 — per-class conformance. The self-test above proves each
+      # class's reference component is discovered and selected. This step
+      # proves the loader CONTRACT around it, class by class, with the same
+      # hardware-free registrations: Enabled=0 falls back (§2.5/§2.6),
+      # Preferred wins (§2.6), and an ABI-major-mismatched component is
+      # rejected and fallen through — never dispatched (§2.1, ADR-020 rule 3).
+      # The ABI fixtures are the test-only stub modules the unit tests build
+      # (tests_conversion_loader_stub_*_abi.dll), registered by path exactly as
+      # a vendor plug-in would be; they live in the build tree, which the #952
+      # guard refuses by design, so the documented dev override is set for
+      # this step only. Rows are HKLM (the runner is admin) and are removed in
+      # the finally block. Every verdict is read from `selftest --json` fields,
+      # never from log text. Enabled=0-falls-back and Preferred-wins are
+      # asserted for all three classes: DP `Enabled` + the per-user HKCU overlay
+      # (#2049, N3b) and the input `PreferredPlugin` row (N3a verb, #2048) were
+      # the last two cells to land.
+      # Provenance (N4b, PR B): the gate ENFORCES by default on Windows and the
+      # runner is elevated, so every unsigned binary this step registers is
+      # allowlisted up front (fixtures included, so cell 4 tests the ABI gate,
+      # not the provenance gate); cell 1b takes sim-display's row away to prove
+      # the refusal, then the `Trust\Enforce = 0` opt-out, then re-allowlists.
+      - name: Per-class conformance (ADR-054 N4)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: pwsh
+        run: |
+          $cli = "_package/bin/displayxr-cli.exe"
+          $simDp   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimDisplay.dll").Path
+          $simIn   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimInput.dll").Path
+          $simConv = (Resolve-Path "_package/bin/plugins/DisplayXR-SimConversion.dll").Path
+          $simTr   = (Resolve-Path "_package/bin/plugins/DisplayXR-SimTracking.dll").Path
+          $stubDir = if (Test-Path "build/tests/Release") { "build/tests/Release" } else { "build/tests" }
+          $fxDp   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_dp_abi.dll").Path
+          $fxIn   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_input_abi.dll").Path
+          $fxConv = (Resolve-Path "$stubDir/tests_conversion_loader_stub_abi.dll").Path
+          $fxTr   = (Resolve-Path "$stubDir/tests_conversion_loader_stub_tracking_abi.dll").Path
+          $dpRoot = "HKLM\Software\DisplayXR\DisplayProcessors"
+          $inRoot = "HKLM\Software\DisplayXR\InputProviders"
+          $cvRoot = "HKLM\Software\DisplayXR\ConversionProviders"
+          $trRoot = "HKLM\Software\DisplayXR\TrackingProviders"
+
+          function Reg-Row($root, $id, $bin, $order) {
+            reg add "$root\$id" /v Binary /t REG_SZ /d "$bin" /f | Out-Null
+            reg add "$root\$id" /v ProbeOrder /t REG_DWORD /d $order /f | Out-Null
+            reg add "$root\$id" /v DisplayName /t REG_SZ /d "$id" /f | Out-Null
+          }
+          function Selftest-Json {
+            $raw = (& $cli selftest --json 2>$null | Out-String)
+            $script:lastExit = $LASTEXITCODE
+            $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+            if ($s -lt 0 -or $e -le $s) { throw "selftest --json emitted no JSON object (exit $script:lastExit)" }
+            return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+          }
+          function Cli-Json([string[]]$verb) {
+            $raw = (& $cli @verb --json 2>$null | Out-String)
+            $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+            if ($s -lt 0 -or $e -le $s) { throw "$($verb -join ' ') --json emitted no JSON object" }
+            return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+          }
+          function Plugin($o, $id)  { $o.plugins | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
+          function ConvRow($o, $id) { $o.conversion_providers.providers | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
+          function Check($o, $name) { $o.checks | Where-Object { $_.name -eq $name } | Select-Object -First 1 }
+          $script:fails = @()
+          function Expect($cond, $msg) {
+            if ($cond) { Write-Host "PASS: $msg" } else { Write-Host "::error::FAIL: $msg"; $script:fails += $msg }
+          }
+
+          $env:DXR_SIM_INPUT = "1"
+          $env:DXR_ALLOW_DEV_PLUGIN_PATHS = "1"
+          $allowRoot = "HKLM\Software\DisplayXR\Trust\Allowlist"
+          $trustKey = "HKLM\Software\DisplayXR\Trust"
+          $hashes = @{}
+          foreach ($b in @($simDp, $simIn, $simConv, $simTr, $fxDp, $fxIn, $fxConv, $fxTr)) {
+            $hashes[$b] = (Get-FileHash -Path $b -Algorithm SHA256).Hash.ToLower()
+          }
+          $enforceSet = $false
+          try {
+            foreach ($b in $hashes.Keys) { reg add $allowRoot /v $hashes[$b] /t REG_SZ /d "ci $(Split-Path $b -Leaf)" /f | Out-Null }
+            Reg-Row $dpRoot "sim-display" $simDp 200
+            Reg-Row $inRoot "sim-input" $simIn 200
+            Reg-Row $cvRoot "sim-conversion" $simConv 250
+            reg add "$cvRoot\sim-conversion\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+
+            # 1. The reference component is selected, per class.
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "baseline: selftest exit 0 (got $lastExit)"
+            Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: sim-display is ACTIVE"
+            Expect ($o.input_providers.active_id -eq "sim-input") "input: sim-input is the active provider"
+            Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: sim-conversion NEGOTIATED"
+
+            # 1b. Provenance (ADR-054 N4b), ENFORCING by default since PR B. The
+            # baseline above ran with every binary allowlisted. Take sim-display's
+            # row away: it is unsigned and this runner is elevated (dev override
+            # refused), so the gate must REFUSE it before LoadLibrary — load_result
+            # UNTRUSTED, verdict unverified naming the elevation and the exact
+            # allowlist row — and the self-test fails for want of a DP.
+            reg delete $allowRoot /v $hashes[$simDp] /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -ne 0) "provenance: an unsigned, unlisted DP is refused and the self-test fails (exit $lastExit)"
+            $sd = Plugin $o "sim-display"
+            Expect ($sd.load_result -eq "UNTRUSTED") "provenance: sim-display recorded as UNTRUSTED (got '$($sd.load_result)')"
+            Expect ($sd.provenance -eq "unverified") "provenance: the refused binary reads unverified (got '$($sd.provenance)')"
+            Expect ($sd.provenance_reason -match "elevated") "provenance: the dev override is refused on an elevated host ($($sd.provenance_reason))"
+            Expect ($sd.provenance_reason -match $hashes[$simDp]) "provenance: the reason names the allowlist row to write"
+            # The one-release escape hatch: Trust\Enforce = 0 puts the gate back in
+            # audit mode — same binary, still unverified, but loaded.
+            reg add $trustKey /v Enforce /t REG_DWORD /d 0 /f | Out-Null
+            $enforceSet = $true
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "provenance: Enforce=0 opt-out loads it again (exit $lastExit)"
+            Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "provenance: audit mode -> sim-display ACTIVE"
+            Expect ((Plugin $o "sim-display").provenance -eq "unverified") "provenance: audit mode still reports unverified"
+            reg delete $trustKey /v Enforce /f | Out-Null
+            $enforceSet = $false
+            # Allowlist it again the way register_dev_plugin.bat / the installer do:
+            # enforcing, and the same binary reads "allowlisted".
+            reg add $allowRoot /v $hashes[$simDp] /t REG_SZ /d "ci sim-display" /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "provenance: selftest exit 0 after allowlisting (got $lastExit)"
+            Expect ((Plugin $o "sim-display").provenance -eq "allowlisted") "provenance: allowlisted sim-display reads allowlisted"
+            # Same gate, the other two classes: rows removed, sim-input is REFUSED and
+            # counted apart from load failures (the verdict names the gate), and
+            # sim-conversion reads UNTRUSTED. Both rows restored after.
+            reg delete $allowRoot /v $hashes[$simIn] /f | Out-Null
+            reg delete $allowRoot /v $hashes[$simConv] /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.scan_untrusted -eq 1) -and (-not $o.input_providers.active)) "provenance: unlisted sim-input is refused and counted as untrusted (untrusted=$($o.input_providers.scan_untrusted) active=$($o.input_providers.active))"
+            Expect ((Check $o "input_providers").detail -match "provenance gate") "provenance: the input verdict names the gate ($((Check $o 'input_providers').detail))"
+            Expect ((ConvRow $o "sim-conversion").load -eq "UNTRUSTED") "provenance: unlisted sim-conversion reads UNTRUSTED (got '$((ConvRow $o 'sim-conversion').load)')"
+            reg add $allowRoot /v $hashes[$simIn] /t REG_SZ /d "ci sim-input" /f | Out-Null
+            reg add $allowRoot /v $hashes[$simConv] /t REG_SZ /d "ci sim-conversion" /f | Out-Null
+
+            # 2. Enabled=0 falls back (input, conversion, DP). The DP cell (N3b, #2049)
+            # disables sim-display with a second row of the same DLL (sim-display-alt,
+            # 210) left enabled: the disabled row reads DISABLED (never tried), the alt
+            # row is ACTIVE, and selftest names the skipped row by registration id —
+            # a disabled plug-in is the user's choice, never a failure.
+            Reg-Row $dpRoot "sim-display-alt" $simDp 210
+            reg add "$dpRoot\sim-display" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            reg add "$inRoot\sim-input" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            reg add "$cvRoot\sim-conversion" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "Enabled=0: selftest still exit 0 (got $lastExit)"
+            Expect (([int]$o.input_providers.enabled -eq 0) -and (-not $o.input_providers.active)) "input: Enabled=0 -> nothing loaded, qwerty keeps the hand roles"
+            Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok on a disabled row"
+            Expect (((ConvRow $o "sim-conversion").load -eq "DISABLED") -and ([int]$o.conversion_providers.negotiated -eq 0)) "conversion: Enabled=0 -> DISABLED, nothing negotiated"
+            Expect ((Plugin $o "sim-display").load_result -eq "DISABLED") "DP: Enabled=0 (machine) -> sim-display recorded DISABLED, never tried"
+            Expect ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") "DP: fell back to sim-display-alt"
+            Expect ($o.display_processor.active_id -eq "sim-display-alt") "DP: display_processor.active_id names the winning ROW (got '$($o.display_processor.active_id)')"
+            Expect (@($o.display_processor.skipped_disabled) -contains "sim-display") "DP: display_processor.skipped_disabled names sim-display"
+            reg delete "$inRoot\sim-input" /v Enabled /f | Out-Null
+            reg delete "$cvRoot\sim-conversion" /v Enabled /f | Out-Null
+            reg delete "$dpRoot\sim-display" /v Enabled /f | Out-Null
+
+            # 2b. The per-user overlay (N3b): what `dp disable` writes (HKCU, no admin)
+            # wins over an enabled HKLM row, `dp list --json` reads it back as
+            # enabled_source "user" and moves '*', and selftest falls back the same
+            # way. An unregistered id is refused (no orphan per-user row).
+            & $cli dp disable sim-display | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "DP: 'dp disable sim-display' exit 0 (got $LASTEXITCODE)"
+            $dl = Cli-Json @("dp", "list")
+            $row = $dl.plugins | Where-Object { $_.id -eq "sim-display" } | Select-Object -First 1
+            Expect ((-not $row.enabled) -and ($row.enabled_source -eq "user")) "DP: dp list reads sim-display Enabled=no (user) (got enabled=$($row.enabled) source='$($row.enabled_source)')"
+            Expect ((($dl.plugins | Where-Object { $_.active }).id) -eq "sim-display-alt") "DP: '*' (active) moves to sim-display-alt"
+            Expect ($null -ne $row.provenance) "DP: dp list --json carries provenance (got '$($row.provenance)')"
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") -and ((Plugin $o "sim-display").load_result -eq "DISABLED")) "DP: Enabled=0 (user) -> selftest falls back to sim-display-alt"
+            & $cli dp enable sim-display | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "DP: 'dp enable sim-display' exit 0 (got $LASTEXITCODE)"
+            & $cli dp disable no-such-plugin | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "DP: 'dp disable' of an unregistered id is refused"
+            reg delete "HKCU\Software\DisplayXR\DisplayProcessors\sim-display" /f | Out-Null
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ((Plugin $o "sim-display").load_result -eq "ACTIVE")) "DP: with the overlay removed sim-display is ACTIVE again"
+            reg delete "$dpRoot\sim-display-alt" /f | Out-Null
+
+            # 3. Preferred wins (DP: PreferredPlugin hoists a worse-ranked plug-in).
+            Reg-Row $dpRoot "sim-display-alt" $simDp 210
+            reg add $dpRoot /v PreferredPlugin /t REG_SZ /d "sim-display-alt" /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "Preferred: selftest exit 0 (got $lastExit)"
+            Expect ((Plugin $o "sim-display-alt").load_result -eq "ACTIVE") "DP: PreferredPlugin=sim-display-alt wins over ProbeOrder"
+            Expect ((Plugin $o "sim-display").load_result -eq "NOT_ATTEMPTED") "DP: the better-ranked sim-display was not even tried"
+            reg delete $dpRoot /v PreferredPlugin /f | Out-Null
+            reg delete "$dpRoot\sim-display-alt" /f | Out-Null
+
+            # 3b. Preferred wins (conversion): `PreferredProvider\<task>` = sim-conversion for
+            # a task where the built-in dp-lift row outranks it by ProbeOrder (150 vs 250).
+            # Read from the headless `conv list --json` selection, the same pass the
+            # conversion core runs; the task is picked from the data so the assertion
+            # does not depend on which capabilities the sim provider happens to ship.
+            function ConvList-Json {
+              $raw = (& $cli conv list --json 2>$null | Out-String)
+              $s = $raw.IndexOf('{'); $e = $raw.LastIndexOf('}')
+              if ($s -lt 0 -or $e -le $s) { throw "conv list --json emitted no JSON object" }
+              return ($raw.Substring($s, $e - $s + 1) | ConvertFrom-Json)
+            }
+            function ConvRowList { return ConvList-Json }
+            function ConvListRow($o, $id) { $o.providers | Where-Object { $_.id -eq $id } | Select-Object -First 1 }
+            $cl = ConvList-Json
+            $behind = $cl.tasks | Where-Object { $_.provider -eq "sim-conversion" -and -not $_.selected } | Select-Object -First 1
+            Expect ($null -ne $behind) "conversion: sim-conversion offers a task where it is ranked behind the selection (rows: $(($cl.tasks | ForEach-Object { $_.task + ':' + $_.provider + ':' + $_.selected }) -join ', '))"
+            if ($null -ne $behind) {
+              $convTask = $behind.task
+              reg add "$cvRoot\PreferredProvider" /v $convTask /t REG_SZ /d "sim-conversion" /f | Out-Null
+              $cl = ConvList-Json
+              $sel = $cl.tasks | Where-Object { $_.task -eq $convTask -and $_.selected } | Select-Object -First 1
+              Expect ($sel.provider -eq "sim-conversion") "conversion: PreferredProvider\$convTask=sim-conversion is selected over ProbeOrder (got '$($sel.provider)')"
+              reg delete "$cvRoot\PreferredProvider" /v $convTask /f | Out-Null
+            }
+
+            # 3c. Preferred wins (input): a second row of the same DLL (sim-input-alt,
+            # 210) is ranked first by `PreferredPlugin` although sim-input (200)
+            # outranks it by ProbeOrder. One DLL, two rows, one iface->id — so the
+            # ranked list is by REGISTRATION id, and the hand roles stay held.
+            Reg-Row $inRoot "sim-input-alt" $simIn 210
+            reg add $inRoot /v PreferredPlugin /t REG_SZ /d "sim-input-alt" /f | Out-Null
+            $il = Cli-Json @("input", "list")
+            $alt = $il.providers | Where-Object { $_.id -eq "sim-input-alt" } | Select-Object -First 1
+            Expect (($il.preferred -eq "sim-input-alt") -and $alt.preferred -and $alt.active) "input: input list predicts the preferred row first"
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "input Preferred: selftest exit 0 (got $lastExit)"
+            Expect ((@($o.input_providers.ranked).Count -eq 2) -and (@($o.input_providers.ranked)[0] -eq "sim-input-alt")) "input: PreferredPlugin=sim-input-alt is ranked first (ranked: $(@($o.input_providers.ranked) -join ', '))"
+            Expect ($o.input_providers.active -and (Check $o "input_providers").ok) "input: the preferred row holds the hand roles"
+            reg delete $inRoot /v PreferredPlugin /f | Out-Null
+            reg delete "$inRoot\sim-input-alt" /f | Out-Null
+
+            # 3e. The EmulatedControllers gate (ADR-054 N7, #2143): class policy under
+            # the InputProviders root — `InputProviders\Policy\EmulatedControllers`,
+            # HKCU over HKLM, HKCU hidden by Policy\Lock. 0 = the qwerty left/right
+            # pair is not published (the qwerty head stays); sim-input, resident,
+            # still holds the hands. Every verdict is a selftest --json field: the
+            # gate's {value, source} and the device list, never log text. HKLM is
+            # restored in the finally block.
+            function QwertyPair($o) { @($o.input_providers.devices | Where-Object { $_.str -match '^Qwerty (Left|Right) Controller$' }).Count }
+            function Gate($o) { "$($o.input_providers.emulated_controllers.value)/$($o.input_providers.emulated_controllers.source)/pair=$(QwertyPair $o)" }
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "default") -and ((QwertyPair $o) -eq 2)) "emulated: absent reads value=1 source=default with the qwerty pair present (got $(Gate $o))"
+            reg add "$inRoot\Policy" /v EmulatedControllers /t REG_DWORD /d 0 /f | Out-Null
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "emulated: selftest exit 0 with the gate off (got $lastExit)"
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 0) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 0)) "emulated: HKLM 0 reads value=0 source=machine and no qwerty left/right in the device list (got $(Gate $o))"
+            Expect (@($o.input_providers.devices | Where-Object { $_.str -eq 'Qwerty HMD' }).Count -eq 1) "emulated: the qwerty head (look-around) stays"
+            Expect ($o.input_providers.active -and (Check $o "input_providers").ok) "emulated: sim-input still holds the hand roles with the gate off"
+            # The per-user overlay (what `input emulated on` writes, no admin): HKCU 1
+            # beats HKLM 0 — unless Policy\Lock = 1, which hides the user tier.
+            reg add "HKCU\Software\DisplayXR\InputProviders\Policy" /v EmulatedControllers /t REG_DWORD /d 1 /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "user") -and ((QwertyPair $o) -eq 2)) "emulated: HKCU 1 over HKLM 0 reads value=1 source=user, pair back (got $(Gate $o))"
+            reg add "$inRoot\Policy" /v Lock /t REG_DWORD /d 1 /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 0) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 0)) "emulated: Policy\Lock hides the per-user value (got $(Gate $o))"
+            reg delete "$inRoot\Policy" /v Lock /f | Out-Null
+            reg delete "HKCU\Software\DisplayXR\InputProviders\Policy" /v EmulatedControllers /f | Out-Null
+            # `input list --json` carries the same {value, source}; `input emulated` is the verb that writes it.
+            $il = Cli-Json @("input", "list")
+            Expect (([int]$il.emulated_controllers.value -eq 0) -and ($il.emulated_controllers.source -eq "machine")) "emulated: input list --json carries {value, source} (got $($il.emulated_controllers.value)/$($il.emulated_controllers.source))"
+            & $cli input emulated on --machine | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "emulated: 'input emulated on --machine' exit 0 (got $LASTEXITCODE)"
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "machine") -and ((QwertyPair $o) -eq 2)) "emulated: the verb wrote 1 and the pair is back (got $(Gate $o))"
+            reg delete "$inRoot\Policy" /v EmulatedControllers /f | Out-Null
+            $o = Selftest-Json
+            Expect (([int]$o.input_providers.emulated_controllers.value -eq 1) -and ($o.input_providers.emulated_controllers.source -eq "default") -and ((QwertyPair $o) -eq 2)) "emulated: deleted -> back to value=1 source=default with the pair present (got $(Gate $o))"
+
+            # 3d. The one options contract (ADR-054 decision 7, N3c, #2050), on the
+            # conversion class: without its ENABLE setting sim-conversion declines its
+            # probe; `conv set` writes the per-user HKCU Settings\ENABLE (no admin), the
+            # headless `conv list` then negotiates it and `conv options` reads the value
+            # back as source=user; DXR_CONV_SIM_CONVERSION_ENABLE=0 in the environment
+            # beats the store (source=environment, declined again); `conv unset` reverts.
+            # The HKLM Settings\ENABLE registered above is removed for the cell and
+            # restored after it, since the cells below rely on it. The DP class is
+            # checked through its declaration: `dp options sim-display` lists TRACKING,
+            # read from the plug-in's describe_settings through the new host slot.
+            reg delete "$cvRoot\sim-conversion\Settings" /v ENABLE /f | Out-Null
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -ne "NEGOTIATED") "options: without ENABLE sim-conversion is not NEGOTIATED (got '$((ConvListRow $cl "sim-conversion").load)')"
+            & $cli conv set sim-conversion ENABLE 1 | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "options: 'conv set sim-conversion ENABLE 1' exit 0 (got $LASTEXITCODE)"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($null -ne $en) -and $en.declared -and ($en.value -eq "1") -and ($en.source -eq "user")) "options: conv options reads ENABLE=1 (user), declared by the provider (got value='$($en.value)' source='$($en.source)' declared=$($en.declared))"
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -eq "NEGOTIATED") "options: per-user ENABLE=1 -> sim-conversion NEGOTIATED (got '$((ConvListRow $cl "sim-conversion").load)')"
+            $env:DXR_CONV_SIM_CONVERSION_ENABLE = "0"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($en.value -eq "0") -and ($en.source -eq "environment")) "options: DXR_CONV_SIM_CONVERSION_ENABLE=0 beats the store (got value='$($en.value)' source='$($en.source)')"
+            $cl = ConvRowList
+            Expect ((ConvListRow $cl "sim-conversion").load -ne "NEGOTIATED") "options: with the env override sim-conversion declines again (got '$((ConvListRow $cl "sim-conversion").load)')"
+            Remove-Item Env:\DXR_CONV_SIM_CONVERSION_ENABLE -ErrorAction SilentlyContinue
+            & $cli conv unset sim-conversion ENABLE | Out-Null
+            Expect ($LASTEXITCODE -eq 0) "options: 'conv unset sim-conversion ENABLE' exit 0 (got $LASTEXITCODE)"
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect ($en.source -eq "absent") "options: after unset ENABLE is absent (got source='$($en.source)')"
+            & $cli conv set no-such-provider ENABLE 1 | Out-Null
+            Expect ($LASTEXITCODE -ne 0) "options: 'conv set' of an unregistered id is refused"
+            reg add "$cvRoot\sim-conversion\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            $co = Cli-Json @("conv", "options", "sim-conversion")
+            $en = $co.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($en.value -eq "1") -and ($en.source -eq "machine")) "options: the restored HKLM Settings\ENABLE reads as source=machine (got value='$($en.value)' source='$($en.source)')"
+            $do = Cli-Json @("dp", "options", "sim-display")
+            $tr = $do.settings | Where-Object { $_.key -eq "TRACKING" } | Select-Object -First 1
+            Expect (($null -ne $tr) -and $tr.declared -and ($tr.type -eq "bool")) "options: 'dp options sim-display' lists TRACKING from the plug-in's describe_settings (got declared=$($tr.declared) type='$($tr.type)')"
+            $io = Cli-Json @("input", "options", "sim-input")
+            $ie = $io.settings | Where-Object { $_.key -eq "ENABLE" } | Select-Object -First 1
+            Expect (($null -ne $ie) -and $ie.declared) "options: 'input options sim-input' lists ENABLE from the provider's describe_settings"
+
+            # 4. ABI-major mismatch, per class: rejected, never dispatched, fallen through.
+            Reg-Row $dpRoot "abi-fixture-dp" $fxDp 10
+            Reg-Row $inRoot "abi-fixture-input" $fxIn 10
+            Reg-Row $cvRoot "abi-fixture-conv" $fxConv 10
+            $o = Selftest-Json
+            # The DP gate fails the self-test ON PURPOSE here: a better-ranked DP
+            # that could not load is a misconfiguration (#1212) — and it must say
+            # why. The other two classes fall through and stay green.
+            Expect ($lastExit -ne 0) "DP: a better-ranked ABI-mismatched DP fails the self-test (exit $lastExit)"
+            $vdp = Check $o "vendor_dp"
+            Expect ((-not $vdp.ok) -and ($vdp.detail -match "ABI")) "DP: vendor_dp names the ABI mismatch ($($vdp.detail))"
+            Expect ((Plugin $o "abi-fixture-dp").load_result -eq "ABI_MISMATCH") "DP: fixture recorded as ABI_MISMATCH"
+            Expect ((Plugin $o "abi-fixture-dp").provenance -eq "allowlisted") "provenance: the fixture is allowlisted, so the ABI gate (not the provenance gate) is what rejected it"
+            Expect ((Plugin $o "sim-display").load_result -eq "ACTIVE") "DP: fell through to sim-display"
+            Expect (([int]$o.input_providers.scan_failed -eq 1) -and ($o.input_providers.active_id -eq "sim-input")) "input: fixture counted failed-to-load, sim-input still active"
+            Expect ((Check $o "input_providers").ok) "input: the input_providers check stays ok (fall-through is not a fault)"
+            Expect ((ConvRow $o "abi-fixture-conv").load -eq "ABI_MISMATCH") "conversion: fixture recorded as ABI_MISMATCH"
+            Expect ((ConvRow $o "sim-conversion").load -eq "NEGOTIATED") "conversion: fell through to sim-conversion"
+            Expect ((Check $o "conversion_providers").ok) "conversion: the conversion_providers check stays ok"
+            # The DP fixture fails the self-test on purpose; remove the three
+            # fixtures so the tracking cells below start from a green baseline.
+            foreach ($k in @("$dpRoot\abi-fixture-dp", "$inRoot\abi-fixture-input", "$cvRoot\abi-fixture-conv")) {
+              reg delete $k /f 2>$null | Out-Null
+            }
+
+            # 5. The viewer-tracking class (ADR-054 N6 Part 2), the same four cells.
+            # sim-tracking declines unless its ENABLE setting is on (machine row
+            # here); sim-display declares EXTERNAL_OK and does not track, so the
+            # selected provider IS the primary screen's viewer source.
+            Reg-Row $trRoot "sim-tracking" $simTr 200
+            reg add "$trRoot\sim-tracking\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            function Tr($o) { "active=$($o.tracking_providers.active_id) source=$($o.tracking_providers.viewer_source) ranked=$(@($o.tracking_providers.ranked) -join ',') failed=$($o.tracking_providers.scan_failed)" }
+            $o = Selftest-Json
+            Expect ($lastExit -eq 0) "tracking: selftest exit 0 with sim-tracking registered (got $lastExit)"
+            Expect (($o.tracking_providers.active_id -eq "sim-tracking") -and ($o.tracking_providers.viewer_source -eq "provider:sim-tracking")) "tracking: sim-tracking selected and is the viewer source ($(Tr $o))"
+            Expect ($o.tracking_providers.display_viewer_policy -eq "EXTERNAL_OK") "tracking: sim-display declares EXTERNAL_OK (got '$($o.tracking_providers.display_viewer_policy)')"
+            Expect ([int]$o.tracking_providers.composed_eye_tracking_modes -eq 3) "tracking: composed advertisement MANAGED|MANUAL (got $($o.tracking_providers.composed_eye_tracking_modes))"
+            # 5a. Enabled=0 falls back: no provider -> the nominal viewer, never a fault.
+            reg add "$trRoot\sim-tracking" /v Enabled /t REG_DWORD /d 0 /f | Out-Null
+            $o = Selftest-Json
+            Expect (($lastExit -eq 0) -and ($o.tracking_providers.active_id -eq "") -and ($o.tracking_providers.viewer_source -eq "nominal")) "tracking: Enabled=0 -> nominal viewer, selftest still exit 0 ($(Tr $o))"
+            reg delete "$trRoot\sim-tracking" /v Enabled /f | Out-Null
+            # 5b. Preferred wins: a second row of the same DLL at 210, preferred.
+            Reg-Row $trRoot "sim-tracking-alt" $simTr 210
+            reg add "$trRoot\sim-tracking-alt\Settings" /v ENABLE /t REG_SZ /d "1" /f | Out-Null
+            reg add $trRoot /v PreferredPlugin /t REG_SZ /d "sim-tracking-alt" /f | Out-Null
+            $o = Selftest-Json
+            Expect ((@($o.tracking_providers.ranked)[0] -eq "sim-tracking-alt") -and ($o.tracking_providers.viewer_source -eq "provider:sim-tracking-alt")) "tracking: PreferredPlugin=sim-tracking-alt is ranked first and serves the screen ($(Tr $o))"
+            $tl = Cli-Json @("tracking", "list")
+            Expect ((($tl.providers | Where-Object { $_.first }).id) -eq "sim-tracking-alt") "tracking: tracking list predicts the preferred row first"
+            reg delete $trRoot /v PreferredPlugin /f | Out-Null
+            reg delete "$trRoot\sim-tracking-alt" /f | Out-Null
+            # 5c. ABI-major mismatch: rejected, counted failed-to-load, fallen through.
+            Reg-Row $trRoot "abi-fixture-tracking" $fxTr 10
+            $o = Selftest-Json
+            Expect (([int]$o.tracking_providers.scan_failed -eq 1) -and ($o.tracking_providers.active_id -eq "sim-tracking")) "tracking: ABI fixture rejected, sim-tracking still selected ($(Tr $o))"
+            # 5d. A display that tracks always wins: sim-display's dev TRACKING toggle.
+            reg delete "$trRoot\abi-fixture-tracking" /f | Out-Null
+            $env:DXR_DP_SIM_DISPLAY_TRACKING = "1"
+            $o = Selftest-Json
+            Expect ($o.tracking_providers.viewer_source -eq "dp") "tracking: a tracking display beats the provider ($(Tr $o))"
+            Remove-Item Env:\DXR_DP_SIM_DISPLAY_TRACKING -ErrorAction SilentlyContinue
+          } finally {
+            foreach ($k in @("$dpRoot\sim-display", "$dpRoot\sim-display-alt", "$dpRoot\abi-fixture-dp",
+                             "$inRoot\sim-input", "$inRoot\sim-input-alt", "$inRoot\abi-fixture-input",
+                             "$cvRoot\sim-conversion", "$cvRoot\abi-fixture-conv",
+                             "HKCU\Software\DisplayXR\DisplayProcessors\sim-display",
+                             "HKCU\Software\DisplayXR\ConversionProviders\sim-conversion",
+                             "$inRoot\Policy", "HKCU\Software\DisplayXR\InputProviders\Policy",
+                             "$trRoot\sim-tracking", "$trRoot\sim-tracking-alt", "$trRoot\abi-fixture-tracking")) {
+              reg delete $k /f 2>$null | Out-Null
+            }
+            reg delete $dpRoot /v PreferredPlugin /f 2>$null | Out-Null
+            reg delete $inRoot /v PreferredPlugin /f 2>$null | Out-Null
+            reg delete $trRoot /v PreferredPlugin /f 2>$null | Out-Null
+            Remove-Item Env:\DXR_DP_SIM_DISPLAY_TRACKING -ErrorAction SilentlyContinue
+            foreach ($b in $hashes.Keys) { reg delete $allowRoot /v $hashes[$b] /f 2>$null | Out-Null }
+            if ($enforceSet) { reg delete $trustKey /v Enforce /f 2>$null | Out-Null }
+            reg delete "$cvRoot\PreferredProvider" /f 2>$null | Out-Null
+            Remove-Item Env:\DXR_SIM_INPUT -ErrorAction SilentlyContinue
+            Remove-Item Env:\DXR_ALLOW_DEV_PLUGIN_PATHS -ErrorAction SilentlyContinue
+          }
+          if ($script:fails.Count -gt 0) {
+            Write-Host "::error::per-class conformance (ADR-054 N4): $($script:fails.Count) assertion(s) failed — see FAIL lines above."
+            exit 1
+          }
+          Write-Host "PASS: per-class conformance (ADR-054 N4) — selected / Enabled=0 falls back / Preferred wins / EmulatedControllers gate / ABI mismatch rejected and fallen through."
+          # Explicit: the pwsh step otherwise exits with the LAST native command's
+          # code, and the finally block's best-effort `reg delete` of an
+          # already-removed value legitimately returns 1.
+          exit 0
+
+      # The DisplayXR Dashboard (src/dashboard, Avalonia/.NET) is published into
+      # _package/bin before the installer is packed, so the installer ships it.
+      # Soft: a dashboard failure must not block the runtime installer (the
+      # Dashboard job below is where it fails loudly).
+      - name: Setup .NET (dashboard)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Publish DisplayXR Dashboard into the package
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        continue-on-error: true
+        shell: pwsh
+        run: >-
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true
+          -o _package/bin --nologo
+
       - name: Build Installer
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build build --config Release --target installer
+
+      # #1790: the runtime reports the checkout's version and the installer is
+      # named after it -- exactly the tag on a v* push (what /release uploads
+      # over), the last release + describe suffix on anything else. Checked from
+      # the artifacts (displayxr-cli info prints the runtimeVersion number and
+      # the runtimeName tag), against an expectation re-derived from git.
+      - name: Runtime + installer carry the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          exes=(_package/DisplayXRSetup-*.exe)
+          [ "${#exes[@]}" -eq 1 ] || { echo "::error::expected exactly one installer, found: ${exes[*]:-none}"; exit 1; }
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --cli _package/bin/displayxr-cli.exe \
+            --binary _package/bin/DisplayXRClient.dll \
+            --package "${exes[0]}"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v6
@@ -516,11 +1073,50 @@ jobs:
           draft: false
           prerelease: false
 
-      # NOTE: per-CI OneDrive upload removed. Build artifacts are no longer
-      # pushed to OneDrive on every run — the *bundle* meta-installer
-      # (DisplayXR/displayxr-installer, publish-bundle.yml) uploads to
-      # OneDrive on release only. Reviewers use the upload-artifact steps
-      # above; release assets attach to the GitHub Release on tag.
+      # No OneDrive upload: reviewers use the upload-artifact steps above; release
+      # assets attach to the GitHub Release on tag (the single distribution point).
+
+  # The DisplayXR Dashboard (src/dashboard): an Avalonia / .NET renderer over
+  # displayxr-cli (ADR-051 D4). Tests + a self-contained single-file publish,
+  # uploaded as an artifact. Not a required check; doc-only PRs skip the work.
+  Dashboard:
+    needs: DetectChanges
+    runs-on: windows-2022
+    steps:
+      - name: Doc-only PR — skipping the dashboard build
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "DetectChanges flagged docs_only=true; nothing to build."
+
+      - name: Checkout repository
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/checkout@v5
+
+      - name: Setup .NET
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet test src/dashboard/DisplayXR.Dashboard.sln -c Release --nologo
+
+      - name: Publish displayxr-dashboard.exe
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: >-
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj
+          -c Release -r win-x64 --self-contained true
+          -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true
+          -o dashboard-out --nologo
+
+      - name: Upload dashboard
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          retention-days: 7
+          name: DisplayXR-Dashboard
+          if-no-files-found: error
+          path: dashboard-out/displayxr-dashboard.exe
 
   # All Windows test apps, built in one shot through the globbing aggregator
   # (test_apps/CMakeLists.txt discovers every <class>/<app>/CMakeLists.txt and

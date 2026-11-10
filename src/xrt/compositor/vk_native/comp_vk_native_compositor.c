@@ -13,13 +13,16 @@
 
 #include "comp_vk_native_compositor.h"
 #include "comp_vk_native_deposit.h"
-#include "comp_vk_native_split.h"
+#include "hub_d3d11/comp_hub_d3d11.h"
 #include "comp_vk_native_swapchain.h"
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_renderer.h"
 #include "comp_vk_native_alpha_probe.h"
+#include "comp_vk_native_segments.h"
+#include "comp_vk_native_async_handoff.h"
 
 #include "util/comp_swapchain_ring.h"
+#include "util/comp_cursor_look.h"
 #include "util/comp_zone_tier1.h"
 #include "util/comp_layer_accum.h"
 #include "util/comp_bg2d.h"
@@ -27,6 +30,8 @@
 // -> publish -> dump). Only the typed get_background_preview call stays here.
 #include "util/comp_rear_budget.h"
 #include "util/comp_lazy_transparency.h"
+#include "util/comp_segments.h"
+#include "util/comp_segments_route.h"
 #ifdef XRT_OS_WINDOWS
 #include "util/comp_display_refresh_win.h"
 #endif
@@ -45,6 +50,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_setting.h"
+#include "util/u_vk_queue_lock.h"
 #include "util/u_weave_scope.h"
 #include "util/u_display_mode_hold.h"
 #include "util/u_debug.h"
@@ -52,19 +58,31 @@
 #include "util/u_time.h"
 #include "util/u_hud.h"
 #include "os/os_time.h"
+#include "util/u_eye_history.h" // N6 Part 1 (#2144): eyes sampled at a target time
 #include "os/os_threading.h"
 #ifdef XRT_OS_ANDROID
 #include <sys/system_properties.h>
 #endif
 
 #include "math/m_api.h"
+#include "util/u_color_encoding.h"
 #include "util/u_tiling.h"
 #include "util/u_canvas.h"
 #include "util/u_capture_intent.h"
+#include "util/u_cursor_depth.h"
 #include "util/u_repaint_gate.h"
 #include "util/u_fill_thread_win.h"
 #include "util/u_image_capture.h"
 #include <displayxr_mcp/mcp_capture.h>
+
+/*
+ * Multi-screen segments (ADR-047 D2): the in-process Vulkan compositor weaves a
+ * window that spans screens per segment on desktop Linux (M2) and on Windows
+ * (M6). Everywhere else (Android, macOS) a window is never segmented.
+ */
+#if defined(XRT_OS_LINUX_DESKTOP) || defined(XRT_OS_WINDOWS)
+#define VK_NATIVE_HAVE_SEGMENTS 1
+#endif
 
 // STB_IMAGE_WRITE_STATIC scopes all stbi_write_* to this TU so linking
 // alongside other compositors that also implement stb doesn't produce
@@ -83,7 +101,7 @@
 #include "d3d11/comp_d3d11_window.h"
 // #918 Phase 3 — the shared `weave placement:` line, plus the canonical reason
 // tokens. This compositor DOES have an output-device split (VK-1, #1178), but
-// every call into the transport goes through comp_vk_native_split.h; what is
+// every call into the transport goes through hub_d3d11/comp_hub_d3d11.h; what is
 // needed here are the reason tokens and, since VK-1b, the PLANE indices the
 // plane pass stages against. Both are macros — still no direct bridge call.
 #include "d3d/d3d_weave_placement.h"
@@ -109,6 +127,15 @@
 #include "android/android_globals.h"
 // #1401: the container-scaled tell itself, shared with the state tracker.
 #include "android/android_mini_window_tell.h"
+
+/*
+ * #1905: mid-frame fills — the repaint loop may fill at panel rate while the
+ * app is mid-frame. Android-only by construction: every block it adds is
+ * behind this one macro, so no other platform compiles a byte of it. (A
+ * separate macro, rather than bare XRT_OS_ANDROID, only so the platform-neutral
+ * logic can be compile-checked off-device with -DVK_MIDFRAME_FILL=1.)
+ */
+#define VK_MIDFRAME_FILL 1
 #endif
 
 // Direct-scanout present path (ST-5539). Only compiled when the bundle carries
@@ -126,6 +153,7 @@
 #if defined(XRT_HAVE_WAYLAND) && defined(XRT_HAVE_DBUS)
 #define DXR_HAVE_WL_GEOM
 #include "vk_native/comp_vk_native_wl_geom.h"
+#include "vk_native/comp_vk_native_wl_move_sync.h"
 // THE logical->device conversion + the 1:1 decision (#1595/#1596).
 #include "util/u_wayland_geom.h"
 #endif
@@ -200,12 +228,14 @@ dxr_frame_stage_timing_enabled(void)
 
 enum vk_frame_stage
 {
-	VK_FSTAGE_PRE = 0,      // commit entry → pre-DP cmd recorded (renderer, accum, crops)
-	VK_FSTAGE_PREFLUSH,     // pre-DP submit + queue drain (self-submitting DP flush)
-	VK_FSTAGE_WEAVE,        // xrt_display_processor_process_atlas (SDK-internal submit+wait)
-	VK_FSTAGE_POSTWAIT,     // post-weave vkDeviceWaitIdle (audit B7)
-	VK_FSTAGE_COMPOSITE,    // Local2D composite + HUD record + submit + drain
-	VK_FSTAGE_PRESENT,      // comp_vk_native_target_present (bridge copy + DXGI Present)
+	VK_FSTAGE_PRE = 0,   // commit entry → pre-DP cmd recorded (renderer, accum, crops)
+	VK_FSTAGE_PREFLUSH,  // pre-DP submit (+ queue drain on the host-wait path; submit only under the #2095 chain)
+	VK_FSTAGE_WEAVE,     // xrt_display_processor_process_atlas (SDK-internal submit, + its own wait if it has one)
+	VK_FSTAGE_POSTWAIT,  // post-weave queue drain (host-wait path only; ~0 under the chain — nothing is waited)
+	VK_FSTAGE_COMPOSITE, // Local2D composite + HUD record + submit (+ fence wait on the host-wait path only)
+	                     // #2095: under the chain no stage contains GPU completion — that is observed at the
+	                     // NEXT commit's wait on this frame's fence (the #1905 trace's wsync_prev / #1962 drain).
+	VK_FSTAGE_PRESENT,   // comp_vk_native_target_present (bridge copy + DXGI Present)
 	VK_FSTAGE_COUNT
 };
 
@@ -269,6 +299,71 @@ struct comp_vk_settings
 #define VK_SPLIT_PLANE_CMD_RING 3
 
 /*!
+ * #2095 / ADR-055 — the in-process weave-sync ring: frames in flight on the
+ * GPU semaphore chain (pre batch → self-submitting DP → post batch → present).
+ * Slot count: VK_WEAVE_SYNC_RING, bounded by the target's image count.
+ */
+#define VK_WEAVE_SYNC_RING 2
+/*!
+ * Bound on every wait against a ring fence (#925: no unbounded waits). ONE
+ * second, deliberately shorter than the 2 s hand-off expiry (#1394,
+ * weave_hand): a slot that does not retire is reported and the ring latched
+ * off while the frame's requester is still waiting, so the ring's bounded
+ * recovery resolves BEFORE the abandon path can declare the weave wedged. A
+ * fence that is still pending after 1 s is a GPU that is not coming back,
+ * not a slow frame (a whole chained frame is a few ms of GPU time).
+ */
+#define VK_WEAVE_SYNC_WAIT_NS (1ULL * 1000 * 1000 * 1000)
+
+struct vk_weave_sync_slot
+{
+	//! Signalled by the slot's post batch — proves the whole chain retired.
+	VkFence fence;
+	//! Acquire → pre batch (the target's image_available, per slot).
+	VkSemaphore image_available;
+	//! Pre batch → DP (set_weave_sync wait).
+	VkSemaphore pre_sem;
+	//! DP → post batch (set_weave_sync signal).
+	VkSemaphore post_sem;
+	//! Post batch → vkQueuePresentKHR.
+	VkSemaphore present_sem;
+	//! The two batches, parked until the fence retires (they are pending).
+	VkCommandBuffer cmd_pre, cmd_post;
+	VkCommandPool pool;
+	//! Commit serial of the frame in flight (the swapchain read-serial key).
+	uint64_t serial;
+	bool in_flight; //!< fence submitted and not yet observed signalled + reset
+};
+
+struct vk_weave_sync_ring
+{
+	/*!
+	 * Leaf lock: ring bookkeeping + the swapchain read serials. Taken by the
+	 * frame path under c->mutex and by the app thread (xrWaitSwapchainImage,
+	 * swapchain destroy, the top of layer_commit) WITHOUT c->mutex. Never
+	 * take c->mutex or weave_hand.mutex while holding it. A fence wait may
+	 * run under it: every waiter is waiting the same GPU work, so holding
+	 * it across the wait only serialises waiters that would block anyway.
+	 */
+	struct os_mutex mutex;
+	struct vk_weave_sync_slot slot[VK_WEAVE_SYNC_RING];
+	uint32_t count, next;
+	//! Monotone commit serial (0 = none yet), assigned when a slot is taken.
+	//! There is deliberately NO "highest retired serial" shortcut: the serve
+	//! queue toggles between the runtime-owned queue (non-blocking serve) and
+	//! the app's (blocking), so frame N+1's fence retiring on one queue says
+	//! nothing about frame N's post batch on the other. "No in-flight slot
+	//! carries the serial" is the only sound test (the ring is 2 deep).
+	uint64_t serial;
+	bool created;     //!< ring resources exist
+	bool failed;      //!< creation failed or a slot never retired: host-wait path for the session
+	bool dp_declined; //!< the DP returned false from set_weave_sync: host-wait path for this DP
+	int last_mode;    //!< enum vk_weave_sync_mode, for the on-change log
+	uint64_t last_warn_ns;
+	uint64_t wait_prev_ema_ns; //!< TRACE: the app thread's wait on the previous chained weave at commit
+};
+
+/*!
  * The Vulkan native compositor structure.
  */
 struct comp_vk_native_compositor
@@ -302,6 +397,22 @@ struct comp_vk_native_compositor
 	//! Accumulated layers for the current frame.
 	struct comp_layer_accum layer_accum;
 
+#ifdef VK_MIDFRAME_FILL
+	/*!
+	 * #1905: the APP's private accumulator. On Android the app thread
+	 * accumulates into this (begin_frame / layer_begin / layer_* / discard,
+	 * none of which hold c->mutex) and layer_commit publishes it into
+	 * @ref layer_accum under c->mutex. layer_accum is therefore only ever
+	 * written under the lock, so a fill may read it at any moment — including
+	 * while the app is mid-frame, which is what lets the repaint loop drop the
+	 * app_frame_in_progress bail. Without this a mid-frame fill reads
+	 * layer_count / Local2D / zone rects while the app rewrites them
+	 * (vk_composite_local_2d's reuse_twod path), and a 2D-over app flickers
+	 * its overlay at fill rate.
+	 */
+	struct comp_layer_accum layer_stage;
+#endif
+
 	//! Compositor settings.
 	struct comp_vk_settings settings;
 
@@ -321,10 +432,10 @@ struct comp_vk_native_compositor
 	 * Non-NULL ⟹ the weave, the repaint tick and the present live on the
 	 * SCANOUT adapter and this compositor's Vulkan display processor and
 	 * Vulkan target were never created. Everything the split owns is behind
-	 * the opaque handle — see comp_vk_native_split.h.
+	 * the opaque handle — see hub_d3d11/comp_hub_d3d11.h.
 	 * @{
 	 */
-	struct comp_vk_split *split;
+	struct comp_hub_d3d11 *split;
 
 	//! Packed LUID of the VkPhysicalDevice — the split's gate and the
 	//! `weave placement:` line both need it, resolved once.
@@ -391,6 +502,11 @@ struct comp_vk_native_compositor
 	VkCommandBuffer ws_cmd[VK_SPLIT_PLANE_CMD_RING];
 	uint64_t ws_cmd_value[VK_SPLIT_PLANE_CMD_RING];
 	uint32_t ws_cmd_next;
+	//! #2340 — the PQ re-encode pass's own ring, recycled the same way.
+	VkCommandPool pq_cmd_pool;
+	VkCommandBuffer pq_cmd[VK_SPLIT_PLANE_CMD_RING];
+	uint64_t pq_cmd_value[VK_SPLIT_PLANE_CMD_RING];
+	uint32_t pq_cmd_next;
 	/*!
 	 * Last frame's composite region. A change means the panel-sized plane holds
 	 * stale pixels outside the new region, so the whole surface is re-cleared and
@@ -459,6 +575,32 @@ struct comp_vk_native_compositor
 	//! bus is unreachable; the provider itself degrades to "no data" when the
 	//! GNOME Shell extension is absent.
 	struct comp_vk_native_wl_geom *wl_geom;
+	/*!
+	 * #1748: the per-commit frame tag that lets the GNOME extension show each
+	 * frame at the position it was woven for during a compositor move (move
+	 * sync). Created whenever the extension supports it; NULL when it does
+	 * not, or with DXR_WL_MOVE_SYNC=0 — the drag-lattice path.
+	 */
+	struct comp_vk_native_wl_move_sync *wl_move_sync;
+	/*!
+	 * Move-sync state, all written under c->mutex by the weave. The repaint
+	 * loop reads @ref wl_ms_moving and @ref wl_ms_last_weave_ns WITHOUT the
+	 * lock as a hint only, and re-checks under it (like repaint.armed).
+	 */
+	struct
+	{
+		//! The last snapshot said the extension syncs this window.
+		bool active;
+		//! ...and a move grab is running on it: re-weave every refresh.
+		bool moving;
+		//! When the last weave (app frame or fill) chose its origin.
+		uint64_t last_weave_ns;
+		//! The position the weave in progress was woven for (logical).
+		bool have_pending;
+		int32_t pending_x, pending_y;
+		//! One-shot log guards.
+		bool logged_active, logged_fill;
+	} wl_ms;
 #endif
 #endif
 
@@ -483,6 +625,17 @@ struct comp_vk_native_compositor
 	//! Generic Vulkan display processor (vendor-agnostic weaving).
 	struct xrt_display_processor *display_processor;
 
+	//! The DP's output survives a display-server resample
+	//! (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE). Read at DP creation and again
+	//! whenever the head's rendering mode changes (sim_display's answer
+	//! follows its output mode: INTERLACED needs 1:1) — never per frame.
+	//! Relaxes the #1595 / #1831 refuse-rather-than-resample gates (M2).
+	bool dp_tolerates_resample;
+	//! The rendering-mode index @ref dp_tolerates_resample was last read at.
+	uint32_t dp_caps_mode_index;
+	//! vk_make_dp_vk called the factory (whether or not it succeeded).
+	bool dp_create_attempted;
+
 	/*!
 	 * #1484 — the atlas encoding last DECLARED to `display_processor` via base
 	 * slot 14, as an `int` so `-1` can mean "unknown / never declared". The
@@ -493,6 +646,30 @@ struct comp_vk_native_compositor
 	 * moves — a fresh DP's state is unknown.
 	 */
 	int dp_atlas_encoding_latched;
+
+	/*!
+	 * #2340 DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2).
+	 *
+	 * Vulkan DP path: @ref pq_dp_asked is the DP the `accepts_atlas_encoding`
+	 * answer in @ref pq_dp_accepts belongs to (NULL = not asked; reset
+	 * wherever the DP pointer moves, like @ref dp_atlas_encoding_latched).
+	 * @ref pq_atlas_now says the atlas the DP is about to read holds PQ code
+	 * values — set per APP frame, kept across a repaint (which replays the
+	 * same, already encoded, atlas) — and is what
+	 * @ref vk_native_atlas_encoding declares.
+	 *
+	 * Split path: the split's D3D11 DP is asked once (@ref pq_split_checked);
+	 * @ref pq_split_active while it weaves PQ.
+	 */
+	struct xrt_display_processor *pq_dp_asked;
+	bool pq_dp_accepts;
+	bool pq_atlas_now;
+	bool pq_split_checked;
+	bool pq_split_active;
+	//! One WARN each, never per frame.
+	bool pq_warned_format;
+	bool pq_warned_override;
+	bool pq_warned_pass;
 
 	//! A 2D/3D request that arrived BEFORE the display processor existed (it is
 	//! created lazily with the first target, while xrRequestDisplayRenderingModeDXR
@@ -565,6 +742,12 @@ struct comp_vk_native_compositor
 	//! Display refresh rate in Hz.
 	float display_refresh_rate;
 
+	//! #1264 S1: a repaint ("fill") is parked in vkWaitForFences with
+	//! c->mutex RELEASED, its command buffer still executing. Set and cleared
+	//! under c->mutex. Anything that frees an object a weave references must
+	//! check it (multi-screen M2: the segment manager defers its releases).
+	bool fill_parked;
+
 	//! Last present origin handed to the DP (panel-relative px) — an origin
 	//! change means the window is being dragged; the target clamps its queue
 	//! shallow for the duration so the weave phase stays snapped (#912).
@@ -583,7 +766,7 @@ struct comp_vk_native_compositor
 
 	//! Last canvas / view / submitted-tile sizes logged by the handle-app
 	//! VIEW_DIMS line in layer_commit — logged on change only, never per frame.
-	uint32_t view_dims_logged[6];
+	uint32_t view_dims_logged[7];
 
 #ifdef XRT_OS_LINUX_DESKTOP
 	//! One-shot guard for the X11 present-origin refusal WARN (see
@@ -603,6 +786,9 @@ struct comp_vk_native_compositor
 	//! Where this move started — the phase reference the DP is given.
 	int32_t wl_snap_anchor_x, wl_snap_anchor_y;
 	bool wl_snap_moving;    //!< a move is in progress
+	//! #2071: the window-geometry publisher generation this compositor last
+	//! re-synced to (comp_vk_native_wl_geom_publisher_generation).
+	uint32_t wl_geom_publisher_gen_seen;
 	//! A move request is out and its landing has not been read back yet.
 	bool wl_snap_verify_pending;
 	int32_t wl_snap_want_x, wl_snap_want_y; //!< what that request asked for
@@ -613,6 +799,16 @@ struct comp_vk_native_compositor
 #endif
 	//! Last SPAN_2D band count logged, so the line fires on change only.
 	uint32_t last_offpanel_band_count;
+	/*!
+	 * #1748 measurement hook (DXR_WL_ORIGIN_STAMP=1): a host-visible buffer
+	 * holding a barcode of this frame's present origin, copied into the
+	 * top-left of the target after the weave so a compositor-side audit can
+	 * compare where a frame is painted with where it was woven for.
+	 */
+	VkBuffer stamp_buffer;
+	VkDeviceMemory stamp_memory;
+	uint8_t *stamp_map;
+	uint32_t stamp_seq;
 	//! X11 placement quantum (#1588 follow-up): measured once, on the first
 	//! snap request, by @ref vk_x11_placement_quantum. 0 = unknown, 1 = every
 	//! device pixel is addressable, >1 = window origins land only on
@@ -636,9 +832,19 @@ struct comp_vk_native_compositor
 	 */
 	bool linux_surface_not_1to1;
 	/*!
+	 * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h):
+	 * what the state tracker last asked for (@ref
+	 * comp_vk_native_compositor_set_mono_2d_hold, app thread, plain write),
+	 * and the state applied at the top of the composed frame. Applied, it is
+	 * the same degrade as @ref linux_surface_not_1to1: hardware 2D through the
+	 * hold below, the frame collapsed to tile 0, no weave.
+	 */
+	bool mono_2d_wanted;
+	bool mono_2d_hold;
+	/*!
 	 * The session's own hardware 2D/3D choice, and whether a runtime degrade
-	 * (today only @ref vk_linux_update_surface_not_1to1) is holding the panel
-	 * in 2D over it. Every request through
+	 * (@ref vk_linux_update_surface_not_1to1, or auto-2D on a flat submission
+	 * — @ref mono_2d_hold) is holding the panel in 2D over it. Every request through
 	 * @ref comp_vk_native_compositor_request_display_mode records the choice;
 	 * while held it is not forwarded, and releasing the hold restores it —
 	 * never a forced 3D. Under a vendor where the first explicit lens call
@@ -649,6 +855,102 @@ struct comp_vk_native_compositor
 	struct u_display_mode_hold display_mode_hold;
 	//! One-shot: said once that the 1:1 gate has nothing to measure.
 	bool warned_1to1_unknown;
+	//! #1831: the X11 arm of the 1:1 gate has been evaluated (once — its
+	//! inputs are the static desktop resolution in sys_info).
+	bool x11_1to1_evaluated;
+#endif // XRT_OS_LINUX_DESKTOP
+
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	/*!
+	 * Multi-screen M2 (ADR-047 D2): per-screen segment DPs for a window that
+	 * spans screens. @ref segments is created lazily, on the first weave
+	 * after @ref comp_vk_native_compositor_set_screens, once the DP command
+	 * pool exists. The window's desktop rect is cached by
+	 * @ref vk_update_present_origin from the same metrics read the present
+	 * origin uses, so segmentation costs no window-system round trip.
+	 */
+	struct comp_vk_native_segments *segments;
+	struct xrt_screen_list *seg_screens; //!< heap copy; NULL = never set
+	//! heap copy of the info @ref seg_screens was built from (its DP registry;
+	//! #2305: not @ref sys_info, which stays as it was at session create)
+	struct xrt_system_compositor_info *seg_sys_info;
+	uint64_t seg_pinned_display_id;
+	struct comp_seg_rect seg_window;
+	bool have_seg_window;
+	//! set_screens() handed over a new list; the manager is rebuilt on the
+	//! next weave with no fill in flight.
+	bool seg_rebuild;
+	//! ADR-047 Amendment 8 (#2305, Windows): the screen whose DP
+	//! display_processor is while the home screen is gone (screen_id 0 = the
+	//! home's); kept across rebuilds.
+	struct comp_segments_away seg_away;
+	/*!
+	 * #2218: the last weave found the window NOT wholly on the primary screen,
+	 * so the compose step must not hand the app's image to the DP as-is
+	 * (zero-copy) — the frame is composed into our atlas and woven per screen.
+	 * Written by the weave, read by layer_commit, under seg_pub_mutex.
+	 */
+	bool seg_zero_copy_withheld;
+
+	/*!
+	 * Multi-screen M3: per-segment views. @ref seg_pub is the segment table
+	 * the weave last took (count 0 = not split) — what xrLocateViews
+	 * frames each segment's views from; @ref seg_route is which of the
+	 * committed frame's views belong to which segment (set by the state
+	 * tracker at xrEndFrame). Both cross threads (app thread vs weave), so
+	 * they — and the @ref segments pointer when it is created or destroyed —
+	 * are guarded by this leaf lock.
+	 */
+	struct os_mutex seg_pub_mutex;
+	struct xrt_segment_metrics seg_pub;
+	struct xrt_segment_view_routing seg_route;
+	struct comp_vk_native_eff_layout seg_route_logged;
+	/*!
+	 * #1883: the per-segment partition the renderer atlas is painted with
+	 * (eff_layout's routing; count 0 = unrouted), set with eff_layout so a
+	 * repaint replays it with the atlas it describes. Under the #918 split the
+	 * woven egress slot can be a frame or two older, so the split records
+	 * each submitted frame's partition by its own sequence.
+	 */
+	struct comp_segments_content seg_content;
+#endif // VK_NATIVE_HAVE_SEGMENTS
+	/*!
+	 * #2247: the last weave's table does not cover the primary screen (the
+	 * window has been off it for the hand-off's dwell), so the session's DP —
+	 * which weaves the primary — is asked for 2D whatever the session's mode,
+	 * and gets the session's mode back when the window returns. Written by
+	 * the segment weave (VK_NATIVE_HAVE_SEGMENTS); read on every platform by
+	 * vk_dp_request_display_mode, so declared unconditionally (always false
+	 * where there are no segments).
+	 */
+	bool seg_primary_uncovered;
+
+	/*!
+	 * N6 Part 1 (#2144): every eye answer this compositor gets from its DP
+	 * (the per-frame HUD / camera query, xrLocateViews) is pushed here.
+	 * It is read (at the target, clamped — never
+	 * extrapolated) only when the DP's own target-time slot fails; a DP
+	 * without the slot keeps its "latest" answer unchanged.
+	 */
+	struct u_eye_history eye_hist;
+
+#ifdef XRT_OS_WINDOWS
+	/*!
+	 * ADR-047 Amendment 2 on Vulkan (multi-screen M6): the segment manager can
+	 * swap @ref display_processor for a windowless per-screen DP (and back)
+	 * between two weaves, when another screen takes the majority of the
+	 * window. The weave thread swaps under c->mutex; this leaf lock also
+	 * guards the app-thread readers (eyes, panel geometry, 2D/3D and
+	 * eye-tracking requests, the snap) so none of them calls into a DP that
+	 * is being retired. Never held across c->mutex.
+	 */
+	struct os_mutex dp_swap_mutex;
+	//! The DP holding the window when it is another screen's segment DP
+	//! (NULL = the session's primary DP): the snap asks it.
+	struct xrt_display_processor *snap_dp;
+	//! The session's eye-tracking mode, re-sent to a swapped-in primary DP.
+	uint32_t eye_tracking_mode;
+	bool eye_tracking_mode_set;
 #endif
 
 #ifdef XRT_OS_ANDROID
@@ -656,6 +958,24 @@ struct comp_vk_native_compositor
 	//! / already logged, so the per-window rect feed and its Kooima line stay
 	//! lifecycle events rather than per-frame noise (#1037).
 	uint64_t android_rect_generation_fed;
+	/*!
+	 * The last published rect whose extent matched the weave target, and the
+	 * bounded hold that feeds it while a newer rect is ahead of (or behind) the
+	 * swapchain. See @ref vk_android_rect_for_weave.
+	 */
+	struct
+	{
+		bool valid;
+		int32_t x, y, display_id;
+		uint32_t w, h, disp_w, disp_h;
+		//! Generation of the rect currently being held back (0 = no hold).
+		uint64_t hold_generation;
+		uint64_t hold_since_ns;
+		//! A hold expired without the target ever matching: gate off until a
+		//! coherent pair is seen again, so a structural mismatch never stalls.
+		bool bypass;
+		uint32_t corrections;
+	} android_rect_coherent;
 	//! #1367: last rect generation the view-dims log line reported.
 	uint64_t android_rect_generation_viewed;
 	uint64_t android_rect_generation_logged;
@@ -726,6 +1046,24 @@ struct comp_vk_native_compositor
 	VkQueue repaint_queue;
 	int32_t repaint_queue_family;
 	int32_t repaint_queue_index;
+
+	/*!
+	 * #886: VK_LAYER_DXR_queue_lock as resolved on THIS device at create,
+	 * plus who created the device (set by the state tracker right after
+	 * create, comp_vk_native_compositor_set_vk_device_origin). Read-only
+	 * after that, except the one-shot log flag.
+	 */
+	struct
+	{
+		bool layer_live;             //!< #902 marker resolved
+		uint32_t activation;         //!< enum u_vk_ql_activation from the layer
+		uint32_t family_queue_count; //!< queues in the app's graphics family
+		bool origin_known;           //!< set_vk_device_origin was called
+		bool app_created_device;     //!< vulkan_enable1
+		bool runtime_injected;       //!< the runtime named the layer (enable2)
+		enum u_vk_ql_route route;    //!< resolved at set_vk_device_origin
+		bool serialisation_noted;    //!< one-shot runtime#2039 guard line
+	} ql;
 
 	/*!
 	 * #868: fence and command pool used ONLY by the repaint replay.
@@ -855,6 +1193,57 @@ struct comp_vk_native_compositor
 		uint64_t mask_view;
 
 		uint64_t count, ticks;          //!< Diagnostics.
+
+#ifdef VK_MIDFRAME_FILL
+		/*!
+		 * #1905: mid-frame fill state. Written and read only by the repaint
+		 * thread (enabled/layer_live: once at create, before it starts), so
+		 * it needs no lock.
+		 */
+		struct
+		{
+			//! The resolved switch (dxr_midframe_fill_resolve): auto = ON
+			//! iff the queue-lock layer is live on this device; the
+			//! env/property forces it either way.
+			bool enabled;
+			//! #902 marker handshake resolved on THIS device's chain at
+			//! create — VK_LAYER_DXR_queue_lock serialises every vkQueue*
+			//! call in the process, the app's own included.
+			bool layer_live;
+			//! Unlocked fence-park time inside the current fill (#1264 S1
+			//! park site), and its EMA. TRACE ONLY — fill_ema / the duty
+			//! deliberately keep the park in (see fill_ema_ns).
+			uint64_t fill_parked_ns, parked_ema_ns;
+			//! When the last app-frame weave this thread SERVED started / ended.
+			uint64_t serve_start_ns, serve_end_ns;
+			//! EMA of the spacing between served app weaves (the app's frame
+			//! interval as the weave thread sees it). Trace-only; 0 = no data.
+			uint64_t serve_iv_ema_ns;
+			//! Consecutive serve-interval samples rejected as outliers.
+			uint32_t serve_iv_rejects;
+			/*!
+			 * EMA of a fill's WALL time (fire_t0 -> fire_t1, the unlocked
+			 * fence-park INCLUDED), over EVERY fill — legacy and mid-frame —
+			 * seeded from the first. The duty governor's only input; never
+			 * frozen, because it does not gate the fills that feed it to
+			 * zero. The park stays in on purpose: it is where a fill's GPU
+			 * cost shows up (round 4 measured excluding it as a regression).
+			 */
+			uint64_t fill_ema_ns;
+			//! This fill holds c->mutex across its own GPU wait (no fence-park).
+			//! Set by this thread under c->mutex right before the fill.
+			bool hold_lock;
+			//! Trace window: start, and summed fill wall time inside it.
+			uint64_t win_start_ns, win_busy_ns;
+			//! Trace-window tallies (#1257 row; zeroed when a row goes out).
+			uint32_t legacy_fires, midframe_fires, in_frame, skip_pending, skip_duty;
+			//! Last duty refusal counted into skip_duty. The loop ticks at
+			//! P/4, so one deferred fill used to count ~4 times; a refusal
+			//! now counts once per 0.9 P (the fill spacing floor) — i.e.
+			//! per fill the cap actually withheld, not per tick.
+			uint64_t last_duty_skip_ns;
+		} mf;
+#endif
 	} repaint;
 
 	/*!
@@ -890,6 +1279,12 @@ struct comp_vk_native_compositor
 		//! seeds its marks from this; without it VK_FSTAGE_PRE measured from
 		//! zero, i.e. from the epoch.
 		uint64_t fp0;
+#ifdef VK_MIDFRAME_FILL
+		//! #1905 ask 2: the requester did NOT wait for this serve (non-blocking
+		//! hand-off). The serve loop then runs the app frame's post-weave tail
+		//! itself (vk_async_handoff_tail) — nobody else is left to run it.
+		bool async;
+#endif
 		/*
 		 * There is deliberately no pointer to the requester's fp[] here. It
 		 * used to be one, and it was only valid while that frame was still
@@ -970,6 +1365,117 @@ struct comp_vk_native_compositor
 		struct os_mutex mutex;
 		struct os_cond cond;
 	} weave_hand;
+#ifdef VK_MIDFRAME_FILL
+	/*!
+	 * #1905 ask 2: non-blocking in-process hand-off (Android, single ownership).
+	 *
+	 * xrEndFrame posts the weave request and returns once the frame is
+	 * COMMITTED: layers published to layer_accum and the app's projection
+	 * images blitted into the runtime atlas (renderer_draw waits its own
+	 * submit, so those reads are complete). The bound — at most ONE posted,
+	 * unserved weave — is enforced at the top of the NEXT layer_commit
+	 * (vk_async_handoff_drain), before anything the outstanding weave reads
+	 * (layer_accum, eff_layout, the atlas) is overwritten. See the design
+	 * note at vk_async_handoff_eligible.
+	 */
+	struct
+	{
+		//! Resolved once at create (dxr_async_handoff_resolve).
+		bool enabled;
+		//! The serial of the posted-but-not-awaited request; 0 = none.
+		//! Under weave_hand.mutex: set at the post, cleared only by
+		//! layer_commit's drain. Other app-thread drains (the zone-mask
+		//! entry points, which may run on any app thread) only wait on it.
+		uint64_t outstanding_seq;
+		//! TRACE, all under weave_hand.mutex: EMA of the app thread's
+		//! hand-off wait — the post->served wait on a blocking frame, the
+		//! commit drain on a non-blocking one — and the window tallies
+		//! (snapshotted + zeroed with the #1905 row): frames posted
+		//! non-blocking / blocking, and commit drains that actually had to
+		//! wait (> 0.5 ms — the previous weave was still unserved: the bound).
+		uint64_t wait_ema_ns;
+		uint32_t win_async, win_sync, win_stalls;
+		//! #2356 TRACE (under weave_hand.mutex like the tallies above):
+		//! frames whose window-space layers were composited at commit, and
+		//! the EMA of that composite's app-thread cost (record + submit + wait).
+		uint32_t win_ws_commit;
+		uint64_t ws_commit_ema_ns;
+		//! #2356 TRACE breakdown (same lock): the serve thread's submit of
+		//! the stamp (EMA), and app-thread waits for it — at
+		//! xrWaitSwapchainImage (count + EMA of the waits that blocked) and
+		//! before renderer_draw (EMA).
+		uint64_t ws_sub_ema_ns;
+		uint32_t win_ws_img_waits;
+		uint64_t ws_img_wait_ema_ns;
+		uint64_t ws_retire_ema_ns;
+		//! #2356 TRACE: wall time of an app-frame serve on the weave thread
+		//! (c->mutex taken -> weave returned), EMA — what a commit drain
+		//! stands behind when the serve has not finished.
+		uint64_t serve_ema_ns;
+		//! #2356 TRACE breakdown of the commit's own host time (EMAs):
+		//! c->mutex acquisition in layer_commit; and, inside the stamp's
+		//! ws_commit, the ws_stamp.mutex wait, the recording proper and
+		//! vkEndCommandBuffer (where a tiler driver may build its per-bin
+		//! command streams).
+		uint64_t commit_lock_ema_ns;
+		uint64_t ws_lock_ema_ns, ws_rec_ema_ns, ws_end_ema_ns;
+		//! #2356 TRACE: the stamp's recording (on the serve) split at the
+		//! enum vk_ws_prof probes — each entry is the time since the previous
+		//! probe reached (EMA).
+		uint64_t ws_prof_ema_ns[8];
+		/*!
+		 * #1905/#1962: harm-scored fallback to the blocking hand-off. On an
+		 * app that runs frames ahead (a command-buffer ring that never
+		 * waits), the serve's GPU work lands behind the app's queued frames
+		 * — the two queues share one global priority (see oxr_vulkan.c) —
+		 * so the commit drain waits ~a frame. That wait alone is NOT harm:
+		 * on a vsync-paced app it replaces time the app would have spent
+		 * blocked anyway (#1962: model viewer, Lume phone, v2.37.1 — drains
+		 * of 8-16 ms on nearly every frame at 55-59 fps non-blocking, vs
+		 * 31 fps blocking). It became harm only before #1959 removed the
+		 * per-frame sRGB copy (#1939: 22.5 -> 13.4 fps). So the scorer
+		 * judges the APP's frame interval (admit to admit, attributed to the
+		 * mode the previous frame was posted in), after a warm-up, over
+		 * windows — see vk_async_fallback_admit for the rules.
+		 *
+		 * `forced` is the resolved knob (1 = forced ON: never falls back).
+		 * Everything below `forced` is app-thread only (layer_commit —
+		 * xrEndFrame is externally synchronised), except: `fallback`,
+		 * `probing`, `trips`, `recoveries` are additionally written under
+		 * weave_hand.mutex so the trace row may read them there, and
+		 * `sc_gen` is only touched under weave_hand.mutex (bumped by
+		 * create_swapchain on whatever thread the app calls it from).
+		 */
+		int forced;
+		bool fallback;
+		bool probing;
+		uint32_t trips, recoveries, probe_fails;
+		uint32_t sc_gen;
+		//! Scorer state (app thread).
+		bool fb_prev_valid; //!< fb_prev_async describes the previous admitted frame
+		bool fb_prev_async; //!< ...which was posted non-blocking
+		bool fb_rearm;      //!< the drain abandoned a serve: restart the warm-up
+		uint32_t fb_sc_gen_seen;
+		uint64_t fb_cfg_key;
+		uint64_t fb_last_admit_ns;
+		uint64_t fb_last_drain_ns; //!< this commit's drain wait (0 = nothing was outstanding)
+		uint32_t fb_warm_frames;
+		uint64_t fb_warm_until_ns;
+		uint32_t fb_settle; //!< samples still to discard after a mode switch
+		uint32_t fb_n, fb_over_p;
+		uint64_t fb_iv_ns, fb_drain_ns;
+		uint64_t fb_blk_ref_iv_ns; //!< mean app interval of the last full BLOCKING window; 0 = none
+		uint64_t fb_next_probe_ns;
+		/*!
+		 * The weave thread is serving a non-blocking request right now.
+		 * Weave thread only, set and cleared under c->mutex around the
+		 * vk_dp_weave_and_present call. Routes that serve's queue work —
+		 * acquire wait, pre-DP flush, weave submit + frame fence, present —
+		 * onto the runtime-owned queue (see the comment at the queue choice).
+		 */
+		bool serving;
+	} hand_async;
+#endif
 	//! Paired with c->mutex. #1394 moved the weave hand-off onto its own
 	//! leaf lock (weave_hand.mutex/cond), so nothing signals this today; it
 	//! stays as the compositor-lock condvar for future use.
@@ -1011,6 +1517,96 @@ struct comp_vk_native_compositor
 	//! HUD per-eye disparity / parallax (#210).
 	struct vk_hud_blend window_space_blend;
 	bool window_space_blend_attempted;
+	/*!
+	 * #1795: the LINEAR window-space path. The layers blend into the
+	 * renderer's private compose target through its `_SRGB` view, sampled
+	 * as their declared format, so a window-space layer obeys the same
+	 * ADR-044 contract as a projection layer. @ref window_space_blend stays
+	 * as the encoded-space fallback (legacy hatch, or no compose target).
+	 * @{
+	 */
+	struct vk_hud_blend window_space_blend_linear;
+	VkFramebuffer ws_linear_fb;
+	VkImageView ws_linear_fb_view;
+	uint32_t ws_linear_fb_w, ws_linear_fb_h;
+	bool ws_linear_failed; //!< sticky: init failed once, stay on the fallback
+	bool ws_linear_logged;
+	//! @}
+	/*!
+	 * #2356: this frame's window-space layers were already composited into
+	 * the atlas by layer_commit (vk_async_composite_window_space_at_commit),
+	 * so the weave must not stamp them again. Reset by every layer_commit
+	 * before its draw; read by the weave under c->mutex. Only ever set on the
+	 * Android non-blocking hand-off path.
+	 */
+	bool ws_composited_at_commit;
+	/*!
+	 * #2356: the commit-time window-space stamp — at most ONE in flight.
+	 *
+	 * DECIDED at commit (app thread: it only tags the layer images), RECORDED
+	 * and SUBMITTED by the serve as its first act, on the runtime queue — so
+	 * the app thread does no Vulkan work for it at all (submitting or
+	 * recording it on the app thread measured 5.5-6 ms there, at any GPU
+	 * clock). Never host-waited on the frame path. What then waits for it,
+	 * and only when needed:
+	 *  - the served weave: queue order on that same queue (plus a full
+	 *    barrier at the stamp's end), never the host;
+	 *  - the next stamp and the next renderer_draw (which rewrites the atlas
+	 *    on the app's queue): the fence, at the top of the next commit —
+	 *    normally long signalled, since the serve that follows the stamp on
+	 *    the same queue was already drained;
+	 *  - the app re-acquiring a layer image the stamp reads:
+	 *    xrWaitSwapchainImage waits the fence when that image carries the
+	 *    in-flight stamp's serial (comp_vk_native_compositor_wait_swapchain_read)
+	 *    — backpressure only if the app laps the compositor. If the stamp is
+	 *    still only recorded, the wait first lets the outstanding serve run
+	 *    (the #1905 quiesce), so the fence it waits is one that will signal;
+	 *    a stamp the serve never submitted (a dropped frame) read nothing and
+	 *    is simply discarded.
+	 * Everything below is under @ref mutex (any thread: commit, wait_image,
+	 * swapchain destroy).
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		VkCommandPool pool; //!< on the runtime queue's family
+		VkCommandBuffer cmd;
+		VkFence fence;
+		bool in_flight;      //!< submitted; the fence is pending until retired
+		bool pending_submit; //!< decided at commit; the serve records + submits it
+		//! the serve is recording it right now — WITHOUT the mutex held, so
+		//! xrWaitSwapchainImage on any swapchain never stands behind the
+		//! recording; a wait on a tagged image treats it like pending_submit
+		bool recording;
+		/*!
+		 * #2356 TRACE: timestamps the composite drops while the serve records
+		 * the stamp (prof_on), so the row can bisect the recording. Indexed by
+		 * enum vk_ws_prof; 0 = that point was not reached this frame.
+		 */
+		bool prof_on;
+		uint64_t prof[8];
+		uint64_t serial;     //!< of the last recorded stamp (images are tagged with it)
+	} ws_stamp;
+	/*!
+	 * Swapchain images destroyed since the last window-space pass (#1782).
+	 *
+	 * window_space_blend caches a view per source VkImage, and the driver
+	 * reuses a destroyed image's handle for the next image it creates: an app
+	 * that resizes a HUD (destroy + create its swapchain) then gets the old
+	 * entry back, and the pass samples freed memory (VK_ERROR_DEVICE_LOST).
+	 * Swapchain destroy queues the images here and the pass forgets them
+	 * before it looks anything up. A leaf lock of its own: destroy runs on
+	 * the app thread, the pass can run on the weave thread, and c->mutex may
+	 * be held by a wedged weave thread (#1394).
+	 */
+	struct
+	{
+		struct os_mutex mutex;
+		VkImage images[VK_HUD_BLEND_MAX_IMAGES];
+		uint32_t count;
+		//! More images died than fit: forget the whole cache instead.
+		bool overflow;
+	} ws_dead;
 	//! Cached framebuffer for atlas window-space pass (one per atlas view).
 	/*!
 	 * Framebuffer for the window-space-into-atlas pass, keyed by the atlas
@@ -1038,6 +1634,13 @@ struct comp_vk_native_compositor
 	//! at the projection-done boundary (PROJECTION_ONLY) or end of
 	//! frame (POST_COMPOSE).
 	struct u_capture_intent capture_intent;
+	/*!
+	 * #2342 P2c: on a hub route the HUB is the one capture site. A pending
+	 * capture intent is moved here at the top of the frame (so this tier's
+	 * own projection / post dispatch points stay idle), handed to the hub
+	 * before the app-frame weave, and completed after it.
+	 */
+	struct u_capture_intent hub_capture;
 
 	//! Composite-tap diagnostics (#833 debugging): the Local2D composite
 	//! stashes this frame's target + scratch state here so the
@@ -1053,14 +1656,32 @@ struct comp_vk_native_compositor
 	//! #837 — fence for the windowed path's per-frame submit. Waiting this
 	//! instead of vkQueueWaitIdle scopes the CPU stall to OUR submission
 	//! (identical on a single-queue iGPU, strictly narrower elsewhere) and
-	//! is the stepping stone for deferred present. Lazily created.
+	//! is the stepping stone for deferred present. Lazily created. Host-wait
+	//! path only: a #2095 chained frame signals its ring slot's fence instead.
 	VkFence frame_fence;
+
+	//! #2095 / ADR-055 — the weave-sync ring (see the struct). Lazily created
+	//! on the first chained frame; the mutex is initialised at create.
+	struct vk_weave_sync_ring wsync;
+
+	//! #1917: signalled by the shared-texture commit's OWN submits, which
+	//! wait on it instead of vkQueueWaitIdle(main_queue) — the app's queue,
+	//! so idling it also waited for work other threads queued after ours.
+	//! Created once (lazily), reset after every wait — never per frame.
+	VkFence shared_submit_fence;
 
 	//! #439 Phase 3 — masked 2D-over-3D composite (post-weave). Pipelines +
 	//! render passes; created eagerly at compositor init (formats are fixed
 	//! B8G8R8A8_UNORM for both the target and the scratch — see the init).
 	struct vk_local2d_composite local2d;
 	bool local2d_initialized;
+	//! #1795 — local2d's `_SRGB` (B8G8R8A8_SRGB) flatten pipelines exist.
+	bool local2d_srgb_flatten_ready;
+	//! The weave snapshot runs as a draw (DXR_VK_ZONES_COPY_TO_DRAW, default
+	//! on): vk_local2d_composite_init_snapshot succeeded for weave_scratch's
+	//! format. Per frame it still needs a SAMPLED target
+	//! (comp_vk_native_target_images_sampled); otherwise the copy.
+	bool local2d_snapshot_ready;
 
 	//! twod flatten scratch (B8G8R8A8_UNORM, COLOR_ATTACHMENT|SAMPLED). The
 	//! frame's OVER Local2D layers (after the projection in list order) are
@@ -1071,6 +1692,12 @@ struct comp_vk_native_compositor
 	VkImageView local2d_scratch_view;
 	VkFramebuffer local2d_scratch_fb;
 	uint32_t local2d_scratch_w, local2d_scratch_h;
+	//! #1795 / ADR-044 §7 — the flatten's `_SRGB` view of local2d_scratch
+	//! (MUTABLE, {UNORM,_SRGB}). Non-NULL ⟺ local2d_scratch_fb is built over it
+	//! and local2d.flatten_srgb_rp, so the layers blend in linear light and the
+	//! attachment encodes once; local2d_scratch_view (UNORM) still reads the
+	//! ENCODED bytes every downstream reader expects. NULL = legacy hatch.
+	VkImageView local2d_scratch_srgb_view;
 
 	//! #491 part 3 — 2D-under backdrop scratch (same fmt/usage as
 	//! local2d_scratch). The frame's UNDER Local2D layers (before the projection
@@ -1083,13 +1710,18 @@ struct comp_vk_native_compositor
 	VkImageView backdrop_scratch_view;
 	VkFramebuffer backdrop_scratch_fb;
 	uint32_t backdrop_scratch_w, backdrop_scratch_h;
+	//! #1795 — same contract as local2d_scratch_srgb_view.
+	VkImageView backdrop_scratch_srgb_view;
 
-	//! Weave snapshot scratch (target format, TRANSFER_DST|SAMPLED). The DP
-	//! wrote the woven 3D into the target (RT≠SRV), so the lerp reads this
-	//! copy. Lazily (re)allocated to the window region dims.
+	//! Weave snapshot scratch (B8G8R8A8_UNORM, TRANSFER_DST|SAMPLED, plus
+	//! COLOR_ATTACHMENT when the snapshot is a draw). The DP wrote the woven
+	//! 3D into the target (RT≠SRV), so the lerp reads this snapshot. Lazily
+	//! (re)allocated to the window region dims.
 	VkImage weave_scratch;
 	VkDeviceMemory weave_scratch_mem;
 	VkImageView weave_scratch_view;
+	//! Over local2d.snapshot_rp; VK_NULL_HANDLE unless local2d_snapshot_ready.
+	VkFramebuffer weave_scratch_fb;
 	uint32_t weave_scratch_w, weave_scratch_h;
 
 	//! Runtime-owned IMPLICIT zone mask (R8_UNORM, COLOR_ATTACHMENT|SAMPLED),
@@ -1195,6 +1827,74 @@ struct comp_vk_native_compositor
 	//! one pool; resetting it twice while a shared cmd buffer still references
 	//! the earlier sets is a use-after-reset. Cleared at the top of layer_commit.
 	bool local2d_pool_reset_this_frame;
+
+	/*!
+	 * XR_DXR_cursor_depth v5, the runtime draws the cursor (ADR-046
+	 * Amendment 2 B).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * XrCursorDepthDrawInfoDXR. layer_commit tests `req.requested` and does
+	 * nothing else; the default look and the renderer's sprite image are
+	 * built on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_draw_request req;
+		//! The shared default look, uploaded to the renderer on change.
+		struct comp_cursor_look look;
+		uint64_t default_gen;
+		bool default_uploaded;
+		bool warned_zones;
+		bool warned_routed;
+	} cursor_draw;
+
+	/*!
+	 * XR_DXR_cursor_depth v7, measured disparity (ADR-046 Amendment 3).
+	 *
+	 * ZERO COST UNLESS REQUESTED: all zero for a session that never chained
+	 * the measured-disparity source. layer_commit tests `req.requested` and
+	 * `in_flight` and does nothing else; the command pool, staging buffers,
+	 * fences and query pool are created on the first real request only.
+	 */
+	struct
+	{
+		//! One-frame request from the state tracker, consumed by the next commit.
+		struct u_cursor_measure_request req;
+		VkCommandPool pool;
+		VkQueryPool queries; //!< 2 timestamps per slot (GPU cost evidence), or null
+		float ts_period_ns;
+		struct
+		{
+			VkBuffer buf;
+			VkDeviceMemory mem;
+			uint8_t *mapped;
+			VkDeviceSize size;
+			VkCommandBuffer cmd;
+			VkFence fence;
+			bool in_flight;
+			struct u_cursor_measure_request req;
+			struct u_cursor_measure_plan plan;
+			enum u_cursor_measure_format format;
+			uint32_t pitch;      //!< bytes per row of each view's copy
+			uint32_t view_bytes; //!< offset of view B's copy
+		} slot[3];
+		uint32_t next_slot;
+		uint32_t in_flight;
+		bool announced;
+		bool warned_format;
+		bool failed; //!< setup failed once: stop trying (one-time WARN)
+		struct u_cursor_measure_cache cache;
+		//! Newest finished measurement; guarded by `cursor_measure_mutex`.
+		struct u_cursor_measure_result result;
+		uint32_t stat_n, stat_reused;
+		uint64_t stat_cpu_ns, stat_cpu_max_ns;
+		bool warned_uncached;
+		double stat_gpu_ns, stat_gpu_max_ns;
+	} cursor_measure;
+	//! Guards cursor_measure.result: the locate may run on another thread.
+	//! A leaf lock (c->mutex can stay held across a weave hand-off).
+	struct os_mutex cursor_measure_mutex;
 };
 
 /*
@@ -1658,6 +2358,12 @@ vk_compositor_create_swapchain(struct xrt_compositor *xc,
                                 struct xrt_swapchain **out_xsc)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1962: a new swapchain restarts the hand-off scorer's warm-up.
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.sc_gen++;
+	os_mutex_unlock(&c->weave_hand.mutex);
+#endif
 	return comp_vk_native_swapchain_create(c, info, out_xsc);
 }
 
@@ -1744,6 +2450,18 @@ vk_compositor_predict_frame(struct xrt_compositor *xc,
 		}
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
+#ifdef XRT_OS_WINDOWS
+	else if (c->split != NULL) {
+		// #2327: under the split there is no VK target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: panel period on purpose — see wait_frame's note on
 	// the double-pacing failure.
@@ -1846,7 +2564,7 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		// bound on a signal it just deleted. Same key as everywhere else:
 		// this compositor's own grid, not the process-wide state.
 		if (c->split != NULL) {
-			comp_vk_split_set_app_paced(c->split, c->repaint.partition.next_release_ns != 0);
+			comp_hub_d3d11_set_app_paced(c->split, c->repaint.partition.next_release_ns != 0);
 		}
 #endif
 	}
@@ -1865,6 +2583,18 @@ vk_compositor_wait_frame(struct xrt_compositor *xc,
 		}
 		comp_vk_native_target_mark_wait_frame(c->target);
 	}
+#ifdef XRT_OS_WINDOWS
+	else if (c->split != NULL) {
+		// #2327: under the split there is no VK target — the hub's target owns
+		// the weave and the present, so ITS #867 ledger is the measured one.
+		// The fixed two-period fallback over-promised by ~0.75 ms (D < 0).
+		const uint64_t measured = comp_hub_d3d11_get_predicted_lookahead_ns(c->split);
+		if (measured != 0) {
+			lookahead_ns = (int64_t)measured;
+		}
+		comp_hub_d3d11_mark_wait_frame(c->split);
+	}
+#endif
 	*out_predicted_display_time_ns = now_ns + lookahead_ns;
 	// #1257 partition: deliberately still the PANEL period, never D x period.
 	// Reporting the stretched period made well-behaved apps pace themselves
@@ -1947,7 +2677,7 @@ vk_repaint_disarm_locked(struct comp_vk_native_compositor *c)
  * So the dispatch lives here, in one function whose contract is the whole
  * invariant: **the output follows the window**. A third output owner has to be
  * added to this function or it will present at the wrong size — and the tripwire
- * in `comp_vk_split_weave_and_present` says so out loud if one ever is not.
+ * in `comp_hub_d3d11_weave_and_present` says so out loud if one ever is not.
  *
  * Caller MUST hold c->mutex.
  */
@@ -1959,7 +2689,7 @@ vk_output_follow_window_locked(struct comp_vk_native_compositor *c, uint32_t wid
 		// The scanout chain is the runtime's own, on the runtime's own
 		// device; no Vulkan object is involved and there is nothing to
 		// drain on the app's Vulkan device.
-		(void)comp_vk_split_resize_target(c->split, width, height);
+		(void)comp_hub_d3d11_resize_target(c->split, width, height);
 		return;
 	}
 #endif
@@ -1990,6 +2720,9 @@ static bool
 dxr_weave_app_submit_guard(void);
 static bool
 vk_weave_blocked(struct comp_vk_native_compositor *c);
+//! #2095: the depth-1 wait on the newest chained weave (defined with the ring helpers).
+static uint64_t
+vk_weave_sync_wait_latest(struct comp_vk_native_compositor *c, const char *who);
 
 static xrt_result_t
 vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
@@ -2217,7 +2950,11 @@ vk_compositor_begin_frame(struct xrt_compositor *xc, int64_t frame_id)
 	// pay a clock read per frame when it is off — which is the default.
 	c->repaint.app_frame_begin_ns = dxr_weave_app_submit_guard() ? os_monotonic_get_ns() : 0;
 
+#ifdef VK_MIDFRAME_FILL
+	c->layer_stage.layer_count = 0;
+#else
 	c->layer_accum.layer_count = 0;
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2228,7 +2965,11 @@ vk_compositor_discard_frame(struct xrt_compositor *xc, int64_t frame_id)
 	// #1394: a discarded frame submits nothing more — close the window the
 	// matching begin_frame opened, or the repaint loop stays gated on it.
 	c->repaint.app_submit_window = false;
+#ifdef VK_MIDFRAME_FILL
+	c->layer_stage.layer_count = 0;
+#else
 	c->layer_accum.layer_count = 0;
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2248,7 +2989,11 @@ vk_compositor_layer_begin(struct xrt_compositor *xc, const struct xrt_layer_fram
 	// opened at begin_frame, is the one that covers them.
 	c->repaint.app_frame_in_progress = true;
 
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_begin(&c->layer_stage, data);
+#else
 	comp_layer_accum_begin(&c->layer_accum, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2259,7 +3004,11 @@ vk_compositor_layer_projection(struct xrt_compositor *xc,
                                 const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_projection(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_projection(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2271,7 +3020,11 @@ vk_compositor_layer_projection_depth(struct xrt_compositor *xc,
                                       const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_projection_depth(&c->layer_stage, xsc, d_xsc, data);
+#else
 	comp_layer_accum_projection_depth(&c->layer_accum, xsc, d_xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2282,7 +3035,11 @@ vk_compositor_layer_quad(struct xrt_compositor *xc,
                           const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_quad(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_quad(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2293,7 +3050,11 @@ vk_compositor_layer_cube(struct xrt_compositor *xc,
                           const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_cube(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_cube(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2304,7 +3065,11 @@ vk_compositor_layer_cylinder(struct xrt_compositor *xc,
                               const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_cylinder(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_cylinder(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2315,7 +3080,11 @@ vk_compositor_layer_equirect1(struct xrt_compositor *xc,
                                const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_equirect1(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_equirect1(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2326,7 +3095,11 @@ vk_compositor_layer_equirect2(struct xrt_compositor *xc,
                                const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_equirect2(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_equirect2(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2345,7 +3118,11 @@ vk_compositor_layer_window_space(struct xrt_compositor *xc,
                                   const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_window_space(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_window_space(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2362,7 +3139,11 @@ vk_compositor_layer_local_2d(struct xrt_compositor *xc,
                              const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_local_2d(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_local_2d(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2378,7 +3159,11 @@ vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
                             const struct xrt_layer_data *data)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	comp_layer_accum_zone_3d(&c->layer_stage, xsc, data);
+#else
 	comp_layer_accum_zone_3d(&c->layer_accum, xsc, data);
+#endif
 	return XRT_SUCCESS;
 }
 
@@ -2405,6 +3190,467 @@ vk_compositor_layer_zone_3d(struct xrt_compositor *xc,
  * @param tile_columns  Atlas tile columns.
  * @param tile_rows     Atlas tile rows.
  */
+
+//! #2356 TRACE: probe points of the window-space composite's recording.
+enum vk_ws_prof
+{
+	VK_WS_PROF_START = 0, //!< before vkResetCommandBuffer
+	VK_WS_PROF_BEGUN,     //!< after reset + begin + the leading barrier
+	VK_WS_PROF_DEAD,      //!< after forgetting destroyed images
+	VK_WS_PROF_SETUP,     //!< after the path's target / framebuffer setup
+	VK_WS_PROF_CIN,       //!< after the linear path's copy-in
+	VK_WS_PROF_STAMP,     //!< after the stamp render passes
+	VK_WS_PROF_COUT,      //!< after the linear path's copy-out (or the encoded path's barrier)
+	VK_WS_PROF_END,       //!< after the trailing barrier + vkEndCommandBuffer
+};
+
+//! #2356 TRACE: drop a probe timestamp (only while the serve records the stamp).
+static inline void
+vk_ws_prof(struct comp_vk_native_compositor *c, enum vk_ws_prof at)
+{
+	if (c->ws_stamp.prof_on) {
+		c->ws_stamp.prof[at] = os_monotonic_get_ns();
+	}
+}
+
+/*!
+ * Drop window_space_blend's cache entries for swapchain images destroyed since
+ * the last call (#1782). See comp_vk_native_compositor::ws_dead.
+ */
+static void
+vk_compositor_forget_dead_window_space_images(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	os_mutex_lock(&c->ws_dead.mutex);
+	if (c->ws_dead.overflow) {
+		while (c->window_space_blend.image_count > 0) {
+			vk_hud_blend_forget_image(&c->window_space_blend, vk,
+			                          c->window_space_blend.cached_images[0].image);
+		}
+		while (c->window_space_blend_linear.image_count > 0) {
+			vk_hud_blend_forget_image(&c->window_space_blend_linear, vk,
+			                          c->window_space_blend_linear.cached_images[0].image);
+		}
+	} else {
+		for (uint32_t i = 0; i < c->ws_dead.count; i++) {
+			vk_hud_blend_forget_image(&c->window_space_blend, vk, c->ws_dead.images[i]);
+			vk_hud_blend_forget_image(&c->window_space_blend_linear, vk, c->ws_dead.images[i]);
+		}
+	}
+	c->ws_dead.count = 0;
+	c->ws_dead.overflow = false;
+	os_mutex_unlock(&c->ws_dead.mutex);
+}
+
+/*!
+ * The atlas-pixel rect window-space layer @p ws is stamped at in view @p eye
+ * of a @p tile_columns x @p tile_rows grid of @p view_w x @p view_h tiles —
+ * the ONE placement rule, shared by the stamp and by the #2356 bounds of the
+ * linear path's copies (so the two can never disagree).
+ */
+static void
+vk_ws_eye_rect(const struct xrt_layer_window_space_data *ws,
+               uint32_t eye,
+               uint32_t tile_columns,
+               uint32_t tile_rows,
+               uint32_t view_w,
+               uint32_t view_h,
+               int32_t *out_x,
+               int32_t *out_y,
+               int32_t *out_w,
+               int32_t *out_h)
+{
+	const uint32_t effective_views = tile_columns * tile_rows;
+	const uint32_t tile_x = eye % tile_columns;
+	const uint32_t tile_y = eye / tile_columns;
+
+	const float tile_origin_x = (float)(tile_x * view_w);
+	const float tile_origin_y = (float)(tile_y * view_h);
+	const float tile_w = (float)view_w;
+	const float tile_h = (float)view_h;
+
+	// Per-view horizontal disparity, graded across the view sweep
+	// (view index = baseline order, same as the projection views):
+	// first view = -half, last = +half. Degenerates to the classic
+	// -/+ pair for 2-view modes and to 0 for a single view.
+	const float half_disp = ws->disparity / 2.0f;
+	float eye_shift = 0.0f;
+	if (effective_views > 1) {
+		float t = (float)eye / (float)(effective_views - 1);
+		eye_shift = -half_disp + ws->disparity * t;
+	}
+
+	*out_x = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
+	*out_y = (int32_t)(tile_origin_y + ws->y * tile_h);
+	*out_w = (int32_t)(ws->width * tile_w);
+	*out_h = (int32_t)(ws->height * tile_h);
+}
+
+/*!
+ * #2356: the atlas region every window-space stamp of this frame touches (the
+ * union of the per-view rects, clamped to the atlas). False when nothing would
+ * be drawn. The linear path copies only this region to and from its compose
+ * target: two whole-atlas copies were most of the composite's GPU cost (a
+ * 600x1024 panel on a ~3 K atlas), and the bytes outside it are never touched.
+ */
+static bool
+vk_ws_stamp_bounds(const struct comp_vk_native_compositor *c,
+                   uint32_t atlas_w,
+                   uint32_t atlas_h,
+                   uint32_t view_w,
+                   uint32_t view_h,
+                   uint32_t tile_columns,
+                   uint32_t tile_rows,
+                   VkOffset3D *out_off,
+                   VkExtent3D *out_ext)
+{
+	int64_t x0 = INT64_MAX, y0 = INT64_MAX, x1 = INT64_MIN, y1 = INT64_MIN;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE || layer->sc_array[0] == NULL) {
+			continue;
+		}
+		const uint32_t views = tile_columns * tile_rows;
+		for (uint32_t eye = 0; eye < views; eye++) {
+			int32_t dx, dy, dw, dh;
+			vk_ws_eye_rect(&layer->data.window_space, eye, tile_columns, tile_rows, view_w, view_h, &dx,
+			               &dy, &dw, &dh);
+			if (dw <= 0 || dh <= 0) {
+				continue;
+			}
+			x0 = dx < x0 ? dx : x0;
+			y0 = dy < y0 ? dy : y0;
+			x1 = (int64_t)dx + dw > x1 ? (int64_t)dx + dw : x1;
+			y1 = (int64_t)dy + dh > y1 ? (int64_t)dy + dh : y1;
+		}
+	}
+	// One pixel of margin each side: the stamp's rasterisation never reaches
+	// past its rect, but the margin costs nothing and absorbs any rounding.
+	x0 = x0 - 1 < 0 ? 0 : x0 - 1;
+	y0 = y0 - 1 < 0 ? 0 : y0 - 1;
+	x1 = x1 + 1 > (int64_t)atlas_w ? (int64_t)atlas_w : x1 + 1;
+	y1 = y1 + 1 > (int64_t)atlas_h ? (int64_t)atlas_h : y1 + 1;
+	if (x1 <= x0 || y1 <= y0) {
+		return false;
+	}
+	*out_off = (VkOffset3D){(int32_t)x0, (int32_t)y0, 0};
+	*out_ext = (VkExtent3D){(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1};
+	return true;
+}
+
+/*!
+ * Stamp every window-space layer, per tile, into @p fb (#1795: shared by the
+ * linear and the encoded-space paths). The target must be in
+ * COLOR_ATTACHMENT_OPTIMAL; it is left there. Each source is transitioned to
+ * SHADER_READ_ONLY_OPTIMAL for its draws and handed back to the app.
+ *
+ * @p honest selects the source view: true → the swapchain's declared format,
+ * for a target that blends in linear and encodes on write; false → the legacy
+ * non-decoding view, for the encoded atlas.
+ */
+static void
+vk_compositor_stamp_window_space_layers(struct comp_vk_native_compositor *c,
+                                        VkCommandBuffer cmd,
+                                        struct vk_hud_blend *blend,
+                                        VkFramebuffer fb,
+                                        bool honest,
+                                        uint32_t atlas_w,
+                                        uint32_t atlas_h,
+                                        uint32_t view_w,
+                                        uint32_t view_h,
+                                        uint32_t tile_columns,
+                                        uint32_t tile_rows)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
+			continue;
+		}
+		struct xrt_swapchain *xsc = layer->sc_array[0];
+		if (xsc == NULL) {
+			continue;
+		}
+
+		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
+		uint32_t sc_index = ws->sub.image_index;
+
+		// #1786: same rule as D3D11/D3D12's window-space pass —
+		// SOURCE_ALPHA_BIT clear means premultiplied bytes, set means
+		// straight. Deliberately not comp_layer_blend_mode() (#1599): see
+		// the comment in comp_d3d11_renderer.cpp's window-space draw.
+		bool ws_premultiplied = (layer->data.flags & XRT_LAYER_COMPOSITION_BLEND_TEXTURE_SOURCE_ALPHA_BIT) == 0;
+
+		VkImage src_image = (VkImage)(uintptr_t)
+		    comp_vk_native_swapchain_get_image(xsc, sc_index);
+		if (src_image == VK_NULL_HANDLE) {
+			continue;
+		}
+		// #1795: honest → sample the app's bytes as their declared format
+		// (decode an _SRGB source, read UNORM as linear, keep BGRA's channel
+		// order); encoded-space → the legacy R8G8B8A8_UNORM view.
+		const VkFormat src_fmt = honest ? (VkFormat)comp_vk_native_swapchain_get_declared_format(xsc)
+		                                : VK_FORMAT_UNDEFINED;
+
+		// Source: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
+		VkImageMemoryBarrier src_to_sample = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
+
+		// Per-view pass with disparity shift in tile-fraction → atlas px.
+		// Mirrors the metal/GL compositors (#413). The caller passes the
+		// frame's EFFECTIVE content grid (#542): mono content arrives as a
+		// 1×1 grid whose tile spans the full content region, so the old
+		// hardware-keyed full-region special case is just the grid math.
+		uint32_t effective_views = tile_columns * tile_rows;
+		for (uint32_t eye = 0; eye < effective_views; eye++) {
+			int32_t dx, dy, dw_i, dh_i;
+			vk_ws_eye_rect(ws, eye, tile_columns, tile_rows, view_w, view_h, &dx, &dy, &dw_i, &dh_i);
+			if (dw_i <= 0 || dh_i <= 0) {
+				continue;
+			}
+
+			// One-shot per-geometry diagnostic (#413): logs the resolved
+			// per-view placement whenever the mode/layout/dims change, so a
+			// missing-HUD report can be pinned to placement vs crop without
+			// a custom build. Not per-frame (see debug-logging conventions).
+			{
+				static uint32_t logged_key = 0;
+				uint32_t key = (tile_columns << 28) ^ (tile_rows << 24) ^
+				               (effective_views << 20) ^ (view_w << 8) ^ view_h ^
+				               ((uint32_t)c->hardware_display_3d << 31);
+				if (key != logged_key && eye == 0) {
+					logged_key = key;
+					U_LOG_W("[VK native] window-space placement: 3d=%d tiles=%ux%u "
+					        "views=%u view=%ux%u atlas=%ux%u first stamp dst=(%d,%d "
+					        "%dx%d) ws=(%.3f,%.3f %.3fx%.3f disp=%.3f)",
+					        (int)c->hardware_display_3d, tile_columns, tile_rows,
+					        effective_views, view_w, view_h, atlas_w, atlas_h,
+					        dx, dy, dw_i, dh_i,
+					        ws->x, ws->y, ws->width, ws->height, ws->disparity);
+				}
+			}
+
+			vk_hud_blend_draw_no_layout_fmt(blend, vk, cmd, fb, atlas_w, atlas_h, src_image, src_fmt, dx, dy,
+			                                (uint32_t)dw_i, (uint32_t)dh_i, ws_premultiplied);
+		}
+
+		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
+		VkImageMemoryBarrier src_back = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
+		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .image = src_image,
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
+		                         ws->sub.array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+		    0, 0, NULL, 0, NULL, 1, &src_back);
+	}
+}
+
+//! Record one layout transition for a single-mip, single-layer colour image.
+static void
+ws_linear_barrier(struct vk_bundle *vk,
+                  VkCommandBuffer cmd,
+                  VkImage image,
+                  VkImageLayout from,
+                  VkImageLayout to,
+                  VkAccessFlags src_access,
+                  VkAccessFlags dst_access,
+                  VkPipelineStageFlags src_stage,
+                  VkPipelineStageFlags dst_stage)
+{
+	VkImageMemoryBarrier b = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = src_access,
+	    .dstAccessMask = dst_access,
+	    .oldLayout = from,
+	    .newLayout = to,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = image,
+	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+	};
+	vk->vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, NULL, 0, NULL, 1, &b);
+}
+
+/*!
+ * #1795 - composite the window-space layers in LINEAR light.
+ *
+ * The atlas is plain B8G8R8A8_UNORM holding encoded bytes, and it cannot be
+ * given an `_SRGB` view (the deposit atlas is an imported D3D texture). So,
+ * the same shape as the D3D11 window-space pass drawing into its compose RTV
+ * and then publishing to the atlas:
+ *
+ *  1. raw-copy the published atlas into the private compose target;
+ *  2. blend each layer onto it through the target's `_SRGB` view, sampling
+ *     the layer as its DECLARED format (an `_SRGB` source decodes, a UNORM
+ *     source is read as the linear values it holds, BGRA keeps its channel
+ *     order), so the blend happens in linear light and the view encodes
+ *     once on write;
+ *  3. raw-copy the result back into the atlas.
+ *
+ * Both copies are vkCmdCopyImage between two B8G8R8A8_UNORM images: bytes,
+ * never a conversion. The cost, two atlas copies, is paid only on frames
+ * that carry window-space layers.
+ *
+ * Returns false, recording nothing, when the path is unavailable; the caller
+ * then takes the encoded-space path, which is what every frame did before.
+ */
+static bool
+vk_compositor_render_window_space_linear(struct comp_vk_native_compositor *c,
+                                         VkCommandBuffer cmd,
+                                         VkImage atlas_image,
+                                         uint32_t atlas_w,
+                                         uint32_t atlas_h,
+                                         uint32_t view_w,
+                                         uint32_t view_h,
+                                         uint32_t tile_columns,
+                                         uint32_t tile_rows)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (c->ws_linear_failed) {
+		return false;
+	}
+	if ((VkFormat)comp_vk_native_renderer_get_format(c->renderer) != VK_FORMAT_B8G8R8A8_UNORM) {
+		return false; // a raw copy to/from the compose target would swap channels
+	}
+	uint64_t img_u = 0;
+	uint64_t view_u = 0;
+	uint32_t cw = 0;
+	uint32_t ch = 0;
+	if (!comp_vk_native_renderer_get_linear_compose_target(c->renderer, &img_u, &view_u, &cw, &ch)) {
+		return false;
+	}
+	if (cw != atlas_w || ch != atlas_h) {
+		return false; // a resize in flight: this frame keeps the old path
+	}
+	VkImage comp_image = (VkImage)(uintptr_t)img_u;
+	VkImageView comp_view = (VkImageView)(uintptr_t)view_u;
+
+	if (!c->window_space_blend_linear.initialized) {
+		// Alpha written too, as on the encoded path (#1780).
+		if (!vk_hud_blend_init_ex(&c->window_space_blend_linear, vk, VK_FORMAT_B8G8R8A8_SRGB, true)) {
+			U_LOG_E("[VK native] linear window-space blend init failed; staying on the encoded path");
+			c->ws_linear_failed = true;
+			return false;
+		}
+	}
+	if (c->ws_linear_fb == VK_NULL_HANDLE || c->ws_linear_fb_view != comp_view || c->ws_linear_fb_w != cw ||
+	    c->ws_linear_fb_h != ch) {
+		// Safe to destroy: the previous frame's submit is waited on before
+		// this recording begins (same rule as the atlas_ws_fb ring).
+		if (c->ws_linear_fb != VK_NULL_HANDLE) {
+			vk->vkDestroyFramebuffer(vk->device, c->ws_linear_fb, NULL);
+			c->ws_linear_fb = VK_NULL_HANDLE;
+		}
+		VkFramebufferCreateInfo fb_ci = {
+		    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+		    .renderPass = c->window_space_blend_linear.render_pass,
+		    .attachmentCount = 1,
+		    .pAttachments = &comp_view,
+		    .width = cw,
+		    .height = ch,
+		    .layers = 1,
+		};
+		if (vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, &c->ws_linear_fb) != VK_SUCCESS) {
+			U_LOG_E("[VK native] linear window-space framebuffer failed (%ux%u); staying on the encoded path",
+			        cw, ch);
+			c->ws_linear_fb = VK_NULL_HANDLE;
+			c->ws_linear_failed = true;
+			return false;
+		}
+		c->ws_linear_fb_view = comp_view;
+		c->ws_linear_fb_w = cw;
+		c->ws_linear_fb_h = ch;
+	}
+
+	// #2356: only the region the stamps touch makes the round trip. The blend
+	// render pass loads its target and draws only inside the stamp rects, so
+	// the compose target outside the region (undefined after the UNDEFINED
+	// transition below) is never read back into the atlas.
+	VkOffset3D region_off = {0, 0, 0};
+	VkExtent3D region_ext = {cw, ch, 1};
+	if (!vk_ws_stamp_bounds(c, atlas_w, atlas_h, view_w, view_h, tile_columns, tile_rows, &region_off,
+	                        &region_ext)) {
+		return true; // nothing would be drawn: the atlas is already right
+	}
+	vk_ws_prof(c, VK_WS_PROF_SETUP);
+	const VkImageCopy whole = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = region_off,
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = region_off,
+	    .extent = region_ext,
+	};
+
+	// 1. atlas -> compose target (bytes).
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, comp_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+	vk_ws_prof(c, VK_WS_PROF_CIN);
+
+	// 2. blend in linear light.
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend_linear, c->ws_linear_fb,
+	                                        /*honest=*/true, atlas_w, atlas_h, view_w, view_h, tile_columns,
+	                                        tile_rows);
+	vk_ws_prof(c, VK_WS_PROF_STAMP);
+
+	// 3. compose target -> atlas (bytes), atlas back to the DP's layout.
+	ws_linear_barrier(vk, cmd, comp_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+	                  VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_TRANSFER_BIT);
+	vk->vkCmdCopyImage(cmd, comp_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, atlas_image,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &whole);
+	ws_linear_barrier(vk, cmd, atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                  VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+	vk_ws_prof(c, VK_WS_PROF_COUT);
+
+	if (!c->ws_linear_logged) {
+		c->ws_linear_logged = true;
+		U_LOG_W("[VK native] window-space layers composite in linear light, sampled as their declared "
+		        "format (#1795)");
+	}
+	return true;
+}
+
 static void
 vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c,
                                                VkCommandBuffer cmd,
@@ -2419,6 +3665,12 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 {
 	struct vk_bundle *vk = &c->vk;
 
+	// #1782: before any lookup can hit a reused handle. Safe to free here for
+	// the same reason the framebuffer eviction below is: the previous frame's
+	// submit is waited on before this recording begins.
+	vk_compositor_forget_dead_window_space_images(c);
+	vk_ws_prof(c, VK_WS_PROF_DEAD);
+
 	bool has_ws = false;
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
@@ -2430,10 +3682,21 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		return;
 	}
 
+	if (vk_compositor_render_window_space_linear(c, cmd, atlas_image, atlas_w, atlas_h, view_w, view_h,
+	                                             tile_columns, tile_rows)) {
+		return;
+	}
+
 	if (!c->window_space_blend.initialized && !c->window_space_blend_attempted) {
 		c->window_space_blend_attempted = true;
 		VkFormat atlas_fmt = (VkFormat)comp_vk_native_renderer_get_format(c->renderer);
-		if (!vk_hud_blend_init(&c->window_space_blend, vk, atlas_fmt)) {
+		// #1780: write alpha. The atlas alpha is the window's transparency in
+		// a transparent session, so an RGB-only stamp leaves the HUD invisible
+		// wherever no 3D content sits under it. Same blend as D3D11 (#225);
+		// an opaque atlas (alpha 1) is unchanged by it. Not keyed on the
+		// session's transparency: that can switch on mid-session (lazy
+		// transparency) and this pipeline is built once.
+		if (!vk_hud_blend_init_ex(&c->window_space_blend, vk, atlas_fmt, true)) {
 			U_LOG_E("[VK native] window-space alpha-blend init failed; "
 			        "layers will be skipped");
 		}
@@ -2500,6 +3763,7 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 		c->atlas_ws_fb = c->atlas_ws_fb_ring[slot];
 	}
 
+	vk_ws_prof(c, VK_WS_PROF_SETUP);
 	// Atlas: SHADER_READ_ONLY_OPTIMAL → COLOR_ATTACHMENT_OPTIMAL.
 	VkImageMemoryBarrier atlas_to_color = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2515,117 +3779,9 @@ vk_compositor_render_window_space_into_atlas(struct comp_vk_native_compositor *c
 	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 	    0, 0, NULL, 0, NULL, 1, &atlas_to_color);
 
-	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		if (layer->data.type != XRT_LAYER_WINDOW_SPACE) {
-			continue;
-		}
-		struct xrt_swapchain *xsc = layer->sc_array[0];
-		if (xsc == NULL) {
-			continue;
-		}
-
-		const struct xrt_layer_window_space_data *ws = &layer->data.window_space;
-		uint32_t sc_index = ws->sub.image_index;
-
-		VkImage src_image = (VkImage)(uintptr_t)
-		    comp_vk_native_swapchain_get_image(xsc, sc_index);
-		if (src_image == VK_NULL_HANDLE) {
-			continue;
-		}
-
-		// Source: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL.
-		VkImageMemoryBarrier src_to_sample = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .image = src_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-		                         ws->sub.array_index, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		    0, 0, NULL, 0, NULL, 1, &src_to_sample);
-
-		// Per-view pass with disparity shift in tile-fraction → atlas px.
-		// Mirrors the metal/GL compositors (#413). The caller passes the
-		// frame's EFFECTIVE content grid (#542): mono content arrives as a
-		// 1×1 grid whose tile spans the full content region, so the old
-		// hardware-keyed full-region special case is just the grid math.
-		uint32_t effective_views = tile_columns * tile_rows;
-		float half_disp = ws->disparity / 2.0f;
-		for (uint32_t eye = 0; eye < effective_views; eye++) {
-			uint32_t tile_x = eye % tile_columns;
-			uint32_t tile_y = eye / tile_columns;
-
-			float tile_origin_x = (float)(tile_x * view_w);
-			float tile_origin_y = (float)(tile_y * view_h);
-			float tile_w = (float)view_w;
-			float tile_h = (float)view_h;
-
-			// Per-view horizontal disparity, graded across the view sweep
-			// (view index = baseline order, same as the projection views):
-			// first view = -half, last = +half. Degenerates to the classic
-			// -/+ pair for 2-view modes and to 0 for a single view.
-			float eye_shift = 0.0f;
-			if (effective_views > 1) {
-				float t = (float)eye / (float)(effective_views - 1);
-				eye_shift = -half_disp + ws->disparity * t;
-			}
-
-			int32_t dx = (int32_t)(tile_origin_x + (ws->x + eye_shift) * tile_w);
-			int32_t dy = (int32_t)(tile_origin_y + ws->y * tile_h);
-			int32_t dw_i = (int32_t)(ws->width * tile_w);
-			int32_t dh_i = (int32_t)(ws->height * tile_h);
-			if (dw_i <= 0 || dh_i <= 0) {
-				continue;
-			}
-
-			// One-shot per-geometry diagnostic (#413): logs the resolved
-			// per-view placement whenever the mode/layout/dims change, so a
-			// missing-HUD report can be pinned to placement vs crop without
-			// a custom build. Not per-frame (see debug-logging conventions).
-			{
-				static uint32_t logged_key = 0;
-				uint32_t key = (tile_columns << 28) ^ (tile_rows << 24) ^
-				               (effective_views << 20) ^ (view_w << 8) ^ view_h ^
-				               ((uint32_t)c->hardware_display_3d << 31);
-				if (key != logged_key && eye == 0) {
-					logged_key = key;
-					U_LOG_W("[VK native] window-space placement: 3d=%d tiles=%ux%u "
-					        "views=%u view=%ux%u atlas=%ux%u first stamp dst=(%d,%d "
-					        "%dx%d) ws=(%.3f,%.3f %.3fx%.3f disp=%.3f)",
-					        (int)c->hardware_display_3d, tile_columns, tile_rows,
-					        effective_views, view_w, view_h, atlas_w, atlas_h,
-					        dx, dy, dw_i, dh_i,
-					        ws->x, ws->y, ws->width, ws->height, ws->disparity);
-				}
-			}
-
-			vk_hud_blend_draw_no_layout(&c->window_space_blend, vk, cmd,
-			    c->atlas_ws_fb, atlas_w, atlas_h,
-			    src_image, dx, dy, (uint32_t)dw_i, (uint32_t)dh_i);
-		}
-
-		// Source back to COLOR_ATTACHMENT_OPTIMAL so the app can rerender.
-		VkImageMemoryBarrier src_back = {
-		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-		    .srcAccessMask = VK_ACCESS_SHADER_READ_BIT,
-		    .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-		    .oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-		    .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		    .image = src_image,
-		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1,
-		                         ws->sub.array_index, 1},
-		};
-		vk->vkCmdPipelineBarrier(cmd,
-		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-		    0, 0, NULL, 0, NULL, 1, &src_back);
-	}
+	vk_compositor_stamp_window_space_layers(c, cmd, &c->window_space_blend, c->atlas_ws_fb, /*honest=*/false,
+	                                        atlas_w, atlas_h, view_w, view_h, tile_columns, tile_rows);
+	vk_ws_prof(c, VK_WS_PROF_STAMP);
 
 	// Atlas: COLOR_ATTACHMENT_OPTIMAL → SHADER_READ_ONLY_OPTIMAL for DP.
 	VkImageMemoryBarrier atlas_back = {
@@ -2677,13 +3833,23 @@ vk_dp_display_pixel_info(
 {
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_display_pixel_info(c->split, out_w, out_h, out_left, out_top);
+		return comp_hub_d3d11_get_display_pixel_info(c->split, out_w, out_h, out_left, out_top);
 	}
 #endif
+#ifdef XRT_OS_WINDOWS
+	// ADR-047 Amendment 2: the weave may swap the primary DP; never call into
+	// one being retired.
+	os_mutex_lock(&c->dp_swap_mutex);
+	const bool ok = c->display_processor != NULL && xrt_display_processor_get_display_pixel_info(
+	                                                    c->display_processor, out_w, out_h, out_left, out_top);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
+#else
 	if (c->display_processor == NULL) {
 		return false;
 	}
 	return xrt_display_processor_get_display_pixel_info(c->display_processor, out_w, out_h, out_left, out_top);
+#endif
 }
 
 static bool
@@ -2691,27 +3857,88 @@ vk_dp_display_dimensions(struct comp_vk_native_compositor *c, float *out_w_m, fl
 {
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_display_dimensions(c->split, out_w_m, out_h_m);
+		return comp_hub_d3d11_get_display_dimensions(c->split, out_w_m, out_h_m);
 	}
 #endif
+#ifdef XRT_OS_WINDOWS
+	os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
+	const bool ok = c->display_processor != NULL &&
+	                xrt_display_processor_get_display_dimensions(c->display_processor, out_w_m, out_h_m);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
+#else
 	if (c->display_processor == NULL) {
 		return false;
 	}
 	return xrt_display_processor_get_display_dimensions(c->display_processor, out_w_m, out_h_m);
+#endif
 }
 
 static bool
 vk_dp_predicted_eyes(struct comp_vk_native_compositor *c, struct xrt_eye_positions *out_eye_pos)
 {
+	bool ok;
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		return comp_vk_split_get_predicted_eye_positions(c->split, out_eye_pos);
+		ok = comp_hub_d3d11_get_predicted_eye_positions(c->split, out_eye_pos);
+	} else {
+		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
+		ok = c->display_processor != NULL &&
+		     xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+		os_mutex_unlock(&c->dp_swap_mutex);
 	}
-#endif
+#else
 	if (c->display_processor == NULL) {
 		return false;
 	}
-	return xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+	ok = xrt_display_processor_get_predicted_eye_positions(c->display_processor, out_eye_pos);
+#endif
+	// N6 Part 1 (#2144): every "latest" answer feeds the ring, keyed by the
+	// time it was ASKED (the vendor's horizon is unknown; the ring's own
+	// extrapolation is relative to query time).
+	if (ok && out_eye_pos->valid) {
+		u_eye_history_push(&c->eye_hist, out_eye_pos, (int64_t)os_monotonic_get_ns());
+	}
+	return ok;
+}
+
+/*!
+ * N6 Part 1 (#2144): the eyes for @p target_ns — the DP's own target-time
+ * slot when it has one (if it fails, this compositor's ring — fed by every
+ * per-frame query above — read at the target, clamped); a DP without the
+ * slot gets its plain "latest" answer unchanged.
+ */
+static bool
+vk_dp_eyes_at(struct comp_vk_native_compositor *c, int64_t target_ns, struct xrt_eye_positions *out_eye_pos)
+{
+	// N6 Part 1 (#2144): a DP WITHOUT the target-time slot keeps today's
+	// behaviour exactly — its own get_predicted_eye_positions answer,
+	// unchanged (it is already vendor-predicted; sampling it again at the
+	// target would double the horizon). Only a DP that HAS the slot gets
+	// display-time sampling; if that slot fails, the ring is read at the
+	// target CLAMPED to its newest sample (never extrapolated).
+	bool has = false;
+	bool ok = false;
+#ifdef XRT_OS_WINDOWS
+	if (c->split == NULL) {
+		os_mutex_lock(&c->dp_swap_mutex); // ADR-047 Amendment 2 swap
+		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+		has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+		ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
+		os_mutex_unlock(&c->dp_swap_mutex);
+	}
+#else
+	struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)c->display_processor;
+	has = xrt_display_processor_vk_has_eye_positions_at(vdp);
+	ok = has && xrt_display_processor_vk_get_eye_positions_at(vdp, target_ns, out_eye_pos);
+#endif
+	if (ok && out_eye_pos->valid) {
+		return true;
+	}
+	if (has && u_eye_history_get_clamped(&c->eye_hist, target_ns, out_eye_pos) != U_EYE_HISTORY_RESULT_EMPTY) {
+		return out_eye_pos->valid;
+	}
+	return vk_dp_predicted_eyes(c, out_eye_pos);
 }
 
 static bool
@@ -2867,6 +4094,118 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
  */
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND)
+/*
+ * #1748 MEASUREMENT HOOK (DXR_WL_ORIGIN_STAMP=1, off by default, Linux only).
+ *
+ * Writes a barcode of the present origin this frame was woven for into the
+ * top-left 352x8 device px of the target: 44 blocks of 8x8, white = 1. Blocks
+ * 0-3 are a 1010 marker, then origin x + 32768 (16 bits, MSB first), origin
+ * y + 32768 (16 bits), and an 8-bit frame counter. The GNOME extension's paint
+ * audit (DISPLAYXR_STAMP_AUDIT=1) reads it back from the window's texture and
+ * compares it with where the stage painted the window, per painted frame. It
+ * overwrites real content, so it is a test hook and nothing else.
+ */
+#define VK_STAMP_BLOCK 8u
+#define VK_STAMP_BLOCKS 44u
+#define VK_STAMP_W (VK_STAMP_BLOCK * VK_STAMP_BLOCKS)
+#define VK_STAMP_H VK_STAMP_BLOCK
+
+static void
+vk_debug_origin_stamp(struct comp_vk_native_compositor *c,
+                      VkCommandBuffer cmd,
+                      VkImage target_image,
+                      uint32_t target_width,
+                      uint32_t target_height,
+                      VkImageLayout target_layout)
+{
+	static int enabled = -1;
+	if (enabled < 0) {
+		const char *e = getenv("DXR_WL_ORIGIN_STAMP");
+		enabled = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	if (enabled == 0 || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE || target_width < VK_STAMP_W ||
+	    target_height < VK_STAMP_H || !c->have_last_present_origin) {
+		return;
+	}
+	struct vk_bundle *vk = &c->vk;
+	if (c->stamp_buffer == VK_NULL_HANDLE) {
+		if (!vk_buffer_init(vk, VK_STAMP_W * VK_STAMP_H * 4, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		                    &c->stamp_buffer, &c->stamp_memory)) {
+			enabled = 0;
+			return;
+		}
+		void *map = NULL;
+		if (vk->vkMapMemory(vk->device, c->stamp_memory, 0, VK_WHOLE_SIZE, 0, &map) != VK_SUCCESS) {
+			enabled = 0;
+			return;
+		}
+		c->stamp_map = map;
+		U_LOG_W(
+		    "DXR_WL_ORIGIN_STAMP=1: stamping each frame's present origin into its top-left %ux%u px "
+		    "(#1748 measurement hook - overwrites content)",
+		    VK_STAMP_W, VK_STAMP_H);
+	}
+	uint8_t bits[VK_STAMP_BLOCKS];
+	const uint32_t ux = (uint32_t)(c->last_present_origin_x + 32768) & 0xffffu;
+	const uint32_t uy = (uint32_t)(c->last_present_origin_y + 32768) & 0xffffu;
+	const uint32_t seq = (c->stamp_seq++) & 0xffu;
+	bits[0] = 1;
+	bits[1] = 0;
+	bits[2] = 1;
+	bits[3] = 0;
+	for (uint32_t i = 0; i < 16; i++) {
+		bits[4 + i] = (uint8_t)((ux >> (15 - i)) & 1u);
+		bits[20 + i] = (uint8_t)((uy >> (15 - i)) & 1u);
+	}
+	for (uint32_t i = 0; i < 8; i++) {
+		bits[36 + i] = (uint8_t)((seq >> (7 - i)) & 1u);
+	}
+	// Same bytes in RGBA and BGRA: white (ff ff ff ff) or opaque black.
+	for (uint32_t y = 0; y < VK_STAMP_H; y++) {
+		for (uint32_t x = 0; x < VK_STAMP_W; x++) {
+			uint8_t *px = c->stamp_map + (y * VK_STAMP_W + x) * 4;
+			const uint8_t v = bits[x / VK_STAMP_BLOCK] ? 0xff : 0x00;
+			px[0] = v;
+			px[1] = v;
+			px[2] = v;
+			px[3] = 0xff;
+		}
+	}
+
+	const VkImageSubresourceRange color = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	VkImageMemoryBarrier to_dst = {
+	    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .oldLayout = target_layout,
+	    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .image = target_image,
+	    .subresourceRange = color,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &to_dst);
+	const VkBufferImageCopy region = {
+	    .bufferOffset = 0,
+	    .bufferRowLength = 0,
+	    .bufferImageHeight = 0,
+	    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .imageOffset = {0, 0, 0},
+	    .imageExtent = {VK_STAMP_W, VK_STAMP_H, 1},
+	};
+	vk->vkCmdCopyBufferToImage(cmd, c->stamp_buffer, target_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+	                           &region);
+	VkImageMemoryBarrier back = to_dst;
+	back.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT;
+	back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	back.newLayout = target_layout;
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0,
+	                         NULL, 1, &back);
+}
+
 /*!
  * Paint the off-panel part of the woven target with flat 2D (#1654).
  *
@@ -2880,7 +4219,7 @@ vk_hud_prepare(struct comp_vk_native_compositor *c, uint32_t target_width, uint3
  * band never overwrites chrome the app asked for and the HUD stays readable on
  * either side of the seam.
  *
- * DXR_WAYLAND_SPAN_2D=0 turns it off (the whole surface is then woven, which
+ * DXR_SPAN_2D=0 (or DXR_WAYLAND_SPAN_2D=0) turns it off (the whole surface is then woven, which
  * is the pre-#1654 behaviour and shows the interlace on the other monitor).
  */
 static void
@@ -2893,7 +4232,12 @@ vk_composite_offpanel_2d(struct comp_vk_native_compositor *c,
 {
 	static int enabled = -1;
 	if (enabled < 0) {
-		const char *e = getenv("DXR_WAYLAND_SPAN_2D");
+		// DXR_SPAN_2D is the platform-neutral name the service weave engine
+		// reads too; DXR_WAYLAND_SPAN_2D is the original one.
+		const char *e = getenv("DXR_SPAN_2D");
+		if (e == NULL) {
+			e = getenv("DXR_WAYLAND_SPAN_2D");
+		}
 		enabled = (e != NULL && e[0] == '0') ? 0 : 1;
 	}
 	if (enabled == 0 || !c->use_wayland || cmd == VK_NULL_HANDLE || target_image == VK_NULL_HANDLE) {
@@ -3292,13 +4636,21 @@ vk_ensure_dp_input_image(struct comp_vk_native_compositor *c,
 	VkImageCreateInfo image_ci = {
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 	    .imageType = VK_IMAGE_TYPE_2D,
-	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    // The atlas's own format: the crop below is a raw vkCmdCopyImage, so any
+	    // other format reinterprets the bits (a 10-bit atlas reached the weaver
+	    // as garbage this way before this followed the atlas).
+	    .format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer),
 	    .extent = {content_w, content_h, 1},
 	    .mipLevels = 1,
 	    .arrayLayers = 1,
 	    .samples = VK_SAMPLE_COUNT_1_BIT,
 	    .tiling = VK_IMAGE_TILING_OPTIMAL,
-	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+	    // TRANSFER_SRC: a display processor may read this image with a
+	    // transfer, not only sample it. The Leia Linux DP's 2D path presents
+	    // it with vkCmdBlitImage; without the bit that blit and the barriers
+	    // into TRANSFER_SRC_OPTIMAL are invalid usage (VUID-vkCmdBlitImage-
+	    // srcImage-00219, VUID-VkImageMemoryBarrier-oldLayout-01212/01197).
+	    .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
 	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 	};
@@ -3345,7 +4697,7 @@ vk_ensure_dp_input_image(struct comp_vk_native_compositor *c,
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 	    .image = c->dp_input_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_B8G8R8A8_UNORM,
+	    .format = (VkFormat)comp_vk_native_renderer_get_format(c->renderer),
 	    .subresourceRange = {
 	        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 	        .baseMipLevel = 0,
@@ -3545,6 +4897,12 @@ vk_native_capture_atlas_to_png(struct comp_vk_native_compositor *c, const char *
 	    : comp_vk_native_renderer_get_format(c->renderer));
 	bool swap_bgra =
 	    (atlas_format == VK_FORMAT_B8G8R8A8_UNORM || atlas_format == VK_FORMAT_B8G8R8A8_SRGB);
+	if (!swap_bgra && atlas_format != VK_FORMAT_R8G8B8A8_UNORM && atlas_format != VK_FORMAT_R8G8B8A8_SRGB) {
+		// The staging buffer is 4 bytes per texel: a 16F atlas (DXR_ATLAS_FORMAT)
+		// would overrun it and a 10-bit one would come out as garbage.
+		U_LOG_W("[VK native] capture: atlas format %d is not 8-bit RGBA - skipped", (int)atlas_format);
+		return false;
+	}
 
 	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 	if (cmd_pool == VK_NULL_HANDLE) {
@@ -3715,6 +5073,11 @@ vk_native_dump_image_to_png(struct comp_vk_native_compositor *c,
 	if (image == VK_NULL_HANDLE || w == 0 || h == 0) {
 		return false;
 	}
+	// #2095: this dump idles main_queue only; under the chain a non-blocking
+	// serve's batches run on the runtime queue and may still be sampling or
+	// writing the image being read back. Wait the latest chained frame first
+	// (bounded; a capture is a diagnostic, not a frame).
+	(void)vk_weave_sync_wait_latest(c, "capture");
 	VkCommandPool cmd_pool = (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
 	if (cmd_pool == VK_NULL_HANDLE) {
 		return false;
@@ -3879,6 +5242,9 @@ vk_native_dispatch_composite_tap(struct comp_vk_native_compositor *c)
 #endif
 }
 
+static void
+vk_ws_stamp_wait_submitted(struct comp_vk_native_compositor *c); // #2356, below
+
 // Run the capture readback if the per-frame intent matches @p mode_filter.
 // Caller polls intent at top of layer_commit; this fires at each boundary.
 static void
@@ -3887,6 +5253,10 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 	if (!u_capture_intent_should_capture(&c->capture_intent, mode_filter)) {
 		return;
 	}
+	// #2356: a commit-time window-space stamp writes the atlas on the runtime
+	// queue; the capture reads it from another. Trigger-gated, so a host wait
+	// is fine here.
+	vk_ws_stamp_wait_submitted(c);
 	bool ok = vk_native_capture_atlas_to_png(c, c->capture_intent.path);
 	if (ok) {
 		U_LOG_I("Atlas captured (mode=%u) to %s",
@@ -3895,6 +5265,42 @@ vk_native_dispatch_capture(struct comp_vk_native_compositor *c, uint32_t mode_fi
 		U_LOG_W("Atlas capture failed (mode=%u path=%s)",
 		        c->capture_intent.mode, c->capture_intent.path);
 	}
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	// Multi-screen M2: with the window split across screens, also write each
+	// segment's own DP input — `<stem>.seg<i>.png` — so a capture shows the
+	// per-screen canvases, not only the whole-window atlas they were cut from.
+	if (ok && mode_filter == MCP_CAPTURE_MODE_POST_COMPOSE && c->segments != NULL) {
+		const char *path = c->capture_intent.path;
+		// The extension's dot only — not one in a directory name.
+		const char *dot = strrchr(path, '.');
+		const char *slash = strrchr(path, '/');
+		if (dot != NULL && slash != NULL && dot < slash) {
+			dot = NULL;
+		}
+		const size_t stem = dot != NULL ? (size_t)(dot - path) : strlen(path);
+		for (uint32_t i = 0; i < COMP_SEGMENTS_MAX; i++) {
+			VkImage img = VK_NULL_HANDLE;
+			uint32_t w = 0, h = 0;
+			uint64_t screen_id = 0;
+			bool woven = false;
+			if (!comp_vk_native_segments_get_capture(c->segments, i, &img, &w, &h, &screen_id, &woven)) {
+				break;
+			}
+			if (!woven || img == VK_NULL_HANDLE) {
+				U_LOG_W("Atlas capture: segment %u (screen 0x%016llx) is flat 2D this frame — no DP input",
+				        i, (unsigned long long)screen_id);
+				continue;
+			}
+			char seg_path[MCP_CAPTURE_PATH_MAX + 16];
+			snprintf(seg_path, sizeof(seg_path), "%.*s.seg%u.png", (int)stem, path, i);
+			const bool seg_ok = vk_native_dump_image_to_png(
+			    c, img, w, h, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+			    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, u_image_capture_raw_alpha(), seg_path);
+			U_LOG_W("Atlas capture: segment %u (screen 0x%016llx) DP input %ux%u -> %s%s", i,
+			        (unsigned long long)screen_id, w, h, seg_path, seg_ok ? "" : " FAILED");
+		}
+	}
+#endif
 	u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
 }
 
@@ -3927,6 +5333,19 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c);
 // (windowed-weaving phase anchor). Defined below, next to get_window_metrics.
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c);
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+// #2071: geometry re-sync when the window-geometry publisher reappears.
+static void
+vk_wl_geom_resync_if_publisher_reappeared(struct comp_vk_native_compositor *c);
+#endif
+// #1748 move sync (native Wayland) — defined beside vk_update_present_origin;
+// no-ops elsewhere.
+static void
+vk_wl_move_sync_take(struct comp_vk_native_compositor *c, bool *have, int32_t *x, int32_t *y);
+static void
+vk_wl_move_sync_tag_present(struct comp_vk_native_compositor *c, bool have, int32_t x, int32_t y);
+static bool
+vk_wl_move_fill_due(const struct comp_vk_native_compositor *c, uint64_t period_ns);
 #ifdef XRT_OS_WINDOWS
 //! #918 VK-1 (#1178) — defined beside the two creates it re-runs; called from
 //! the frame path far above them.
@@ -3939,6 +5358,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 
 static void
 vk_split_composite_window_space(struct comp_vk_native_compositor *c);
+static bool
+vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c);
 //! VK-1b-3 - this frame's authoritative app-authored mask, and the ensure that
 //! must run BEFORE any command is recorded. Defined with the zone helpers.
 struct comp_vk_native_zone_mask;
@@ -4126,6 +5547,21 @@ static bool
 vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d);
 
 #ifdef XRT_OS_LINUX_DESKTOP
+static void
+vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1);
+
+/*!
+ * Whether this frame is collapsed to flat 2D for a runtime reason: a surface
+ * that cannot be presented 1:1 (#1595/#1831), or auto-2D on a flat stereo
+ * submission (util/u_mono_auto_2d.h). Either way the frame is tile 0, the DP
+ * takes its mono passthrough, and there is no weave.
+ */
+static inline bool
+vk_linux_collapsed_2d(const struct comp_vk_native_compositor *c)
+{
+	return c->linux_surface_not_1to1 || c->mono_2d_hold;
+}
+
 /*!
  * Refuse rather than resample, desktop-Linux edition (#1595).
  *
@@ -4152,17 +5588,14 @@ vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d);
  * `on_pause`/`on_resume` pair to release the session's lens preference
  * (#1039), and @ref vk_compute_effective_layout collapsing the frame to tile 0.
  *
- * ## Scope: the Wayland arm only, and why
+ * ## Scope: this is the Wayland arm
  *
- * X11 is deliberately NOT gated here. The only signal available there is
- * `display_desktop_rect_is_panel`, and that flag is false on every dev box by
- * construction — sim_display declares a 1920x1080 panel no real desktop rect
- * matches — so gating the weave on it would put every X11 sim session into
- * flat 2D. It already gates the weave PHASE
- * (@ref vk_x11_present_origin_is_panel_native), which is the part it can
- * honestly speak to. Wayland is where the measurement exists: the geometry
- * service publishes the surface's monitor and its scale, so the destination
- * extent is a number rather than an inference.
+ * Wayland's measurement is per surface: the geometry service publishes the
+ * surface's monitor and its scale, so the destination extent is a number
+ * rather than an inference. X11's is per session — the panel's X11 rect
+ * against its connector's device mode — and lives in
+ * @ref vk_x11_update_not_1to1 (#1831), which shares the degrade itself
+ * (@ref vk_linux_apply_not_1to1).
  *
  * ## Never degrade on ignorance
  *
@@ -4240,12 +5673,15 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	//      scale 1, i.e. a surface twice the output. A surface INSIDE the frame
 	//      (a title bar above it) is fine. Unknown never degrades.
 	const bool fits_surface = wr.surface_within_frame;
-	const bool not_1to1 = !on_panel || !fits_window || !fits_surface;
+	// Multi-screen M2: (b) and (c) are resamples; a DP whose output survives
+	// one (XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) is not degraded by them.
+	// (a) stays: off the panel, native Wayland has no segment to weave into.
+	const bool tolerant = c->display_processor != NULL && c->dp_tolerates_resample;
+	const bool not_1to1 = !on_panel || (!tolerant && (!fits_window || !fits_surface));
 
 	if (not_1to1 == c->linux_surface_not_1to1) {
 		return;
 	}
-	c->linux_surface_not_1to1 = not_1to1;
 
 	// ONE line per transition. A silent 2D fallback is its own debugging trap,
 	// so the line names both extents AND which of the two reasons fired.
@@ -4266,6 +5702,61 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 		    buf_px_w, buf_px_h, panel_px_w, panel_px_h, c->display_mode_hold.wanted_3d ? "3D" : "2D");
 	}
 
+	vk_linux_apply_not_1to1(c, not_1to1);
+#else
+	(void)c;
+#endif
+}
+
+/*!
+ * Enter or leave the refuse-rather-than-resample state (#1595). The caller has
+ * already logged the transition and why; this is the degrade itself, shared by
+ * the Wayland and X11 arms.
+ */
+static void
+vk_linux_apply_hold(struct comp_vk_native_compositor *c);
+
+static void
+vk_linux_apply_not_1to1(struct comp_vk_native_compositor *c, bool not_1to1)
+{
+	if (not_1to1 == c->linux_surface_not_1to1) {
+		return;
+	}
+	c->linux_surface_not_1to1 = not_1to1;
+	vk_linux_apply_hold(c);
+}
+
+/*!
+ * Auto-2D on a flat stereo submission: apply the state tracker's last request
+ * (comp_vk_native_compositor_set_mono_2d_hold) at the top of the composed
+ * frame, beside the #1595 gate. Transitions only. The state tracker logs the
+ * edge; this logs nothing.
+ */
+static void
+vk_linux_update_mono_2d(struct comp_vk_native_compositor *c)
+{
+	const bool want = c->mono_2d_wanted;
+	if (want == c->mono_2d_hold) {
+		return;
+	}
+	c->mono_2d_hold = want;
+	vk_linux_apply_hold(c);
+}
+
+/*!
+ * Enter or leave the runtime hardware-2D hold. The hold is the OR of every
+ * runtime reason (NOT_1TO1, auto-2D), so one reason clearing while the other
+ * stands keeps the panel 2D, and only the last one out restores the session's
+ * own choice.
+ */
+static void
+vk_linux_apply_hold(struct comp_vk_native_compositor *c)
+{
+	const bool hold = vk_linux_collapsed_2d(c);
+	if (hold == c->display_mode_hold.held) {
+		return;
+	}
+
 	// Same degrade the Android arm performs: ask the panel for hardware 2D and
 	// release this session's lens preference, because the Leia DP only ever
 	// re-asserts the lens from inside a weave and with the weave gone nothing
@@ -4277,15 +5768,168 @@ vk_linux_update_surface_not_1to1(struct comp_vk_native_compositor *c)
 	// weaver for good, so if the clear edge did not ask for the lens back,
 	// nobody ever would. While the hold is on, the session's own requests are
 	// recorded, not forwarded (comp_vk_native_compositor_request_display_mode).
-	(void)vk_dp_request_display_mode(c, u_display_mode_hold_set(&c->display_mode_hold, not_1to1));
-	if (not_1to1) {
+	(void)vk_dp_request_display_mode(c, u_display_mode_hold_set(&c->display_mode_hold, hold));
+	if (hold) {
 		xrt_display_processor_on_pause(c->display_processor);
 	} else {
 		xrt_display_processor_on_resume(c->display_processor);
 	}
-#else
-	(void)c;
+}
+
+/*!
+ * The X11 arm of refuse-rather-than-resample (#1831).
+ *
+ * ## The rule
+ *
+ * An X11 window's pixels reach the panel 1:1 only if the panel's rect in the X
+ * root IS its device mode. Under XWayland that is a property of the session,
+ * not of the window: Mutter gives the whole X screen one integer scale `G`
+ * (the ceiling of the largest monitor scale) and composites each X11 surface
+ * onto an output at `scale / G`. So on a 3840x2160 panel at 150 % the X11 rect
+ * is 5120x2880 and every X11 window there is drawn at 2x and downsampled by
+ * 0.75 with a linear filter; at 200 % the rect is 3840x2160 and the factor is
+ * exactly 1. A weave survives the second and is destroyed by the first.
+ *
+ * No window-level property changes that (Mutter applies the effective scale
+ * to every Xwayland surface, and rootless Xwayland's own fractional-scale
+ * support is rootful-only). The one exception is a fullscreen client that sets
+ * a RandR-emulated mode of the panel's device size, which Xwayland maps through
+ * a viewport at exactly 1:1 — the runtime does not drive that today, so it is
+ * not what this function sees.
+ *
+ * ## Why it can speak now when the old X11 note said it could not
+ *
+ * The old reason for leaving X11 ungated was that the only signal,
+ * `display_desktop_rect_is_panel`, is false on every dev box by construction
+ * (sim_display's declared panel matches no desktop rect). This gate does not
+ * use that flag. It acts only on positive evidence: the resolver identified the
+ * panel by its CONNECTOR's device mode (so that monitor really is the panel),
+ * that device mode is known, and the X11 rect differs from it. A box where
+ * nothing matches, or where the device mode is unknown, keeps today's
+ * behaviour exactly — never degrade on ignorance. An integer-scale session
+ * (rect == device mode) is 1:1 and keeps weaving exactly as before.
+ *
+ * Evaluated once: its inputs are the desktop resolution taken at system
+ * creation, which is static for the life of the compositor on X11.
+ */
+/*!
+ * Multi-screen M2 review: re-read the DP's resample tolerance when the head's
+ * rendering mode changes. sim_display's answer follows its output mode (the
+ * 1/2/3 keys / V): switching to INTERLACED on a scaled desktop must degrade
+ * (#1595 / #1831 — a resampled interlace is a double image), switching back to
+ * anaglyph must weave again. A change re-arms the X11 gate's one-shot; the
+ * Wayland arm reads the flag on every evaluation. One vtable call per MODE
+ * CHANGE, never per frame.
+ */
+static void
+vk_dp_refresh_resample_caps(struct comp_vk_native_compositor *c)
+{
+	if (c->display_processor == NULL || c->xdev == NULL || c->xdev->hmd == NULL) {
+		return;
+	}
+	const uint32_t idx = c->xdev->hmd->active_rendering_mode_index;
+	if (idx == c->dp_caps_mode_index) {
+		return;
+	}
+	c->dp_caps_mode_index = idx;
+	const bool tol =
+	    xrt_display_processor_vk_tolerates_resample((struct xrt_display_processor_vk *)c->display_processor);
+	if (tol == c->dp_tolerates_resample) {
+		return;
+	}
+	U_LOG_I("1:1 gate: rendering mode %u — the display processor's output %s a resample now; re-evaluating",
+	        idx, tol ? "tolerates" : "does NOT tolerate");
+	c->dp_tolerates_resample = tol;
+	c->x11_1to1_evaluated = false;
+}
+
+static void
+vk_x11_update_not_1to1(struct comp_vk_native_compositor *c)
+{
+	// Not evaluated until the system info has arrived; then exactly once.
+	if (c->x11_1to1_evaluated || !c->sys_info_set) {
+		return;
+	}
+	// Multi-screen M2: the verdict depends on the DP's resample tolerance, so
+	// wait until this compositor has tried to create its DP (it is made
+	// lazily); a failed create evaluates with "needs 1:1".
+	if (c->display_processor == NULL && c->dp_factory_available && !c->dp_create_attempted) {
+		return;
+	}
+	// One-shot per tolerance: vk_dp_refresh_resample_caps re-arms it when a
+	// mode switch changes the DP's answer.
+	c->x11_1to1_evaluated = true;
+#ifdef DXR_HAVE_DIRECT_SCANOUT
+	// A leased connector is scanned out by us, not composited: no resample.
+	if (c->direct_window != NULL) {
+		return;
+	}
 #endif
+
+	uint32_t panel_px_w = 0, panel_px_h = 0;
+	{
+		int32_t ignored_left = 0, ignored_top = 0;
+		if (!(vk_dp_has_any(c) &&
+		      vk_dp_display_pixel_info(c, &panel_px_w, &panel_px_h, &ignored_left, &ignored_top) &&
+		      panel_px_w > 0 && panel_px_h > 0)) {
+			panel_px_w = c->sys_info.display_pixel_width;
+			panel_px_h = c->sys_info.display_pixel_height;
+		}
+	}
+
+	const struct xrt_system_compositor_info *si = &c->sys_info;
+	const uint32_t dev_w = si->display_desktop_native_width;
+	const uint32_t dev_h = si->display_desktop_native_height;
+	const uint32_t x11_w = si->display_desktop_width;
+	const uint32_t x11_h = si->display_desktop_height;
+
+	// Positive evidence only. The resolved monitor must BE the panel by its
+	// hardware mode, and that mode must be known.
+	const bool panel_identified = panel_px_w > 0 && panel_px_h > 0 && dev_w == panel_px_w && dev_h == panel_px_h;
+	if (!panel_identified || x11_w == 0 || x11_h == 0) {
+		return;
+	}
+	if (x11_w == dev_w && x11_h == dev_h) {
+		U_LOG_I(
+		    "X11 1:1 gate: the panel '%s' is %ux%u in the X root = its %ux%u device mode — X11 pixels "
+		    "are device pixels there, weaving as before. (#1831)",
+		    si->display_device_name, x11_w, x11_h, dev_w, dev_h);
+		return;
+	}
+
+	/*
+	 * Multi-screen M2: the gate protects a weave that a resample destroys.
+	 * A DP whose output survives one (sim_display anaglyph/SBS/blend —
+	 * XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE) keeps weaving: there is no
+	 * interlace to lose, and degrading it would hide the very 3D a scaled
+	 * dev box can show. Every other DP — every lenticular weave — degrades as
+	 * before (an absent or silent caps slot reads as "needs 1:1").
+	 */
+	if (c->display_processor != NULL && c->dp_tolerates_resample) {
+		U_LOG_W("X11 1:1 gate: the panel '%s' is resampled (%ux%u in the X root, %ux%u device px), but this "
+		        "display processor's output tolerates a resample — weaving%s. (#1831, multi-screen M2)",
+		        si->display_device_name, x11_w, x11_h, dev_w, dev_h,
+		        c->linux_surface_not_1to1 ? " again (the mode switched to one that does)" : " anyway");
+		vk_linux_apply_not_1to1(c, false);
+		return;
+	}
+	if (c->linux_surface_not_1to1) {
+		return; // already presenting 2D for this reason
+	}
+
+	char scale_str[48] = "";
+	if (si->display_desktop_scale > 0.0f) {
+		(void)snprintf(scale_str, sizeof(scale_str), " at %.0f%% scale",
+		               (double)si->display_desktop_scale * 100.0);
+	}
+	U_LOG_W(
+	    "NOT_1TO1 (X11): presenting 2D (no weave) — this X11 window is on the 3D panel '%s' (%ux%u device "
+	    "px%s), which the X server exposes as %ux%u: the display server resamples X11 windows there by "
+	    "%.4f, and a resampled weave is a uniform double image. X11 apps cannot be presented 1:1 on an "
+	    "output whose scale differs from the X screen's integer scale; run the app natively on Wayland "
+	    "to get 3D at this scale. (#1831)",
+	    si->display_device_name, dev_w, dev_h, scale_str, x11_w, x11_h, (double)dev_w / (double)x11_w);
+	vk_linux_apply_not_1to1(c, true);
 }
 #endif // XRT_OS_LINUX_DESKTOP
 
@@ -4321,12 +5965,29 @@ vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
 			break;
 		}
 	}
-	const uint32_t now[6] = {
-	    c->settings.preferred.width, c->settings.preferred.height, view_w, view_h, sub_w, sub_h};
+	// Multi-screen M3: under per-segment views each view covers only its
+	// segment's part of a tile (the mosaic), so a submission narrower than the
+	// tile is the layout, not an upscale.
+	uint32_t segments = 0;
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	os_mutex_lock(&c->seg_pub_mutex);
+	segments = c->seg_route.count;
+	os_mutex_unlock(&c->seg_pub_mutex);
+#endif
+	const uint32_t now[7] = {
+	    c->settings.preferred.width, c->settings.preferred.height, view_w, view_h, sub_w, sub_h, segments};
 	if (memcmp(now, c->view_dims_logged, sizeof(now)) == 0) {
 		return;
 	}
 	memcpy(c->view_dims_logged, now, sizeof(now));
+	if (segments > 0) {
+		U_LOG_W(
+		    "VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; mosaic: %u segment(s), view 0 "
+		    "submits %ux%u into its segment of the tile (per-segment views, not an upscale)",
+		    now[0], now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h, segments,
+		    sub_w, sub_h);
+		return;
+	}
 	const bool upscaled = sub_w > 0 && sub_h > 0 && (sub_w < view_w || sub_h < view_h);
 	U_LOG_W("VIEW_DIMS: canvas %ux%u x mode scale %.3fx%.3f -> tile %ux%u; app submits %ux%u per view%s", now[0],
 	        now[1], (double)mode->view_scale_x, (double)mode->view_scale_y, view_w, view_h, sub_w, sub_h,
@@ -4334,9 +5995,17 @@ vk_log_view_dims_on_change(struct comp_vk_native_compositor *c,
 }
 #endif
 
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+static void
+vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_view_count);
+#endif
+
 static void
 vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 {
+	// Multi-screen M3: no per-segment routing unless set at the end below.
+	c->eff_layout.route_count = 0;
+
 	uint32_t mode_cols = 1, mode_rows = 1;
 	uint32_t view_w = 0, view_h = 0;
 	comp_vk_native_renderer_get_tile_layout(c->renderer, &mode_cols, &mode_rows);
@@ -4371,7 +6040,10 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 	// session that cannot be 1:1 collapses to TILE 0 — still a full stereo
 	// pair painted at view_w x view_h, with the right view dropped, so the
 	// tile keeps its own width and the DP takes its mono passthrough.
-	if (c->linux_surface_not_1to1 && view_w > 0 && view_h > 0) {
+	// Auto-2D on a flat stereo submission takes the same collapse: every view
+	// is the same image, so tile 0 IS the picture, painted over the output by
+	// the DP's mono passthrough with no weave.
+	if (vk_linux_collapsed_2d(c) && view_w > 0 && view_h > 0) {
 		c->eff_layout.views = 1;
 		c->eff_layout.cols = 1;
 		c->eff_layout.rows = 1;
@@ -4382,11 +6054,15 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 #endif
 
 	uint32_t views = mode_tiles;
+	uint32_t proj_layer_views = 0; // M3: the projection layer's full view count (0 = none)
 	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
 		if (c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_PROJECTION_DEPTH ||
 		    c->layer_accum.layers[i].data.type == XRT_LAYER_ZONE_3D) {
 			views = c->layer_accum.layers[i].data.view_count;
+			if (c->layer_accum.layers[i].data.type != XRT_LAYER_ZONE_3D) {
+				proj_layer_views = views;
+			}
 			break;
 		}
 	}
@@ -4412,6 +6088,13 @@ vk_compute_effective_layout(struct comp_vk_native_compositor *c)
 		c->eff_layout.tile_w = view_w;
 		c->eff_layout.tile_h = view_h;
 	}
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	if (proj_layer_views > 0) {
+		vk_route_effective_layout(c, proj_layer_views);
+	}
+#else
+	(void)proj_layer_views;
+#endif
 }
 
 /*!
@@ -4496,6 +6179,369 @@ vk_dp_canvas_rect(struct comp_vk_native_compositor *c)
 	return r;
 }
 
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+/*!
+ * #2247: the session's DP weaves the primary screen, so its lens wish is the
+ * session's mode while the window covers the primary and 2D once the window
+ * has been off it for the hand-off's 0.5 s dwell
+ * (comp_vk_native_segments_primary_covered); covered again, the session's mode
+ * is re-sent at once. Sends @p dp that wish on a coverage edge, or always with
+ * @p force (a freshly swapped-in DP). Not while the desktop-Linux NOT_1TO1
+ * hold keeps the panel 2D: its release asks for the session's choice through
+ * vk_dp_request_display_mode, which applies the same gate. One WARN per edge.
+ * Weave thread.
+ */
+static void
+vk_seg_primary_lens(struct comp_vk_native_compositor *c, struct xrt_display_processor *dp, bool force)
+{
+	if (dp == NULL) {
+		return;
+	}
+	const bool uncovered = !comp_vk_native_segments_primary_covered(c->segments);
+	const bool edge = uncovered != c->seg_primary_uncovered;
+	if (!edge && !force) {
+		return;
+	}
+	c->seg_primary_uncovered = uncovered;
+	const bool want = c->hardware_display_3d && !uncovered;
+#ifdef XRT_OS_LINUX_DESKTOP
+	const bool held = c->display_mode_hold.held;
+#else
+	const bool held = false;
+#endif
+	if (!held) {
+		(void)xrt_display_processor_request_display_mode(dp, want);
+	}
+	if (edge) {
+		U_LOG_W("segments: the window %s the primary screen%s — its lens wish %s (#2247)%s",
+		        uncovered ? "has been off" : "is back on", uncovered ? " for 0.5 s" : "", want ? "3D" : "2D",
+		        held ? " — held 2D (NOT_1TO1) for now" : "");
+	}
+}
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * ADR-047 Amendment 2 hook (multi-screen M6, Vulkan): install @p dp as the
+ * session's primary DP (weave thread, c->mutex held) and return the previous
+ * one, which the segment manager RETIRES (deferred past any in-flight fill).
+ * Re-sends the session-level state a new DP has not seen; the per-frame inputs
+ * of the weave in progress are replayed at the weave site.
+ */
+static struct xrt_display_processor *
+vk_segments_swap_primary_cb(void *userdata, struct xrt_display_processor *dp)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	struct xrt_display_processor *old = c->display_processor;
+	c->display_processor = dp;
+	os_mutex_unlock(&c->dp_swap_mutex);
+	// #1484: a fresh DP's colour state is unknown; the weave site re-asserts it.
+	c->dp_atlas_encoding_latched = -1;
+	// #2340: and it has not been asked about PQ.
+	c->pq_dp_asked = NULL;
+	c->pq_atlas_now = false;
+	if (dp != NULL) {
+		struct xrt_display_processor_vk *vdp = (struct xrt_display_processor_vk *)dp;
+		c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(vdp);
+		xrt_display_processor_vk_set_transparent_background(vdp, c->transparent_background, false);
+		xrt_display_processor_vk_set_shared_texture_present(vdp, c->has_shared_texture);
+		// #2247: the session's mode, but not on a primary screen the window left.
+		vk_seg_primary_lens(c, dp, true);
+		if (c->eye_tracking_mode_set) {
+			xrt_display_processor_set_eye_tracking_mode(dp, c->eye_tracking_mode);
+		}
+	}
+	// A zone mask published to the old DP goes with it; the next publish
+	// starts fresh instead of clearing a mask the new DP never saw.
+	c->zone_published = false;
+	return old;
+}
+
+/*!
+ * ADR-047 Amendment 2 hook: bracket a hand-off. The snap target is detached
+ * before any DP holding the window is retired and re-armed on the DP holding
+ * it after (NULL = the session's primary DP).
+ */
+static void
+vk_segments_hwnd_bracket_cb(void *userdata, bool begin, struct xrt_display_processor *hwnd_dp)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->snap_dp = begin ? NULL : hwnd_dp;
+	os_mutex_unlock(&c->dp_swap_mutex);
+}
+
+/*!
+ * #2405: drag phase-snap provider for the runtime-owned window (hosted), the
+ * Vulkan twin of the D3D11 compositor's: the same DP choice as
+ * comp_vk_native_compositor_snap_window_rect's Windows branch. Runs on the
+ * window thread, so it only TRIES dp_swap_mutex — a drag step that coincides
+ * with a primary swap goes unsnapped rather than waiting on the window thread.
+ */
+static bool
+vk_own_window_snap_cb(void *userdata,
+                      int32_t origin_x,
+                      int32_t origin_y,
+                      int32_t target_x,
+                      int32_t target_y,
+                      int32_t *out_x,
+                      int32_t *out_y)
+{
+	struct comp_vk_native_compositor *c = (struct comp_vk_native_compositor *)userdata;
+	if (c == NULL || os_mutex_trylock(&c->dp_swap_mutex) != 0) {
+		return false;
+	}
+	struct xrt_display_processor *sdp = c->snap_dp != NULL ? c->snap_dp : c->display_processor;
+	const bool ok = sdp != NULL && xrt_display_processor_vk_snap_window_rect((struct xrt_display_processor_vk *)sdp,
+	                                                                         origin_x, origin_y, target_x, target_y,
+	                                                                         out_x, out_y);
+	os_mutex_unlock(&c->dp_swap_mutex);
+	return ok;
+}
+#endif // XRT_OS_WINDOWS
+
+/*!
+ * Multi-screen M2: does THIS weave take the per-screen segment path?
+ *
+ * Runs the segment manager's metric update (segment table + DP lifecycle)
+ * and answers true only when the window covers a screen other than the
+ * primary one. Everything that cannot be segmented today answers false and
+ * keeps the shipped single-DP path, byte for byte:
+ *
+ * - native Wayland: the geometry service reports a rect relative to the
+ *   window's own monitor, in that monitor's device px — not a desktop rect
+ *   (docs/specs/runtime/wayland-window-geometry.md, M2 follow-up);
+ * - Windows under the #918 split (the weave is the split's D3D11 one, which
+ *   segments with the D3D11 manager inside hub_d3d11/comp_hub_d3d11.cpp — here
+ *   display_processor is NULL);
+ * - zero-copy (no compositor-owned atlas to crop per segment);
+ * - a self-submitting DP or one with no render pass (the split path records
+ *   every segment DP into our command buffer, sharing our framebuffer);
+ * - no screens handed over, one screen, a pinned session, mixed vendors.
+ *
+ * #2218: @p out_would_split is answered on EVERY weave the manager exists for
+ * — before and independently of zero-copy / the DP's submission mode — so the
+ * compose step can withhold zero-copy for a window off the primary screen.
+ * Only the split itself still needs an atlas that is ours to crop.
+ */
+static bool
+vk_segments_frame_update_split(struct comp_vk_native_compositor *c,
+                               const struct xrt_rect *dp_canvas,
+                               bool zero_copy,
+                               bool dp_self_submits,
+                               VkRenderPass dp_render_pass,
+                               bool *out_would_split)
+{
+	*out_would_split = false;
+	if (c->seg_screens == NULL || c->display_processor == NULL || c->cmd_pool == VK_NULL_HANDLE ||
+	    !c->have_seg_window) {
+		return false;
+	}
+#ifdef XRT_HAVE_WAYLAND
+	if (c->use_wayland) {
+		return false;
+	}
+#endif
+	// A new screen list (set_screens) rebuilds the manager — but never under
+	// a parked fill, whose command buffer may still use its DPs and images.
+	if (c->seg_rebuild && !c->fill_parked) {
+		os_mutex_lock(&c->seg_pub_mutex); // the app thread reads c->segments (M3)
+		// The home gone from the new list, the window stays with a ready
+		// screen instead (ADR-047 A8, #2305; Windows, hooks set).
+		comp_vk_native_segments_destroy_for_rebuild(&c->segments, c->seg_screens);
+		memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+		os_mutex_unlock(&c->seg_pub_mutex);
+		c->seg_rebuild = false;
+	}
+	if (c->segments != NULL && c->seg_rebuild) {
+		return false; // old manager, new list: sit this frame out
+	}
+	if (c->segments == NULL) {
+		struct comp_vk_native_segments *segs =
+		    comp_vk_native_segments_create(&c->vk, c->cmd_pool, c->repaint_queue);
+		if (segs == NULL) {
+			return false;
+		}
+#ifdef XRT_OS_WINDOWS
+		// ADR-047 Amendment 2: the window follows the majority screen —
+		// sessions with a real window only (a shared-texture session's app
+		// HWND is a position anchor, #696).
+		if (c->hwnd != NULL && !c->has_shared_texture) {
+			struct comp_vk_native_segments_hwnd_hooks hooks = {
+			    .hwnd = c->hwnd,
+			    .userdata = c,
+			    .swap_primary = vk_segments_swap_primary_cb,
+			    .bracket = vk_segments_hwnd_bracket_cb,
+			    .away = &c->seg_away,
+			};
+			comp_vk_native_segments_set_hwnd_hooks(segs, &hooks);
+		}
+#endif
+		comp_vk_native_segments_set_screens(segs, c->seg_screens, c->seg_sys_info, c->seg_pinned_display_id);
+		os_mutex_lock(&c->seg_pub_mutex);
+		c->segments = segs;
+		os_mutex_unlock(&c->seg_pub_mutex);
+	}
+	if (!comp_vk_native_segments_enabled(c->segments)) {
+		return false;
+	}
+	struct comp_seg_rect canvas = {
+	    dp_canvas->offset.w,
+	    dp_canvas->offset.h,
+	    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
+	    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
+	};
+	*out_would_split = comp_vk_native_segments_would_split(c->segments, &c->seg_window, &canvas);
+	if (zero_copy || dp_self_submits || dp_render_pass == VK_NULL_HANDLE) {
+		return false;
+	}
+	const bool split = comp_vk_native_segments_update(
+	    c->segments, &c->seg_window, &canvas, (int32_t)VK_FORMAT_B8G8R8A8_UNORM, !c->fill_parked,
+	    (c->xdev != NULL && c->xdev->hmd != NULL) ? c->xdev->hmd->active_rendering_mode_index : 0);
+	// Every segment DP follows the session's 2D/3D mode on the screens the
+	// window covers, 2D on one it left (#2247) — a DP created by the update
+	// above gets it here, before it weaves.
+	comp_vk_native_segments_set_display_mode(c->segments, c->hardware_display_3d);
+	return split;
+}
+
+static bool
+vk_segments_frame_update(struct comp_vk_native_compositor *c,
+                         const struct xrt_rect *dp_canvas,
+                         bool zero_copy,
+                         bool dp_self_submits,
+                         VkRenderPass dp_render_pass)
+{
+	bool would_split = false;
+	const bool split =
+	    vk_segments_frame_update_split(c, dp_canvas, zero_copy, dp_self_submits, dp_render_pass, &would_split);
+	// #2247: the primary screen's lens follows coverage too. Edges only: a
+	// window wholly on the primary never leaves "covered", so this never runs.
+	vk_seg_primary_lens(c, c->display_processor, false);
+
+	/*
+	 * Multi-screen M3: publish the table this weave took, for the next
+	 * xrLocateViews to frame per-segment views from. Nothing is published
+	 * (count 0 = one view set) unless the window really is woven per
+	 * segment — and not while the session is collapsed to flat 2D for a
+	 * resampled surface (#1595/#1831), whose single tile cannot hold a
+	 * per-segment mosaic.
+	 */
+	struct xrt_segment_metrics m;
+	memset(&m, 0, sizeof(m));
+#ifdef XRT_OS_LINUX_DESKTOP
+	const bool collapsed_2d = vk_linux_collapsed_2d(c);
+#else
+	const bool collapsed_2d = false;
+#endif
+	if (split && !collapsed_2d) {
+		const struct comp_seg_rect canvas = {
+		    dp_canvas->offset.w,
+		    dp_canvas->offset.h,
+		    (uint32_t)(dp_canvas->extent.w > 0 ? dp_canvas->extent.w : 0),
+		    (uint32_t)(dp_canvas->extent.h > 0 ? dp_canvas->extent.h : 0),
+		};
+		(void)comp_vk_native_segments_get_metrics(c->segments, &c->seg_window, &canvas,
+		                                          c->display_processor != NULL, &m);
+	}
+	os_mutex_lock(&c->seg_pub_mutex);
+	m.generation = c->seg_pub.generation;
+	struct xrt_segment_metrics prev = c->seg_pub;
+	prev.generation = m.generation;
+	if (memcmp(&prev, &m, sizeof(m)) != 0) {
+		m.generation++;
+	}
+	c->seg_pub = m;
+	const bool withheld_changed = c->seg_zero_copy_withheld != would_split;
+	c->seg_zero_copy_withheld = would_split;
+	os_mutex_unlock(&c->seg_pub_mutex);
+	if (withheld_changed) {
+		U_LOG_W("segments: window %s the primary screen — zero-copy %s (#2218)",
+		        would_split ? "left" : "is back on",
+		        would_split ? "withheld: frames compose and weave per screen" : "allowed again");
+	}
+	return split;
+}
+
+/*!
+ * Multi-screen M3: turn the committed frame's per-segment view routing into
+ * the renderer's mosaic (comp_vk_native_eff_layout::route). Each segment's
+ * rect inside a tile comes from comp_segments_tile_rect — the mapping the
+ * per-segment crop reads with — so a segment DP's cropped input is exactly
+ * that segment's own views.
+ *
+ * Anything inconsistent (the mode changed between the locate and this commit
+ * so a segment's view count no longer equals the tile count, a short
+ * submission, a degenerate rect) routes nothing: the frame then shows its
+ * first view set across the window for that one frame.
+ */
+static void
+vk_route_effective_layout(struct comp_vk_native_compositor *c, uint32_t layer_view_count)
+{
+	struct xrt_segment_view_routing r;
+	os_mutex_lock(&c->seg_pub_mutex);
+	r = c->seg_route;
+	os_mutex_unlock(&c->seg_pub_mutex);
+
+	struct comp_vk_native_eff_layout *L = &c->eff_layout;
+	L->route_count = 0;
+	memset(&c->seg_content, 0, sizeof(c->seg_content));
+	if (r.count == 0 || r.count > XRT_MAX_SEGMENTS || L->views == 0 || L->tile_w == 0 || L->tile_h == 0) {
+		return;
+	}
+	const struct comp_seg_rect canvas = {
+	    r.canvas.offset.w,
+	    r.canvas.offset.h,
+	    (uint32_t)(r.canvas.extent.w > 0 ? r.canvas.extent.w : 0),
+	    (uint32_t)(r.canvas.extent.h > 0 ? r.canvas.extent.h : 0),
+	};
+	for (uint32_t k = 0; k < r.count; k++) {
+		// The route is what the locate handed out. Across a 2D<->3D toggle
+		// the mode (tile count) can change between that locate and this
+		// commit: route the views the tiles can hold (min of the two) rather
+		// than dropping the routing for the frame — unrouted, segment 0's
+		// views would stretch over the whole window.
+		const uint32_t n = r.view_count[k] < L->views ? r.view_count[k] : L->views;
+		if (n == 0 || r.first_view[k] + n > layer_view_count) {
+			return;
+		}
+		const struct comp_seg_rect seg = {
+		    r.rect[k].offset.w,
+		    r.rect[k].offset.h,
+		    (uint32_t)(r.rect[k].extent.w > 0 ? r.rect[k].extent.w : 0),
+		    (uint32_t)(r.rect[k].extent.h > 0 ? r.rect[k].extent.h : 0),
+		};
+		struct comp_seg_rect tr;
+		if (!comp_segments_tile_rect(&seg, &canvas, L->tile_w, L->tile_h, &tr)) {
+			return;
+		}
+		L->route[k].first_view = r.first_view[k];
+		L->route[k].view_count = n;
+		L->route[k].x = tr.x;
+		L->route[k].y = tr.y;
+		L->route[k].w = tr.w;
+		L->route[k].h = tr.h;
+	}
+	L->route_count = r.count;
+	// #1883: the partition these pixels are painted with, for the segment crop.
+	comp_segments_content_from_routing(&r, &c->seg_content);
+
+	// One INFO line per routing change (a move, a resize, a mode switch).
+	if (memcmp(L->route, c->seg_route_logged.route, sizeof(L->route)) != 0 ||
+	    L->route_count != c->seg_route_logged.route_count || L->tile_w != c->seg_route_logged.tile_w ||
+	    L->tile_h != c->seg_route_logged.tile_h) {
+		c->seg_route_logged = *L;
+		U_LOG_I(
+		    "segments: per-segment views routed — %u segment(s) x %u view(s), tile %ux%u; [0] views %u.. "
+		    "at %d,%d %ux%u; [1] views %u.. at %d,%d %ux%u",
+		    L->route_count, L->views, L->tile_w, L->tile_h, L->route[0].first_view, L->route[0].x,
+		    L->route[0].y, L->route[0].w, L->route[0].h, L->route_count > 1 ? L->route[1].first_view : 0,
+		    L->route_count > 1 ? L->route[1].x : 0, L->route_count > 1 ? L->route[1].y : 0,
+		    L->route_count > 1 ? L->route[1].w : 0, L->route_count > 1 ? L->route[1].h : 0);
+	}
+}
+#endif // VK_NATIVE_HAVE_SEGMENTS
+
 /*!
  * #1484 — `DXR_VK_ATLAS_ENCODING`: diagnostic override for the ADR-021 atlas-
  * encoding declaration below. Values:
@@ -4570,8 +6616,53 @@ dxr_vk_atlas_encoding_override(void)
 static inline enum xrt_atlas_encoding
 vk_native_atlas_encoding(const struct comp_vk_native_compositor *c)
 {
-	(void)c;
+	/*
+	 * #2340 — the one linear-ish exception so far, and still not a guess from
+	 * a format: PQ only after THIS DP said it accepts it and the compositor
+	 * itself re-encoded the atlas (vk_maybe_encode_atlas_pq). A DP swapped in
+	 * since (ADR-047 Amendment 2) was not asked, so it is told ENCODED until
+	 * the next app frame asks it.
+	 */
+	if (c->pq_atlas_now && c->pq_dp_asked != NULL && c->display_processor == c->pq_dp_asked) {
+		return XRT_ATLAS_ENCODING_PQ;
+	}
 	return XRT_ATLAS_ENCODING_ENCODED;
+}
+
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+/*!
+ * Multi-screen M2: the encoding segment DPs are told — exactly what
+ * @ref vk_dp_assert_atlas_encoding tells the primary, DXR_VK_ATLAS_ENCODING
+ * included; -1 when the override says never to call the slot.
+ */
+static int
+vk_segments_atlas_encoding(struct comp_vk_native_compositor *c)
+{
+	const int over = dxr_vk_atlas_encoding_override();
+	if (over == DXR_VK_ATLAS_ENCODING_DISABLED) {
+		return -1;
+	}
+	if (over != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
+		return over;
+	}
+	const enum xrt_atlas_encoding enc = vk_native_atlas_encoding(c);
+	// #2340: PQ goes only to a DP that accepted it, and the segment DPs on the
+	// other screens were not asked — the in-process D3D11 path does not tell
+	// its segment DPs either.
+	return (int)(enc == XRT_ATLAS_ENCODING_PQ ? XRT_ATLAS_ENCODING_ENCODED : enc);
+}
+#endif
+
+//! #1484 / #2340 — a declared encoding's name for the WARN lines; -1 = none yet.
+static const char *
+vk_atlas_encoding_name(int enc)
+{
+	switch (enc) {
+	case (int)XRT_ATLAS_ENCODING_ENCODED: return "ENCODED";
+	case (int)XRT_ATLAS_ENCODING_LINEAR: return "LINEAR";
+	case (int)XRT_ATLAS_ENCODING_PQ: return "PQ";
+	default: return "undeclared";
+	}
 }
 
 /*!
@@ -4605,12 +6696,96 @@ vk_dp_assert_atlas_encoding(struct comp_vk_native_compositor *c,
 	xrt_display_processor_set_atlas_encoding(dp, enc);
 	// One WARN per CHANGE, never per frame (a first declaration counts as a
 	// change, so this fires exactly once on a stable path).
-	U_LOG_W("#1484 VK atlas encoding declared to the DP: %s (was %s)",
-	        enc == XRT_ATLAS_ENCODING_LINEAR ? "LINEAR" : "ENCODED",
-	        c->dp_atlas_encoding_latched < 0                                 ? "undeclared"
-	        : c->dp_atlas_encoding_latched == (int)XRT_ATLAS_ENCODING_LINEAR ? "LINEAR"
-	                                                                         : "ENCODED");
+	U_LOG_W("#1484 VK atlas encoding declared to the DP: %s (was %s)", vk_atlas_encoding_name((int)enc),
+	        vk_atlas_encoding_name(c->dp_atlas_encoding_latched));
 	c->dp_atlas_encoding_latched = (int)enc;
+}
+
+/*!
+ * #2340 — DXR_ATLAS_ENCODING=pq (experimental, needs DXR_ATLAS_FORMAT=rgb10a2):
+ * cached once, like the D3D11 compositor's knob of the same name.
+ */
+static bool
+vk_pq_requested(void)
+{
+	static int requested = -1;
+	if (requested < 0) {
+		const char *v = getenv("DXR_ATLAS_ENCODING");
+		requested =
+		    (v != NULL && (v[0] == 'p' || v[0] == 'P') && (v[1] == 'q' || v[1] == 'Q') && v[2] == '\0') ? 1 : 0;
+	}
+	return requested == 1;
+}
+
+/*!
+ * #2340 — PQ code values need the 10-bit atlas (an 8-bit one would band, a
+ * float one is not what the D3D11 deposit maps to R10G10B10A2). One WARN when
+ * the knob is set over any other format.
+ */
+static bool
+vk_pq_atlas_format_ok(struct comp_vk_native_compositor *c)
+{
+	if (c->renderer != NULL &&
+	    (VkFormat)comp_vk_native_renderer_get_format(c->renderer) == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+		return true;
+	}
+	if (!c->pq_warned_format) {
+		c->pq_warned_format = true;
+		U_LOG_W(
+		    "DXR_ATLAS_ENCODING=pq (#2340, experimental): atlas is not A2B10G10R10 "
+		    "(set DXR_ATLAS_FORMAT=rgb10a2) - keeping the sRGB atlas");
+	}
+	return false;
+}
+
+/*!
+ * #2340 — the Vulkan DP path (no split: Linux, macOS, a same-adapter Windows
+ * box). Re-encode the composed atlas as PQ in @p cmd, but only for a DP that
+ * accepts PQ through the appended `accepts_atlas_encoding` slot; anything else
+ * — unset knob, older DP, 8-bit/16F atlas, zero-copy (@p cmd NULL, no atlas) —
+ * leaves the atlas and the declared encoding exactly as before, with one WARN
+ * saying why. The declaration itself rides vk_native_atlas_encoding, so every
+ * weave site's existing #1484 assert sends it.
+ *
+ * App frames only: a repaint replays the atlas this already encoded.
+ */
+static void
+vk_maybe_encode_atlas_pq(struct comp_vk_native_compositor *c, VkCommandBuffer cmd)
+{
+	c->pq_atlas_now = false;
+	if (!vk_pq_requested() || cmd == VK_NULL_HANDLE || c->display_processor == NULL) {
+		return;
+	}
+	if (dxr_vk_atlas_encoding_override() != DXR_VK_ATLAS_ENCODING_NO_OVERRIDE) {
+		if (!c->pq_warned_override) {
+			c->pq_warned_override = true;
+			U_LOG_W(
+			    "DXR_ATLAS_ENCODING=pq (#2340, experimental): DXR_VK_ATLAS_ENCODING overrides the "
+			    "declaration - keeping the sRGB atlas");
+		}
+		return;
+	}
+	if (!vk_pq_atlas_format_ok(c)) {
+		return;
+	}
+	if (c->pq_dp_asked != c->display_processor) {
+		c->pq_dp_asked = c->display_processor;
+		c->pq_dp_accepts = xrt_display_processor_vk_accepts_atlas_encoding(
+		    (struct xrt_display_processor_vk *)c->display_processor, XRT_ATLAS_ENCODING_PQ);
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): %s",
+		        c->pq_dp_accepts ? "Vulkan DP accepts PQ - weaving a PQ atlas"
+		                         : "Vulkan DP does not accept PQ - keeping the sRGB atlas");
+	}
+	if (!c->pq_dp_accepts) {
+		return;
+	}
+	c->pq_atlas_now = comp_vk_native_renderer_encode_atlas_pq(c->renderer, cmd);
+	if (!c->pq_atlas_now && !c->pq_warned_pass) {
+		c->pq_warned_pass = true;
+		U_LOG_W(
+		    "DXR_ATLAS_ENCODING=pq (#2340, experimental): the PQ pass is unavailable - keeping "
+		    "the sRGB atlas");
+	}
 }
 
 
@@ -4764,79 +6939,866 @@ dxr_weave_cadence_trace(void)
 	return on == 1;
 }
 
+/*
+ * ── #2095 / ADR-055: in-process weave sync — a GPU semaphore chain ──────────
+ *
+ * A self-submitting DP (the Android CNSDK weaver) runs its weave in its own
+ * vkQueueSubmit, on the runtime-owned queue it captured at factory time
+ * (#868, #2012; CNSDK 0.10.78 initialize_with_queue). This path used to order
+ * the runtime's batches against that submit with HOST waits — the acquire's
+ * dummy submit + vkQueueWaitIdle, a pre-DP vkQueueWaitIdle, the #837
+ * post-weave queue drain, and a synchronous frame-fence wait. On an in-order
+ * queue those drains now also drain the app's NEXT frame (the non-blocking
+ * hand-off has it submitted by then), measured 10-40 % off GPU-bound apps;
+ * on a second queue they order nothing at all (#2095).
+ *
+ * The chain, per frame, on one ring slot:
+ *
+ *   acquire  —signals→ image_available
+ *   pre batch (WS composite, crop, backdrop, target→COLOR)
+ *            waits image_available, —signals→ pre_sem
+ *   DP (set_weave_sync: waits pre_sem before its first atlas read,
+ *       signals post_sem after its last target write, on ITS queue)
+ *   post batch (Local2D composite, HUD, COLOR→PRESENT)
+ *            waits post_sem, —signals→ present_sem, fence = slot fence
+ *   present  waits present_sem
+ *
+ * Nothing on the commit thread waits for the GPU. What still waits, and why:
+ *   - a slot is only REUSED after its fence (binary semaphores: one signal,
+ *     one wait, then proof the wait retired);
+ *   - the NEXT commit waits the previous chained frame's fence before it
+ *     rewrites the single-buffered atlas / crop scratch / backdrop the DP may
+ *     still be sampling on the other queue (vk_weave_sync_wait_latest — this
+ *     is the depth-1 bound the drain used to give for free);
+ *   - xrWaitSwapchainImage waits the fence of the last commit that read THAT
+ *     image (comp_vk_native_compositor_wait_swapchain_read): backpressure
+ *     only when the app laps the compositor;
+ *   - a fill waits the latest chained frame before its own submits (its host
+ *     waits only cover its own queue).
+ * Every way of leaving the chain part-way (a DP that declines the slot, a
+ * dropped frame, a failed submit or present) drains both queues and
+ * recreates the ring's semaphores before any later process_atlas — the slot
+ * contract's recreate-on-drop, as the browser path does it
+ * (comp_multi_weave_android.c, XR_DXR_weave v20).
+ *
+ * Scope: app frames against a self-submitting DP only. Fills keep their
+ * host-wait path (the fence-park's drop-if-superseded check depends on it);
+ * a recording DP (sim_display, the desktop weavers) orders itself in one
+ * batch and needs none of this.
+ */
+
+//! Why a frame is (not) on the chain — logged on change, never per frame.
+enum vk_weave_sync_mode
+{
+	VK_WEAVE_SYNC_MODE_NONE = 0,
+	VK_WEAVE_SYNC_MODE_GPU_CHAIN,
+	VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH,
+	VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED,
+	VK_WEAVE_SYNC_MODE_FALLBACK_RING,
+};
+
+static const char *
+vk_weave_sync_mode_str(enum vk_weave_sync_mode m)
+{
+	switch (m) {
+	case VK_WEAVE_SYNC_MODE_GPU_CHAIN: return "GPU chain (DP took set_weave_sync; no host waits)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH:
+		return "FALLBACK: DXR_WEAVE_SYNC_INPROC=0 / debug.dxr.weave_sync_inproc=0 (host waits)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED:
+		return "FALLBACK: DP lacks set_weave_sync or declined it (host waits for this DP)";
+	case VK_WEAVE_SYNC_MODE_FALLBACK_RING:
+		return "FALLBACK: weave-sync ring unavailable — creation failed or a slot never retired (host waits)";
+	default: return "none";
+	}
+}
+
+static void
+vk_weave_sync_log_mode(struct comp_vk_native_compositor *c, enum vk_weave_sync_mode m)
+{
+	if (c->wsync.last_mode != (int)m) {
+		c->wsync.last_mode = (int)m;
+		U_LOG_W("#2095: in-process weave sync = %s", vk_weave_sync_mode_str(m));
+	}
+}
+
+//! Lifecycle-rate WARN for the ring (one line per 5 s at most).
+static void
+vk_weave_sync_warn_throttled(struct comp_vk_native_compositor *c, const char *what)
+{
+	const uint64_t now = os_monotonic_get_ns();
+	if (c->wsync.last_warn_ns == 0 || now - c->wsync.last_warn_ns > 5ULL * U_TIME_1S_IN_NS) {
+		c->wsync.last_warn_ns = now;
+		U_LOG_W("#2095: %s (throttled to one line per 5 s)", what);
+	}
+}
+
 /*!
- * #837 prototype: narrow the post-weave drain from the DEVICE to the DP's QUEUE.
- *
- * `postwait` measures 3.29 ms of a ~9.4 ms fire — 35% — and it is one
- * `vkDeviceWaitIdle`. Its comment says the wait "costs nothing in practice" on
- * Android because `c->hud == NULL` there; the first half is true (u_hud_create
- * is compiled out on Android) but the wait does not test for a HUD, so the cost
- * is real and was never measured.
- *
- * What it must actually guarantee: the vendor's weave submit has finished
- * writing `target_image` before we record and submit post-DP work that writes
- * the same image (the HUD on desktop, and `vk_composite_local_2d` everywhere —
- * which is why simply skipping the wait when there is no HUD would be wrong).
- *
- * The DP submits on ONE known queue. `vk_make_dp_vk` creates it with
- * `vk.main_queue->queue` temporarily swapped to `c->repaint_queue`, so that is
- * the queue the vendor's weave goes to. Waiting on that queue therefore gives
- * the identical ordering guarantee, while a device-wide wait ALSO drains the
- * app's own queue — its scene rendering, which never touches `target_image`.
- * On this device that is the majority of the wait.
- *
- * Falls back to the passed-in queue on the shared-queue tier, where there is no
- * runtime-owned queue and the DP submits on the app's.
- *
- * DEFAULT ON (2026-08-31), on three independent lines of evidence:
- *   - Queue identity, confirmed on-device rather than by reading this comment:
- *     `#868: queue handles — app=0x..ad0 repaint=0x..b70` and `creating the
- *     display processor against the runtime-owned queue 0x..b70` — the DP's
- *     queue IS `c->repaint_queue`, so this drain covers the vendor weave.
- *   - A/B on NP02J, identical conditions: postwait 3.25 ms -> 0.04 ms with the
- *     weave itself unchanged (0.43 -> 0.47 ms), zero discards, zero validation
- *     errors. The stall cost ~7x the weave it was protecting.
- *   - Human eyeball, 90 s of head motion + model rotation: no bad frame.
- *
- * NOT empirically covered: the `vk_composite_local_2d` consumer is inert in
- * every Android demo on hand (`#879: ... local2d_scratch=0x0`), so no test here
- * has exercised the read-after-weave hazard this wait exists for. State that
- * rather than imply otherwise. The correctness argument does not rest on it:
- * the wait is on the PRODUCER's queue and is host-blocking, so the weave is
- * complete before any consumer's command buffer is even recorded.
- *
- * Kill switch: DXR_WEAVE_POSTWAIT_QUEUE=0 / debug.dxr.weave_postwait_queue 0.
+ * Kill switch for a device A/B (ADR-055 "Consequences"): DXR_WEAVE_SYNC_INPROC=0
+ * / Android `debug.dxr.weave_sync_inproc=0` forces the host-wait path for the
+ * session. Default ON. Read once, logged once; the env, when set non-empty,
+ * wins over the property.
  */
 static bool
-dxr_postwait_queue_only(void)
+dxr_weave_sync_inproc_enabled(void)
 {
 	static int on = -1;
 	if (on < 0) {
-		on = 1; // default ON — see the evidence in the comment above
-		const char *e = getenv("DXR_WEAVE_POSTWAIT_QUEUE");
+		on = 1;
+		const char *src = "default";
+		const char *e = getenv("DXR_WEAVE_SYNC_INPROC");
 		if (e != NULL && e[0] != '\0') {
 			on = (e[0] == '0') ? 0 : 1;
+			src = "DXR_WEAVE_SYNC_INPROC";
 		}
 #ifdef XRT_OS_ANDROID
 		else {
 			char sp[PROP_VALUE_MAX] = {0};
-			// Now that the default is ON the prop must be able to turn it
-			// OFF, so test for '0' rather than only honouring '1'.
-			if (__system_property_get("debug.dxr.weave_postwait_queue", sp) > 0 &&
-			    sp[0] != '\0') {
+			if (__system_property_get("debug.dxr.weave_sync_inproc", sp) > 0 && sp[0] != '\0') {
 				on = (sp[0] == '0') ? 0 : 1;
+				src = "debug.dxr.weave_sync_inproc";
 			}
 		}
 #endif
-		/*
-		 * Say which drain is live, exactly once. A switch guarding a data
-		 * race with no engagement log made a clean QA pass unattributable:
-		 * the props had been cleared afterwards and nothing in the log could
-		 * establish whether the narrow drain had ever actually run.
-		 */
-		U_LOG_W("#837: post-weave drain = %s", on ? "QUEUE (narrow)" : "DEVICE (wide)");
+		U_LOG_W("#2095: in-process weave sync (GPU semaphore chain) %s (%s)", on ? "ENABLED" : "DISABLED", src);
 	}
 	return on == 1;
+}
+
+//! Every chain submit goes through the #1905 -3 retry on Android, like the rest.
+static VkResult
+vk_weave_sync_submit(struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *si, VkFence fence, const char *site)
+{
+#ifdef XRT_OS_ANDROID
+	return comp_vk_native_queue_submit_retry(vk, queue, si, fence, site);
+#else
+	(void)site;
+	return vk->vkQueueSubmit(queue, 1, si, fence);
+#endif
+}
+
+static void
+vk_weave_sync_slot_destroy_sems(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	VkSemaphore *sems[] = {&s->image_available, &s->pre_sem, &s->post_sem, &s->present_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (*sems[i] != VK_NULL_HANDLE) {
+			vk->vkDestroySemaphore(vk->device, *sems[i], NULL);
+			*sems[i] = VK_NULL_HANDLE;
+		}
+	}
+}
+
+static bool
+vk_weave_sync_slot_create_sems(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	VkSemaphoreCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	VkSemaphore *sems[] = {&s->image_available, &s->pre_sem, &s->post_sem, &s->present_sem};
+	for (size_t i = 0; i < ARRAY_SIZE(sems); i++) {
+		if (vk->vkCreateSemaphore(vk->device, &sci, NULL, sems[i]) != VK_SUCCESS) {
+			vk_weave_sync_slot_destroy_sems(vk, s);
+			return false;
+		}
+	}
+	return true;
+}
+
+//! Only after the slot's work is known complete (fence waited / queues idle).
+static void
+vk_weave_sync_slot_free_cmds(struct vk_bundle *vk, struct vk_weave_sync_slot *s)
+{
+	if (s->pool == VK_NULL_HANDLE) {
+		return;
+	}
+	if (s->cmd_pre != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, s->pool, 1, &s->cmd_pre);
+		s->cmd_pre = VK_NULL_HANDLE;
+	}
+	if (s->cmd_post != VK_NULL_HANDLE) {
+		vk->vkFreeCommandBuffers(vk->device, s->pool, 1, &s->cmd_post);
+		s->cmd_post = VK_NULL_HANDLE;
+	}
+	s->pool = VK_NULL_HANDLE;
+}
+
+/*!
+ * Lazy creation, c->mutex held. K = VK_WEAVE_SYNC_RING bounded by the target's
+ * image count (a slot per frame that can be in flight against the presentation
+ * engine). A failure latches the host-wait path for the session.
+ */
+static bool
+vk_weave_sync_ring_ensure(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->wsync.created) {
+		return true;
+	}
+	if (c->wsync.failed) {
+		return false;
+	}
+	uint32_t n = comp_vk_native_target_get_image_count(c->target);
+	if (n == 0) {
+		n = 1;
+	}
+	if (n > VK_WEAVE_SYNC_RING) {
+		n = VK_WEAVE_SYNC_RING;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkCreateFence(vk->device, &fci, NULL, &s->fence) != VK_SUCCESS ||
+		    !vk_weave_sync_slot_create_sems(vk, s)) {
+			for (uint32_t j = 0; j <= i; j++) {
+				vk_weave_sync_slot_destroy_sems(vk, &c->wsync.slot[j]);
+				if (c->wsync.slot[j].fence != VK_NULL_HANDLE) {
+					vk->vkDestroyFence(vk->device, c->wsync.slot[j].fence, NULL);
+					c->wsync.slot[j].fence = VK_NULL_HANDLE;
+				}
+			}
+			c->wsync.failed = true;
+			U_LOG_W("#2095: weave-sync ring creation failed — host-wait path for this session");
+			return false;
+		}
+	}
+	c->wsync.count = n;
+	c->wsync.next = 0;
+	c->wsync.created = true;
+	U_LOG_W("#2095: weave-sync ring created: %u slot(s) (target has %u image(s))", n,
+	        comp_vk_native_target_get_image_count(c->target));
+	return true;
+}
+
+//! wsync.mutex held. true = the slot's fence is signalled (or it was never in flight).
+static bool
+vk_weave_sync_slot_wait_locked(struct comp_vk_native_compositor *c, struct vk_weave_sync_slot *s, uint64_t timeout_ns)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!s->in_flight) {
+		return true;
+	}
+	return vk->vkWaitForFences(vk->device, 1, &s->fence, VK_TRUE, timeout_ns) == VK_SUCCESS;
+}
+
+/*!
+ * wsync.mutex held: give up on a slot whose fence did not retire inside the
+ * bound. Its fence and parked command buffers are LEAKED on purpose — they
+ * are pending on a GPU that is not answering, and destroying or freeing a
+ * pending object is worse than a leak (teardown's vkDeviceWaitIdle reclaims
+ * them if the device ever does come back). Dropping the bookkeeping is what
+ * keeps every later commit, fill and tagged xrWaitSwapchainImage from paying
+ * the full bound again for a serial that can never retire.
+ */
+static void
+vk_weave_sync_slot_abandon_locked(struct vk_weave_sync_slot *s)
+{
+	s->in_flight = false;
+	s->cmd_pre = VK_NULL_HANDLE;
+	s->cmd_post = VK_NULL_HANDLE;
+	s->pool = VK_NULL_HANDLE;
+	s->fence = VK_NULL_HANDLE;
+}
+
+//! wsync.mutex held: make a slot reusable (fence reset, parked buffers freed).
+static bool
+vk_weave_sync_slot_retire_locked(struct comp_vk_native_compositor *c, struct vk_weave_sync_slot *s)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!vk_weave_sync_slot_wait_locked(c, s, VK_WEAVE_SYNC_WAIT_NS)) {
+		return false;
+	}
+	if (s->in_flight) {
+		vk->vkResetFences(vk->device, 1, &s->fence);
+		s->in_flight = false;
+	}
+	vk_weave_sync_slot_free_cmds(vk, s);
+	return true;
+}
+
+/*!
+ * c->mutex held, app frame against a self-submitting DP: the slot this frame
+ * runs on, or NULL for the host-wait path (reason logged on change).
+ * @p out_skip is set when the slot to reuse did not retire inside the bound —
+ * a GPU that is not coming back; the caller fails the frame instead of
+ * reusing a pending fence, and the ring is latched off for the session.
+ */
+static struct vk_weave_sync_slot *
+vk_weave_sync_take_slot(struct comp_vk_native_compositor *c, bool *out_skip)
+{
+	*out_skip = false;
+	if (!dxr_weave_sync_inproc_enabled()) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_KILLSWITCH);
+		return NULL;
+	}
+	if (c->wsync.dp_declined) {
+		return NULL; // logged when it declined
+	}
+	if (c->wsync.failed || !vk_weave_sync_ring_ensure(c)) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+		return NULL;
+	}
+	os_mutex_lock(&c->wsync.mutex);
+	struct vk_weave_sync_slot *s = &c->wsync.slot[c->wsync.next];
+	const bool ok = vk_weave_sync_slot_retire_locked(c, s);
+	const uint64_t stuck_serial = s->serial;
+	if (ok) {
+		c->wsync.next = (c->wsync.next + 1) % c->wsync.count;
+		// The serial is assigned HERE, before the acquire, and the app images
+		// this frame reads are tagged with it right after (the caller), so a
+		// tagged wait covers the whole GPU window from the pre batch on —
+		// not only what comes after the post submit.
+		s->serial = ++c->wsync.serial;
+	} else {
+		vk_weave_sync_slot_abandon_locked(s);
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (!ok) {
+		c->wsync.failed = true;
+		*out_skip = true;
+		U_LOG_W(
+		    "#2095: ring slot (commit #%llu) did not retire in %llu ms — failing this frame and "
+		    "latching the host-wait path for the session (device loss / hung vendor submit?)",
+		    (unsigned long long)stuck_serial, (unsigned long long)(VK_WEAVE_SYNC_WAIT_NS / U_TIME_1MS_IN_NS));
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+		return NULL;
+	}
+	return s;
+}
+
+/*!
+ * Wait (bounded) for chained commit @p serial to retire. Any thread; takes
+ * wsync.mutex. The test is "no in-flight slot carries the serial": a slot
+ * only leaves the in-flight state through a waited fence (or an abandon,
+ * which is the device not answering). A serial that was assigned but whose
+ * slot never went in flight (the frame left the chain, or its post batch is
+ * not submitted yet) has nothing on the GPU to wait for — the frame that
+ * left the chain host-waited, and a frame between take-slot and submit can
+ * only be an app-thread or blocking serve (the app thread is inside the
+ * commit) or a non-blocking serve that reads no app image (its eligibility).
+ * Returns false on timeout, after a throttled WARN.
+ */
+static bool
+vk_weave_sync_wait_serial(struct comp_vk_native_compositor *c, uint64_t serial, uint64_t timeout_ns, const char *who)
+{
+	if (serial == 0 || !c->wsync.created) {
+		return true;
+	}
+	bool ok = true;
+	os_mutex_lock(&c->wsync.mutex);
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		if (s->in_flight && s->serial == serial) {
+			ok = vk_weave_sync_slot_wait_locked(c, s, timeout_ns);
+			break;
+		}
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (!ok) {
+		char buf[160];
+		snprintf(buf, sizeof(buf),
+		         "%s waited %llu ms for chained weave #%llu and it has not retired — proceeding", who,
+		         (unsigned long long)(timeout_ns / U_TIME_1MS_IN_NS), (unsigned long long)serial);
+		vk_weave_sync_warn_throttled(c, buf);
+	}
+	return ok;
+}
+
+/*!
+ * The depth-1 bound: wait the NEWEST chained frame (the top of layer_commit,
+ * before c->mutex; a fill before its submits). Returns the time spent, so the
+ * caller can account for it where the old host drain was accounted.
+ */
+static uint64_t
+vk_weave_sync_wait_latest(struct comp_vk_native_compositor *c, const char *who)
+{
+	if (!c->wsync.created) {
+		return 0;
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+	os_mutex_lock(&c->wsync.mutex);
+	const uint64_t serial = c->wsync.serial;
+	os_mutex_unlock(&c->wsync.mutex);
+	(void)vk_weave_sync_wait_serial(c, serial, VK_WEAVE_SYNC_WAIT_NS, who);
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->wsync.mutex);
+	const uint64_t ema = c->wsync.wait_prev_ema_ns;
+	c->wsync.wait_prev_ema_ns = ema == 0 ? d : (ema * 7 + d) / 8;
+	os_mutex_unlock(&c->wsync.mutex);
+	return d;
+}
+
+/*!
+ * Host-drain every queue a chain can span: the caller's, the DP's
+ * (repaint_queue) and the app's (main_queue). The third matters when the
+ * caller IS the runtime queue (a non-blocking serve): the previous frame's
+ * post batch and present may have run on main_queue (a blocking serve), and
+ * a reset that then destroys their semaphores must have seen them retire.
+ * Failure paths only, so draining the app's queue too is acceptable.
+ */
+static void
+vk_weave_sync_drain_queues(struct comp_vk_native_compositor *c, VkQueue queue)
+{
+	struct vk_bundle *vk = &c->vk;
+	vk->vkQueueWaitIdle(queue);
+	if (c->repaint_queue != VK_NULL_HANDLE && c->repaint_queue != queue) {
+		vk->vkQueueWaitIdle(c->repaint_queue);
+	}
+	if (vk->main_queue->queue != VK_NULL_HANDLE && vk->main_queue->queue != queue &&
+	    vk->main_queue->queue != c->repaint_queue) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+}
+
+/*!
+ * Recreate-on-drop (the slot contract), applied to every way of leaving the
+ * chain part-way: drain both queues, retire every slot, destroy and recreate
+ * every semaphore. c->mutex held (frame path), after the frame's present.
+ *
+ * Assumes that once the presenting queue is idle the present's own semaphore
+ * wait has executed — queue operations execute in submission order, and the
+ * target's recreate path destroys the swapchain on the same assumption.
+ */
+static void
+vk_weave_sync_ring_reset(struct comp_vk_native_compositor *c, VkQueue queue, const char *why)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->wsync.created) {
+		return;
+	}
+	vk_weave_sync_drain_queues(c, queue);
+	os_mutex_lock(&c->wsync.mutex);
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		if (!vk_weave_sync_slot_retire_locked(c, s)) {
+			// Its fence is pending despite the drain: leave its semaphores
+			// alone (destroying objects with pending operations is worse than
+			// a stale signal), drop its bookkeeping so no later wait pays the
+			// bound for it again, and stop chaining for the session.
+			vk_weave_sync_slot_abandon_locked(s);
+			c->wsync.failed = true;
+			continue;
+		}
+		vk_weave_sync_slot_destroy_sems(vk, s);
+		if (!vk_weave_sync_slot_create_sems(vk, s)) {
+			c->wsync.failed = true;
+		}
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	char buf[160];
+	snprintf(buf, sizeof(buf), "weave-sync ring reset — %s; queues drained, semaphores recreated%s", why,
+	         c->wsync.failed ? " (a slot would not retire: host-wait path from here on)" : "");
+	vk_weave_sync_warn_throttled(c, buf);
+	if (c->wsync.failed) {
+		vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_RING);
+	}
+}
+
+//! Teardown, after vkDeviceWaitIdle: nothing in the ring is pending.
+static void
+vk_weave_sync_ring_destroy(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->wsync.created) {
+		return;
+	}
+	for (uint32_t i = 0; i < c->wsync.count; i++) {
+		struct vk_weave_sync_slot *s = &c->wsync.slot[i];
+		s->in_flight = false;
+		vk_weave_sync_slot_free_cmds(vk, s);
+		vk_weave_sync_slot_destroy_sems(vk, s);
+		if (s->fence != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, s->fence, NULL);
+			s->fence = VK_NULL_HANDLE;
+		}
+	}
+	c->wsync.created = false;
+	c->wsync.count = 0;
+}
+
+static void
+vk_weave_sync_note_sub(struct xrt_swapchain *xsc, const struct xrt_sub_image *sub, uint64_t serial)
+{
+	if (xsc != NULL) {
+		comp_vk_native_swapchain_note_read(xsc, sub->image_index, serial);
+	}
+}
+
+/*!
+ * wsync.mutex held, c->mutex held: tag every app swapchain image this
+ * commit's GPU work reads with its serial. The weave's inputs that are
+ * app-owned: the projection views (zero-copy: the DP samples them directly;
+ * otherwise the renderer already blitted them, host-waited, before the
+ * commit), window-space and Local2D images (composited in the pre/post
+ * batches), zone views. Tagging a view the renderer already consumed costs
+ * one already-signalled fence check at the app's next wait — nothing.
+ */
+static void
+vk_weave_sync_note_layer_reads_locked(struct comp_vk_native_compositor *c, uint64_t serial)
+{
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		const struct xrt_layer_data *d = &l->data;
+		switch (d->type) {
+		case XRT_LAYER_PROJECTION:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_PROJECTION_DEPTH:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->depth.v[v].sub, serial);
+				vk_weave_sync_note_sub(l->sc_array[XRT_MAX_VIEWS + v], &d->depth.d[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_ZONE_3D:
+			for (uint32_t v = 0; v < d->view_count && v < XRT_MAX_VIEWS; v++) {
+				vk_weave_sync_note_sub(l->sc_array[v], &d->zone_3d.proj.v[v].sub, serial);
+			}
+			break;
+		case XRT_LAYER_QUAD: vk_weave_sync_note_sub(l->sc_array[0], &d->quad.sub, serial); break;
+		case XRT_LAYER_CUBE: vk_weave_sync_note_sub(l->sc_array[0], &d->cube.sub, serial); break;
+		case XRT_LAYER_CYLINDER: vk_weave_sync_note_sub(l->sc_array[0], &d->cylinder.sub, serial); break;
+		case XRT_LAYER_EQUIRECT1: vk_weave_sync_note_sub(l->sc_array[0], &d->equirect1.sub, serial); break;
+		case XRT_LAYER_EQUIRECT2: vk_weave_sync_note_sub(l->sc_array[0], &d->equirect2.sub, serial); break;
+		case XRT_LAYER_WINDOW_SPACE:
+			vk_weave_sync_note_sub(l->sc_array[0], &d->window_space.sub, serial);
+			break;
+		case XRT_LAYER_LOCAL_2D: vk_weave_sync_note_sub(l->sc_array[0], &d->local_2d.sub, serial); break;
+		default: break;
+		}
+	}
+}
+
+//! #2356: bound on any wait for the commit-time window-space stamp.
+#define VK_WS_STAMP_WAIT_NS (2ULL * U_TIME_1S_IN_NS)
+
+/*!
+ * #2356: ws_stamp.mutex held. Retire the in-flight commit-time stamp, waiting
+ * its fence (bounded). Returns false only when it did not retire inside the
+ * bound — the fence is then still pending and must not be reset or reused.
+ */
+static bool
+vk_ws_stamp_retire_locked(struct comp_vk_native_compositor *c)
+{
+	if (!c->ws_stamp.in_flight) {
+		return true;
+	}
+	struct vk_bundle *vk = &c->vk;
+	const VkResult r = vk->vkWaitForFences(vk->device, 1, &c->ws_stamp.fence, VK_TRUE, VK_WS_STAMP_WAIT_NS);
+	if (r == VK_TIMEOUT) {
+		return false;
+	}
+	// Signalled, or the device is gone (nothing is coming back either way).
+	vk->vkResetFences(vk->device, 1, &c->ws_stamp.fence);
+	c->ws_stamp.in_flight = false;
+	if (r != VK_SUCCESS) {
+		U_LOG_E("#2356: waiting the window-space stamp fence failed: %d", r);
+	}
+	return true;
+}
+
+//! #2356 TRACE: fold @p d into an EMA (0 = no data yet).
+static inline void
+vk_ws_stamp_ema(uint64_t *ema, uint64_t d)
+{
+	*ema = *ema == 0 ? (d == 0 ? 1 : d) : (*ema * 7 + d) / 8;
+}
+
+static void
+vk_ws_stamp_warn_timeout(const char *who)
+{
+	static uint64_t s_warn_ns = 0; // a GPU that is not coming back: throttle
+	const uint64_t now = os_monotonic_get_ns();
+	if (s_warn_ns == 0 || now - s_warn_ns > 5ULL * U_TIME_1S_IN_NS) {
+		s_warn_ns = now;
+		U_LOG_W(
+		    "#2356: %s waited %llu ms for the window-space stamp and it has not retired — proceeding "
+		    "(throttled to one line per 5 s)",
+		    who, (unsigned long long)(VK_WS_STAMP_WAIT_NS / U_TIME_1MS_IN_NS));
+	}
+}
+
+/*!
+ * #2356: layer_commit, before renderer_draw rewrites the atlas. The previous
+ * commit's serve has been drained by now, so a stamp still only RECORDED was
+ * never submitted (its frame was dropped): it read nothing and is discarded.
+ * One that was submitted is retired (normally already signalled — the serve
+ * that followed it on the same queue was waited by the #2095 commit wait or
+ * its own host waits). A timeout is logged; the next stamp then refuses to
+ * reuse the pending fence and that frame falls back to the weave-time
+ * composite.
+ */
+static void
+vk_ws_stamp_retire_before_draw(struct comp_vk_native_compositor *c)
+{
+	const uint64_t t0 = os_monotonic_get_ns();
+	os_mutex_lock(&c->ws_stamp.mutex);
+	c->ws_stamp.pending_submit = false;
+	const bool was_in_flight = c->ws_stamp.in_flight;
+	const bool ok = vk_ws_stamp_retire_locked(c);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout("layer_commit");
+	}
+#ifdef VK_MIDFRAME_FILL
+	if (was_in_flight) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.ws_retire_ema_ns, d);
+		os_mutex_unlock(&c->weave_hand.mutex);
+	}
+#else
+	(void)t0;
+	(void)was_in_flight;
+#endif
+}
+
+/*!
+ * #2356: a reader of the atlas off the serve's queue (the post-compose
+ * capture) — wait a SUBMITTED stamp only; never discard a recorded one, whose
+ * serve may still be about to run. Trigger-gated, so a host wait is fine.
+ */
+static void
+vk_ws_stamp_wait_submitted(struct comp_vk_native_compositor *c)
+{
+	os_mutex_lock(&c->ws_stamp.mutex);
+	const bool ok = vk_ws_stamp_retire_locked(c);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout("atlas capture");
+	}
+}
+
+#ifdef VK_MIDFRAME_FILL
+static bool
+vk_async_handoff_quiesce(struct comp_vk_native_compositor *c); // #1905, below
+#endif
+
+//! ws_stamp.mutex held: does the latest stamp read image @p index of @p xsc (UINT32_MAX = any)?
+static bool
+vk_ws_stamp_reads_locked(struct comp_vk_native_compositor *c, struct xrt_swapchain *xsc, uint32_t index)
+{
+	const uint64_t s = c->ws_stamp.serial;
+	if (s == 0) {
+		return false;
+	}
+	if (index != UINT32_MAX) {
+		return comp_vk_native_swapchain_get_stamp_serial(xsc, index) == s;
+	}
+	for (uint32_t i = 0; i < xsc->image_count; i++) {
+		if (comp_vk_native_swapchain_get_stamp_serial(xsc, i) == s) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*!
+ * #2356: xrWaitSwapchainImage / swapchain destroy — hold the app off a layer
+ * image the latest commit-time stamp reads until that stamp has retired on the
+ * GPU. Only one stamp is ever outstanding, so an image tagged with an older
+ * serial has already retired. A stamp that is only RECORDED (its serve has not
+ * run yet) is waited by first letting the outstanding serve run (the #1905
+ * quiesce: c->mutex is not held here); if the serve then did not submit it, it
+ * read nothing and is discarded.
+ */
+static void
+vk_ws_stamp_wait_image(struct comp_vk_native_compositor *c, struct xrt_swapchain *xsc, uint32_t index)
+{
+	const char *who = index == UINT32_MAX ? "swapchain destroy" : "xrWaitSwapchainImage";
+	os_mutex_lock(&c->ws_stamp.mutex);
+	bool reads = (c->ws_stamp.in_flight || c->ws_stamp.pending_submit || c->ws_stamp.recording) &&
+	             vk_ws_stamp_reads_locked(c, xsc, index);
+	const bool pending = reads && (c->ws_stamp.pending_submit || c->ws_stamp.recording);
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!reads) {
+		return; // the common case
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+#ifdef VK_MIDFRAME_FILL
+	if (pending) {
+		(void)vk_async_handoff_quiesce(c);
+	}
+#else
+	(void)pending;
+#endif
+	os_mutex_lock(&c->ws_stamp.mutex);
+	if (c->ws_stamp.pending_submit && vk_ws_stamp_reads_locked(c, xsc, index)) {
+		c->ws_stamp.pending_submit = false; // never submitted: nothing reads the image
+	}
+	bool ok = true;
+	if (c->ws_stamp.in_flight && vk_ws_stamp_reads_locked(c, xsc, index)) {
+		ok = vk_ws_stamp_retire_locked(c);
+	}
+	os_mutex_unlock(&c->ws_stamp.mutex);
+	if (!ok) {
+		vk_ws_stamp_warn_timeout(who);
+	}
+#ifdef VK_MIDFRAME_FILL
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.win_ws_img_waits++;
+	vk_ws_stamp_ema(&c->hand_async.ws_img_wait_ema_ns, d);
+	os_mutex_unlock(&c->weave_hand.mutex);
+#else
+	(void)t0;
+#endif
+}
+
+#ifdef VK_MIDFRAME_FILL
+/*!
+ * #2356: the serve's first act for a frame whose window-space composite was
+ * decided at commit — RECORD it (from this frame's published layer state) and
+ * submit it on @p queue (the runtime queue: see serve_rt), so queue order puts
+ * it ahead of everything this weave submits. c->mutex held (the serve), weave
+ * thread — the same thread the weave-time composite always recorded on, so the
+ * blend caches keep a single user. On any failure the stamp is discarded: this
+ * one frame is woven without its overlay, and nothing reads the app's image.
+ *
+ * TRACE: ws_rec_ema / ws_end_ema / ws_sub_ema, plus the per-probe split
+ * (enum vk_ws_prof) as ws_prof EMAs.
+ */
+static void
+vk_ws_stamp_submit_for_serve(struct comp_vk_native_compositor *c, VkQueue queue)
+{
+	struct vk_bundle *vk = &c->vk;
+	os_mutex_lock(&c->ws_stamp.mutex);
+	if (!c->ws_stamp.pending_submit) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
+	}
+	c->ws_stamp.pending_submit = false;
+	const VkCommandBuffer cmd = c->ws_stamp.cmd;
+	if (cmd == VK_NULL_HANDLE || c->renderer == NULL) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
+	}
+	// Record and submit without the mutex: every xrWaitSwapchainImage takes it.
+	// cmd, pool and fence have this thread as their only user meanwhile (the
+	// next commit drains this serve before it touches them).
+	c->ws_stamp.recording = true;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	for (uint32_t i = 0; i < ARRAY_SIZE(c->ws_stamp.prof); i++) {
+		c->ws_stamp.prof[i] = 0;
+	}
+	c->ws_stamp.prof_on = true;
+	vk_ws_prof(c, VK_WS_PROF_START);
+	bool ok = vk->vkResetCommandBuffer(cmd, 0) == VK_SUCCESS;
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	ok = ok && vk->vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS;
+	VkResult res = VK_ERROR_UNKNOWN;
+	if (ok) {
+		/*
+		 * Full barriers either side. Before: anything still reading the
+		 * atlas on this queue (a fill's crop or DP pass) completes first —
+		 * the composite's own first barrier only waits the fragment stage.
+		 * After: the crop (transfer), the transparency probe and the DP,
+		 * whatever stage they read in, see the composited atlas — the
+		 * composite's own last barrier only makes it visible to the fragment
+		 * stage, which was enough when it shared the weave's command buffer.
+		 */
+		const VkMemoryBarrier full = {
+		    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+		                         1, &full, 0, NULL, 0, NULL);
+		vk_ws_prof(c, VK_WS_PROF_BEGUN);
+		uint32_t atlas_w = 0, atlas_h = 0;
+		comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w, &atlas_h);
+		vk_compositor_render_window_space_into_atlas(
+		    c, cmd, (VkImage)(uintptr_t)comp_vk_native_renderer_get_atlas_image(c->renderer),
+		    (VkImageView)(uintptr_t)comp_vk_native_renderer_get_atlas_view(c->renderer), atlas_w, atlas_h,
+		    c->eff_layout.tile_w, c->eff_layout.tile_h, c->eff_layout.cols, c->eff_layout.rows);
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+		                         1, &full, 0, NULL, 0, NULL);
+		const uint64_t t_rec1 = os_monotonic_get_ns();
+		ok = vk->vkEndCommandBuffer(cmd) == VK_SUCCESS;
+		vk_ws_prof(c, VK_WS_PROF_END);
+		const uint64_t t_end = os_monotonic_get_ns();
+		if (ok) {
+			VkSubmitInfo si = {
+			    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			    .commandBufferCount = 1,
+			    .pCommandBuffers = &cmd,
+			};
+			res = comp_vk_native_queue_submit_retry(vk, queue, &si, c->ws_stamp.fence, "ws-stamp");
+		}
+		const uint64_t t_sub = os_monotonic_get_ns();
+		os_mutex_lock(&c->ws_stamp.mutex);
+		c->ws_stamp.in_flight = res == VK_SUCCESS;
+		os_mutex_unlock(&c->ws_stamp.mutex);
+
+		// TRACE (weave_hand.mutex is a leaf; ws_stamp.mutex is never taken under it).
+		const uint64_t *pr = c->ws_stamp.prof;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.ws_rec_ema_ns, t_rec1 - pr[VK_WS_PROF_START]);
+		vk_ws_stamp_ema(&c->hand_async.ws_end_ema_ns, t_end - t_rec1);
+		vk_ws_stamp_ema(&c->hand_async.ws_sub_ema_ns, t_sub - t_end);
+		// Each probe's share: from the previous probe that was reached.
+		uint64_t prev = pr[VK_WS_PROF_START];
+		for (uint32_t i = VK_WS_PROF_BEGUN; i <= VK_WS_PROF_END; i++) {
+			if (pr[i] != 0 && prev != 0 && pr[i] >= prev) {
+				vk_ws_stamp_ema(&c->hand_async.ws_prof_ema_ns[i], pr[i] - prev);
+				prev = pr[i];
+			}
+		}
+		os_mutex_unlock(&c->weave_hand.mutex);
+	}
+	c->ws_stamp.prof_on = false;
+	os_mutex_lock(&c->ws_stamp.mutex);
+	c->ws_stamp.recording = false;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	if (res != VK_SUCCESS) {
+		static bool s_logged = false;
+		if (!s_logged) {
+			s_logged = true;
+			U_LOG_W(
+			    "#2356: window-space stamp record/submit failed (%d) — that frame is woven without its "
+			    "overlay",
+			    res);
+		}
+	}
+}
+#endif
+
+void
+comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *c,
+                                              struct xrt_swapchain *xsc,
+                                              uint32_t index)
+{
+	if (c == NULL || xsc == NULL) {
+		return;
+	}
+	// #2356: the commit-time window-space stamp (not part of the #2095 ring).
+	vk_ws_stamp_wait_image(c, xsc, index);
+
+	// `created` is set once, under c->mutex, by the first chained frame; the
+	// app thread reads it bare. Benign: an image can only have been tagged
+	// by a chained frame, and that frame's commit happens-before the app's
+	// next wait on the image (the hand-off wait, or the same thread).
+	if (!c->wsync.created) {
+		return;
+	}
+	uint64_t serial = 0;
+	os_mutex_lock(&c->wsync.mutex);
+	if (index == UINT32_MAX) {
+		for (uint32_t i = 0; i < xsc->image_count; i++) {
+			const uint64_t s = comp_vk_native_swapchain_get_read_serial(xsc, i);
+			serial = s > serial ? s : serial;
+		}
+	} else {
+		serial = comp_vk_native_swapchain_get_read_serial(xsc, index);
+	}
+	os_mutex_unlock(&c->wsync.mutex);
+	if (serial != 0) {
+		(void)vk_weave_sync_wait_serial(c, serial, VK_WEAVE_SYNC_WAIT_NS,
+		                                index == UINT32_MAX ? "swapchain destroy" : "xrWaitSwapchainImage");
+	}
 }
 
 /*
@@ -4884,7 +7846,7 @@ dxr_postwait_queue_only(void)
  *
  * - the windowed Vulkan site, inside vk_dp_weave_and_present, skipped on
  *   `is_repaint`,
- * - the split site, after the `is_repaint=false` comp_vk_split_weave_and_present
+ * - the split site, after the `is_repaint=false` comp_hub_d3d11_weave_and_present
  *   in layer_commit (the repaint thread's call passes `is_repaint=true` and does
  *   not tick),
  * - the shared-texture site, which has no repaint at all.
@@ -4919,7 +7881,7 @@ vk_rear_budget_tick(struct comp_vk_native_compositor *c)
 	if (polled) {
 #ifdef XRT_OS_WINDOWS
 		if (c->split != NULL) {
-			got = comp_vk_split_get_background_preview(c->split, &pv);
+			got = comp_hub_d3d11_get_background_preview(c->split, &pv);
 		}
 #endif
 		if (!got && c->display_processor != NULL) {
@@ -5125,6 +8087,10 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
                         uint64_t *fp,
                         bool *out_skip_frame)
 {
+	//! #1748: the position this weave's frame is woven for (move sync).
+	bool ms_tag = false;
+	int32_t ms_tag_x = 0, ms_tag_y = 0;
+
 	/*
 	 * #902 cadence census. Every weave — app frame and repaint alike — passes
 	 * through here, so this is the one place the OUTPUT stream can be split by
@@ -5229,6 +8195,42 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	 */
 	VkQueue queue =
 	    (is_repaint && c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : vk->main_queue->queue;
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: a NON-BLOCKING app weave goes to the runtime-owned queue
+	 * too. Measured on the Lume phone with it on the app's queue: the app had
+	 * already submitted its next frame there, so the acquire's
+	 * vkQueueWaitIdle, the pre-DP flush's vkQueueWaitIdle and the frame-fence
+	 * wait all queued behind the app's GPU work — the serve took ~22 ms wall,
+	 * the app's next post was always pending when it ended, and every fill
+	 * yielded (fills 28/s -> 0, GetFace 54 -> 32 Hz).
+	 *
+	 * Safe to move: the atlas is complete on the host before the request is
+	 * posted (renderer_draw waits its own submit on the app thread), both
+	 * queues are the same family (no ownership transfer), and fills already
+	 * sample that same atlas from this queue. The DP was created against this
+	 * queue (#868, vk_make_dp_vk), so the vendor weave's own submits are here
+	 * already. Fills run on this thread, so the queue holds only this serve's
+	 * work and its waits drain nothing of the app's. The non-blocking switch
+	 * requires a runtime-owned queue (dxr_async_handoff_resolve).
+	 */
+	//
+	// #2356: and so does ANY serve of a frame whose window-space layers were
+	// composited at commit — that composite was submitted on the runtime
+	// queue, and queue order on it is what orders it before this weave. A
+	// blocking serve (the #1962 fallback) is safe there for the same reason
+	// as a non-blocking one, and its requester is parked meanwhile.
+	const bool serve_rt = !is_repaint && (c->hand_async.serving || c->ws_composited_at_commit) &&
+	                      c->repaint_queue != VK_NULL_HANDLE && c->repaint_cmd_pool != VK_NULL_HANDLE;
+	if (serve_rt) {
+		queue = c->repaint_queue;
+	}
+	// #2356: this frame's window-space stamp, recorded at commit, goes first
+	// on this queue — ahead of the acquire, the crop and the DP.
+	if (!is_repaint && c->ws_composited_at_commit) {
+		vk_ws_stamp_submit_for_serve(c, queue);
+	}
+#endif
 
 	// Re-sync the output surface against the live ANativeWindow (Android).
 	// On background→card the SurfaceView's surface is destroyed; presenting
@@ -5243,10 +8245,66 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		return XRT_SUCCESS;
 	}
 
+	/*
+	 * #2095 / ADR-055 — does THIS frame run on the GPU semaphore chain?
+	 *
+	 * Only an app frame (not a fill) against a self-submitting DP, with the
+	 * switch on, the DP not having declined the slot, and a ring slot that
+	 * has retired. `ws` is the slot for the frame; `ws_chain` says the chain
+	 * is still intact (it drops to false at the first thing that cannot be
+	 * chained — a declined arm, a dropped weave, a failed submit — and the
+	 * frame finishes on the host-wait path); `ws_done` says the chained post
+	 * batch was submitted on the slot, so the slot is in flight and the
+	 * present may wait its semaphore. A slot that was taken and not completed
+	 * is drained and its semaphores recreated after the present (a stranded
+	 * signal on a binary semaphore would poison its next use).
+	 */
+	struct vk_weave_sync_slot *ws = NULL;
+	bool ws_chain = false;
+	bool ws_acq_signalled = false; // ws->image_available carries this frame's acquire
+	bool ws_armed = false;         // the DP took set_weave_sync for this frame
+	bool ws_done = false;
+	const char *ws_fail = NULL; // why the chain was left part-way, for the reset log
+	if (is_repaint) {
+		// A fill's depth-1 wait on the last chained app frame runs in
+		// vk_repaint_thread BEFORE it takes c->mutex (#1264 S1: no GPU wait
+		// under the compositor lock), not here.
+	} else if (c->display_processor != NULL && xrt_display_processor_is_self_submitting(c->display_processor)) {
+		bool ws_skip = false;
+		ws = vk_weave_sync_take_slot(c, &ws_skip);
+		ws_chain = ws != NULL;
+		if (ws_skip) {
+			// The slot to reuse did not retire inside the bound: a GPU that
+			// is not coming back (device loss, a hung vendor submit). Nothing
+			// below could present through it either; fail this frame
+			// cleanly rather than reuse a pending fence.
+			*out_skip_frame = true;
+			return XRT_SUCCESS;
+		}
+		if (ws != NULL) {
+			// Tag the app images this frame's GPU work reads with its serial
+			// NOW, so a tagged xrWaitSwapchainImage covers the whole window
+			// from the pre batch on (see vk_weave_sync_wait_serial for the
+			// taken-but-not-submitted case).
+			os_mutex_lock(&c->wsync.mutex);
+			vk_weave_sync_note_layer_reads_locked(c, ws->serial);
+			os_mutex_unlock(&c->wsync.mutex);
+		}
+	}
+
 	uint32_t target_index;
-	xret = comp_vk_native_target_acquire(c->target, &target_index, queue, is_repaint);
+	xret = comp_vk_native_target_acquire_ex(c->target, &target_index, queue, is_repaint,
+	                                        ws != NULL ? ws->image_available : VK_NULL_HANDLE,
+	                                        ws != NULL ? &ws_acq_signalled : NULL);
 	if (xret != XRT_SUCCESS) {
 		U_LOG_E("Failed to acquire target");
+		if (ws != NULL) {
+			// The slot is not known clean: a SUBOPTIMAL first acquire that
+			// then failed its recreate, or a driver that signalled on an
+			// error path, leaves image_available signalled. Reset rather
+			// than reason about which — this is an error path.
+			vk_weave_sync_ring_reset(c, queue, "acquire failed");
+		}
 		return xret;
 	}
 
@@ -5323,6 +8381,13 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	VkCommandPool cmd_pool = is_repaint && c->repaint_cmd_pool != VK_NULL_HANDLE
 	                             ? c->repaint_cmd_pool
 	                             : (VkCommandPool)(uintptr_t)comp_vk_native_renderer_get_cmd_pool(c->renderer);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: and its own pool — the renderer's belongs to the app
+	// thread (renderer_draw, the zone-mask API).
+	if (serve_rt) {
+		cmd_pool = c->repaint_cmd_pool;
+	}
+#endif
 
 	VkCommandBufferAllocateInfo alloc_info = {
 	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -5436,7 +8501,11 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// and redrawn. The atlas already carries what the last app
 			// frame composited, so replaying the weave over it is both
 			// correct and what the repaint is for.
-			if (!zero_copy && !is_repaint) {
+			//
+			// #2356: and skipped when layer_commit already composited them
+			// (the non-blocking hand-off path) — stamping twice would
+			// double the overlay's alpha.
+			if (!zero_copy && !is_repaint && !c->ws_composited_at_commit) {
 				uint32_t atlas_w_pre, atlas_h_pre;
 				comp_vk_native_renderer_get_atlas_dimensions(c->renderer, &atlas_w_pre, &atlas_h_pre);
 				vk_compositor_render_window_space_into_atlas(c, cmd,
@@ -5444,6 +8513,14 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    (VkImageView)(uintptr_t)src_view_u64,
 				    atlas_w_pre, atlas_h_pre,
 				    view_width, view_height, tc, tr);
+			}
+
+			// #2340 HDR10 (experimental): PQ-encode the atlas after the
+			// last pass that composes into it and before the crop that
+			// hands it to the DP. Zero-copy has no atlas to encode; a
+			// repaint replays the one this frame already encoded.
+			if (!is_repaint) {
+				vk_maybe_encode_atlas_pq(c, zero_copy ? VK_NULL_HANDLE : cmd);
 			}
 
 			// Crop atlas to content dimensions before passing to DP
@@ -5543,10 +8620,66 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			if (ftime) {
 				fp[1] = os_monotonic_get_ns();
 			}
-			if (dp_self_submits) {
-				// Flush pre-DP work (WS-layer composite, atlas crop,
-				// target-image layout transition) so the DP's
-				// internal submit sees the right state on the GPU.
+			if (dp_self_submits && ws_chain) {
+				/*
+				 * #2095 / ADR-055 — the pre batch joins the chain. It waits
+				 * this frame's acquire (the slot's image_available, replacing
+				 * the acquire-side dummy submit + vkQueueWaitIdle) and signals
+				 * pre_sem, which the DP waits before its first atlas read.
+				 * No vkQueueWaitIdle: nothing on the host waits for it.
+				 *
+				 * Wait stage ALL_COMMANDS rather than COLOR_ATTACHMENT_OUTPUT:
+				 * the batch's first write to the target is the pre_weave
+				 * layout transition above, whose srcStage is TOP_OF_PIPE — a
+				 * narrower wait stage would let that transition run before
+				 * the presentation engine has released the image. The batch
+				 * is small, so waiting it whole costs nothing measurable.
+				 */
+				vk->vkEndCommandBuffer(cmd);
+				const VkPipelineStageFlags acq_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+				VkSubmitInfo pre_si = {
+				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				    .waitSemaphoreCount = ws_acq_signalled ? 1u : 0u,
+				    .pWaitSemaphores = &ws->image_available,
+				    .pWaitDstStageMask = &acq_stage,
+				    .commandBufferCount = 1,
+				    .pCommandBuffers = &cmd,
+				    .signalSemaphoreCount = 1,
+				    .pSignalSemaphores = &ws->pre_sem,
+				};
+				res = vk_weave_sync_submit(vk, queue, &pre_si, VK_NULL_HANDLE, "chain-pre");
+				if (res == VK_SUCCESS) {
+					// Pending on the GPU: parked in the slot, freed when its
+					// fence retires — never by the post-weave block below.
+					ws->cmd_pre = cmd;
+					ws->pool = cmd_pool;
+					ws_acq_signalled = false; // consumed
+				} else {
+					// A failed submit neither waits nor signals
+					// (LeiaInc/CNSDK#734 is the same lesson on the vendor
+					// side): the DP must NOT be armed with a pre_sem no one
+					// will signal, and the acquire signal is still pending on
+					// image_available. Consume it on the host NOW (dummy
+					// submit + idle, what the host-wait acquire always did):
+					// it orders the DP's weave after the presentation engine
+					// released the image, and leaves the semaphore clean for
+					// the post-present reset to destroy. Then finish this
+					// frame on the host-wait path — which, exactly as before,
+					// does not wait for a pre batch that never landed.
+					if (ws_acq_signalled) {
+						comp_vk_native_target_consume_acquire_signal(c->target, queue,
+						                                             ws->image_available);
+						ws_acq_signalled = false;
+					}
+					ws_chain = false;
+					ws_fail = "pre-DP submit failed";
+				}
+			} else if (dp_self_submits) {
+				// Host-wait path (no chain: the switch is off, the DP declined
+				// the slot, or the ring is unavailable). Flush pre-DP work
+				// (WS-layer composite, atlas crop, target-image layout
+				// transition) so the DP's internal submit sees the right
+				// state on the GPU.
 				vk->vkEndCommandBuffer(cmd);
 				VkSubmitInfo pre_si = {
 				    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -5578,6 +8711,8 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// Windowed weaving (runtime#757 / LeiaSR#85): anchor the lens phase
 			// to the window's panel position. Must precede process_atlas.
 			vk_update_present_origin(c);
+			// #1748: the position this frame is woven for, for its tag.
+			vk_wl_move_sync_take(c, &ms_tag, &ms_tag_x, &ms_tag_y);
 
 			// Weave-latency harness mark (env-gated no-op otherwise). A
 			// repaint paced itself unlocked and stays out of the #867
@@ -5668,13 +8803,116 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 			// precede process_atlas; no-op on no change.
 			vk_dp_assert_atlas_encoding(c, c->display_processor, vk_native_atlas_encoding(c));
 
-			xrt_display_processor_process_atlas(
-			    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
-			    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
-			    view_height, tc, tr, (VkFormat_XDP)view_format, target_fb,
-			    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
-			    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
-			    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+			// Multi-screen M2/M6: a window spanning screens is woven per
+			// segment, each by its own screen's DP. A window on the primary
+			// screen only never takes this branch (byte-for-byte the single-
+			// DP call below).
+			struct xrt_display_processor *const dp_before_segments = c->display_processor;
+			const bool seg_split =
+			    vk_segments_frame_update(c, &dp_canvas, zero_copy, dp_self_submits, dp_render_pass);
+#ifdef XRT_OS_WINDOWS
+			/*
+			 * ADR-047 Amendment 2: the update above may have swapped the
+			 * session's primary DP (the window handle moved between
+			 * screens). The swap re-sent the session-level state; replay
+			 * THIS weave's per-frame inputs, which went to the old DP.
+			 */
+			if (c->display_processor != dp_before_segments && c->display_processor != NULL) {
+				xrt_display_processor_set_target_color_view(c->display_processor,
+				                                            (VkImageView)(uintptr_t)target_view);
+				xrt_display_processor_set_background_2d(c->display_processor, bd_view, bd_w, bd_h);
+				xrt_display_processor_vk_set_frame_timing(
+				    (struct xrt_display_processor_vk *)c->display_processor,
+				    comp_vk_native_target_get_measured_weave_ns(c->target),
+				    (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+				vk_dp_assert_atlas_encoding(c, c->display_processor, vk_native_atlas_encoding(c));
+			}
+#else
+			(void)dp_before_segments;
+#endif
+#else
+			const bool seg_split = false;
+#endif
+			if (seg_split && ws_chain) {
+				// #2095: the segments branch records its own per-screen
+				// process_atlas calls and never arms the primary DP, so the
+				// chain cannot hold across it. Unreachable today — a
+				// self-submitting DP never splits (vk_segments_frame_update_split)
+				// — kept so it stays that way: complete the pre batch on the
+				// host and finish on the host-wait path.
+				vk->vkQueueWaitIdle(queue);
+				ws_chain = false;
+				ws_fail = "segments";
+			}
+			if (seg_split) {
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+				struct comp_vk_native_segments_frame sf = {
+				    .cmd = cmd,
+				    .is_repaint = is_repaint,
+				    .src_image = (VkImage)(uintptr_t)src_image_u64,
+				    .src_format = (VkFormat)view_format,
+				    .view_width = view_width,
+				    .view_height = view_height,
+				    .tile_columns = tc,
+				    .tile_rows = tr,
+				    .target_fb = target_fb,
+				    .target_image = (VkImage)(uintptr_t)target_image,
+				    .target_view = (VkImageView)(uintptr_t)target_view,
+				    .target_width = tgt_width,
+				    .target_height = tgt_height,
+				    .target_format = (VkFormat)comp_vk_native_target_get_format(c->target),
+				    .canvas = {dp_canvas.offset.w, dp_canvas.offset.h,
+				               (uint32_t)(dp_canvas.extent.w > 0 ? dp_canvas.extent.w : (int)tgt_width),
+				               (uint32_t)(dp_canvas.extent.h > 0 ? dp_canvas.extent.h : (int)tgt_height)},
+				    .content = &c->seg_content, // #1883: crop where the views were painted
+				    .transparent_background = c->transparent_background,
+				    .atlas_encoding = vk_segments_atlas_encoding(c),
+				    .primary_dp = c->display_processor,
+				};
+				(void)comp_vk_native_segments_record(c->segments, &sf);
+#endif
+			} else {
+				/*
+				 * #2095 / ADR-055 — arm the DP IMMEDIATELY before the
+				 * process_atlas it applies to (the slot's contract: nothing
+				 * but set_target_color_view may come between, and nothing
+				 * does). The DP commits to wait pre_sem before its first
+				 * atlas read and to signal post_sem after its last target
+				 * write, in the submits it issues on its own queue. The pre
+				 * batch signalling pre_sem is already in flight.
+				 *
+				 * false = the DP lacks the slot or declines it (an older
+				 * plug-in, or the legacy own-queue init). Then this DP never
+				 * takes it: latch, log once, and finish THIS frame the way
+				 * the host-wait path would have — the pre batch has to be
+				 * complete before the DP's own submit can see it, which the
+				 * host-wait flush guaranteed with an idle and we now owe
+				 * late. pre_sem keeps a signal nobody waits; the
+				 * post-present reset recreates it.
+				 */
+				if (ws_chain) {
+					if (xrt_display_processor_vk_set_weave_sync(
+					        (struct xrt_display_processor_vk *)c->display_processor,
+					        (VkSemaphore_XDP)ws->pre_sem, 0, (VkSemaphore_XDP)ws->post_sem, 0)) {
+						ws_armed = true;
+						vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_GPU_CHAIN);
+					} else {
+						c->wsync.dp_declined = true;
+						vk_weave_sync_log_mode(c, VK_WEAVE_SYNC_MODE_FALLBACK_DP_DECLINED);
+						vk->vkQueueWaitIdle(queue);
+						ws_chain = false;
+						ws_fail = "DP declined set_weave_sync";
+					}
+				}
+				xrt_display_processor_process_atlas(
+				    c->display_processor, dp_self_submits ? VK_NULL_HANDLE : cmd,
+				    (VkImage_XDP)(uintptr_t)src_image_u64, (VkImageView)(uintptr_t)src_view_u64, view_width,
+				    view_height, tc, tr, (VkFormat_XDP)view_format, target_fb,
+				    (VkImage_XDP)(uintptr_t)target_image, tgt_width, tgt_height,
+				    (VkFormat_XDP)comp_vk_native_target_get_format(c->target), dp_canvas.offset.w,
+				    dp_canvas.offset.h, (uint32_t)dp_canvas.extent.w, (uint32_t)dp_canvas.extent.h);
+			}
 
 			/*
 			 * #1394 — the DP is allowed to say "that frame did not happen".
@@ -5790,6 +9028,26 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				}
 			}
 
+			/*
+			 * #2095 / ADR-055 — the drop clause, as the browser path does it.
+			 * The slot's contract asks the DP to wait pre_sem and signal
+			 * post_sem even on a dropped frame, but the runtime does not bet a
+			 * GPU hang on a vendor submit that may never have been enqueued:
+			 * for THIS frame post_sem is not waited on the GPU — the queues
+			 * are drained on the host instead (both of them: the DP's own and
+			 * the one carrying our batches), the post batch and the present
+			 * then wait nothing, and the post-present reset destroys and
+			 * recreates the slot's semaphores before any later process_atlas
+			 * (so a DP that cannot tell whether its weaver consumed pre_sem is
+			 * never asked to wait it again). The #1394 recycle itself —
+			 * overlays suppressed, clear to black, uncounted present — is
+			 * unchanged and logged by the lines above.
+			 */
+			if (ws_armed && frame_dropped) {
+				vk_weave_sync_drain_queues(c, queue);
+				ws_chain = false;
+				ws_fail = "DP dropped the frame";
+			}
 
 			// XR_DXR_depth_budget: evaluate the rear budget from the background
 			// the DP just composited under. AFTER process_atlas, because that is
@@ -5803,24 +9061,38 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				fp[3] = os_monotonic_get_ns();
 			}
 			if (dp_self_submits) {
-				// DP owned the post-weave submit. The vendor weave's
-				// queue submit may still be in flight writing to
-				// target_image; the HUD cmd buffer we're about to
-				// record writes to the same image, so drain the GPU
-				// before recording the HUD to avoid a target_image
-				// race (audit B7). On Android the HUD is c->hud==NULL
-				// and this overlay is a no-op, so the wait costs
-				// nothing in practice — but keep it for safety when
-				// HUD eventually wires up.
-				if (dxr_postwait_queue_only()) {
-					// #837: drain only the queue the DP actually
-					// submits on (see dxr_postwait_queue_only).
-					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE)
-					                   ? c->repaint_queue
-					                   : queue;
-					vk->vkQueueWaitIdle(dp_q);
+				if (ws_chain) {
+					// #2095 / ADR-055: the vendor weave may still be in flight
+					// writing target_image — and that is fine: the post batch
+					// below waits post_sem on the GPU before its first touch of
+					// the target. Nothing is drained. The pre batch's buffer is
+					// parked in the slot (pending), not freed here.
 				} else {
-					vk->vkDeviceWaitIdle(vk->device);
+					// Host-wait path. DP owned the post-weave submit. The vendor
+					// weave's queue submit may still be in flight writing to
+					// target_image; the cmd buffer we're about to record
+					// (Local2D composite, HUD) writes to the same image, so
+					// drain before recording to avoid a target_image race
+					// (audit B7). #837: drain only the queue the DP submits on
+					// — `vk_make_dp_vk` creates the DP with the runtime-owned
+					// queue swapped in as main_queue, and the Android CNSDK DP
+					// captures it at initialize_with_queue (#2012 settled it);
+					// on the shared-queue tier that is the passed-in queue. A
+					// device-wide wait would also drain the app's own queue,
+					// which never touches target_image. (The old DEVICE-wide
+					// variant and its DXR_WEAVE_POSTWAIT_QUEUE switch are gone
+					// with ADR-055; the chain above is the real fix.)
+					VkQueue dp_q = (c->repaint_queue != VK_NULL_HANDLE) ? c->repaint_queue : queue;
+					vk->vkQueueWaitIdle(dp_q);
+					if (ws != NULL && ws->cmd_pre == cmd) {
+						// #2095: this frame left the chain AFTER its pre batch
+						// was submitted (a declined arm, a dropped weave). The
+						// buffer is parked in the slot and freed by the
+						// post-present ring reset once both queues are drained
+						// — not here, and never twice.
+					} else {
+						vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
+					}
 				}
 
 				// Allocate a fresh cmd buffer for any post-DP
@@ -5832,7 +9104,6 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 				    .commandBufferCount = 1,
 				};
-				vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
 				vk->vkAllocateCommandBuffers(vk->device, &post_ai, &cmd);
 				VkCommandBufferBeginInfo post_bi = {
 				    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -5904,6 +9175,9 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 				                         tgt_height,
 				                         dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
 				                                         : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+				vk_debug_origin_stamp(c, cmd, (VkImage)(uintptr_t)target_image, tgt_width, tgt_height,
+				                      dp_self_submits ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+				                                      : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 			}
 #endif
 
@@ -6028,12 +9302,42 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		// strictly narrower elsewhere, and the prerequisite for
 		// deferring the present off the frame's critical path.
 		// #868: a repaint signals its OWN fence — see repaint_fence.
-		VkFence *fence_p = is_repaint ? &c->repaint_fence : &c->frame_fence;
+		// #2095: a chained frame signals its ring slot's fence, which is
+		// never waited here — only before the slot is REUSED, by the next
+		// commit's depth-1 wait, and by xrWaitSwapchainImage on an image
+		// this frame read.
+		VkFence *fence_p = is_repaint ? &c->repaint_fence : ws_chain ? &ws->fence : &c->frame_fence;
 		if (*fence_p == VK_NULL_HANDLE) {
 			VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			vk->vkCreateFence(vk->device, &fci, NULL, fence_p);
 		}
+		/*
+		 * #2095 / ADR-055 — the post batch joins the chain: it waits post_sem
+		 * (the DP's "last target write done") and signals present_sem for
+		 * vkQueuePresentKHR. Wait stage ALL_COMMANDS for the same reason as
+		 * the pre batch: the composite's and the drop-clear's internal
+		 * barriers include TOP_OF_PIPE-sourced transitions on the target,
+		 * which a FRAGMENT|COLOR|TRANSFER mask would not hold back.
+		 */
+		const VkPipelineStageFlags post_wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		if (ws_chain) {
+			submit_info.waitSemaphoreCount = 1;
+			submit_info.pWaitSemaphores = &ws->post_sem;
+			submit_info.pWaitDstStageMask = &post_wait_stage;
+			submit_info.signalSemaphoreCount = 1;
+			submit_info.pSignalSemaphores = &ws->present_sem;
+		}
+#ifdef XRT_OS_ANDROID
+		// #1905: one retry on -3 (shared-GSL-context race; see the helper).
+		// Clean here: nothing has touched the command buffer or the fence
+		// since the failed attempt, which left both unchanged.
+		res = comp_vk_native_queue_submit_retry(vk, queue, &submit_info, *fence_p,
+		                                        is_repaint ? "fill"
+		                                        : ws_chain ? "chain-post"
+		                                                   : "app-weave");
+#else
 		res = vk->vkQueueSubmit(queue, 1, &submit_info, *fence_p);
+#endif
 
 		// Tell the DP the weave went to the GPU, and on which queue. The DP
 		// RECORDED this weave (into `cmd`) but the submit is ours, so without
@@ -6061,7 +9365,35 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 		}
 
 		bool cmd_freed = false;
-		if (res == VK_SUCCESS) {
+		if (ws_chain) {
+			if (res == VK_SUCCESS) {
+				/*
+				 * #2095 / ADR-055 — no host wait. The slot is in flight: its
+				 * fence retires the pre batch, the DP's weave (post_sem) and
+				 * this batch together. Record the commit serial and tag every
+				 * app swapchain image this frame's GPU work reads, so
+				 * xrWaitSwapchainImage can wait exactly this fence if the app
+				 * laps us (vk_swapchain_wait_image). Both command buffers stay
+				 * parked in the slot until it retires.
+				 */
+				os_mutex_lock(&c->wsync.mutex);
+				ws->cmd_post = cmd;
+				ws->pool = cmd_pool;
+				ws->in_flight = true; // serial assigned and images tagged at take-slot
+				os_mutex_unlock(&c->wsync.mutex);
+				ws_done = true;
+				cmd_freed = true;
+			} else {
+				// post_sem keeps the DP's signal and present_sem is never
+				// signalled: the present below must wait nothing, and the
+				// post-present reset recreates the slot. Drain first, as the
+				// host-wait path effectively did before presenting a target
+				// whose post batch never landed.
+				vk_weave_sync_drain_queues(c, queue);
+				ws_chain = false;
+				ws_fail = "post batch submit failed";
+			}
+		} else if (res == VK_SUCCESS) {
 			if (*fence_p != VK_NULL_HANDLE) {
 				/*
 				 * #1264 S1 fence-park: a FILL must not hold the compositor
@@ -6082,14 +9414,40 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 					const char *pe = getenv("DXR_FILL_FENCE_PARK");
 					park = (pe != NULL && pe[0] == '0') ? 0 : 1;
 				}
+#ifdef VK_MIDFRAME_FILL
+				/*
+				 * #1905: with midframe_fill_park=0 (A/B only; the default
+				 * parks) a mid-frame-schedule fill waits UNDER the lock — see
+				 * dxr_midframe_fill_park. Bounded, so a fence that does not
+				 * signal falls through to the ordinary park below and
+				 * c->mutex is never held indefinitely (#1394 un-wedge needs
+				 * it free).
+				 */
+				if (is_repaint && c->repaint.mf.hold_lock &&
+				    vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, 250ULL * 1000 * 1000) ==
+				        VK_SUCCESS) {
+					vk->vkResetFences(vk->device, 1, fence_p);
+				} else if (is_repaint && park == 1 && c->target != NULL) {
+#else
 				if (is_repaint && park == 1 && c->target != NULL) {
+#endif
 					const uint32_t gen_park =
 					    comp_vk_native_target_get_generation(c->target);
 					const uint64_t serial_park = c->present_serial;
+					c->fill_parked = true;
+#ifdef VK_MIDFRAME_FILL
+					const uint64_t park_t0 = os_monotonic_get_ns();
+#endif
 					os_mutex_unlock(&c->mutex);
 					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, fence_p);
 					os_mutex_lock(&c->mutex);
+					c->fill_parked = false;
+#ifdef VK_MIDFRAME_FILL
+					// #1905: unlocked time (wait + relock) — trace only
+					// (parked_ema); fill_ema / the duty keep it in.
+					c->repaint.mf.fill_parked_ns += os_monotonic_get_ns() - park_t0;
+#endif
 					// GPU is done — the command buffer is free regardless of
 					// what the validation below decides.
 					vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -6109,9 +9467,26 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 							vk->vkDestroyFramebuffer(vk->device, target_fb,
 							                         NULL);
 						}
+						/*
+						 * The image this fill acquired is NOT presented, so
+						 * it must be handed back, or it is gone for the life
+						 * of the swapchain: a few such drops and the next
+						 * acquire blocks forever, with the app holding
+						 * c->mutex (#1748: DXR_WEAVE_REPAINT_FORCE=1 hung the
+						 * app in vkAcquireNextImageKHR within seconds). The
+						 * next frame renders into it instead. A recreate
+						 * (generation moved) drops the hold on its own.
+						 */
+						if (c->target != NULL) {
+							comp_vk_native_target_hold_unpresented(c->target, target_index);
+						}
 						*out_skip_frame = true;
 						return XRT_SUCCESS;
 					}
+					// Another frame may have acquired (and failed before
+					// presenting) while the lock was released: present THIS
+					// fill's image.
+					comp_vk_native_target_set_current_index(c->target, target_index);
 				} else {
 					vk->vkWaitForFences(vk->device, 1, fence_p, VK_TRUE, UINT64_MAX);
 					vk->vkResetFences(vk->device, 1, fence_p);
@@ -6141,13 +9516,40 @@ vk_dp_weave_and_present(struct comp_vk_native_compositor *c,
 	// hung off it (the frame witness, the presentID chains, the residual ring
 	// the #206 horizon is derived from, and the #902 vblank grid) would
 	// otherwise be anchored on a frame that never became pixels.
-	xret = comp_vk_native_target_present(c->target, queue, /*counted=*/!frame_dropped);
+	// #1748: the tag rides this commit — set here, under the lock, right
+	// before it, so no other commit can carry it.
+	vk_wl_move_sync_tag_present(c, ms_tag, ms_tag_x, ms_tag_y);
+	// #2095 / ADR-055: a chained frame's present waits present_sem on the
+	// GPU — the post batch signalled it after the COLOR→PRESENT barrier —
+	// instead of the host having drained first.
+	xret = comp_vk_native_target_present_ex(c->target, queue, /*counted=*/!frame_dropped,
+	                                        ws_done ? ws->present_sem : VK_NULL_HANDLE);
 	if (xret == XRT_SUCCESS && !frame_dropped) {
 		// #1394: a dropped frame IS presented (it is the only way to give the
 		// acquired image back) but never COUNTED. present_serial is the
 		// fence-park's drop-if-superseded key — bumping it here would let a
 		// parked fill mistake a recycled frame for a fresher one.
 		c->present_serial++; // #1264 S1: the fence-park's drop-if-superseded key
+	}
+	/*
+	 * #2095 / ADR-055 — a slot that did not complete its chain (left part-way
+	 * for any of the reasons in ws_fail, or whose present failed outright)
+	 * may hold a signal nothing waits, and a binary semaphore in that state
+	 * poisons its next use. Drain both queues and recreate every semaphore
+	 * in the ring before any later process_atlas — the slot contract's
+	 * recreate-on-drop, applied to every way of leaving the chain.
+	 */
+	if (ws != NULL && (!ws_done || xret != XRT_SUCCESS)) {
+		if (ws_acq_signalled) {
+			// The pre batch was never submitted (command-buffer allocation
+			// failed, or the DP path was not taken): the acquire signal is
+			// still pending and the target was presented with nothing
+			// waiting the presentation engine. Consume it on the host
+			// before the reset destroys the semaphore.
+			comp_vk_native_target_consume_acquire_signal(c->target, queue, ws->image_available);
+			ws_acq_signalled = false;
+		}
+		vk_weave_sync_ring_reset(c, queue, ws_fail != NULL ? ws_fail : "present failed");
 	}
 
 	/*
@@ -6435,6 +9837,1001 @@ vk_app_submit_window_open(const struct comp_vk_native_compositor *c)
 	return true;
 }
 
+#ifdef VK_MIDFRAME_FILL
+/*!
+ * #1905: fill at panel rate while the app is MID-FRAME (Android).
+ *
+ * Enable policy (dxr_midframe_fill_resolve, once at create): ON when
+ * VK_LAYER_DXR_queue_lock is live on the app's device — the #902 marker
+ * handshake, resolved through THIS device's vkGetDeviceProcAddr, so it is true
+ * however the layer got into the chain (the oxr_vulkan.c injection, the app's
+ * nativeLibraryDir, or the gpu_debug_layer_app settings path) and never
+ * depends on a log line. Absent: OFF. DXR_MIDFRAME_FILL /
+ * `debug.dxr.midframe_fill` "1" forces ON (test), "0" forces OFF; empty = auto.
+ *
+ * Why it needs the layer. Mid-frame fills put a runtime submit on the repaint
+ * queue while the app is submitting on its own — and on Adreno both queues
+ * land on ONE GSL context. The runtime's submits are serialised by c->mutex;
+ * the app's own vkQueueSubmit calls are not, and cannot be from here. The
+ * collision corrupts the context timestamp and the NEXT submit fails with
+ * VK_ERROR_INITIALIZATION_FAILED: when that next submit is the runtime's,
+ * comp_vk_native_queue_submit_retry recovers it; when it is the APP's, the
+ * app's frame is lost silently (earthview lost 12 of its own submits in 30 s
+ * under forced fills without the layer), and an app that waits a fence on it
+ * would hang. The layer's per-queue lock wraps every vkQueue* call in the
+ * process, the app's included — measured on the Lume phone with the layer
+ * live: 0 GSL warnings, 0 submit -3, across forced and mid-frame fills.
+ *
+ * Why it exists. A GPU-bound Android app is never between frames: it is
+ * either inside xrEndFrame (app_frame_in_progress) or rendering its next one,
+ * and the legacy quiet gate ("quiet >= 1.2 periods since the last APP frame")
+ * almost never opens inside a ~35 ms interval. Measured on a Lume phone
+ * (Adreno 740, 60 Hz): earthview 0.0-0.2 fills/s, weave + face refresh at the
+ * app's ~28 Hz while the panel and the vendor SDK sustain 60. With the layer
+ * and this on: earthview W 50 Hz, model viewer W 31.5 Hz, app fps = baseline.
+ *
+ * What it changes (see vk_midframe_gate_open for the rule):
+ *   - the `app_frame_in_progress` bail is dropped. Safe because on Android
+ *     layer_accum is only written under c->mutex (the app accumulates into
+ *     layer_stage, published at layer_commit), so a fill never reads a
+ *     half-written frame;
+ *   - between app frames a fill fires if the legacy gate says yes OR the
+ *     present-paced rule says yes; while the app is mid-frame every fill
+ *     (legacy-admitted too) must pass the present-paced spacing + duty rule;
+ *   - every fill yields to a posted app frame (weave_hand.pending, re-checked
+ *     under the lock); its GPU wait fence-parks unlocked by default
+ *     (dxr_midframe_fill_park).
+ * Off is the prior gating. (The layer_stage publish stays either way — it is
+ * the same frame, published under the lock instead of written in place.)
+ */
+static bool
+dxr_midframe_fill_resolve(bool layer_live)
+{
+	int forced = -1; // -1 = auto
+	const char *e = getenv("DXR_MIDFRAME_FILL");
+	if (e != NULL && e[0] != '\0') {
+		forced = (e[0] == '1') ? 1 : 0;
+	}
+#ifdef XRT_OS_ANDROID
+	else {
+		char sp[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.midframe_fill", sp) > 0 && sp[0] != '\0') {
+			forced = (sp[0] == '1') ? 1 : 0;
+		}
+	}
+#endif
+	const bool on = forced >= 0 ? (forced == 1) : layer_live;
+	U_LOG_W(
+	    "#1905: mid-frame fill %s — %s (DXR_MIDFRAME_FILL / debug.dxr.midframe_fill: 1 forces ON, 0 "
+	    "forces OFF, empty = auto on the queue-lock layer)",
+	    on ? "ON" : "OFF",
+	    forced == 1   ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: app submits are NOT "
+	                                  "serialised with fills, expect Adreno GSL -3 / lost app submits")
+	    : forced == 0 ? (layer_live ? "forced OFF; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced OFF; VK_LAYER_DXR_queue_lock absent")
+	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live on this device (it serialises the app's "
+	                    "submits with the fill's)"
+	                  : "auto: VK_LAYER_DXR_queue_lock absent on this device, app submits would race the "
+	                    "fill's on a shared GSL context");
+	return on;
+}
+
+/*!
+ * #1905: the duty-cycle cap for present-paced fills, in percent of wall time.
+ * DXR_MIDFRAME_FILL_DUTY / `debug.dxr.midframe_fill_duty`, default 60,
+ * clamped to [5, 100].
+ *
+ * The cap is a closed loop on MEASURED cost, not a prediction: fill_ema_ns is
+ * a fill's WALL time, the unlocked fence-park included, so allowing one
+ * present-paced fill start every fill_ema / duty keeps fills in flight at most
+ * `duty` of the time. The park must stay in: a fill's GPU cost shows up as
+ * park time, so it is the only brake on the GPU share fills take from a
+ * GPU-saturated app. Measured on the Lume phone (layer live, park=1), model
+ * viewer: wall-time duty -> fills 10.5/s, app 13.4 -> 9.9 fps = baseline,
+ * weave 31.5 Hz; lock-held-only duty (park excluded) -> fills 13.6/s, app
+ * 13.4 -> 7.3 fps, weave 25.3 Hz. Earthview was fine either way (~51 Hz).
+ * 60 is chosen from the force-probe data (FORCE ran fills at ~18-32/s with no
+ * app regression on model viewer and 10-30% on earthview). It applies to EVERY fill
+ * that starts while the app is mid-frame — legacy-gate ones included (round 3;
+ * exempting them let back-to-back legacy fills run the duty to 43-48%).
+ * Between app frames legacy fills keep their old, unthrottled verdict.
+ */
+static uint32_t
+dxr_midframe_fill_duty(void)
+{
+	static int duty = -1;
+	if (duty < 0) {
+		duty = 60;
+		const char *e = getenv("DXR_MIDFRAME_FILL_DUTY");
+#ifdef XRT_OS_ANDROID
+		char sp[PROP_VALUE_MAX] = {0};
+		if ((e == NULL || e[0] == '\0') && __system_property_get("debug.dxr.midframe_fill_duty", sp) > 0 &&
+		    sp[0] != '\0') {
+			e = sp;
+		}
+#endif
+		if (e != NULL && e[0] != '\0') {
+			const long v = strtol(e, NULL, 10);
+			duty = v < 5 ? 5 : (v > 100 ? 100 : (int)v);
+		}
+		U_LOG_W(
+		    "#1905: mid-frame fill duty cap %d%% (DXR_MIDFRAME_FILL_DUTY / "
+		    "debug.dxr.midframe_fill_duty)",
+		    duty);
+	}
+	return (uint32_t)duty;
+}
+
+/*!
+ * #1905: may a mid-frame-schedule fill fence-park (release c->mutex across
+ * its GPU wait, the #1264 S1 park)? DXR_MIDFRAME_FILL_PARK /
+ * `debug.dxr.midframe_fill_park` — default 1 (park); "0" selects the
+ * lock-held wait for A/B.
+ *
+ * History. Round 2 held c->mutex across the fill's GPU wait as a mitigation
+ * for the Adreno GSL -3 (the park was the one window where the repaint
+ * thread's wait ran beside the app's renderer_draw submit). It did not fix the
+ * race — the race is CPU-side, between the app's own unlocked vkQueueSubmit
+ * and any runtime submit; VK_LAYER_DXR_queue_lock fixes it — and it costs a
+ * GPU-saturated app: model viewer with the layer, park=0 vs park=1, app fps
+ * 13.2 -> 8.9 vs 13.4 -> 9.9 (baseline 13.5 -> 9.9), weave 25.8 vs 31.5 Hz;
+ * earthview W 48.3 vs 50.2 Hz. The app's layer_commit waited out every fill's
+ * GPU time. The park's other cost (renderer_draw may rewrite the atlas while
+ * the fill's weave still reads it on the GPU) is the same as for every legacy
+ * fill, which always parked. The lock-held wait stays BOUNDED when selected
+ * (see the park site).
+ */
+static bool
+dxr_midframe_fill_park(void)
+{
+	static int park = -1;
+	if (park < 0) {
+		park = 1;
+		const char *e = getenv("DXR_MIDFRAME_FILL_PARK");
+		if (e != NULL && e[0] != '\0') {
+			park = (e[0] == '1') ? 1 : 0;
+		}
+#ifdef XRT_OS_ANDROID
+		else {
+			char sp[PROP_VALUE_MAX] = {0};
+			if (__system_property_get("debug.dxr.midframe_fill_park", sp) > 0 && sp[0] != '\0') {
+				park = (sp[0] == '1') ? 1 : 0;
+			}
+		}
+#endif
+		U_LOG_W("#1905: mid-frame fill GPU wait: %s (DXR_MIDFRAME_FILL_PARK / debug.dxr.midframe_fill_park)",
+		        park ? "fence-park, c->mutex released (default)" : "held under c->mutex (A/B, bounded 250 ms)");
+	}
+	return park == 1;
+}
+
+/*!
+ * #1905: does the mid-frame schedule own this tick?
+ *
+ * Keyed on the resolved switch (c->repaint.mf.enabled), #1196 single weave ownership (the served-weave
+ * stamps the rule paces off only exist there), the #1257 partition NOT being
+ * engaged (it owns its own schedule), and the FORCE probe off (a probe keeps
+ * the old path so it stays comparable). Deliberately NOT keyed on the gate
+ * mode: that is 0 until the first u_repaint_gate_open, so keying on it made
+ * the first tick of every session take the legacy bail.
+ */
+static bool
+vk_midframe_active(const struct comp_vk_native_compositor *c)
+{
+	return c->repaint.mf.enabled && c->repaint.partition.next_release_ns == 0 && c->weave_hand.enabled == 1 &&
+	       c->repaint.force != 1;
+}
+
+/*
+ * #1905 ask 2 — non-blocking in-process hand-off.
+ *
+ * WHAT THE BLOCKING WAIT PROTECTED. Not the app's projection images:
+ * comp_vk_native_renderer_draw blits them into the runtime atlas and waits
+ * its own submit on the app thread, before the request is posted. What the
+ * served weave still reads is (a) the single runtime atlas, (b) compositor
+ * state the commit wrote for it (layer_accum, eff_layout, repaint.view_*,
+ * the capture source), and (c) on some frames the APP's swapchain images
+ * directly — window-space layers composited into the atlas, the Local2D
+ * flatten/composite, and zones. (a) and (b) are only rewritten by the NEXT
+ * layer_commit, under c->mutex; (c) is rewritten whenever the app reacquires.
+ *
+ * SO: no second atlas. The next commit drains the outstanding request
+ * (vk_async_handoff_drain) before it publishes layer_stage or touches the
+ * atlas — that IS the depth-1 bound, and since everything the weave reads is
+ * written only after it, the single atlas is never overwritten mid-sample.
+ * A second atlas would buy nothing: commit and weave serialise on c->mutex
+ * anyway. Frames whose weave reads app images (c) keep the
+ * blocking wait (vk_async_handoff_eligible), as do zero-copy frames (the
+ * "atlas" is then the app's own image).
+ *
+ * #2356: window-space layers are no longer one of them on this path —
+ * layer_commit submits their composite into the atlas itself, on the serve's
+ * queue, before the post (vk_async_composite_window_space_at_commit); the
+ * weave then skips its own stamp, and the app's reuse of a layer image is
+ * held at xrWaitSwapchainImage until that submit retires — the #2095
+ * backpressure. Local2D and zones still read app images from the weave.
+ *
+ * The served weave now runs while the app is submitting its next frame, so
+ * its queue work goes to the runtime-owned queue (see the queue choice in
+ * vk_dp_weave_and_present) — on the app's queue it queued behind the app's
+ * GPU work and starved the fills. The switch still requires
+ * VK_LAYER_DXR_queue_lock (the #902 marker the mid-frame fill keys on): on
+ * Adreno the runtime queue shares the GSL context with the app's, the race
+ * #1910 measured. Auto-ON on that layer (dxr_async_handoff_resolve).
+ */
+static bool
+dxr_async_handoff_resolve(bool layer_live, bool rt_queue, int single, int *out_forced)
+{
+	/*
+	 * AUTO-ON: on when the queue-lock layer is live, single weave ownership
+	 * is on and a runtime-owned queue exists. Measured on the Lume phone
+	 * (earthview, layer live, serve on the runtime queue): GetFace 53.8 ->
+	 * 59.8 Hz (flat 60 Hz presents), fills 28 -> 26/s, hand-off wait 6.0 ->
+	 * 0.54 ms, app +11%. Exactly "1" forces ON (still needs single ownership
+	 * and a runtime queue — without them it is unsafe or a regression), exactly
+	 * "0" disables, anything else is auto. The env, when set non-empty, wins
+	 * over the prop.
+	 */
+	int forced = -1; // -1 = auto
+	const char *e = getenv("DXR_ASYNC_HANDOFF");
+	if (e != NULL && e[0] != '\0') {
+		forced = strcmp(e, "1") == 0 ? 1 : strcmp(e, "0") == 0 ? 0 : -1;
+	}
+#ifdef XRT_OS_ANDROID
+	else {
+		char sp[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.async_handoff", sp) > 0) {
+			forced = strcmp(sp, "1") == 0 ? 1 : strcmp(sp, "0") == 0 ? 0 : -1;
+		}
+	}
+#endif
+	const bool base = single == 1 && rt_queue;
+	const bool on = forced == 0 ? false : forced == 1 ? base : (base && layer_live);
+	*out_forced = forced;
+	U_LOG_W(
+	    "#1905: non-blocking frame hand-off %s — %s (DXR_ASYNC_HANDOFF / debug.dxr.async_handoff: \"1\" forces "
+	    "ON with no fallback, \"0\" disables, anything else = auto on the queue-lock layer, falling back to "
+	    "blocking only while non-blocking measurably costs the app throughput — #1962)",
+	    on ? "ON" : "OFF",
+	    forced == 0   ? "disabled"
+	    : single != 1 ? "needs single weave ownership (#1196), which is off"
+	    : !rt_queue   ? "no runtime-owned VkQueue: the serve would queue behind the app's next frame on its "
+	                    "queue and starve the fills"
+	    : forced == 1 ? (layer_live ? "forced ON; VK_LAYER_DXR_queue_lock is live"
+	                                : "forced ON WITHOUT VK_LAYER_DXR_queue_lock: app submits are NOT serialised "
+	                                  "with the weave thread's, expect Adreno GSL -3 / lost app submits")
+	    : layer_live  ? "auto: VK_LAYER_DXR_queue_lock is live and the serve runs on the runtime-owned queue"
+	                  : "auto: VK_LAYER_DXR_queue_lock absent on this device — xrEndFrame keeps waiting for the "
+	                    "weave");
+	return on;
+}
+
+/*!
+ * #1905 ask 2: may THIS frame's weave run without the app waiting for it?
+ * Only when the served weave reads nothing the app owns — see the design
+ * note above. Called under c->mutex, after the frame's layer scan.
+ */
+static struct comp_vk_native_async_frame
+vk_async_frame_facts(const struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct comp_vk_native_async_frame f = {
+	    .enabled = c->hand_async.enabled,
+	    // The serve must be able to run on the runtime-owned queue + pool (the
+	    // pool is created after the switch resolves and its failure drops the
+	    // queue) — on the app's queue it starves the fills.
+	    .runtime_queue = c->repaint_queue != VK_NULL_HANDLE && c->repaint_cmd_pool != VK_NULL_HANDLE,
+	    .zero_copy = zero_copy,
+	    .local_2d = c->local_2d_last_frame,
+	    .zones = c->zones_frame,
+	    .zone_mask = c->active_zone_mask != NULL,
+	    .has_window_space = false,
+	    .window_space_at_commit = c->ws_composited_at_commit,
+	};
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		if (c->layer_accum.layers[i].data.type == XRT_LAYER_WINDOW_SPACE) {
+			f.has_window_space = true;
+			break;
+		}
+	}
+	return f;
+}
+
+static bool
+vk_async_handoff_eligible(const struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	// #2356: a window-space frame qualifies once layer_commit composited its
+	// layers itself (vk_async_composite_window_space_at_commit).
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	return comp_vk_native_async_frame_eligible(&f);
+}
+
+/*!
+ * #2356: decide, at commit, that this frame's window-space layers are
+ * composited into the atlas by a separate stamp batch (instead of inside the
+ * weave's own command buffer) — so the frame may take the non-blocking
+ * hand-off while the app's layer images stay protected.
+ *
+ * DECIDED AND TAGGED HERE; RECORDED AND SUBMITTED BY THE SERVE. Every app-
+ * thread placement of the Vulkan work cost the app its frame on a Nubia Pad 2:
+ * v1 submitted + host-waited here (14 ms at 220 MHz, 33 fps), v2 submitted
+ * here (~6 ms inside vkQueueSubmit, 38.5 fps), v3/v4 recorded here (~5.5 ms of
+ * recording at any GPU clock, 45.5 fps). Now the app thread only tags the
+ * layer images; the serve records and submits the batch as its first act
+ * (vk_ws_stamp_submit_for_serve) on the RUNTIME queue — the queue the serve
+ * runs on — and it is ordered by the GPU:
+ *
+ *  - AFTER the app's writes to its layer image and renderer_draw's atlas
+ *    writes: renderer_draw host-waited its own fence on the app's queue just
+ *    before this, and that fence covers everything submitted there before
+ *    it (the app's rendering into the layer image included). Exactly the
+ *    reasoning that already lets the non-blocking serve run on this queue.
+ *  - BEFORE the served weave: same queue, later in submission order, and the
+ *    stamp ends in a full ALL_COMMANDS barrier, so the crop, the transparency
+ *    probe and the DP's own submits (the DP was created against this queue,
+ *    #868; on the #2095 chain its pre_sem signal covers every earlier
+ *    command on the queue) all see the composited atlas. A frame stamped here
+ *    is therefore always served on the runtime queue, blocking or not
+ *    (vk_dp_weave_and_present's serve_rt).
+ *  - BEFORE the app overwrites the layer image: the image is tagged HERE with
+ *    the stamp's serial and xrWaitSwapchainImage waits the stamp's fence for
+ *    it (vk_ws_stamp_wait_image; if the serve has not yet run it first lets
+ *    it run) — the #2095 backpressure, for this one batch. With a
+ *    multi-image layer swapchain it has long retired by then.
+ *  - BEFORE the next stamp / renderer_draw rewrites the atlas: the fence, at
+ *    the top of the next commit (vk_ws_stamp_retire_before_draw) — normally
+ *    already signalled, because the serve that followed it on the same queue
+ *    was drained.
+ *
+ * It is the SAME GPU work the weave used to record
+ * (vk_compositor_render_window_space_into_atlas, incl. the #1795 linear path),
+ * moved, not duplicated; repaints and fills replay the atlas, which now
+ * already carries the overlay (#868).
+ *
+ * Only when the frame would otherwise qualify (comp_vk_native_async_composite_ws_at_commit);
+ * every other frame keeps the weave-time composite. On any failure
+ * c->ws_composited_at_commit stays false and the weave composites the layers
+ * as before (and the frame stays blocking).
+ *
+ * App thread, c->mutex held, after renderer_draw (the atlas holds the
+ * projection content in SHADER_READ_ONLY_OPTIMAL, and stays so until the serve
+ * — fills are skipped while a request is pending) and after the commit's drain
+ * of the previous non-blocking weave.
+ */
+static void
+vk_async_composite_window_space_at_commit(struct comp_vk_native_compositor *c, bool zero_copy)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	c->ws_composited_at_commit = false;
+	const struct comp_vk_native_async_frame f = vk_async_frame_facts(c, zero_copy);
+	if (!comp_vk_native_async_composite_ws_at_commit(&f) || c->renderer == NULL || c->eff_layout.cols == 0 ||
+	    c->eff_layout.rows == 0) {
+		return;
+	}
+	const uint64_t t0 = os_monotonic_get_ns();
+
+	os_mutex_lock(&c->ws_stamp.mutex);
+	const uint64_t t_lk = os_monotonic_get_ns();
+	// One outstanding at most (already retired / discarded at the top of this
+	// commit; this is the bound for the case that wait gave up).
+	c->ws_stamp.pending_submit = false;
+	if (!vk_ws_stamp_retire_locked(c)) {
+		os_mutex_unlock(&c->ws_stamp.mutex);
+		return;
+	}
+	if (c->ws_stamp.pool == VK_NULL_HANDLE) {
+		// Its own pool, on the runtime queue's family: the renderer's belongs
+		// to this thread's renderer_draw, the repaint pool to the weave thread.
+		VkCommandPoolCreateInfo pci = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		    .queueFamilyIndex = (uint32_t)c->repaint_queue_family,
+		};
+		VkCommandBufferAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		bool ok = vk->vkCreateCommandPool(vk->device, &pci, NULL, &c->ws_stamp.pool) == VK_SUCCESS;
+		if (ok) {
+			ai.commandPool = c->ws_stamp.pool;
+			ok = vk->vkAllocateCommandBuffers(vk->device, &ai, &c->ws_stamp.cmd) == VK_SUCCESS;
+		}
+		if (ok && c->ws_stamp.fence == VK_NULL_HANDLE) {
+			ok = vk->vkCreateFence(vk->device, &fci, NULL, &c->ws_stamp.fence) == VK_SUCCESS;
+		}
+		if (!ok) {
+			if (c->ws_stamp.pool != VK_NULL_HANDLE) {
+				vk->vkDestroyCommandPool(vk->device, c->ws_stamp.pool, NULL);
+			}
+			c->ws_stamp.pool = VK_NULL_HANDLE;
+			c->ws_stamp.cmd = VK_NULL_HANDLE;
+			os_mutex_unlock(&c->ws_stamp.mutex);
+			return;
+		}
+	}
+	// Decided, not recorded: the serve records AND submits it as its first act
+	// (vk_ws_stamp_submit_for_serve), on the runtime queue, from this frame's
+	// published layer state (stable under c->mutex until the next commit,
+	// which drains that serve first). The app thread does no Vulkan work for
+	// it at all: v2 submitted here (~6 ms in that vkQueueSubmit), v3/v4
+	// recorded here (~5.5 ms of recording on a Nubia Pad 2, at any GPU
+	// clock). The layer images are tagged NOW, so an xrWaitSwapchainImage
+	// that races the serve still waits for it (vk_ws_stamp_wait_image).
+	c->ws_stamp.pending_submit = true;
+	const uint64_t serial = ++c->ws_stamp.serial;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const struct comp_layer *l = &c->layer_accum.layers[i];
+		if (l->data.type == XRT_LAYER_WINDOW_SPACE && l->sc_array[0] != NULL) {
+			comp_vk_native_swapchain_note_stamp(l->sc_array[0], l->data.window_space.sub.image_index,
+			                                    serial);
+		}
+	}
+	c->ws_composited_at_commit = true;
+	os_mutex_unlock(&c->ws_stamp.mutex);
+
+	// TRACE: the app thread's cost — the decision and the tags only.
+	const uint64_t d = os_monotonic_get_ns() - t0;
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.win_ws_commit++;
+	vk_ws_stamp_ema(&c->hand_async.ws_commit_ema_ns, d);
+	vk_ws_stamp_ema(&c->hand_async.ws_lock_ema_ns, t_lk - t0);
+	os_mutex_unlock(&c->weave_hand.mutex);
+
+	static bool s_logged_on = false;
+	if (!s_logged_on) {
+		s_logged_on = true;
+		U_LOG_W(
+		    "#2356: window-space layers are composited by the serve (recorded + submitted on the runtime "
+		    "queue as its first act); layer_commit only tags the layer images — no app-thread Vulkan work "
+		    "(first frame: %.3f ms on the app thread)",
+		    (double)d / 1e6);
+	}
+}
+
+//! TRACE: fold one app-side hand-off wait into the EMA. weave_hand.mutex held.
+static void
+vk_async_note_wait(struct comp_vk_native_compositor *c, uint64_t d)
+{
+	const uint64_t ema = c->hand_async.wait_ema_ns;
+	c->hand_async.wait_ema_ns = ema == 0 ? (d == 0 ? 1 : d) : (ema * 7 + d) / 8;
+}
+
+/*
+ * #1905/#1962: harm-scored fallback (see hand_async.fallback). P = one panel
+ * period. The sample is the app's frame interval, admit to admit, attributed
+ * to the mode the PREVIOUS frame was posted in (its blocking wait, or the
+ * drain the next commit paid for it, both land inside that interval).
+ *
+ * - WARM-UP: nothing is scored for the first VK_ASYNC_WARMUP_FRAMES frames
+ *   AND VK_ASYNC_WARMUP_NS of a session, and again after any swapchain
+ *   creation, effective-layout / target / 2D-3D change, a frame that cannot
+ *   go non-blocking, an abandoned serve, or a gap > VK_ASYNC_GAP_NS. #1962:
+ *   the first 16 frames of every model-viewer launch drained 19-43 ms (app
+ *   warm-up) and tripped the old scorer for the whole session.
+ * - SETTLE: the first VK_ASYNC_SETTLE samples after a mode switch mix both
+ *   modes and are discarded.
+ * - TRIP (non-blocking -> blocking), judged per VK_ASYNC_FB_WINDOW samples:
+ *   the drain exceeded a FULL P on more than half of them AND the mean app
+ *   interval is worse than 2P AND, when a blocking reference exists from an
+ *   earlier fallback, worse than 1.1x that reference (hysteresis — async
+ *   already proved it beats blocking there). The #1939 case (13 fps, ~42 ms
+ *   drains) trips; #1962's model viewer (55-59 fps phone, 38-39 tablet,
+ *   8-16 ms drains) does not.
+ * - BLOCKING: every full window of blocking samples refreshes the blocking
+ *   reference interval. Probing waits for one.
+ * - PROBE: VK_ASYNC_FIRST_PROBE_NS after a trip, then every VK_ASYNC_PROBE_NS
+ *   after a failed probe, a WINDOW of non-blocking frames (settle +
+ *   VK_ASYNC_FB_WINDOW samples). It RECOVERS if its mean app interval is not
+ *   worse than 1.05x the blocking reference, or if the window would not trip
+ *   on its own. (The old probe judged ONE frame against P/2 straight after a
+ *   blocking stretch — it could never pass: no recovery in ~25 #1962 runs.)
+ */
+#define VK_ASYNC_FB_WINDOW 32
+#define VK_ASYNC_FB_STALL_NS (500ULL * 1000) //!< trace-row "stall" (win_stalls), not a scoring input
+#define VK_ASYNC_WARMUP_FRAMES 60
+#define VK_ASYNC_WARMUP_NS (1ULL * 1000 * 1000 * 1000)
+#define VK_ASYNC_GAP_NS (250ULL * 1000 * 1000)
+#define VK_ASYNC_SETTLE 2
+#define VK_ASYNC_FIRST_PROBE_NS (1ULL * 1000 * 1000 * 1000)
+#define VK_ASYNC_PROBE_NS (5ULL * 1000 * 1000 * 1000)
+//! Trips / recoveries / probe failures logged at WARN before dropping to INFO.
+#define VK_ASYNC_FB_WARN_MAX 4
+
+//! The panel period the compositor was sized for.
+static uint64_t
+vk_async_period_ns(const struct comp_vk_native_compositor *c)
+{
+	const double hz = (c->display_refresh_rate > 1.0f) ? (double)c->display_refresh_rate : 60.0;
+	return (uint64_t)(U_TIME_1S_IN_NS / hz);
+}
+
+//! What, if it changes, restarts the warm-up: the effective layout, the
+//! target size and the 2D/3D state. FNV-1a over the fields.
+static uint64_t
+vk_async_fb_cfg_key(const struct comp_vk_native_compositor *c, uint32_t tgt_w, uint32_t tgt_h)
+{
+	const uint64_t v[8] = {c->eff_layout.views,
+	                       c->eff_layout.cols,
+	                       c->eff_layout.rows,
+	                       c->eff_layout.tile_w,
+	                       c->eff_layout.tile_h,
+	                       tgt_w,
+	                       tgt_h,
+	                       c->hardware_display_3d};
+	uint64_t h = 1469598103934665603ULL;
+	for (size_t i = 0; i < ARRAY_SIZE(v); i++) {
+		h = (h ^ v[i]) * 1099511628211ULL;
+	}
+	return h;
+}
+
+static void
+vk_async_fb_window_reset(struct comp_vk_native_compositor *c)
+{
+	c->hand_async.fb_n = 0;
+	c->hand_async.fb_over_p = 0;
+	c->hand_async.fb_iv_ns = 0;
+	c->hand_async.fb_drain_ns = 0;
+}
+
+//! Publish the trace-visible state. App thread.
+static void
+vk_async_fb_publish(struct comp_vk_native_compositor *c, bool fallback, bool probing, int trip, int rec, int fail)
+{
+	os_mutex_lock(&c->weave_hand.mutex);
+	c->hand_async.fallback = fallback;
+	c->hand_async.probing = probing;
+	c->hand_async.trips += (uint32_t)trip;
+	c->hand_async.recoveries += (uint32_t)rec;
+	c->hand_async.probe_fails += (uint32_t)fail;
+	os_mutex_unlock(&c->weave_hand.mutex);
+}
+
+/*!
+ * #1905/#1962: judge a full window of samples — trip, refresh the blocking
+ * reference, or settle a probe. App thread, c->mutex held.
+ */
+static void
+vk_async_fb_judge(struct comp_vk_native_compositor *c, uint64_t now, uint64_t p)
+{
+	const uint32_t n = c->hand_async.fb_n;
+	const uint32_t over = c->hand_async.fb_over_p;
+	const uint64_t mean_iv = c->hand_async.fb_iv_ns / n;
+	const double iv_ms = (double)mean_iv / 1e6;
+	const double drain_ms = (double)(c->hand_async.fb_drain_ns / n) / 1e6;
+	const uint64_t ref = c->hand_async.fb_blk_ref_iv_ns;
+	const double ref_ms = (double)ref / 1e6;
+	const double p_ms = (double)p / 1e6;
+	const bool harmful = over * 2 > n && mean_iv > 2 * p;
+	vk_async_fb_window_reset(c);
+
+	if (c->hand_async.fallback && !c->hand_async.probing) {
+		c->hand_async.fb_blk_ref_iv_ns = mean_iv; // newest blocking reference
+		return;
+	}
+
+	if (!c->hand_async.fallback) {
+		if (!harmful || (ref != 0 && mean_iv * 10 <= ref * 11)) {
+			return;
+		}
+		c->hand_async.fb_next_probe_ns = now + VK_ASYNC_FIRST_PROBE_NS;
+		c->hand_async.fb_blk_ref_iv_ns = 0; // re-measure blocking before the probe
+		vk_async_fb_publish(c, true, false, 1, 0, 0);
+		const uint32_t t = c->hand_async.trips;
+		if (t > VK_ASYNC_FB_WARN_MAX) {
+			U_LOG_I("#1905/#1962: hand-off fallback trip #%u: drain>P %u/%u, app iv %.2f ms", t, over, n,
+			        iv_ms);
+			return;
+		}
+		/*
+		 * #2095: what "commit drain" measures. Host-wait path: the wait for the
+		 * previous serve, whose own host drains contain the weave's GPU time.
+		 * GPU chain: the serve returns without waiting the GPU, so the drain is
+		 * the wait for the serve's CPU work PLUS the top-of-commit wait on the
+		 * previous chained weave's fence (vk_weave_sync_wait_latest) — i.e.
+		 * still the whole time this commit stood behind the previous weave,
+		 * measured where it is now paid rather than where it used to be. A
+		 * trip under the chain means the weave's GPU time itself exceeds the
+		 * app's frame, which blocking cannot improve; ADR-055 expects silence.
+		 */
+		U_LOG_W(
+		    "#1905/#1962: non-blocking hand-off -> BLOCKING (trip #%u): over %u frames the commit drain "
+		    "(serve wait + previous weave's fence under the #2095 chain) "
+		    "exceeded P = %.2f ms on %u (mean drain %.2f ms) and the app interval averaged %.2f ms > 2P "
+		    "(last blocking window: %.2f ms, 0 = none) — the served weave runs behind the app's queued "
+		    "frames and costs throughput. Probing a %u-frame non-blocking window in %llu s.",
+		    t, n, p_ms, over, drain_ms, iv_ms, ref_ms, VK_ASYNC_FB_WINDOW,
+		    (unsigned long long)(VK_ASYNC_FIRST_PROBE_NS / 1000000000ULL));
+		return;
+	}
+
+	// The probe window is complete.
+	if (!harmful || mean_iv * 20 <= ref * 21) {
+		vk_async_fb_publish(c, false, false, 0, 1, 0);
+		const uint32_t r = c->hand_async.recoveries;
+		if (r > VK_ASYNC_FB_WARN_MAX) {
+			U_LOG_I("#1905/#1962: hand-off recovery #%u: app iv %.2f vs blocking %.2f ms", r, iv_ms,
+			        ref_ms);
+			return;
+		}
+		U_LOG_W(
+		    "#1905/#1962: hand-off probe window RECOVERED -> non-blocking (recovery #%u): %u frames, app "
+		    "interval %.2f ms vs blocking %.2f ms, drain > P = %.2f ms on %u (mean drain %.2f ms).",
+		    r, n, iv_ms, ref_ms, p_ms, over, drain_ms);
+		return;
+	}
+	c->hand_async.fb_next_probe_ns = now + VK_ASYNC_PROBE_NS;
+	vk_async_fb_publish(c, true, false, 0, 0, 1);
+	const uint32_t f = c->hand_async.probe_fails;
+	if (f > VK_ASYNC_FB_WARN_MAX) {
+		U_LOG_I("#1905/#1962: hand-off probe #%u failed: app iv %.2f vs blocking %.2f ms", f, iv_ms, ref_ms);
+		return;
+	}
+	U_LOG_W(
+	    "#1905/#1962: hand-off probe window failed (#%u), staying BLOCKING: %u frames, app interval %.2f ms "
+	    "vs blocking %.2f ms, drain > P = %.2f ms on %u (mean drain %.2f ms). Next probe in %llu s.",
+	    f, n, iv_ms, ref_ms, p_ms, over, drain_ms, (unsigned long long)(VK_ASYNC_PROBE_NS / 1000000000ULL));
+}
+
+/*!
+ * #1905/#1962: score the previous frame and decide whether THIS frame goes
+ * non-blocking. Every frame on the weave-hand-off path calls it — @p eligible
+ * false (vk_async_handoff_eligible said no) always returns false and restarts
+ * the warm-up. App thread, c->mutex held. Rules: the block comment above.
+ */
+static bool
+vk_async_fallback_admit(struct comp_vk_native_compositor *c, bool eligible, uint32_t tgt_w, uint32_t tgt_h)
+{
+	if (!eligible) {
+		c->hand_async.fb_prev_valid = false;
+		c->hand_async.fb_warm_frames = 0; // forces the re-arm below on the next eligible frame
+		c->hand_async.fb_cfg_key = 0;
+		return false;
+	}
+	if (c->hand_async.forced == 1) {
+		return true; // forced ON: an experiment, never second-guessed
+	}
+
+	const uint64_t now = os_monotonic_get_ns();
+	const uint64_t p = vk_async_period_ns(c);
+	const uint64_t iv = c->hand_async.fb_last_admit_ns != 0 ? now - c->hand_async.fb_last_admit_ns : 0;
+	c->hand_async.fb_last_admit_ns = now;
+
+	os_mutex_lock(&c->weave_hand.mutex);
+	const uint32_t sc_gen = c->hand_async.sc_gen;
+	os_mutex_unlock(&c->weave_hand.mutex);
+	const uint64_t key = vk_async_fb_cfg_key(c, tgt_w, tgt_h);
+
+	const bool cfg_changed = key != c->hand_async.fb_cfg_key || sc_gen != c->hand_async.fb_sc_gen_seen;
+	if (cfg_changed || c->hand_async.fb_rearm || iv == 0 || iv > VK_ASYNC_GAP_NS) {
+		c->hand_async.fb_cfg_key = key;
+		c->hand_async.fb_sc_gen_seen = sc_gen;
+		c->hand_async.fb_rearm = false;
+		c->hand_async.fb_warm_frames = VK_ASYNC_WARMUP_FRAMES;
+		c->hand_async.fb_warm_until_ns = now + VK_ASYNC_WARMUP_NS;
+		c->hand_async.fb_prev_valid = false;
+		vk_async_fb_window_reset(c);
+		if (cfg_changed) {
+			c->hand_async.fb_blk_ref_iv_ns = 0; // measured for another configuration
+		}
+		if (c->hand_async.probing) {
+			// An interrupted probe proves nothing: back to blocking, retry soon.
+			c->hand_async.fb_next_probe_ns = now + VK_ASYNC_FIRST_PROBE_NS;
+			vk_async_fb_publish(c, true, false, 0, 0, 0);
+		}
+	} else if (c->hand_async.fb_prev_valid) {
+		if (c->hand_async.fb_warm_frames > 0 || now < c->hand_async.fb_warm_until_ns) {
+			if (c->hand_async.fb_warm_frames > 0) {
+				c->hand_async.fb_warm_frames--;
+			}
+		} else if (c->hand_async.fb_settle > 0) {
+			c->hand_async.fb_settle--;
+		} else {
+			const bool sample_async = c->hand_async.fb_prev_async;
+			const bool want_async = !c->hand_async.fallback || c->hand_async.probing;
+			if (sample_async == want_async) {
+				c->hand_async.fb_n++;
+				c->hand_async.fb_iv_ns += iv;
+				if (sample_async) {
+					c->hand_async.fb_drain_ns += c->hand_async.fb_last_drain_ns;
+					if (c->hand_async.fb_last_drain_ns > p) {
+						c->hand_async.fb_over_p++;
+					}
+				}
+			}
+		}
+	}
+
+	if (c->hand_async.fb_n >= VK_ASYNC_FB_WINDOW) {
+		vk_async_fb_judge(c, now, p);
+	}
+
+	// Decide this frame.
+	bool post_async;
+	if (!c->hand_async.fallback || c->hand_async.probing) {
+		post_async = true;
+	} else if (now >= c->hand_async.fb_next_probe_ns && c->hand_async.fb_blk_ref_iv_ns != 0 &&
+	           c->hand_async.fb_warm_frames == 0 && now >= c->hand_async.fb_warm_until_ns) {
+		vk_async_fb_window_reset(c);
+		vk_async_fb_publish(c, true, true, 0, 0, 0);
+		post_async = true;
+	} else {
+		post_async = false;
+	}
+	if (c->hand_async.fb_prev_valid && post_async != c->hand_async.fb_prev_async) {
+		c->hand_async.fb_settle = VK_ASYNC_SETTLE;
+	}
+	c->hand_async.fb_prev_async = post_async;
+	c->hand_async.fb_prev_valid = true;
+	return post_async;
+}
+
+enum vk_async_drain
+{
+	VK_ASYNC_DRAIN_CLEAR,      //!< nothing outstanding, or it was served; c->mutex NOT held
+	VK_ASYNC_DRAIN_LOCK_TAKEN, //!< abandoned late weave; c->mutex IS held (trylock won)
+	VK_ASYNC_DRAIN_WEDGED,     //!< abandoned and c->mutex held by the weave: drop this frame
+};
+
+/*!
+ * #1905 ask 2: THE BOUND. Wait for the posted-but-unawaited weave before the
+ * caller touches anything it reads or records from. In the normal case (app
+ * frame longer than the weave) it was served long ago and this returns at once.
+ *
+ * @p from_commit: layer_commit's drain consumes the request (clears
+ * outstanding_seq) and feeds the trace; any other app-thread entry point (the
+ * zone-mask API — its state is read by the serve's tail, and the tail's
+ * trigger-gated captures record on the renderer's pool and submit on the app
+ * queue, as the zone-mask API does) only waits for it.
+ *
+ * Same 2 s deadline, abandon-by-serial and trylock evidence test as the
+ * blocking wait in layer_commit (#1394), for the same reasons — repeated here
+ * rather than shared so the non-Android frame path stays byte-identical.
+ * Called with c->mutex NOT held.
+ */
+static enum vk_async_drain
+vk_async_handoff_drain(struct comp_vk_native_compositor *c, bool from_commit)
+{
+	const uint64_t t0 = os_monotonic_get_ns();
+	bool abandoned = false;
+	os_mutex_lock(&c->weave_hand.mutex);
+	const uint64_t my_seq = c->hand_async.outstanding_seq;
+	if (my_seq == 0) {
+		os_mutex_unlock(&c->weave_hand.mutex);
+		if (from_commit) {
+			c->hand_async.fb_last_drain_ns = 0; // app thread: the #1962 scorer's input
+		}
+		return VK_ASYNC_DRAIN_CLEAR;
+	}
+	if (from_commit) {
+		c->hand_async.outstanding_seq = 0;
+	}
+	const uint64_t deadline_ns = t0 + 2ULL * 1000 * 1000 * 1000;
+	while (c->weave_hand.pending && c->weave_hand.seq == my_seq) {
+		os_cond_wait_timeout_ns(&c->weave_hand.cond, &c->weave_hand.mutex, 100ULL * 1000 * 1000);
+		if (!c->weave_hand.pending || c->weave_hand.seq != my_seq) {
+			break;
+		}
+		if ((uint64_t)os_monotonic_get_ns() < deadline_ns) {
+			continue;
+		}
+		// Expired: withdraw, so a serve that completes later is dropped.
+		c->weave_hand.pending = false;
+		c->weave_hand.seq++;
+		c->weave_hand.result = XRT_SUCCESS;
+		c->weave_hand.skip_frame = true;
+		abandoned = true;
+		break;
+	}
+	if (!abandoned) {
+		c->weave_hand.consecutive_expiries = 0;
+	}
+	if (from_commit) {
+		const uint64_t d = os_monotonic_get_ns() - t0;
+		vk_async_note_wait(c, d);
+		if (d > VK_ASYNC_FB_STALL_NS) {
+			c->hand_async.win_stalls++;
+		}
+		// #1962: scored at this frame's admit (vk_async_fallback_admit),
+		// app thread like this. An abandoned serve restarts the warm-up.
+		c->hand_async.fb_last_drain_ns = d;
+		if (abandoned) {
+			c->hand_async.fb_rearm = true;
+		}
+	}
+	const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
+	os_mutex_unlock(&c->weave_hand.mutex);
+
+	if (!abandoned) {
+		return VK_ASYNC_DRAIN_CLEAR;
+	}
+
+	// The #1394 evidence test, verbatim in intent: a free c->mutex means the
+	// weave is late, not gone (escalate only on repetition); a held one means
+	// it is parked inside the vendor weaver.
+	c->weave_hand.consecutive_expiries++;
+	if (os_mutex_trylock(&c->mutex) == 0) {
+		c->repaint.armed = false;
+		if (c->weave_hand.consecutive_expiries >= 3) {
+			c->weave_hand.wedged_heartbeat = hb_at_expiry;
+			c->weave_hand.wedged = true;
+			U_LOG_E(
+			    "#1394/#1905: %u consecutive 2 s expiries on the non-blocking hand-off — treating the "
+			    "weave as wedged even though c->mutex is free.",
+			    c->weave_hand.consecutive_expiries);
+		} else {
+			U_LOG_W(
+			    "#1394/#1905: the previous frame's weave took over 2 s — dropped it (%u in a row); "
+			    "c->mutex is free, so the weave thread is late, not wedged.",
+			    c->weave_hand.consecutive_expiries);
+		}
+		return VK_ASYNC_DRAIN_LOCK_TAKEN;
+	}
+	c->repaint.armed = false;
+	c->weave_hand.wedged_heartbeat = hb_at_expiry;
+	c->weave_hand.wedged = true;
+	U_LOG_E(
+	    "#1394/#1905: weave thread unresponsive for 2 s and c->mutex is held — abandoning the weave "
+	    "(non-blocking hand-off drain). The app keeps running; the window will not update until the "
+	    "thread returns.");
+	return VK_ASYNC_DRAIN_WEDGED;
+}
+
+/*!
+ * #1905 ask 2: drain for an app-thread entry point outside layer_commit (the
+ * zone-mask API). Returns false when the weave is wedged — the caller then
+ * fails rather than race a parked weave's tail on the renderer's pool.
+ */
+static bool
+vk_async_handoff_quiesce(struct comp_vk_native_compositor *c)
+{
+	switch (vk_async_handoff_drain(c, /*from_commit=*/false)) {
+	case VK_ASYNC_DRAIN_LOCK_TAKEN: os_mutex_unlock(&c->mutex); return true;
+	case VK_ASYNC_DRAIN_WEDGED: return false;
+	default: return true;
+	}
+}
+
+/*!
+ * #1905 ask 2: the app frame's post-weave tail, for a request nobody waited
+ * on. Mirrors what layer_commit runs after a served blocking weave (the #902
+ * app-interval EMA, the #1257 gate, the ADR-027 zone sideband, the
+ * post-compose capture and the composite tap). Weave thread, c->mutex held —
+ * the same lock the blocking path runs it under, so the serialisation is
+ * unchanged; only the thread differs.
+ */
+static void
+vk_async_handoff_tail(struct comp_vk_native_compositor *c, bool skip_frame, xrt_result_t xret)
+{
+	if (skip_frame) {
+		return;
+	}
+	if (xret != XRT_SUCCESS) {
+		// A blocking frame returned this from xrEndFrame; nobody is waiting
+		// now, so it is logged (throttled) and the frame is lost — exactly
+		// what happens to a failed fill.
+		static uint64_t s_logged_ns = 0;
+		const uint64_t now_ns = os_monotonic_get_ns();
+		if (s_logged_ns == 0 || now_ns - s_logged_ns > 5ULL * 1000 * 1000 * 1000) {
+			s_logged_ns = now_ns;
+			U_LOG_W(
+			    "#1905: non-blocking app weave failed (xrt_result %d) — frame dropped. Throttled to one "
+			    "line per 5 s.",
+			    (int)xret);
+		}
+		return;
+	}
+	const uint64_t now_af = os_monotonic_get_ns();
+	if (c->repaint.last_app_frame_ns != 0) {
+		const uint64_t d = now_af - c->repaint.last_app_frame_ns;
+		if (d > 1000000ULL && d < 500000000ULL) {
+			c->repaint.app_interval_ns =
+			    c->repaint.app_interval_ns == 0 ? d : (c->repaint.app_interval_ns * 7 + d) / 8;
+		}
+	}
+	c->repaint.last_app_frame_ns = now_af;
+	u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
+
+	vk_sync_zone_mask_to_dp(c);
+	vk_native_dispatch_capture(c, MCP_CAPTURE_MODE_POST_COMPOSE);
+	vk_native_dispatch_composite_tap(c);
+}
+
+/*!
+ * #1905: may a present-paced fill start at @p now_ns? OR-ed with the legacy
+ * gate between app frames (there it only ever ADDS fills); AND-ed with it while
+ * the app is mid-frame (vk_midframe_app_mid), where it is the throttle every
+ * fill must pass.
+ *
+ *  1. HALF A PERIOD past the last present (served app weave END, or fill END),
+ *     so the fill targets the NEXT vblank rather than the one the last present
+ *     already took.
+ *  2. Fill START to fill START >= max(0.9 P, fill_ema * 100 / duty). The 0.9 P
+ *     floor keeps it to one fill per panel period (same spacing constant as
+ *     the #1257 stall branches); the duty term is the governor — it caps the
+ *     share of wall time fills hold c->mutex at `duty` percent, measured from
+ *     actual fills (dxr_midframe_fill_duty).
+ *
+ * No prediction of the app's next post: the round-1 predictor refused ~100%
+ * of fills on device and froze its own estimate (it only updated on the fills
+ * it refused). App priority is instead structural — a posted app frame always
+ * wins the lock race (weave_hand.pending, checked under the lock), and the
+ * duty cap bounds how long the app can wait for c->mutex in aggregate.
+ *
+ * @p duty_refused, when non-NULL, reports that (2)'s duty term was the reason.
+ */
+static bool
+vk_midframe_gate_open(const struct comp_vk_native_compositor *c,
+                      uint64_t now_ns,
+                      uint64_t period_ns,
+                      bool *duty_refused)
+{
+	if (duty_refused != NULL) {
+		*duty_refused = false;
+	}
+	const uint64_t last_end = c->repaint.mf.serve_end_ns > c->repaint.gate.last_repaint_end_ns
+	                              ? c->repaint.mf.serve_end_ns
+	                              : c->repaint.gate.last_repaint_end_ns;
+	if (last_end == 0 || now_ns < last_end || now_ns - last_end < period_ns / 2) {
+		return false;
+	}
+	const uint64_t last_fill = c->repaint.gate.last_repaint_ns;
+	if (last_fill != 0 && now_ns > last_fill) {
+		const uint64_t since = now_ns - last_fill;
+		if (since < (period_ns * 9) / 10) {
+			return false;
+		}
+		const uint64_t duty_gap = c->repaint.mf.fill_ema_ns * 100 / dxr_midframe_fill_duty();
+		if (since < duty_gap) {
+			if (duty_refused != NULL) {
+				*duty_refused = true;
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
+/*!
+ * #1905: is the app MID-FRAME (between xrBeginFrame and the end of its
+ * xrEndFrame submit)? This is the window where fills compete with the app for
+ * c->mutex and the GPU, so every fill admitted in it — by the legacy gate or
+ * the present-paced rule — must also pass vk_midframe_gate_open's spacing +
+ * duty rule. Between frames the legacy gate keeps its unthrottled verdict.
+ */
+static bool
+vk_midframe_app_mid(const struct comp_vk_native_compositor *c)
+{
+	return c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
+}
+
+//! #1905: count a duty refusal into the trace tally — once per withheld fill
+//! (0.9 P), not once per P/4 loop tick.
+static void
+vk_midframe_note_duty_skip(struct comp_vk_native_compositor *c, uint64_t now_ns, uint64_t period_ns)
+{
+	const uint64_t last = c->repaint.mf.last_duty_skip_ns;
+	if (last == 0 || now_ns < last || now_ns - last >= (period_ns * 9) / 10) {
+		c->repaint.mf.skip_duty++;
+		c->repaint.mf.last_duty_skip_ns = now_ns;
+	}
+}
+
+//! #1905: is an app-frame weave posted and not yet served? Takes the hand-off
+//! leaf lock; legal with c->mutex held (c->mutex -> weave_hand.mutex only).
+static bool
+vk_midframe_app_weave_pending(struct comp_vk_native_compositor *c)
+{
+	os_mutex_lock(&c->weave_hand.mutex);
+	const bool pending = c->weave_hand.pending;
+	os_mutex_unlock(&c->weave_hand.mutex);
+	return pending;
+}
+#endif // VK_MIDFRAME_FILL
+
 static bool
 dxr_vblank_grid_pacing_enabled(void)
 {
@@ -6510,7 +10907,10 @@ vk_repaint_thread(void *ptr)
 			 * does not exist yet; until it does, refusing to chase is the only
 			 * honest option.
 			 */
-			if (measured_ns != 0 && measured_ns < period_ns) {
+			// FASTER means a different mode, not rounding: 1e9/60 assumed vs a
+			// measured 16666666 ns tripped a strict `<` (#2068). Same 1%
+			// deadband the grid itself uses for a mode change.
+			if (measured_ns != 0 && measured_ns * 100 < period_ns * 99) {
 				if (!c->repaint.grid_clamp_logged) {
 					c->repaint.grid_clamp_logged = true;
 					U_LOG_W("#902: measured %.3f ms is FASTER than the assumed %.3f ms — "
@@ -6589,6 +10989,9 @@ vk_repaint_thread(void *ptr)
 		uint64_t h_zc_image = 0, h_zc_view = 0;
 		int32_t h_zc_format = 0;
 		uint32_t h_zc_w = 0, h_zc_h = 0, h_tgt_w = 0, h_tgt_h = 0;
+#ifdef VK_MIDFRAME_FILL
+		bool h_async = false;
+#endif
 
 		os_mutex_lock(&c->weave_hand.mutex);
 		if (!c->weave_hand.pending) {
@@ -6607,6 +11010,9 @@ vk_repaint_thread(void *ptr)
 			h_tgt_h = c->weave_hand.tgt_height;
 			h_ftime = c->weave_hand.ftime;
 			h_fp0 = c->weave_hand.fp0;
+#ifdef VK_MIDFRAME_FILL
+			h_async = c->weave_hand.async;
+#endif
 		}
 		os_mutex_unlock(&c->weave_hand.mutex);
 
@@ -6619,16 +11025,73 @@ vk_repaint_thread(void *ptr)
 			// an epoch-length first interval in DXR_FRAME_STAGE_TIMING.
 			h_fp[0] = h_fp0;
 
+#ifdef VK_MIDFRAME_FILL
+			// #1905 (trace): the app's interval as this thread sees it, serve
+			// START to serve START. Outlier-rejecting: a sample > 2x the EMA
+			// (a hitch, a pause) is dropped, and only three in a row reseed —
+			// so one 400 ms stall cannot poison it. 0 means "no data".
+			{
+				const uint64_t s_now = os_monotonic_get_ns();
+				const uint64_t s_prev = c->repaint.mf.serve_start_ns;
+				if (s_prev != 0 && s_now > s_prev) {
+					const uint64_t d = s_now - s_prev;
+					const uint64_t ema = c->repaint.mf.serve_iv_ema_ns;
+					if (ema == 0 || d <= 2 * ema) {
+						c->repaint.mf.serve_iv_ema_ns = ema == 0 ? d : (ema * 7 + d) / 8;
+						c->repaint.mf.serve_iv_rejects = 0;
+					} else if (++c->repaint.mf.serve_iv_rejects >= 3) {
+						c->repaint.mf.serve_iv_ema_ns = d;
+						c->repaint.mf.serve_iv_rejects = 0;
+					}
+				}
+				c->repaint.mf.serve_start_ns = s_now;
+			}
+#endif
+
 			os_mutex_lock(&c->mutex);
 			if (os_thread_helper_is_running(&c->repaint_thread) && c->display_processor != NULL &&
 			    c->target != NULL) {
 				h_skip = false;
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = h_async;
+				const uint64_t serve_t0 = os_monotonic_get_ns();
+#endif
 				h_result = vk_dp_weave_and_present(c, /*is_repaint=*/false, h_zero_copy, h_zc_image,
 				                                   h_zc_view, h_zc_format, h_zc_w, h_zc_h, h_tgt_w,
 				                                   h_tgt_h, h_ftime, h_fp, &h_skip);
+#ifdef VK_MIDFRAME_FILL
+				c->hand_async.serving = false;
+				{
+					// #2356 TRACE: serve wall time (weave_hand.mutex: the row reads it there).
+					const uint64_t sd = os_monotonic_get_ns() - serve_t0;
+					os_mutex_lock(&c->weave_hand.mutex);
+					vk_ws_stamp_ema(&c->hand_async.serve_ema_ns, sd);
+					os_mutex_unlock(&c->weave_hand.mutex);
+				}
+#endif
 			}
 			// else: torn down under the waiter. Fail the frame, never strand it.
+#ifdef VK_MIDFRAME_FILL
+			// #1905 ask 2: nobody waits for a non-blocking request, so its
+			// post-weave tail runs here, still under c->mutex.
+			// Only for a request that is still the live one: a serve the
+			// requester abandoned (#1394) must not stamp the gate or consume
+			// a capture. c->mutex -> weave_hand.mutex is the legal order.
+			if (h_async) {
+				os_mutex_lock(&c->weave_hand.mutex);
+				const bool live = c->weave_hand.pending && c->weave_hand.seq == serve_seq;
+				os_mutex_unlock(&c->weave_hand.mutex);
+				if (live) {
+					vk_async_handoff_tail(c, h_skip, h_result);
+				}
+			}
+#endif
 			os_mutex_unlock(&c->mutex);
+#ifdef VK_MIDFRAME_FILL
+			// #1905: the app weave's present is the "last present" a mid-frame
+			// fill paces off — stamped here, on the weave thread, at the END.
+			c->repaint.mf.serve_end_ns = os_monotonic_get_ns();
+#endif
 
 			os_mutex_lock(&c->weave_hand.mutex);
 			// Drop the result if this request was abandoned (or superseded)
@@ -6652,8 +11115,91 @@ vk_repaint_thread(void *ptr)
 		if (u_repaint_trace_enabled(&c->repaint.trace)) {
 			const uint64_t tn = os_monotonic_get_ns();
 			u_repaint_trace_tick(&c->repaint.trace, tn);
+#ifdef VK_MIDFRAME_FILL
+			const uint64_t mf_row_before = c->repaint.trace.last_report_ns;
+#endif
 			u_repaint_trace_report(&c->repaint.trace, tn, "vk", &c->repaint.gate, period_ns,
 			                       &c->repaint.partition);
+#ifdef VK_MIDFRAME_FILL
+			// #1905: companion to the #1257 row, emitted only when that row
+			// just went out (so at its ~5 s cadence, trace-gated, never per
+			// frame) — kept out of u_repaint_gate.h so no other backend's row
+			// changes. Window tallies over the same 5 s.
+			if (mf_row_before != 0 && c->repaint.trace.last_report_ns != mf_row_before) {
+				const uint64_t win = c->repaint.mf.win_start_ns != 0 && tn > c->repaint.mf.win_start_ns
+				                         ? tn - c->repaint.mf.win_start_ns
+				                         : 0;
+				os_mutex_lock(&c->weave_hand.mutex);
+				const uint32_t ha_async = c->hand_async.win_async;
+				const uint32_t ha_total = c->hand_async.win_async + c->hand_async.win_sync;
+				const uint32_t ha_stalls = c->hand_async.win_stalls;
+				const double ha_wait_ms = (double)c->hand_async.wait_ema_ns / 1e6;
+				const char *ha_mode = !c->hand_async.enabled      ? "blocking"
+				                      : c->hand_async.forced == 1 ? "async"
+				                      : c->hand_async.probing     ? "probe"
+				                      : c->hand_async.fallback    ? "fallback"
+				                                                  : "auto";
+				const uint32_t ha_trips = c->hand_async.trips;
+				const uint32_t ha_rec = c->hand_async.recoveries;
+				const uint32_t ha_pfail = c->hand_async.probe_fails;
+				const uint32_t ha_ws = c->hand_async.win_ws_commit;
+				const double ha_ws_ms = (double)c->hand_async.ws_commit_ema_ns / 1e6;
+				const double ha_ws_sub_ms = (double)c->hand_async.ws_sub_ema_ns / 1e6;
+				const double ha_ws_ret_ms = (double)c->hand_async.ws_retire_ema_ns / 1e6;
+				const uint32_t ha_ws_iw = c->hand_async.win_ws_img_waits;
+				const double ha_ws_iw_ms = (double)c->hand_async.ws_img_wait_ema_ns / 1e6;
+				const double ha_serve_ms = (double)c->hand_async.serve_ema_ns / 1e6;
+				const double ha_clk_ms = (double)c->hand_async.commit_lock_ema_ns / 1e6;
+				const double ha_wlk_ms = (double)c->hand_async.ws_lock_ema_ns / 1e6;
+				const double ha_wrec_ms = (double)c->hand_async.ws_rec_ema_ns / 1e6;
+				const double ha_wend_ms = (double)c->hand_async.ws_end_ema_ns / 1e6;
+				double ha_prof[8];
+				for (uint32_t pi = 0; pi < 8; pi++) {
+					ha_prof[pi] = (double)c->hand_async.ws_prof_ema_ns[pi] / 1e6;
+				}
+				c->hand_async.win_ws_img_waits = 0;
+				c->hand_async.win_async = 0;
+				c->hand_async.win_sync = 0;
+				c->hand_async.win_stalls = 0;
+				c->hand_async.win_ws_commit = 0;
+				os_mutex_unlock(&c->weave_hand.mutex);
+				// #2095: the app thread's wait on the previous chained weave at
+				// the top of layer_commit (EMA) — where GPU completion is now
+				// observed; 0 while the host-wait path is live.
+				os_mutex_lock(&c->wsync.mutex);
+				const double wsync_prev_ms = (double)c->wsync.wait_prev_ema_ns / 1e6;
+				os_mutex_unlock(&c->wsync.mutex);
+				const double duty_pct =
+				    win != 0 ? 100.0 * (double)c->repaint.mf.win_busy_ns / (double)win : 0.0;
+				U_LOG_W(
+				    "#1905 trace site=vk midframe{on=%d legacy_fires=%u midframe_fires=%u in_frame=%u "
+				    "skip_pending=%u skip_duty=%u duty=%.0f%%/%u%% fill_ema=%.2fms parked_ema=%.2fms "
+				    "app_iv=%.1fms park=%d layer=%d} handoff{mode=%s async=%d frames=%u/%u "
+				    "wait_ema=%.2fms stalls=%u trips=%u recovered=%u probe_fails=%u wsync_prev=%.2fms "
+				    "ws_commit=%u ws_commit_ema=%.2fms ws_sub_ema=%.2fms ws_retire_ema=%.2fms "
+				    "ws_img_waits=%u ws_img_wait_ema=%.2fms serve_ema=%.2fms commit_lock_ema=%.2fms "
+				    "ws_lock_ema=%.2fms ws_rec_ema=%.2fms ws_end_ema=%.2fms rec{begin=%.2f dead=%.2f "
+				    "setup=%.2f cin=%.2f stamp=%.2f cout=%.2f end=%.2f}ms}",
+				    (int)vk_midframe_active(c), c->repaint.mf.legacy_fires,
+				    c->repaint.mf.midframe_fires, c->repaint.mf.in_frame, c->repaint.mf.skip_pending,
+				    c->repaint.mf.skip_duty, duty_pct, dxr_midframe_fill_duty(),
+				    (double)c->repaint.mf.fill_ema_ns / 1e6, (double)c->repaint.mf.parked_ema_ns / 1e6,
+				    (double)c->repaint.mf.serve_iv_ema_ns / 1e6, (int)dxr_midframe_fill_park(),
+				    (int)c->repaint.mf.layer_live, ha_mode, (int)c->hand_async.enabled, ha_async,
+				    ha_total, ha_wait_ms, ha_stalls, ha_trips, ha_rec, ha_pfail, wsync_prev_ms, ha_ws,
+				    ha_ws_ms, ha_ws_sub_ms, ha_ws_ret_ms, ha_ws_iw, ha_ws_iw_ms, ha_serve_ms, ha_clk_ms,
+				    ha_wlk_ms, ha_wrec_ms, ha_wend_ms, ha_prof[VK_WS_PROF_BEGUN],
+				    ha_prof[VK_WS_PROF_DEAD], ha_prof[VK_WS_PROF_SETUP], ha_prof[VK_WS_PROF_CIN],
+				    ha_prof[VK_WS_PROF_STAMP], ha_prof[VK_WS_PROF_COUT], ha_prof[VK_WS_PROF_END]);
+				c->repaint.mf.legacy_fires = 0;
+				c->repaint.mf.midframe_fires = 0;
+				c->repaint.mf.in_frame = 0;
+				c->repaint.mf.skip_pending = 0;
+				c->repaint.mf.skip_duty = 0;
+				c->repaint.mf.win_busy_ns = 0;
+				c->repaint.mf.win_start_ns = tn;
+			}
+#endif
 		}
 
 		// #868 diag: where the loop actually goes. A repaint that never fires
@@ -6669,21 +11215,62 @@ vk_repaint_thread(void *ptr)
 			        (unsigned long long)(os_monotonic_get_ns() - c->repaint.last_app_frame_ns));
 		}
 
+#ifdef VK_MIDFRAME_FILL
+		// #1905: under the mid-frame schedule the app being inside xrEndFrame
+		// is not a reason to skip — layer_accum is only written under the
+		// lock, and a posted app frame is checked under it below. `armed` and
+		// the opt-in #1394 submit-window guard still apply.
+		const bool mf_on = vk_midframe_active(c);
+		if (!c->repaint.armed || vk_app_submit_window_open(c) || (c->repaint.app_frame_in_progress && !mf_on)) {
+#else
 		if (!c->repaint.armed || c->repaint.app_frame_in_progress || vk_app_submit_window_open(c)) {
+#endif
 			u_repaint_trace_bail_armed(&c->repaint.trace);
 			continue;
 		}
+		// #1748: a move-sync drag wants a weave every refresh (see
+		// vk_wl_move_fill_due). An unlocked hint; re-checked under the lock.
+		const bool move_fill = vk_wl_move_fill_due(c, period_ns);
 		// #1257: cadence-aware gate. Keyed on the last APP frame, never on
 		// the last repaint — otherwise repaints pace off their own timestamps
 		// and free-run. With a trusted vblank-count cadence (app presents
 		// every N vblanks) each app frame gets a budget of N-1 repaints,
 		// presented clear of the app's own queue slot; otherwise it is the
 		// legacy fixed 2-period gate. See u_repaint_gate.h for the design.
-		if (c->repaint.force != 1 &&
+#ifdef VK_MIDFRAME_FILL
+		// #1905: legacy verdict OR the present-paced rule. mf_fill marks a
+		// fill ONLY the new rule admitted (it re-checks that rule under the
+		// lock). While the app is MID-FRAME a legacy-admitted fill must ALSO
+		// pass the spacing + duty rule: round 2 exempted it, and on model
+		// viewer legacy fills (quiet >= 1.2 P, no spacing of their own) then
+		// fired back-to-back mid-frame, each holding c->mutex across its GPU
+		// wait — fill_ema 37-43 ms, duty 43-48%, app 12.2 -> 7.5 fps vs the
+		// 13.5 -> 9.9 baseline. Between frames the legacy verdict stands.
+		bool mf_fill = false;
+		if (c->repaint.force != 1 && !move_fill) {
+			const uint64_t now_g = os_monotonic_get_ns();
+			bool open = u_repaint_gate_open(&c->repaint.gate, now_g, period_ns, &c->repaint.partition);
+			if (mf_on && (!open || vk_midframe_app_mid(c))) {
+				bool duty_refused = false;
+				const bool mf_ok = vk_midframe_gate_open(c, now_g, period_ns, &duty_refused);
+				if (duty_refused) {
+					vk_midframe_note_duty_skip(c, now_g, period_ns);
+				}
+				mf_fill = mf_ok && !open;
+				open = mf_ok;
+			}
+			if (!open) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				continue;
+			}
+		}
+#else
+		if (c->repaint.force != 1 && !move_fill &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
 			u_repaint_trace_bail_gate(&c->repaint.trace);
 			continue;
 		}
+#endif
 
 		/*
 		 * #902 PHASE HOLD. The gate above says "allowed"; this says "not yet".
@@ -6706,7 +11293,7 @@ vk_repaint_thread(void *ptr)
 		 * hitching, not pacing, and the original #868 case applies — fill
 		 * immediately rather than waiting for a midpoint that will not come.
 		 */
-		if (dxr_repaint_phase_enabled() && c->repaint.force != 1 &&
+		if (dxr_repaint_phase_enabled() && c->repaint.force != 1 && !move_fill &&
 		    c->repaint.app_interval_ns != 0 && c->repaint.last_app_frame_ns != 0) {
 			const uint64_t now_ph = os_monotonic_get_ns();
 			const uint64_t since = now_ph - c->repaint.last_app_frame_ns;
@@ -6740,8 +11327,24 @@ vk_repaint_thread(void *ptr)
 		if (c->split != NULL) {
 			// Bail BEFORE pacing+acquire when there is nothing published to
 			// replay (warmup, or an app frame that refused its slot).
-			if (!comp_vk_split_has_weave_slot(c->split)) {
+			if (!comp_hub_d3d11_has_weave_slot(c->split)) {
 				continue;
+			}
+			/*
+			 * #2342 P2c: the HUB paces the replay, on its own target — the
+			 * native D3D11 leg's pacer (scanout wait + #884 late sleep), held
+			 * under the lock so a retire cannot free what the unlocked wait
+			 * reads. Skipped under an ENGAGED #1257 partition (the schedule IS
+			 * the pacing), as natively. Before P2c the split replay had none.
+			 */
+			if (c->repaint.partition.next_release_ns == 0) {
+				void *hold = NULL;
+				os_mutex_lock(&c->mutex);
+				if (c->split != NULL) {
+					hold = comp_hub_d3d11_repaint_pace_hold(c->split);
+				}
+				os_mutex_unlock(&c->mutex);
+				comp_hub_d3d11_repaint_pace_wait(hold);
 			}
 			const uint64_t fire_t0 = os_monotonic_get_ns();
 			os_mutex_lock(&c->mutex);
@@ -6751,18 +11354,55 @@ vk_repaint_thread(void *ptr)
 				os_mutex_unlock(&c->mutex);
 				continue;
 			}
-			// #1339: no fill into the arm's flip queue while it holds a
-			// pending present (see comp_d3d11_target_repaint_admit).
-			if (c->repaint.partition.next_release_ns == 0 && !comp_vk_split_repaint_admit(c->split)) {
-				u_repaint_trace_bail_gate(&c->repaint.trace);
-				os_mutex_unlock(&c->mutex);
-				continue;
+			/*
+			 * #2345 review: the pace above can block about a period plus the
+			 * #884 late sleep, so an app frame may have landed meanwhile —
+			 * re-run the cadence gate under the lock, as the native VK arm,
+			 * the D3D12 reroute and the D3D11 hub arms do, or the fill fires
+			 * right behind the app's own present.
+			 */
+			{
+				const bool move_fill_locked = move_fill && vk_wl_move_fill_due(c, period_ns);
+				const uint64_t now_r = os_monotonic_get_ns();
+#ifdef VK_MIDFRAME_FILL
+				const bool mf_locked = mf_on && vk_midframe_active(c);
+				bool relock_gate_ok;
+				if (mf_locked && mf_fill) {
+					relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+				} else {
+					relock_gate_ok = !(c->repaint.force != 1 && !move_fill_locked &&
+					                   !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns,
+					                                        &c->repaint.partition));
+					if (relock_gate_ok && mf_locked && !move_fill_locked &&
+					    vk_midframe_app_mid(c)) {
+						relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+					}
+				}
+#else
+				const bool relock_gate_ok =
+				    !(c->repaint.force != 1 && !move_fill_locked &&
+				      !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns, &c->repaint.partition));
+#endif
+				if (!relock_gate_ok) {
+					u_repaint_trace_bail_race(&c->repaint.trace);
+					os_mutex_unlock(&c->mutex);
+					continue;
+				}
 			}
+			// #1339 / #2342 P2c: the hub's one admission + replay — no fill
+			// into the arm's flip queue while it holds a pending present (see
+			// comp_d3d11_target_repaint_admit).
 			const struct xrt_rect rp_canvas = vk_dp_canvas_rect(c);
 			// #1339: spacing is stamped from the START of the fire (fire_t0/t1
 			// keep measuring DURATION for the trace).
 			const uint64_t rp_start_ns = os_monotonic_get_ns();
-			(void)comp_vk_split_weave_and_present(c->split, /*is_repaint=*/true, &rp_canvas);
+			const enum comp_hub_d3d11_repaint_result rr =
+			    comp_hub_d3d11_repaint(c->split, c->repaint.partition.next_release_ns != 0, &rp_canvas);
+			if (rr == COMP_HUB_D3D11_REPAINT_NOT_ADMITTED || rr == COMP_HUB_D3D11_REPAINT_NO_FRAME) {
+				u_repaint_trace_bail_gate(&c->repaint.trace);
+				os_mutex_unlock(&c->mutex);
+				continue;
+			}
 			c->repaint.count++;
 			const uint64_t fire_t1 = os_monotonic_get_ns();
 			u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
@@ -6845,11 +11485,46 @@ vk_repaint_thread(void *ptr)
 			u_repaint_trace_pace(&c->repaint.trace, pace_t0, pace_t1);
 		}
 
+		// #2095: a fill replays the atlas and the backdrop that the last
+		// chained app frame's GPU work may still be sampling or writing on
+		// the OTHER queue; the fill's own host waits only ever cover its own.
+		// Waited HERE, with c->mutex released — the #1264 S1 rule: a fill
+		// never holds the compositor lock across a GPU wait. Bounded, and
+		// normally retired long ago.
+		(void)vk_weave_sync_wait_latest(c, "fill");
+
 		os_mutex_lock(&c->mutex);
 
 		// Re-check under the lock. app_frame_in_progress is load-bearing and
 		// is NOT bypassed by the force probe: replaying into a half-written
 		// layer_accum does not exercise the feature, it corrupts the frame.
+#ifdef VK_MIDFRAME_FILL
+		/*
+		 * #1905: under the mid-frame schedule a fill does not need
+		 * app_frame_in_progress clear — on Android layer_accum and the
+		 * c->repaint.* replay state are only written under THIS lock (the app
+		 * accumulates into layer_stage) — but every fill MUST yield to a
+		 * posted app frame. layer_commit posts and then releases c->mutex,
+		 * so this is exactly the race where a fill that was waiting for the
+		 * lock wins it ahead of the weave thread's own serve: bail, and the
+		 * loop top serves the app frame next. (app_frame_in_progress is what used to
+		 * catch this, by being true for the whole hand-off.)
+		 */
+		const bool mf_locked = mf_on && vk_midframe_active(c);
+		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
+		    (c->repaint.app_frame_in_progress && !mf_locked) || vk_app_submit_window_open(c) ||
+		    c->display_processor == NULL || c->target == NULL) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+		if (mf_locked && vk_midframe_app_weave_pending(c)) {
+			c->repaint.mf.skip_pending++;
+			u_repaint_trace_bail_race(&c->repaint.trace);
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+#else
 		if (!os_thread_helper_is_running(&c->repaint_thread) || !c->repaint.armed ||
 		    c->repaint.app_frame_in_progress || vk_app_submit_window_open(c) || c->display_processor == NULL ||
 		    c->target == NULL) {
@@ -6857,6 +11532,7 @@ vk_repaint_thread(void *ptr)
 			os_mutex_unlock(&c->mutex);
 			continue;
 		}
+#endif
 		if (comp_vk_native_target_get_generation(c->target) != gen_before) {
 			// Resized/recreated across the pace. begin_frame's disarm
 			// normally catches this first; the acquire-side out-of-date
@@ -6868,9 +11544,37 @@ vk_repaint_thread(void *ptr)
 		// Re-run the gate under the lock: an app frame that landed while we
 		// paced resets its quiet key, so this is the race check. (Was a bare
 		// `quiet < period` floor; the #1257 adaptive window opens at half a
-		// period, which that floor would kill.)
-		if (c->repaint.force != 1 &&
+		// period, which that floor would kill.) A move fill re-checks its own
+		// condition: an app frame that just wove has taken this refresh.
+		const bool move_fill_locked = move_fill && vk_wl_move_fill_due(c, period_ns);
+		if (move_fill && !move_fill_locked) {
+			u_repaint_trace_bail_race(&c->repaint.trace);
+			os_mutex_unlock(&c->mutex);
+			continue;
+		}
+#ifdef VK_MIDFRAME_FILL
+		// #1905: a fill only the present-paced rule admitted re-runs THAT rule
+		// — an app weave served while we waited for the lock moved
+		// serve_end_ns. A legacy-admitted fill re-runs the legacy gate as
+		// before, AND the present-paced rule if the app is mid-frame now (it
+		// may have entered xrBeginFrame while this thread waited).
+		const uint64_t now_r = os_monotonic_get_ns();
+		bool relock_gate_ok;
+		if (mf_locked && mf_fill) {
+			relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+		} else {
+			relock_gate_ok =
+			    !(c->repaint.force != 1 && !move_fill_locked &&
+			      !u_repaint_gate_open(&c->repaint.gate, now_r, period_ns, &c->repaint.partition));
+			if (relock_gate_ok && mf_locked && !move_fill_locked && vk_midframe_app_mid(c)) {
+				relock_gate_ok = vk_midframe_gate_open(c, now_r, period_ns, NULL);
+			}
+		}
+		if (!relock_gate_ok) {
+#else
+		if (c->repaint.force != 1 && !move_fill_locked &&
 		    !u_repaint_gate_open(&c->repaint.gate, os_monotonic_get_ns(), period_ns, &c->repaint.partition)) {
+#endif
 			u_repaint_trace_bail_race(&c->repaint.trace);
 			os_mutex_unlock(&c->mutex);
 			continue;
@@ -6928,6 +11632,16 @@ vk_repaint_thread(void *ptr)
 		// between this and fire_t0, so one read serves both: fire_t0 pairs with
 		// fire_t1 for DURATION (trace + #1264 shed), rp_start_ns feeds spacing.
 		const uint64_t rp_start_ns = fire_t0;
+#ifdef VK_MIDFRAME_FILL
+		// #1905 trace: the app is MID-FRAME (between xrBeginFrame and the end
+		// of xrEndFrame) as this fill starts.
+		const bool mf_in_frame_at_fire = c->repaint.app_frame_in_progress || c->repaint.app_submit_window;
+		// Lock-held GPU wait only when midframe_fill_park=0 (A/B; the
+		// default parks) — see dxr_midframe_fill_park. Read at the park
+		// site, under this lock.
+		c->repaint.mf.hold_lock = mf_locked && !dxr_midframe_fill_park();
+		c->repaint.mf.fill_parked_ns = 0;
+#endif
 		// zero_copy is hard false: c->repaint.armed is only set off that path.
 		vk_dp_weave_and_present(c, /*is_repaint=*/true, /*zero_copy=*/false, 0, 0, 0, 0, 0,
 		                        tgt_width, tgt_height, /*ftime=*/false, fp, &skip_frame);
@@ -6940,6 +11654,40 @@ vk_repaint_thread(void *ptr)
 		const uint64_t fire_t1 = os_monotonic_get_ns();
 		u_repaint_gate_note_repaint(&c->repaint.gate, rp_start_ns);
 		u_repaint_trace_fire(&c->repaint.trace, fire_t0, fire_t1);
+#ifdef VK_MIDFRAME_FILL
+		c->repaint.mf.hold_lock = false;
+		{
+			// #1905: the duty governor's input — EVERY fill's WALL time
+			// (late-weave sleep in the acquire, submit, GPU wait — parked or
+			// lock-held — and present), seeded from the first fill so it is
+			// never frozen. The park stays IN: it carries the fill's GPU cost,
+			// and excluding it (round 4) let ~30% more fills through on model
+			// viewer at a 25% app-fps cost. A sample over 200 ms (a recreate,
+			// a stall) is clamped rather than dropped, so a genuinely slow
+			// fill still throttles the next ones.
+			uint64_t d = fire_t1 - fire_t0;
+			if (d > 200000000ULL) {
+				d = 200000000ULL;
+			}
+			c->repaint.mf.fill_ema_ns =
+			    c->repaint.mf.fill_ema_ns == 0 ? d : (c->repaint.mf.fill_ema_ns * 7 + d) / 8;
+			// Trace only: how much of that wall time was the unlocked park.
+			const uint64_t parked = c->repaint.mf.fill_parked_ns;
+			c->repaint.mf.parked_ema_ns = (c->repaint.mf.parked_ema_ns * 7 + parked) / 8;
+			if (c->repaint.mf.win_start_ns == 0) {
+				c->repaint.mf.win_start_ns = fire_t0;
+			}
+			c->repaint.mf.win_busy_ns += fire_t1 - fire_t0;
+			if (mf_fill) {
+				c->repaint.mf.midframe_fires++;
+			} else {
+				c->repaint.mf.legacy_fires++;
+			}
+			if (mf_locked && mf_in_frame_at_fire) {
+				c->repaint.mf.in_frame++;
+			}
+		}
+#endif
 		os_mutex_unlock(&c->mutex);
 
 		static bool logged = false;
@@ -6949,6 +11697,12 @@ vk_repaint_thread(void *ptr)
 			        "(set DXR_WEAVE_REPAINT=0 to disable)",
 			        hz);
 		}
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+		if (move_fill_locked && !c->wl_ms.logged_fill) {
+			c->wl_ms.logged_fill = true;
+			U_LOG_W("wl_move_sync: re-weaving every refresh while the window moves (#1748)");
+		}
+#endif
 	}
 
 	// #1196: a request posted after the loop saw `running == false` would
@@ -6975,6 +11729,650 @@ vk_repaint_thread(void *ptr)
  * thread that is never coming back. The wrapper must then not unlock it. Every
  * other return leaves it false and the lock held.
  */
+/*!
+ * #1917: submit on the main queue and wait for THIS submit only, via a fence
+ * created once per compositor. Replaces vkQueueWaitIdle on the shared-texture
+ * commit path: on an in-order queue our fence also covers everything queued
+ * before it (the app's render of this frame, which the atlas/weave read), so
+ * the guarantee is unchanged — what it no longer waits for is work another
+ * thread queued AFTER ours.
+ */
+static VkResult
+vk_shared_submit_and_wait(struct comp_vk_native_compositor *c, const VkSubmitInfo *si)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->shared_submit_fence == VK_NULL_HANDLE) {
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		VkResult fres = vk->vkCreateFence(vk->device, &fci, NULL, &c->shared_submit_fence);
+		if (fres != VK_SUCCESS) {
+			c->shared_submit_fence = VK_NULL_HANDLE;
+			// Old behaviour rather than none.
+			VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, si, VK_NULL_HANDLE);
+			if (res == VK_SUCCESS) {
+				vk->vkQueueWaitIdle(vk->main_queue->queue);
+			}
+			return res;
+		}
+	}
+	VkResult res = vk->vkQueueSubmit(vk->main_queue->queue, 1, si, c->shared_submit_fence);
+	if (res != VK_SUCCESS) {
+		return res;
+	}
+	vk->vkWaitForFences(vk->device, 1, &c->shared_submit_fence, VK_TRUE, UINT64_MAX);
+	vk->vkResetFences(vk->device, 1, &c->shared_submit_fence);
+	return VK_SUCCESS;
+}
+
+/*!
+ * Backing pixels per OS point for the runtime-drawn cursor (#2102): on native
+ * Wayland the scale of the monitor the window is on, as the window-geometry
+ * extension reports it - the scale the desktop draws its own cursor at there,
+ * the way D3D passes its window's DPI. Else the platform's.
+ */
+static float
+vk_cursor_backing_scale(struct comp_vk_native_compositor *c)
+{
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	struct comp_vk_native_wl_window_rect wr;
+	if (c->use_wayland && c->wl_geom != NULL && comp_vk_native_wl_geom_last_rect(c->wl_geom, &wr) &&
+	    wr.monitor_scale > 0.0f) {
+		return wr.monitor_scale;
+	}
+#else
+	(void)c;
+#endif
+	return comp_cursor_look_backing_scale();
+}
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): turn the state tracker's
+ * per-view placement into this frame's renderer cursor - which image, its
+ * size in canvas units, and each view's corners in its tile.
+ *
+ * @param target_w The target (window) width in backing pixels - with @p canvas_px_h, what
+ *        a zone rect is scaled against (#1949).
+ * @param canvas_px_h The canvas (window) height in backing pixels: the size
+ *        the Kooima views were built for, so one unit = canvas height.
+ * @return false if nothing can be drawn this frame (the frame is untouched).
+ */
+static bool
+vk_cursor_resolve(struct comp_vk_native_compositor *c,
+                  const struct u_cursor_draw_request *req_in,
+                  uint32_t target_w,
+                  uint32_t canvas_px_h,
+                  struct comp_vk_native_cursor_draw *out)
+{
+	// A zones frame draws only a zone request (the state tracker sends
+	// nothing else there) and vice versa; belt and braces.
+	// #1952: every way out that draws nothing reports why (the state
+	// tracker then reports willDraw = false at the next locate).
+	if (c->zones_frame != req_in->zone_valid) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_MISMATCH);
+		if (!c->cursor_draw.warned_zones) {
+			c->cursor_draw.warned_zones = true;
+			U_LOG_W(
+			    "cursor_draw: zones frame / zone request mismatch - cursor not drawn (one-time warning)");
+		}
+		return false;
+	}
+	// #1949: a zone request's views are zone-normalised - re-express them in
+	// the tile the way the zone's own layer is placed (zone rect scaled by
+	// tile / target, the renderer's zone pass), and clip to the zone.
+	struct u_cursor_draw_request zreq = *req_in;
+	const struct u_cursor_draw_request *req = &zreq;
+	float clip[4];
+	if (!u_cursor_draw_into_zone(&zreq, target_w, canvas_px_h, clip)) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_ZONE_UNPLACEABLE);
+		return false;
+	}
+	// The panel px that 0..1 of the (now tile-normalised) views span: the
+	// window for a zone request, else the canvas (ADR-046 B.7 ghost offset).
+	// Both are the target here (the zone rect is scaled against it).
+	const float tile_px_w = (float)target_w;
+	const float tile_px_h = (float)canvas_px_h;
+	canvas_px_h = u_cursor_draw_canvas_px_h(req, canvas_px_h);
+	if (c->eff_layout.route_count > 0) {
+		// Multi-screen M3: a tile is a per-segment mosaic, not one view.
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_MULTI_SCREEN);
+		if (!c->cursor_draw.warned_routed) {
+			c->cursor_draw.warned_routed = true;
+			U_LOG_W("cursor_draw: multi-screen routed frame - cursor not drawn (one-time warning)");
+		}
+		return false;
+	}
+	// Panel pixel pitch (metres per backing pixel) and the OS point.
+	if (!c->sys_info_set || c->sys_info.display_pixel_height == 0 || !(c->sys_info.display_height_m > 0.0f) ||
+	    canvas_px_h == 0) {
+		u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_NO_DISPLAY_INFO);
+		return false;
+	}
+	const float m_per_px = c->sys_info.display_height_m / (float)c->sys_info.display_pixel_height;
+	const float backing_scale = vk_cursor_backing_scale(c);
+	const float m_per_pt = m_per_px * backing_scale;
+	const float canvas_h_m = (float)canvas_px_h * m_per_px;
+
+	float aspect, hot_u, hot_v, size_m;
+	memset(out, 0, sizeof(*out));
+	if (req->image != NULL) {
+		uint32_t w = 0, h = 0;
+		comp_vk_native_swapchain_get_dimensions(req->image, &w, &h);
+		if (w == 0 || h == 0) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_SPRITE_UNUSABLE);
+			return false;
+		}
+		aspect = (float)w / (float)h;
+		hot_u = req->hot_u;
+		hot_v = req->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : U_CURSOR_DRAW_DEFAULT_POINTS * m_per_pt;
+		out->xsc = req->image;
+		out->image_index = req->image_index;
+		out->premultiplied = false; // spec: the app's sprite is STRAIGHT alpha
+	} else {
+		struct comp_cursor_look *look = &c->cursor_draw.look;
+		if (!comp_cursor_look_update(look, backing_scale)) {
+			u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+			return false;
+		}
+		if (!c->cursor_draw.default_uploaded || c->cursor_draw.default_gen != look->generation) {
+			if (!comp_vk_native_renderer_set_cursor_default_image(c->renderer, look->rgba, look->w,
+			                                                      look->h)) {
+				u_cursor_draw_report_refused(req_in, U_CURSOR_DRAW_REFUSAL_DEFAULT_LOOK);
+				return false;
+			}
+			c->cursor_draw.default_gen = look->generation;
+			c->cursor_draw.default_uploaded = true;
+		}
+		aspect = look->aspect;
+		hot_u = look->hot_u;
+		hot_v = look->hot_v;
+		size_m = req->size_m > 0.0f ? req->size_m : look->height_pt * m_per_pt;
+		out->premultiplied = true; // the look's pixels are premultiplied
+	}
+	const float height = size_m / canvas_h_m; // sprite height, in units
+
+	// ADR-046 B.7: soften with lift against crosstalk - blur and opacity
+	// both exactly off on the glass (ghost 0, d 0). The blur cap follows the
+	// DRAWN sprite: its height in panel px.
+	const struct u_cursor_soften soften =
+	    u_cursor_draw_soften_sized(req->disparity, u_cursor_draw_ghost_px(req, tile_px_w, tile_px_h),
+	                               height * tile_px_h, comp_cursor_soften_params());
+	out->blur_px = soften.blur_px;
+	out->alpha = soften.alpha;
+	out->tile_px_w = tile_px_w;
+	out->tile_px_h = tile_px_h;
+
+	memcpy(out->clip, clip, sizeof(out->clip));
+	out->view_count = req->view_count < XRT_MAX_VIEWS ? req->view_count : XRT_MAX_VIEWS;
+	for (uint32_t i = 0; i < out->view_count; i++) {
+		u_cursor_draw_corners(&req->view[i], height, aspect, hot_u, hot_v, out->corners[i]);
+	}
+	// The renderer reports the rest (drew, or no pass / no sprite view /
+	// no tile) through the caller's request, which outlives the draw.
+	out->req = req_in;
+	out->report_only = req_in->report_only;
+	out->active = true;
+	return true;
+}
+
+void
+comp_vk_native_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->cursor_draw.req = *req;
+}
+
+
+/*
+ *
+ * XR_DXR_cursor_depth v7 - measured disparity (ADR-046 Amendment 3).
+ *
+ * At a requested commit, before any of the compositor's own work, one small
+ * command buffer copies the footprint patch of the two outermost views out of
+ * the app's projection swapchain (in COLOR_ATTACHMENT_OPTIMAL, the layout the
+ * renderer also expects) into a host-visible buffer, with its own fence. A
+ * later commit that finds the fence signalled (vkGetFenceStatus, never a
+ * wait) runs the shared CPU matcher over the copy and publishes the answer.
+ *
+ */
+
+static enum u_cursor_measure_format
+vk_cursor_measure_format(VkFormat f)
+{
+	switch (f) {
+	case VK_FORMAT_R8G8B8A8_UNORM:
+	case VK_FORMAT_R8G8B8A8_SRGB: return U_CURSOR_MEASURE_FORMAT_RGBA8;
+	case VK_FORMAT_B8G8R8A8_UNORM:
+	case VK_FORMAT_B8G8R8A8_SRGB: return U_CURSOR_MEASURE_FORMAT_BGRA8;
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return U_CURSOR_MEASURE_FORMAT_RGBA16F;
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return U_CURSOR_MEASURE_FORMAT_RGB10A2;
+	default: return U_CURSOR_MEASURE_FORMAT_UNKNOWN;
+	}
+}
+
+static void
+vk_cursor_measure_free_buffer(struct vk_bundle *vk, struct comp_vk_native_compositor *c, uint32_t s)
+{
+	if (c->cursor_measure.slot[s].mapped != NULL) {
+		vk->vkUnmapMemory(vk->device, c->cursor_measure.slot[s].mem);
+		c->cursor_measure.slot[s].mapped = NULL;
+	}
+	if (c->cursor_measure.slot[s].buf != VK_NULL_HANDLE) {
+		vk->vkDestroyBuffer(vk->device, c->cursor_measure.slot[s].buf, NULL);
+		c->cursor_measure.slot[s].buf = VK_NULL_HANDLE;
+	}
+	if (c->cursor_measure.slot[s].mem != VK_NULL_HANDLE) {
+		vk->vkFreeMemory(vk->device, c->cursor_measure.slot[s].mem, NULL);
+		c->cursor_measure.slot[s].mem = VK_NULL_HANDLE;
+	}
+	c->cursor_measure.slot[s].size = 0;
+}
+
+static void
+vk_cursor_measure_destroy(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		if (c->cursor_measure.slot[s].in_flight && c->cursor_measure.slot[s].fence != VK_NULL_HANDLE) {
+			// Teardown only: the copy is tiny and already queued.
+			vk->vkWaitForFences(vk->device, 1, &c->cursor_measure.slot[s].fence, VK_TRUE, UINT64_MAX);
+		}
+		if (c->cursor_measure.slot[s].fence != VK_NULL_HANDLE) {
+			vk->vkDestroyFence(vk->device, c->cursor_measure.slot[s].fence, NULL);
+			c->cursor_measure.slot[s].fence = VK_NULL_HANDLE;
+		}
+		vk_cursor_measure_free_buffer(vk, c, s);
+	}
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkDestroyQueryPool(vk->device, c->cursor_measure.queries, NULL);
+		c->cursor_measure.queries = VK_NULL_HANDLE;
+	}
+	if (c->cursor_measure.pool != VK_NULL_HANDLE) {
+		// Frees the command buffers too.
+		vk->vkDestroyCommandPool(vk->device, c->cursor_measure.pool, NULL);
+		c->cursor_measure.pool = VK_NULL_HANDLE;
+	}
+}
+
+//! First real request: the command pool, one command buffer + fence per slot, a timestamp pool.
+static bool
+vk_cursor_measure_init(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.pool != VK_NULL_HANDLE) {
+		return true;
+	}
+	VkCommandPoolCreateInfo pci = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT | VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+	    .queueFamilyIndex = c->queue_family_index,
+	};
+	if (vk->vkCreateCommandPool(vk->device, &pci, NULL, &c->cursor_measure.pool) != VK_SUCCESS) {
+		c->cursor_measure.pool = VK_NULL_HANDLE;
+		return false;
+	}
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		VkCommandBufferAllocateInfo ai = {
+		    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		    .commandPool = c->cursor_measure.pool,
+		    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		    .commandBufferCount = 1,
+		};
+		VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+		if (vk->vkAllocateCommandBuffers(vk->device, &ai, &c->cursor_measure.slot[s].cmd) != VK_SUCCESS ||
+		    vk->vkCreateFence(vk->device, &fci, NULL, &c->cursor_measure.slot[s].fence) != VK_SUCCESS) {
+			vk_cursor_measure_destroy(c);
+			return false;
+		}
+	}
+	// GPU cost evidence: two timestamps per slot, when the queue has them.
+	VkPhysicalDeviceProperties props;
+	vk->vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+	uint32_t qf_count = 0;
+	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, NULL);
+	VkQueueFamilyProperties qf[16];
+	qf_count = qf_count > 16 ? 16 : qf_count;
+	vk->vkGetPhysicalDeviceQueueFamilyProperties(vk->physical_device, &qf_count, qf);
+	if (c->queue_family_index < qf_count && qf[c->queue_family_index].timestampValidBits > 0 &&
+	    props.limits.timestampPeriod > 0.0f) {
+		VkQueryPoolCreateInfo qci = {
+		    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+		    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+		    .queryCount = 2 * ARRAY_SIZE(c->cursor_measure.slot),
+		};
+		if (vk->vkCreateQueryPool(vk->device, &qci, NULL, &c->cursor_measure.queries) != VK_SUCCESS) {
+			c->cursor_measure.queries = VK_NULL_HANDLE;
+		}
+		c->cursor_measure.ts_period_ns = props.limits.timestampPeriod;
+	}
+	return true;
+}
+
+static bool
+vk_cursor_measure_ensure_buffer(struct comp_vk_native_compositor *c, uint32_t s, VkDeviceSize need)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.slot[s].buf != VK_NULL_HANDLE && c->cursor_measure.slot[s].size >= need) {
+		return true;
+	}
+	vk_cursor_measure_free_buffer(vk, c, s);
+	VkBufferCreateInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+	    .size = need,
+	    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	if (vk->vkCreateBuffer(vk->device, &bi, NULL, &c->cursor_measure.slot[s].buf) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].buf = VK_NULL_HANDLE;
+		return false;
+	}
+	VkMemoryRequirements mreq;
+	vk->vkGetBufferMemoryRequirements(vk->device, c->cursor_measure.slot[s].buf, &mreq);
+	// The matcher reads this memory on the CPU inside xrEndFrame, so it has to be
+	// HOST_CACHED: a plain HOST_VISIBLE|HOST_COHERENT type is typically write-combined,
+	// and the first one on an NVIDIA discrete GPU. Reading a fullscreen 8K patch from it
+	// cost about 90 ms a frame (same class as the capture fix, #2536).
+	uint32_t mem_type = UINT32_MAX;
+	const VkMemoryPropertyFlags uncached =
+	    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &mem_type)) {
+		if (!vk_get_memory_type(vk, mreq.memoryTypeBits, uncached, &mem_type)) {
+			vk_cursor_measure_free_buffer(vk, c, s);
+			return false;
+		}
+		if (!c->cursor_measure.warned_uncached) {
+			c->cursor_measure.warned_uncached = true;
+			U_LOG_W("cursor_measure: no HOST_CACHED readback memory on this GPU - the CPU match reads "
+			        "uncached memory and may slow the frame; DXR_CURSOR_MEASURE=0 turns measuring off "
+			        "(one-time warning)");
+		}
+	}
+	VkMemoryAllocateInfo ai = {
+	    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+	    .allocationSize = mreq.size,
+	    .memoryTypeIndex = mem_type,
+	};
+	if (vk->vkAllocateMemory(vk->device, &ai, NULL, &c->cursor_measure.slot[s].mem) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].mem = VK_NULL_HANDLE;
+		vk_cursor_measure_free_buffer(vk, c, s);
+		return false;
+	}
+	if (vk->vkBindBufferMemory(vk->device, c->cursor_measure.slot[s].buf, c->cursor_measure.slot[s].mem, 0) !=
+	        VK_SUCCESS ||
+	    vk->vkMapMemory(vk->device, c->cursor_measure.slot[s].mem, 0, VK_WHOLE_SIZE, 0,
+	                    (void **)&c->cursor_measure.slot[s].mapped) != VK_SUCCESS) {
+		c->cursor_measure.slot[s].mapped = NULL;
+		vk_cursor_measure_free_buffer(vk, c, s);
+		return false;
+	}
+	c->cursor_measure.slot[s].size = need;
+	return true;
+}
+
+//! Harvest every finished copy, match it, publish the newest. Never blocks on the GPU.
+static void
+vk_cursor_measure_harvest(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+	for (uint32_t s = 0; s < ARRAY_SIZE(c->cursor_measure.slot); s++) {
+		if (!c->cursor_measure.slot[s].in_flight) {
+			continue;
+		}
+		const VkResult fs = vk->vkGetFenceStatus(vk->device, c->cursor_measure.slot[s].fence);
+		if (fs == VK_NOT_READY) {
+			continue; // still in flight: look again next commit
+		}
+		vk->vkResetFences(vk->device, 1, &c->cursor_measure.slot[s].fence);
+		c->cursor_measure.slot[s].in_flight = false;
+		c->cursor_measure.in_flight--;
+		if (fs != VK_SUCCESS) {
+			continue;
+		}
+		double gpu_ns = -1.0;
+		if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+			uint64_t ts[2] = {0, 0};
+			if (vk->vkGetQueryPoolResults(vk->device, c->cursor_measure.queries, 2 * s, 2, sizeof(ts), ts,
+			                              sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
+			    ts[1] >= ts[0]) {
+				gpu_ns = (double)(ts[1] - ts[0]) * (double)c->cursor_measure.ts_period_ns;
+			}
+		}
+		const uint8_t *base = c->cursor_measure.slot[s].mapped;
+		const struct u_cursor_measure_patch pa = {base, c->cursor_measure.slot[s].pitch,
+		                                          c->cursor_measure.slot[s].format};
+		const struct u_cursor_measure_patch pb = {base + c->cursor_measure.slot[s].view_bytes,
+		                                          c->cursor_measure.slot[s].pitch, c->cursor_measure.slot[s].format};
+		struct u_cursor_measure_result res;
+		const uint64_t t0 = os_monotonic_get_ns();
+		if (!u_cursor_measure_run(&c->cursor_measure.slot[s].req, &c->cursor_measure.slot[s].plan, &pa, &pb,
+		                          &c->cursor_measure.cache, &res)) {
+			continue;
+		}
+		const uint64_t cpu_ns = os_monotonic_get_ns() - t0;
+
+		os_mutex_lock(&c->cursor_measure_mutex);
+		if (res.tag > c->cursor_measure.result.tag) {
+			c->cursor_measure.result = res;
+		}
+		os_mutex_unlock(&c->cursor_measure_mutex);
+
+		// Cost evidence (ADR-046 Amendment 3), throttled: never per frame.
+		c->cursor_measure.stat_n++;
+		c->cursor_measure.stat_reused += res.reused ? 1 : 0;
+		c->cursor_measure.stat_cpu_ns += cpu_ns;
+		c->cursor_measure.stat_cpu_max_ns =
+		    cpu_ns > c->cursor_measure.stat_cpu_max_ns ? cpu_ns : c->cursor_measure.stat_cpu_max_ns;
+		if (gpu_ns >= 0.0) {
+			c->cursor_measure.stat_gpu_ns += gpu_ns;
+			c->cursor_measure.stat_gpu_max_ns =
+			    gpu_ns > c->cursor_measure.stat_gpu_max_ns ? gpu_ns : c->cursor_measure.stat_gpu_max_ns;
+		}
+		if (c->cursor_measure.stat_n >= 120) {
+			const double n = (double)c->cursor_measure.stat_n;
+			U_LOG_I(
+			    "cursor_measure: %u measured (%u reused) - CPU match avg %.3f ms max %.3f ms, GPU copy avg "
+			    "%.4f ms max %.4f ms; last: %s %.2f px (sub_w %.0f, %ux%u work px x%d, matched %u, L-R "
+			    "rejected %u, ncc %.3f)",
+			    c->cursor_measure.stat_n, c->cursor_measure.stat_reused,
+			    (double)c->cursor_measure.stat_cpu_ns / n * 1e-6,
+			    (double)c->cursor_measure.stat_cpu_max_ns * 1e-6, c->cursor_measure.stat_gpu_ns / n * 1e-6,
+			    c->cursor_measure.stat_gpu_max_ns * 1e-6, res.confident ? "confident" : "no content",
+			    res.disparity_px, res.sub_w, c->cursor_measure.slot[s].plan.work_w,
+			    c->cursor_measure.slot[s].plan.work_h, c->cursor_measure.slot[s].plan.factor, res.matched,
+			    res.lr_rejected, res.ncc);
+			c->cursor_measure.stat_n = c->cursor_measure.stat_reused = 0;
+			c->cursor_measure.stat_cpu_ns = c->cursor_measure.stat_cpu_max_ns = 0;
+			c->cursor_measure.stat_gpu_ns = c->cursor_measure.stat_gpu_max_ns = 0.0;
+		}
+	}
+}
+
+//! Record + submit this frame's two patch copies, if a slot is free. Never waits for one.
+static void
+vk_cursor_measure_sample(struct comp_vk_native_compositor *c, const struct u_cursor_measure_request *req)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (c->cursor_measure.failed) {
+		return;
+	}
+	struct comp_layer *layer = NULL;
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		const enum xrt_layer_type t = c->layer_accum.layers[i].data.type;
+		if (t == XRT_LAYER_PROJECTION || t == XRT_LAYER_PROJECTION_DEPTH) {
+			layer = &c->layer_accum.layers[i];
+			break;
+		}
+	}
+	if (layer == NULL) {
+		return;
+	}
+	VkImage img[U_CURSOR_DEPTH_PATCH_VIEWS];
+	const struct xrt_sub_image *sub[U_CURSOR_DEPTH_PATCH_VIEWS];
+	VkFormat fmt_vk = VK_FORMAT_UNDEFINED;
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		const uint32_t vi = req->view_index[i];
+		struct xrt_swapchain *xsc = vi < layer->data.view_count ? layer->sc_array[vi] : NULL;
+		if (xsc == NULL) {
+			return;
+		}
+		sub[i] = &layer->data.proj.v[vi].sub;
+		img[i] = (VkImage)(uintptr_t)comp_vk_native_swapchain_get_image(xsc, sub[i]->image_index);
+		if (img[i] == VK_NULL_HANDLE) {
+			return;
+		}
+		const VkFormat f = (VkFormat)comp_vk_native_swapchain_get_declared_format(xsc);
+		if (i > 0 && f != fmt_vk) {
+			return;
+		}
+		fmt_vk = f;
+		uint32_t sw = 0, sh = 0;
+		comp_vk_native_swapchain_get_dimensions(xsc, &sw, &sh);
+		if (sub[i]->rect.offset.w < 0 || sub[i]->rect.offset.h < 0 ||
+		    (uint32_t)(sub[i]->rect.offset.w + sub[i]->rect.extent.w) > sw ||
+		    (uint32_t)(sub[i]->rect.offset.h + sub[i]->rect.extent.h) > sh) {
+			return;
+		}
+	}
+	if (sub[0]->rect.extent.w != sub[1]->rect.extent.w || sub[0]->rect.extent.h != sub[1]->rect.extent.h) {
+		return;
+	}
+	const enum u_cursor_measure_format fmt = vk_cursor_measure_format(fmt_vk);
+	if (fmt == U_CURSOR_MEASURE_FORMAT_UNKNOWN) {
+		if (!c->cursor_measure.warned_format) {
+			c->cursor_measure.warned_format = true;
+			U_LOG_W("cursor_measure: VkFormat %d is not read by the matcher - no content (one-time warning)",
+			        (int)fmt_vk);
+		}
+		return;
+	}
+	struct u_cursor_measure_plan plan;
+	if (!u_cursor_measure_make_plan(req, sub[0]->rect.extent.w, sub[0]->rect.extent.h, false, &plan)) {
+		return;
+	}
+
+	const uint32_t s = c->cursor_measure.next_slot;
+	if (c->cursor_measure.slot[s].in_flight) {
+		return; // the GPU is three copies behind: skip a frame rather than stall
+	}
+	if (!vk_cursor_measure_init(c)) {
+		c->cursor_measure.failed = true;
+		U_LOG_W("cursor_measure: could not create the copy resources - no content (one-time warning)");
+		return;
+	}
+	const uint32_t pitch = (uint32_t)plan.w * u_cursor_measure_format_bytes(fmt);
+	const uint32_t view_bytes = pitch * (uint32_t)plan.h;
+	if (!vk_cursor_measure_ensure_buffer(c, s, (VkDeviceSize)view_bytes * U_CURSOR_DEPTH_PATCH_VIEWS)) {
+		return;
+	}
+
+	VkCommandBuffer cmd = c->cursor_measure.slot[s].cmd;
+	vk->vkResetCommandBuffer(cmd, 0);
+	VkCommandBufferBeginInfo bi = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	if (vk->vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+		return;
+	}
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkCmdResetQueryPool(cmd, c->cursor_measure.queries, 2 * s, 2);
+		vk->vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, c->cursor_measure.queries, 2 * s);
+	}
+	for (uint32_t i = 0; i < U_CURSOR_DEPTH_PATCH_VIEWS; i++) {
+		// SBS: both views may be the same image; a second identical
+		// barrier pair is harmless and keeps this simple.
+		VkImageMemoryBarrier b = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+		    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+		    .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		    .image = img[i],
+		    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, sub[i]->array_index, 1},
+		};
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &b);
+		VkBufferImageCopy region = {
+		    .bufferOffset = (VkDeviceSize)i * view_bytes,
+		    .bufferRowLength = (uint32_t)plan.w,
+		    .bufferImageHeight = (uint32_t)plan.h,
+		    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, sub[i]->array_index, 1},
+		    .imageOffset = {sub[i]->rect.offset.w + plan.x, sub[i]->rect.offset.h + plan.y, 0},
+		    .imageExtent = {(uint32_t)plan.w, (uint32_t)plan.h, 1},
+		};
+		vk->vkCmdCopyImageToBuffer(cmd, img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->cursor_measure.slot[s].buf,
+		                           1, &region);
+		b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+		b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+		b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+		b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+		                             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                         0, 0, NULL, 0, NULL, 1, &b);
+	}
+	VkBufferMemoryBarrier hb = {
+	    .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+	    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+	    .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+	    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	    .buffer = c->cursor_measure.slot[s].buf,
+	    .offset = 0,
+	    .size = VK_WHOLE_SIZE,
+	};
+	vk->vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, NULL, 1, &hb, 0,
+	                         NULL);
+	if (c->cursor_measure.queries != VK_NULL_HANDLE) {
+		vk->vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, c->cursor_measure.queries, 2 * s + 1);
+	}
+	if (vk->vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+		return;
+	}
+	VkSubmitInfo si = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &si, c->cursor_measure.slot[s].fence) != VK_SUCCESS) {
+		return;
+	}
+	c->cursor_measure.slot[s].in_flight = true;
+	c->cursor_measure.in_flight++;
+	c->cursor_measure.next_slot = (s + 1) % ARRAY_SIZE(c->cursor_measure.slot);
+	c->cursor_measure.slot[s].req = *req;
+	c->cursor_measure.slot[s].plan = plan;
+	c->cursor_measure.slot[s].format = fmt;
+	c->cursor_measure.slot[s].pitch = pitch;
+	c->cursor_measure.slot[s].view_bytes = view_bytes;
+
+	if (!c->cursor_measure.announced) {
+		c->cursor_measure.announced = true;
+		U_LOG_W("cursor_measure: Vulkan compositor copying a %dx%d px patch per view (%u bytes) for the "
+		        "measured-disparity cursor (ADR-046 Amendment 3, first request)",
+		        plan.w, plan.h, view_bytes);
+	}
+}
+
+void
+comp_vk_native_compositor_set_cursor_measure_request(struct xrt_compositor *xc,
+                                                     const struct u_cursor_measure_request *req)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->cursor_measure.req = *req;
+}
+
+bool
+comp_vk_native_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	os_mutex_lock(&c->cursor_measure_mutex);
+	*out = c->cursor_measure.result;
+	os_mutex_unlock(&c->cursor_measure_mutex);
+	return out->valid;
+}
+
 static xrt_result_t
 vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
                                   xrt_graphics_sync_handle_t sync_handle,
@@ -6995,6 +12393,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// frame; consumed at the projection-done boundary or end of frame
 	// depending on requested mode. See u_capture_intent.h.
 	u_capture_intent_poll(&c->capture_intent, &c->mcp_capture);
+#ifdef XRT_OS_WINDOWS
+	// #2342 P2c: under the split the hub is the POST-compose capture site; a
+	// projection-only intent stays with the native projection-done point.
+	if (c->split != NULL && c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_POST_COMPOSE) {
+		if (c->hub_capture.pending) {
+			u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+		}
+		c->hub_capture = c->capture_intent;
+		c->capture_intent.pending = false;
+	} else if (c->split == NULL && c->hub_capture.pending) {
+		// Handed to a split that retired before weaving it: fail it, never strand it.
+		u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, false);
+	}
+#endif
 
 	// Composite-tap state is per-frame: only valid when this frame's
 	// Local2D composite runs and re-stashes it.
@@ -7019,6 +12431,19 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// zones publishes none, which is what "the whole canvas is the 3D zone"
 	// means to the runner.
 	vk_publish_rear_budget_zones(c);
+
+	// XR_DXR_cursor_depth v7 (ADR-046 Amendment 3). ZERO COST UNLESS
+	// REQUESTED: two field tests, both false for every session that never
+	// chained the measured-disparity source. Submitted before any of this
+	// commit's own work: after the app's render on the in-order queue, and
+	// before the cursor sprite is drawn anywhere.
+	if (c->cursor_measure.req.requested || c->cursor_measure.in_flight > 0) {
+		vk_cursor_measure_harvest(c);
+		if (u_cursor_measure_should_sample(&c->cursor_measure.req)) {
+			vk_cursor_measure_sample(c, &c->cursor_measure.req);
+		}
+		c->cursor_measure.req.requested = false;
+	}
 
 #ifdef XRT_OS_WINDOWS
 	/*
@@ -7247,7 +12672,22 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// decides whether this frame weaves at all, so it must precede the layout.
 	// Cheap (a non-blocking D-Bus pump the metrics path already performs) and
 	// only acts on a transition.
+	vk_dp_refresh_resample_caps(c);
+#if defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+	// #2071: before the gate, so a publisher that just came back is gated,
+	// fed and snapped from a clean slate this very frame.
+	vk_wl_geom_resync_if_publisher_reappeared(c);
+#endif
 	vk_linux_update_surface_not_1to1(c);
+#ifdef XRT_HAVE_WAYLAND
+	if (!c->use_wayland)
+#endif
+	{
+		// #1831: the X11 arm. One-shot after its first evaluation.
+		vk_x11_update_not_1to1(c);
+	}
+	// Auto-2D on a flat stereo submission: same position, same reason.
+	vk_linux_update_mono_2d(c);
 #endif
 
 	// Per-frame effective CONTENT layout (#542): tile grid/dims from the
@@ -7255,6 +12695,25 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	// renderer draw, the window-space pass, both DP handoffs, and the
 	// capture path — they must all agree on the frame's geometry.
 	vk_compute_effective_layout(c);
+
+	/*
+	 * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B). ZERO COST UNLESS
+	 * REQUESTED: one field test, false for every session that never chained
+	 * XrCursorDepthDrawInfoDXR. The request covers this commit only.
+	 */
+	// #1952: cursor_req lives for the whole commit - the renderer reports
+	// through it (cursor_draw.req) during the draw below.
+	struct comp_vk_native_cursor_draw cursor_draw = {0};
+	struct u_cursor_draw_request cursor_req;
+	if (c->cursor_draw.req.requested) {
+		cursor_req = c->cursor_draw.req;
+		c->cursor_draw.req.requested = false;
+		if (!u_cursor_draw_should_draw(&cursor_req)) {
+			u_cursor_draw_report_refused(&cursor_req, U_CURSOR_DRAW_REFUSAL_INVALID_REQUEST);
+		} else if (!comp_cursor_draw_debug_refuse(&cursor_req)) {
+			(void)vk_cursor_resolve(c, &cursor_req, tgt_width, tgt_height, &cursor_draw);
+		}
+	}
 
 	// Zero-copy check: can we pass the app's swapchain directly to the DP?
 	bool zero_copy = false;
@@ -7329,19 +12788,49 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 						 */
 						const bool true_srgb =
 						    comp_vk_native_swapchain_is_true_srgb(layer->sc_array[0]);
+						/*
+						 * #1589: zero-copy also hands the display
+						 * processor bytes it is told are ENCODED. That
+						 * is only true when the app's REQUESTED format
+						 * says so: a UNORM swapchain holds LINEAR values
+						 * (ADR-021 §6), and this branch owns no pass in
+						 * which to encode them — so the frame takes the
+						 * atlas path, where the private _SRGB compose
+						 * target does the encode. Again a colour
+						 * precondition on u_tiling_can_zero_copy()'s
+						 * RESULT, not a second tiling rule (ADR-030).
+						 */
+						const bool color_needs_encode =
+						    !comp_vk_native_swapchain_is_srgb(layer->sc_array[0]) &&
+						    !u_color_legacy_unorm_encoded();
 						if (!true_srgb &&
 						    // #1628: VkViewport.y with a positive height counts
 						    // down — top-origin. (A negative-height viewport is an
 						    // app-side choice we do not use anywhere.)
 						    u_tiling_can_zero_copy(vc, rxs, rys, rws, rhs_arr, sw, sh, mode,
 						                           U_TILING_ORIGIN_TOP_LEFT)) {
-							zc_image_u64 = comp_vk_native_swapchain_get_image(layer->sc_array[0], img_idx);
-							zc_view_u64 = comp_vk_native_swapchain_get_image_view(layer->sc_array[0], img_idx);
-							if (zc_image_u64 != 0 && zc_view_u64 != 0) {
-								zero_copy = true;
-								zc_format = comp_vk_native_renderer_get_format(c->renderer);
-								zc_width = sw;
-								zc_height = sh;
+							if (color_needs_encode) {
+								static bool zc_color_warned = false;
+								if (!zc_color_warned) {
+									zc_color_warned = true;
+									U_LOG_W(
+									    "[ZC] refused: reason=color_needs_encode "
+									    "— a UNORM swapchain is scene-linear and "
+									    "owes the sRGB encode, which only the "
+									    "compose path can apply (#1589)");
+								}
+							} else {
+								zc_image_u64 = comp_vk_native_swapchain_get_image(
+								    layer->sc_array[0], img_idx);
+								zc_view_u64 = comp_vk_native_swapchain_get_image_view(
+								    layer->sc_array[0], img_idx);
+								if (zc_image_u64 != 0 && zc_view_u64 != 0) {
+									zero_copy = true;
+									zc_format = comp_vk_native_renderer_get_format(
+									    c->renderer);
+									zc_width = sw;
+									zc_height = sh;
+								}
 							}
 						}
 					}
@@ -7380,6 +12869,44 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * Multi-screen M3: a frame carrying one view set per segment is a mosaic
+	 * the renderer builds in the atlas; the app's swapchain is not it. Same
+	 * shape as the guards above: a fact applied to the RESULT of
+	 * `u_tiling_can_zero_copy()` (ADR-030), never a second gate inside it.
+	 */
+	if (c->eff_layout.route_count > 0) {
+		zero_copy = false;
+	}
+#endif
+
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	/*
+	 * #2218: a window that is not wholly on the primary screen is woven per
+	 * screen, so its frame must be composed into our atlas for the segments
+	 * to crop; handed to the primary DP as-is it would be woven by the wrong
+	 * vendor wherever it sits. Decided by the last weave (one-frame lag, like
+	 * the split's own R2 resize lag). Same shape as the guards above: a fact
+	 * applied to the RESULT of `u_tiling_can_zero_copy()` (ADR-030).
+	 */
+	os_mutex_lock(&c->seg_pub_mutex);
+	if (c->seg_zero_copy_withheld) {
+		zero_copy = false;
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+#endif
+
+	/*
+	 * XR_DXR_cursor_depth v5: a frame carrying a runtime-drawn cursor
+	 * composes into the atlas - the cursor is drawn there, never into the
+	 * app's own image. Same shape as the guards above: a fact applied to the
+	 * RESULT of `u_tiling_can_zero_copy()` (ADR-030), not a second gate.
+	 */
+	if (cursor_draw.active) {
+		zero_copy = false;
+	}
+
 	// Record the frame's effective capture source = exactly what the DP will
 	// receive (renderer atlas, or the zero-copy app swapchain). The atlas
 	// capture reads this so it shows the DP's input regardless of render mode
@@ -7396,9 +12923,22 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		                                             &c->capture_src_atlas_h);
 	}
 
+	// #2356: set again (on the Android non-blocking hand-off path only) once
+	// this frame's window-space layers are composited at commit.
+	c->ws_composited_at_commit = false;
+	// #2356: and the previous commit's stamp, still in flight only if its serve
+	// never ran (a dropped frame), must retire before renderer_draw rewrites
+	// the atlas it wrote. Normally already signalled: a no-op.
+	vk_ws_stamp_retire_before_draw(c);
+
 	// Render projection layers to atlas texture (skip if zero-copy)
 	xrt_result_t xret = XRT_SUCCESS;
 	if (!zero_copy) {
+		if (cursor_draw.active) {
+			// Consumed by the draw below (drawn last in its compose pass,
+			// so the projection-only capture point after it shows it).
+			comp_vk_native_renderer_set_cursor(c->renderer, &cursor_draw);
+		}
 		xret = comp_vk_native_renderer_draw(
 		    c->renderer, &c->layer_accum, &left_eye, &right_eye, tgt_width, tgt_height, &c->eff_layout);
 		if (xret != XRT_SUCCESS) {
@@ -7478,6 +13018,9 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    view_width, view_height, tc, tr);
 			}
 
+			// #2340 HDR10 (experimental): as on the windowed path.
+			vk_maybe_encode_atlas_pq(c, zero_copy ? VK_NULL_HANDLE : cmd);
+
 			// Crop atlas to content dimensions before passing to DP
 			{
 				uint32_t content_w = tc * view_width;
@@ -7543,10 +13086,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
-				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &pre_si, VK_NULL_HANDLE);
-				if (res == VK_SUCCESS) {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
-				}
+				res = vk_shared_submit_and_wait(c, &pre_si); // #1917
 			}
 
 			// Hand the DP this frame's backdrop (NULL ⟹ clears it → desktop-only
@@ -7590,9 +13130,8 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				    .commandBufferCount = 1,
 				    .pCommandBuffers = &cmd,
 				};
-				res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
+				res = vk_shared_submit_and_wait(c, &submit_info); // #1917
 				if (res == VK_SUCCESS) {
-					vk->vkQueueWaitIdle(vk->main_queue->queue);
 					weaving_done = true;
 				}
 			}
@@ -7614,10 +13153,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			    .commandBufferCount = 1,
 			    .pCommandBuffers = &cmd,
 			};
-			res = vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE);
-			if (res == VK_SUCCESS) {
-				vk->vkQueueWaitIdle(vk->main_queue->queue);
-			}
+			res = vk_shared_submit_and_wait(c, &submit_info); // #1917
 		}
 
 		vk->vkFreeCommandBuffers(vk->device, cmd_pool, 1, &cmd);
@@ -7626,6 +13162,37 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		// the DP (legacy sticky publish / clear edge; the zones wish only
 		// exists where the composite ran — not on this shared path yet).
 		vk_sync_zone_mask_to_dp(c);
+
+		/*
+		 * #2421: the post-compose capture site for a client-presents session
+		 * (texture class). The window exits below dispatch it; this branch
+		 * returned first, so a `displayxr_atlas_trigger[.<exe>]` was consumed
+		 * and nothing was written. Same files as the D3D11/D3D12 legs and the
+		 * hub: `<path>` = the DP input (the atlas), `<path>.woven` = the shared
+		 * image as the app is about to present it. The DP's process_atlas
+		 * returns the target in PRESENT_SRC_KHR (xrt_display_processor_vk.h);
+		 * the blit fallback leaves it in GENERAL
+		 * (comp_vk_native_renderer_blit_to_shared). The dump restores it.
+		 */
+		if (u_capture_intent_should_capture(&c->capture_intent, MCP_CAPTURE_MODE_POST_COMPOSE)) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->capture_intent.path, ".woven", woven, sizeof(woven));
+			const bool wok =
+			    weaving_done
+			        ? vk_native_dump_image_to_png(c, c->shared_image, tgt_width, tgt_height,
+			                                      VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			                                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+			                                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, false, woven)
+			        : vk_native_dump_image_to_png(c, c->shared_image, tgt_width, tgt_height,
+			                                      VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+			                                      VK_PIPELINE_STAGE_TRANSFER_BIT, false, woven);
+			vk_ws_stamp_wait_submitted(c);
+			const bool ok = vk_native_capture_atlas_to_png(c, c->capture_intent.path);
+			U_LOG_W("#2421 texture capture: DP input -> %s%s; post-weave %ux%u (the caller's image) -> %s%s",
+			        c->capture_intent.path, ok ? "" : " FAILED", tgt_width, tgt_height, woven,
+			        wok ? "" : " FAILED");
+			u_capture_intent_complete(&c->capture_intent, &c->mcp_capture, ok);
+		}
 		return XRT_SUCCESS;
 	}
 
@@ -7653,13 +13220,20 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		vk_split_composite_window_space(c);
 
 		/*
+		 * #2340 HDR10 (experimental) — PQ-encode the atlas after the
+		 * window-space pass and before the handoff, so the bridge carries a PQ
+		 * atlas to the split's D3D11 weaver, which was told PQ.
+		 */
+		const bool pq_frame_ok = vk_split_encode_atlas_pq(c);
+
+		/*
 		 * VK-1b — the PLANE pass, before the handoff is taken.
 		 *
 		 * Order matters twice. It flattens into deposit-backed surfaces and
 		 * claims a timeline value for that submit, so the handoff read below
 		 * carries a `fence_value` that covers the planes as well as the atlas —
 		 * one GPU-side consumer wait for both. And it stages the plane and the
-		 * backdrop extent that comp_vk_split_submit_atlas then stamps onto the
+		 * backdrop extent that comp_hub_d3d11_submit_atlas then stamps onto the
 		 * slot's recipe.
 		 */
 		vk_split_stage_planes(c, tgt_width, tgt_height);
@@ -7675,37 +13249,88 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 		{
 			bool hud_dirty = false;
 			if (vk_hud_prepare(c, tgt_width, tgt_height, &hud_dirty)) {
-				comp_vk_split_set_hud(c->split, u_hud_get_pixels(c->hud), u_hud_get_width(c->hud),
-				                      u_hud_get_height(c->hud), hud_dirty);
+				comp_hub_d3d11_set_hud(c->split, u_hud_get_pixels(c->hud), u_hud_get_width(c->hud),
+				                       u_hud_get_height(c->hud), hud_dirty);
 			} else {
-				comp_vk_split_set_hud(c->split, NULL, 0, 0, false);
+				comp_hub_d3d11_set_hud(c->split, NULL, 0, 0, false);
 			}
 		}
 
-		struct comp_vk_deposit_handoff handoff = {0};
+		struct comp_hub_d3d11_handoff handoff = {0};
 		struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
 		if (comp_vk_deposit_get_handoff(dep, &handoff)) {
-			comp_vk_split_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
-			                           c->eff_layout.tile_w, c->eff_layout.tile_h);
+			if (pq_frame_ok) {
+				// #1883: the slot carries this frame's segment partition (by its seq).
+				comp_hub_d3d11_stage_segment_content(c->split, &c->seg_content);
+				comp_hub_d3d11_submit_atlas(c->split, &handoff, c->eff_layout.cols, c->eff_layout.rows,
+				                            c->eff_layout.tile_w, c->eff_layout.tile_h);
+				// #2317 P2a review: only a handed-off slot may be advanced past.
+				comp_vk_deposit_note_handed(dep);
+			} else {
+				// #2340: an atlas the DP was told is PQ but that missed the
+				// pass. Not handed over, so nothing new is woven (F4) and the
+				// next frame re-renders this slot.
+				U_LOG_I("DXR_ATLAS_ENCODING=pq (#2340): PQ pass skipped this frame - slot not handed over");
+			}
+			if (!comp_hub_d3d11_is_direct(c->split)) {
+				/*
+				 * The slot is free again the instant the bridge's staging copy
+				 * has been recorded on this same immediate context — release it
+				 * so Vulkan's next write into it is ordered, not merely likely.
+				 * Queued signal; nothing waits here. (A slot held back above
+				 * was never read, so releasing it is immediate and harmless.)
+				 */
+				comp_vk_deposit_note_consumed(dep, handoff.slot);
+				/*
+				 * VK-1b — the same edge for the PLANES, and it has to be here
+				 * rather than inside the split: comp_hub_d3d11_submit_atlas has
+				 * just taken the bridge's `pre_plane_write` wait on this app
+				 * immediate context, and this signal must land BEHIND it in that
+				 * one ordered stream. Vulkan's next flatten waits for the value.
+				 */
+				comp_vk_deposit_note_planes_consumed(dep);
+			}
 			/*
-			 * The slot is free again the instant the bridge's staging copy
-			 * has been recorded on this same immediate context — release it
-			 * so Vulkan's next write into it is ordered, not merely likely.
-			 * Queued signal; nothing waits here.
+			 * #2317 P2a: DIRECT ingress — the hub reads the slot on its own
+			 * device and owes each slot's release once it moves off it (also
+			 * the DIRECT era's last slot after a move to xbridge). Bookkeeping
+			 * only; Vulkan's next write into the slot waits on the GPU.
 			 */
-			comp_vk_deposit_note_consumed(dep, handoff.slot);
-			/*
-			 * VK-1b — the same edge for the PLANES, and it has to be here
-			 * rather than inside the split: comp_vk_split_submit_atlas has
-			 * just taken the bridge's `pre_plane_write` wait on this app
-			 * immediate context, and this signal must land BEHIND it in that
-			 * one ordered stream. Vulkan's next flatten waits for the value.
-			 */
-			comp_vk_deposit_note_planes_consumed(dep);
+			uint32_t rel_slot = 0;
+			uint64_t rel_value = 0;
+			while (comp_hub_d3d11_take_slot_release(c->split, &rel_slot, &rel_value)) {
+				comp_vk_deposit_note_hub_release(dep, rel_slot, rel_value);
+			}
 		}
 
 		const struct xrt_rect dp_canvas = vk_dp_canvas_rect(c);
-		const bool wove = comp_vk_split_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		// #2317 P1c: the D rows of DXR_WEAVE_LATENCY_CSV need this frame's promise.
+		// #2327 review: THIS frame's own promise (its xrEndFrame displayTime),
+		// not the latest xrWaitFrame's — a pipelined app has already waited
+		// for the next frame by the time this one is committed.
+		comp_hub_d3d11_set_predicted_display_time(c->split, c->layer_accum.data.display_time_ns > 0
+		                                                        ? (uint64_t)c->layer_accum.data.display_time_ns
+		                                                        : c->last_display_time_ns);
+		// #2342 P2c: a projection-only intent the native point skipped (zero-copy)
+		// goes to the hub too (one consumer either way); then arm the hub.
+		if (c->capture_intent.pending && c->capture_intent.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY &&
+		    !c->hub_capture.pending) {
+			c->hub_capture = c->capture_intent;
+			c->capture_intent.pending = false;
+		}
+		if (c->hub_capture.pending) {
+			char woven[MCP_CAPTURE_PATH_MAX + 16];
+			u_capture_intent_sibling_path(c->hub_capture.path, ".woven", woven, sizeof(woven));
+			comp_hub_d3d11_capture_arm(c->split, c->hub_capture.mode == MCP_CAPTURE_MODE_PROJECTION_ONLY,
+			                           c->hub_capture.path, woven);
+		}
+		const bool wove = comp_hub_d3d11_weave_and_present(c->split, /*is_repaint=*/false, &dp_canvas);
+		{
+			bool cap_ok = false;
+			if (comp_hub_d3d11_capture_take(c->split, &cap_ok) && c->hub_capture.pending) {
+				u_capture_intent_complete(&c->hub_capture, &c->mcp_capture, cap_ok);
+			}
+		}
 
 		/*
 		 * XR_DXR_depth_budget — the split arm's tick. The preview comes from
@@ -7748,7 +13373,7 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 			}
 			u_repaint_gate_on_app_frame(&c->repaint.gate, c->repaint.last_app_frame_ns);
 		}
-		comp_vk_split_render_diag(c->split);
+		comp_hub_d3d11_render_diag(c->split);
 
 		if (c->owns_window && c->own_window != NULL) {
 			comp_d3d11_window_signal_paint_done(c->own_window);
@@ -7798,6 +13423,18 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				 * withdrawn here can only be dropped, never served late.
 				 */
 				uint64_t my_seq;
+#ifdef VK_MIDFRAME_FILL
+				// #2356: composite the window-space layers into the atlas
+				// here, waited, when that is all that keeps this frame off
+				// the non-blocking hand-off.
+				vk_async_composite_window_space_at_commit(c, zero_copy);
+				// #1905 ask 2: decided here, under c->mutex, from this frame's
+				// committed layers (see vk_async_handoff_eligible).
+				// #1905/#1962: and admitted by the harm-scored fallback,
+				// which also scores the previous frame here.
+				const bool async_post = vk_async_fallback_admit(
+				    c, vk_async_handoff_eligible(c, zero_copy), tgt_width, tgt_height);
+#endif
 				os_mutex_lock(&c->weave_hand.mutex);
 				c->weave_hand.zero_copy = zero_copy;
 				c->weave_hand.zc_image_u64 = zc_image_u64;
@@ -7811,10 +13448,35 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				c->weave_hand.fp0 = fp[0];
 				c->weave_hand.result = XRT_SUCCESS;
 				c->weave_hand.skip_frame = false;
+#ifdef VK_MIDFRAME_FILL
+				c->weave_hand.async = async_post;
+#endif
 				my_seq = ++c->weave_hand.seq;
 				c->weave_hand.pending = true;
+#ifdef VK_MIDFRAME_FILL
+				if (async_post) {
+					c->hand_async.outstanding_seq = my_seq;
+					c->hand_async.win_async++;
+				} else {
+					c->hand_async.win_sync++;
+				}
+#endif
 				os_cond_broadcast(&c->weave_hand.cond);
 				os_mutex_unlock(&c->weave_hand.mutex);
+#ifdef VK_MIDFRAME_FILL
+				if (async_post) {
+					/*
+					 * #1905 ask 2: COMMITTED — return without waiting. The
+					 * weave thread serves it as soon as the wrapper drops
+					 * c->mutex and runs the frame's tail itself; the next
+					 * layer_commit drains it before overwriting anything it
+					 * reads (the depth-1 bound). Every return path below
+					 * that tail would have taken is the weave thread's now.
+					 */
+					return XRT_SUCCESS;
+				}
+				const uint64_t hand_t0 = os_monotonic_get_ns();
+#endif
 
 				/*
 				 * #1394: hand the compositor lock over EXPLICITLY.
@@ -7878,6 +13540,11 @@ vk_compositor_layer_commit_locked(struct xrt_compositor *xc,
 				// runs against its own array seeded from weave_hand.fp0.
 				const uint64_t hb_at_expiry = c->weave_hand.heartbeat;
 				os_mutex_unlock(&c->weave_hand.mutex);
+#ifdef VK_MIDFRAME_FILL
+				os_mutex_lock(&c->weave_hand.mutex);
+				vk_async_note_wait(c, os_monotonic_get_ns() - hand_t0);
+				os_mutex_unlock(&c->weave_hand.mutex);
+#endif
 
 				if (abandoned) {
 					/*
@@ -8095,7 +13762,64 @@ vk_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t
 	}
 
 	bool lock_released = false;
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: the depth-1 bound. The previous frame's non-blocking weave
+	 * must be served before this frame republishes layer_accum or re-renders
+	 * the atlas it samples. Normally long done (returns at once); otherwise
+	 * this is where the app waits — at most one frame ahead of the weave.
+	 */
+	const enum vk_async_drain drain = vk_async_handoff_drain(c, /*from_commit=*/true);
+	if (drain == VK_ASYNC_DRAIN_WEDGED) {
+		c->repaint.app_frame_in_progress = false;
+		c->repaint.app_submit_window = false;
+		return XRT_SUCCESS;
+	}
+	/*
+	 * #2095 / ADR-055: the other half of the depth-1 bound. The drain above
+	 * proves the previous serve's CPU work is done; under the GPU chain its
+	 * GPU work (the DP sampling the atlas / crop scratch / backdrop on the
+	 * runtime queue) may still be in flight, and this commit is about to
+	 * rewrite every one of those single-buffered inputs. Wait that frame's
+	 * fence here — before c->mutex, so a fill is not held off by a GPU wait;
+	 * normally long retired. (On the LOCK_TAKEN arm the drain's trylock has
+	 * already won c->mutex, so there the wait runs under it: that is the
+	 * once-per-2-s abandon path, and the wait is bounded.) Folded into the
+	 * #1962 drain: it is the same "this commit stood behind the previous
+	 * weave" time, paid here now.
+	 */
+	{
+		const uint64_t w = vk_weave_sync_wait_latest(c, "commit");
+		if (w != 0) {
+			c->hand_async.fb_last_drain_ns += w; // app thread: the #1962 scorer's input
+		}
+	}
+	if (drain != VK_ASYNC_DRAIN_LOCK_TAKEN) {
+		// #2356 TRACE: how long the commit stands behind c->mutex (a fill,
+		// or anything else the weave thread holds it for).
+		const uint64_t lk0 = os_monotonic_get_ns();
+		os_mutex_lock(&c->mutex);
+		const uint64_t lkd = os_monotonic_get_ns() - lk0;
+		os_mutex_lock(&c->weave_hand.mutex);
+		vk_ws_stamp_ema(&c->hand_async.commit_lock_ema_ns, lkd);
+		os_mutex_unlock(&c->weave_hand.mutex);
+	}
+#else
+	// #2095: same bound without the non-blocking hand-off (see above).
+	(void)vk_weave_sync_wait_latest(c, "commit");
 	os_mutex_lock(&c->mutex);
+#endif
+#ifdef VK_MIDFRAME_FILL
+	// #1905: publish the app's privately accumulated frame under the lock —
+	// the only place layer_accum is written on Android. Only the used layers
+	// are copied (a handful, not XRT_MAX_LAYERS).
+	c->layer_accum.data = c->layer_stage.data;
+	c->layer_accum.layer_count = c->layer_stage.layer_count;
+	if (c->layer_stage.layer_count > 0) {
+		memcpy(c->layer_accum.layers, c->layer_stage.layers,
+		       sizeof(c->layer_stage.layers[0]) * c->layer_stage.layer_count);
+	}
+#endif
 	xrt_result_t xret = vk_compositor_layer_commit_locked(xc, sync_handle, &lock_released);
 	c->repaint.app_frame_in_progress = false;
 	c->repaint.app_submit_window = false;
@@ -8198,6 +13922,11 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	}
 	c->atlas_ws_fb = VK_NULL_HANDLE;
 	vk_hud_blend_fini(&c->window_space_blend, vk);
+	if (c->ws_linear_fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, c->ws_linear_fb, NULL);
+		c->ws_linear_fb = VK_NULL_HANDLE;
+	}
+	vk_hud_blend_fini(&c->window_space_blend_linear, vk);
 
 	// #439 Phase 3 — masked composite pipelines + scratch images. (The active
 	// zone mask is owned by the oxr handle, freed via zone_mask_destroy.)
@@ -8211,10 +13940,28 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkDestroyFence(vk->device, c->repaint_fence, NULL);
 		c->repaint_fence = VK_NULL_HANDLE;
 	}
+	// #2356: the commit-time stamp. Its pool's command buffer goes with it.
+	if (c->ws_stamp.fence != VK_NULL_HANDLE) {
+		vk->vkDestroyFence(vk->device, c->ws_stamp.fence, NULL);
+		c->ws_stamp.fence = VK_NULL_HANDLE;
+	}
+	if (c->ws_stamp.pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->ws_stamp.pool, NULL);
+		c->ws_stamp.pool = VK_NULL_HANDLE;
+		c->ws_stamp.cmd = VK_NULL_HANDLE;
+	}
+	c->ws_stamp.in_flight = false;
 
 	if (c->frame_fence != VK_NULL_HANDLE) {
 		c->vk.vkDestroyFence(c->vk.device, c->frame_fence, NULL);
 		c->frame_fence = VK_NULL_HANDLE;
+	}
+	// #2095: the ring — after the vkDeviceWaitIdle above, so no fence, semaphore
+	// or parked command buffer in it is still pending.
+	vk_weave_sync_ring_destroy(c);
+	if (c->shared_submit_fence != VK_NULL_HANDLE) {
+		c->vk.vkDestroyFence(c->vk.device, c->shared_submit_fence, NULL);
+		c->shared_submit_fence = VK_NULL_HANDLE;
 	}
 
 	vk_release_local2d_state(c);
@@ -8241,7 +13988,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	 * deposit those slots were copied FROM. The repaint thread was already
 	 * joined at the top of this function, which is what makes that safe.
 	 */
-	comp_vk_split_destroy(&c->split);
+	comp_hub_d3d11_destroy(&c->split);
 
 	/*
 	 * VK-1b — the plane pass's own objects. The framebuffer is built over the
@@ -8263,6 +14010,10 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		vk->vkDestroyCommandPool(vk->device, c->ws_cmd_pool, NULL);
 		c->ws_cmd_pool = VK_NULL_HANDLE;
 	}
+	if (c->pq_cmd_pool != VK_NULL_HANDLE) {
+		vk->vkDestroyCommandPool(vk->device, c->pq_cmd_pool, NULL);
+		c->pq_cmd_pool = VK_NULL_HANDLE;
+	}
 	if (c->plane_cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->plane_cmd_pool, NULL);
 		c->plane_cmd_pool = VK_NULL_HANDLE;
@@ -8276,6 +14027,26 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		xrt_display_processor_clear_local_zone_mask(c->display_processor);
 		c->zone_published = false;
 	}
+#ifdef XRT_OS_WINDOWS
+	// #2405: detach the own window's drag snap before any DP dies (the setter
+	// waits out a snap in flight).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, NULL, NULL);
+	}
+#endif
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	// Multi-screen M2: the segment DPs go first (they share the DP pool). No
+	// window hand-back at teardown: the primary DP goes too (hooks cleared).
+	os_mutex_lock(&c->seg_pub_mutex);
+	comp_vk_native_segments_set_hwnd_hooks(c->segments, NULL);
+	comp_vk_native_segments_destroy(&c->segments);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	os_mutex_unlock(&c->seg_pub_mutex);
+	free(c->seg_screens);
+	c->seg_screens = NULL;
+	free(c->seg_sys_info);
+	c->seg_sys_info = NULL;
+#endif
 	xrt_display_processor_destroy(&c->display_processor);
 
 	// Destroy shared texture resources
@@ -8292,6 +14063,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->renderer != NULL) {
 		comp_vk_native_renderer_destroy(&c->renderer);
 	}
+	comp_cursor_look_fini(&c->cursor_draw.look); // XR_DXR_cursor_depth v5 (empty unless requested)
 
 	comp_vk_alpha_probe_destroy(&c->alpha_probe);
 
@@ -8316,10 +14088,20 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 		comp_vk_native_window_xcb_destroy(&c->xcb_window);
 	}
 #ifdef DXR_HAVE_WL_GEOM
+	comp_vk_native_wl_move_sync_destroy(&c->wl_move_sync);
 	if (c->wl_geom != NULL) {
 		comp_vk_native_wl_geom_destroy(&c->wl_geom);
 	}
 #endif
+	if (c->stamp_buffer != VK_NULL_HANDLE) {
+		c->vk.vkDestroyBuffer(c->vk.device, c->stamp_buffer, NULL);
+		c->stamp_buffer = VK_NULL_HANDLE;
+	}
+	if (c->stamp_memory != VK_NULL_HANDLE) {
+		c->vk.vkFreeMemory(c->vk.device, c->stamp_memory, NULL);
+		c->stamp_memory = VK_NULL_HANDLE;
+		c->stamp_map = NULL;
+	}
 #ifdef DXR_HAVE_DIRECT_SCANOUT
 	// After the target (swapchain) is gone — the backend owns the surface it
 	// borrowed to it — release the display back to the X server.
@@ -8333,6 +14115,7 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	if (c->cmd_pool != VK_NULL_HANDLE) {
 		vk->vkDestroyCommandPool(vk->device, c->cmd_pool, NULL);
 	}
+	vk_cursor_measure_destroy(c); // XR_DXR_cursor_depth v7 (nothing unless ever requested)
 
 	// Note: we do NOT destroy the VkDevice — it belongs to the app.
 	// vk_bundle cleanup is minimal (just mutexes).
@@ -8340,8 +14123,19 @@ vk_compositor_destroy(struct xrt_compositor *xc)
 	// #868: last, after the repaint thread has been joined above.
 	os_cond_destroy(&c->weave_cond);
 	os_mutex_destroy(&c->mutex);
+	os_mutex_destroy(&c->cursor_measure_mutex);
 	os_cond_destroy(&c->weave_hand.cond);
 	os_mutex_destroy(&c->weave_hand.mutex);
+	os_mutex_destroy(&c->wsync.mutex); // #2095: ring resources went with the device idle above
+	os_mutex_destroy(&c->ws_dead.mutex);
+	os_mutex_destroy(&c->ws_stamp.mutex); // #2356
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	os_mutex_destroy(&c->seg_pub_mutex);
+#endif
+#ifdef XRT_OS_WINDOWS
+	os_mutex_destroy(&c->dp_swap_mutex);
+#endif
+	u_eye_history_destroy(&c->eye_hist); // N6 Part 1 (#2144)
 
 	// XR_DXR_depth_budget: the runner owns a mutex.
 	comp_rear_budget_fini(&c->rear_budget);
@@ -8537,8 +14331,9 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		 * #868: hand the display processor the RUNTIME-OWNED queue, not the
 		 * app's.
 		 *
-		 * The vendor DP reads vk->main_queue->queue ONCE, here at creation, and
-		 * the SR weaver captures it internally for its own submits — the
+		 * NOT TRUE FOR EVERY DP — see the note at the end of this comment. The
+		 * desktop SR weaver reads vk->main_queue->queue ONCE, here at creation,
+		 * and captures it internally for its own submits — the
 		 * correction-texture upload, which vkQueueSubmit()s and waits from
 		 * inside weave(). weave() is called from the repaint thread too, so
 		 * with the app's queue captured, the SDK submits to the APP's queue off
@@ -8558,6 +14353,17 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 		 * its own queue before returning, which CPU-orders those uploads ahead
 		 * of whichever queue we later submit the recorded weave on.
 		 *
+		 * Android CNSDK DP: up to CNSDK 0.10.75 this swap did NOT move its
+		 * submits — leia_interlacer_vulkan_initialize took no queue, and
+		 * CRendererVulkan::Init picked vkGetDeviceQueue(device, family, 0),
+		 * the APP's queue on a two-queue device, live on every weave pass.
+		 * Since 0.10.78 (initialize_with_queue, leia-plugin#361 /
+		 * runtime#2084) the DP captures the queue it is shown here — this
+		 * one — and #2012 is settled: the vendor weave runs on
+		 * c->repaint_queue. That is the queue the host-wait path's narrow
+		 * post-weave drain idles, and the queue the #2095 / ADR-055 chain's
+		 * set_weave_sync semaphores are waited and signalled on.
+		 *
 		 * The app frame keeps submitting on the APP's queue deliberately — that
 		 * is what orders the compositor's work after the app's own rendering
 		 * into the swapchain images it just released. Moving the app path to
@@ -8573,11 +14379,13 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			    "(app queue %p stays the app frame's)",
 			    (void *)c->repaint_queue, (void *)saved_main_queue);
 		}
+		c->dp_create_attempted = true;
 		xrt_result_t dp_ret = factory(&c->vk, (void *)(uintptr_t)c->cmd_pool, dp_window_handle,
 		                              (int32_t)VK_FORMAT_B8G8R8A8_UNORM, &c->display_processor);
 		c->vk.main_queue->queue = saved_main_queue;
 		// #1484: a fresh DP's colour state is unknown; the weave sites assert it.
 		c->dp_atlas_encoding_latched = -1;
+		c->pq_dp_asked = NULL; // #2340: nor been asked about PQ
 		if (dp_ret != XRT_SUCCESS) {
 			U_LOG_W("VK display processor factory failed (error %d), continuing without", (int)dp_ret);
 			c->display_processor = NULL;
@@ -8589,6 +14397,11 @@ vk_make_dp_vk(struct comp_vk_native_compositor *c,
 			(void)u_weave_scope_report(xrt_display_processor_vk_get_weave_scope(
 			                               (struct xrt_display_processor_vk *)c->display_processor),
 			                           "VK", /* panel_scoped */ false);
+			c->dp_tolerates_resample = xrt_display_processor_vk_tolerates_resample(
+			    (struct xrt_display_processor_vk *)c->display_processor);
+			c->dp_caps_mode_index = (c->xdev != NULL && c->xdev->hmd != NULL)
+			                            ? c->xdev->hmd->active_rendering_mode_index
+			                            : UINT32_MAX;
 		}
 	} else {
 		U_LOG_W("No VK display processor factory provided");
@@ -8794,15 +14607,21 @@ vk_split_retire_locked(struct comp_vk_native_compositor *c, const char *why, con
 		return;
 	}
 
-	comp_vk_split_retire(&c->split, why, short_reason);
+	comp_hub_d3d11_retire(&c->split, why, short_reason);
 	c->split_off_reason = short_reason;
+	// #2317 P2a: the hub (and the consumer fence it owned) is gone; nothing
+	// more is owed. Safe: every submit that waited on it has completed (the
+	// per-frame draw-fence wait), and the retire runs under c->mutex.
+	if (c->renderer != NULL) {
+		(void)comp_vk_deposit_bind_consumer_fence(comp_vk_native_renderer_get_deposit(c->renderer), NULL);
+	}
 
 	/*
 	 * VK-1b — the plane framebuffer is built over the deposit plane's imported
 	 * image and is only ever used by the split's plane pass. Drop it here, in
 	 * the ONE recovery path, so the app-device flatten below goes back to its
 	 * private scratch and no stale framebuffer can outlive the transport that
-	 * gave it its attachment. `comp_vk_split_retire` has already quiesced the
+	 * gave it its attachment. `comp_hub_d3d11_retire` has already quiesced the
 	 * bridge, so nothing is still reading it.
 	 */
 	if (c->plane_bd_fb != VK_NULL_HANDLE) {
@@ -8857,6 +14676,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
+                                 bool app_created_device,
                                  struct xrt_compositor_native **out_xc)
 {
 	if (vk_device == NULL) {
@@ -8898,10 +14718,22 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	// even on the earliest create failure. os_thread_helper_init only prepares
 	// the handle; the loop is started later, once the target exists.
 	os_mutex_init(&c->mutex);
+	os_mutex_init(&c->cursor_measure_mutex); // XR_DXR_cursor_depth v7 result (leaf)
 	os_cond_init(&c->weave_cond);
 	// #1394: the hand-off handshake runs on its own leaf lock — see weave_hand.mutex.
 	os_mutex_init(&c->weave_hand.mutex);
 	os_cond_init(&c->weave_hand.cond);
+	// #2095: the weave-sync ring's leaf lock — see vk_weave_sync_ring.
+	os_mutex_init(&c->wsync.mutex);
+	os_mutex_init(&c->ws_dead.mutex); // #1782
+	os_mutex_init(&c->ws_stamp.mutex); // #2356
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	os_mutex_init(&c->seg_pub_mutex); // multi-screen M3
+#endif
+#ifdef XRT_OS_WINDOWS
+	os_mutex_init(&c->dp_swap_mutex); // ADR-047 Amendment 2
+#endif
+	u_eye_history_init(&c->eye_hist); // N6 Part 1 (#2144)
 	os_thread_helper_init(&c->repaint_thread);
 
 	// XR_DXR_depth_budget: the policy exists from the first frame so that a
@@ -9095,6 +14927,32 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		// Windowed weaving (#817): absolute window position via the
 		// compositor's geometry service. NULL / no-data → display-scoped.
 		c->wl_geom = comp_vk_native_wl_geom_create();
+		// #1748: move-synchronised re-weave — on whenever the extension
+		// supports it. DXR_WL_MOVE_SYNC=0 keeps the drag-lattice path.
+		{
+			const char *ms_env = getenv("DXR_WL_MOVE_SYNC");
+			const bool ms_off = ms_env != NULL && ms_env[0] == '0';
+			if (ms_off) {
+				U_LOG_W("wl_move_sync: DXR_WL_MOVE_SYNC=0 - move sync off, the drag lattice applies");
+			} else if (c->wl_geom != NULL) {
+				// The tag first: once the extension accepts, it expects
+				// tagged commits from this process.
+				c->wl_move_sync = comp_vk_native_wl_move_sync_create(wl->display, wl->surface);
+				enum comp_vk_native_wl_move_sync_reply r = COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED;
+				if (c->wl_move_sync != NULL) {
+					r = comp_vk_native_wl_geom_enable_move_sync(c->wl_geom);
+				}
+				if (r == COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED) {
+					comp_vk_native_wl_move_sync_destroy(&c->wl_move_sync);
+				}
+				U_LOG_W("wl_move_sync: move-synchronised re-weave %s (#1748)",
+				        r == COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED
+				            ? "ON - no drag lattice, no drop snap"
+				            : (r == COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE
+				                   ? "pending - registers when the window-geometry extension appears"
+				                   : "UNAVAILABLE - the drag lattice applies"));
+			}
+		}
 #endif
 	} else
 #endif
@@ -9159,8 +15017,14 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			apply_window_pos_override(&win_left, &win_top);
 			U_LOG_I("Creating self-owned XCB window (%ux%u at %d,%d)", win_w, win_h, win_left,
 			        win_top);
+			// No VK_KHR_xcb_surface on the app's instance means the target will
+			// present through the Xlib fallback: a hosted Windows app under a
+			// translation layer, which already owns its own X11 top-level.
+			// Present as a child of that window rather than a second top-level
+			// (#2322).
+			const bool adopt_own_window = !comp_vk_native_target_instance_has_xcb_surface(c);
 			xrt_result_t xret = comp_vk_native_window_xcb_create(
-			    win_w, win_h, win_left, win_top, transparent_background, &c->xcb_window);
+			    win_w, win_h, win_left, win_top, transparent_background, adopt_own_window, &c->xcb_window);
 			if (xret != XRT_SUCCESS) {
 				U_LOG_E("Failed to create self-owned XCB window");
 				free(c);
@@ -9190,11 +15054,27 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	}
 
 #ifdef XRT_OS_WINDOWS
+	// Unless the window has no size yet: a minimized (or not yet sized) window
+	// reports an empty client rect, and a 0x0 atlas fails xrCreateSession
+	// outright. Keep the display-sized default above, as the macOS and Linux
+	// branches below already do; begin_frame's window-follow adopts the real
+	// size on the first frame it has one (it skips empty client rects).
 	if (c->hwnd != NULL) {
 		RECT rect;
 		if (GetClientRect((HWND)c->hwnd, &rect)) {
-			c->settings.preferred.width = (uint32_t)(rect.right - rect.left);
-			c->settings.preferred.height = (uint32_t)(rect.bottom - rect.top);
+			const int32_t cw = (int32_t)(rect.right - rect.left);
+			const int32_t ch = (int32_t)(rect.bottom - rect.top);
+			const uint32_t fw = c->settings.preferred.width;
+			const uint32_t fh = c->settings.preferred.height;
+			const enum u_tiling_window_size_source src =
+			    u_tiling_pick_window_size(cw, ch, IsIconic((HWND)c->hwnd) != FALSE, fw, fh,
+			                              &c->settings.preferred.width, &c->settings.preferred.height);
+			if (src != U_TILING_WINDOW_SIZE_CLIENT) {
+				U_LOG_W("VK: bound window %p has no usable size at create (%s, client %dx%d) — "
+				        "creating at the pre-window default %ux%u (the display) instead of 0x0; "
+				        "the real size is adopted on the first frame it has one",
+				        c->hwnd, u_tiling_window_size_source_str(src), cw, ch, fw, fh);
+			}
 		}
 	}
 #endif
@@ -9217,20 +15097,34 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	 * single-device Vulkan path it always did.
 	 */
 	{
-		struct comp_vk_split_info si = {
+		struct comp_hub_d3d11_info si = {
 		    .xdev = xdev,
 		    .hwnd = c->hwnd,
 		    .dp_factory_d3d11 = dp_factory_d3d11,
 		    .has_shared_texture = c->has_shared_texture,
 		    .transparent_background = transparent_background,
 		    .app_timeline_semaphores = app_timeline_semaphores,
+		    // #2317 P2a: this caller honours the DIRECT release contract.
+		    .ring_direct = true,
+		    // #2317 P2c: ...and its plane twin: the plane pass signals the
+		    // deposit timeline before the handoff and waits out the hub's last
+		    // plane read (vk_split_stage_planes).
+		    .ring_direct_planes = true,
+		    // ...and takes DIRECT by default on one adapter, as the D3D12
+		    // reroute has since #2518. The opt-in waited for a single-dGPU
+		    // desktop to run VK fence-mode DIRECT, which #2371 accepted
+		    // (2026-11-02); re-checked on an RTX 3080 at 8K (Media Player Pro,
+		    // panels up, 60 fps, km=0): the staged ring's copies took ~43 % of
+		    // the copy engine and ~6 % without them.
+		    // DXR_HUB_INGRESS=xbridge still forces the bridge.
+		    .ring_direct_default = true,
 		    .render_packed_luid = c->render_packed_luid,
 		    .display_screen_left = display_screen_left,
 		    .display_screen_top = display_screen_top,
 		    .preferred_width = c->settings.preferred.width,
 		    .preferred_height = c->settings.preferred.height,
 		};
-		comp_vk_split_stage_a(&si, &c->split, &c->split_off_reason);
+		comp_hub_d3d11_stage_a(&si, &c->split, &c->split_off_reason);
 	}
 	/*
 	 * What a RETIRE needs to rebuild the Vulkan half this session may never
@@ -9482,6 +15376,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * a sysprop for `adb shell setprop` — the kill switch has to be
 		 * reachable on the device that exhibits the bug.
 		 */
+		bool single_explicit = false; // DXR_WEAVE_SINGLE_THREAD / sysprop was set
 		{
 #ifdef XRT_OS_ANDROID
 			int single = 1;
@@ -9519,6 +15414,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 			const char *se = getenv("DXR_WEAVE_SINGLE_THREAD");
 			if (se != NULL && se[0] != '\0') {
 				single = (se[0] == '0') ? 0 : 1;
+				single_explicit = true;
 			}
 #ifdef XRT_OS_ANDROID
 			else {
@@ -9526,14 +15422,19 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 				if (__system_property_get("debug.dxr.weave_single_thread", sp) > 0 &&
 				    sp[0] != '\0') {
 					single = (sp[0] == '0') ? 0 : 1;
+					single_explicit = true;
 				}
 			}
 #endif
+			// Logged below, once the #2393 enable1 rule has had its say.
 			c->weave_hand.enabled = single;
-			U_LOG_W("#1196: weave thread ownership: %s (DXR_WEAVE_SINGLE_THREAD / "
-			        "debug.dxr.weave_single_thread; 0 disables)",
-			        single ? "single — app frames weave on the repaint thread"
-			               : "legacy — app thread and repaint thread both weave");
+#ifdef VK_MIDFRAME_FILL
+			// #1905: resolve (and log, once) the duty + park knobs at
+			// startup rather than on the repaint thread's first tick. The
+			// switch itself needs the #902 marker — resolved below.
+			(void)dxr_midframe_fill_duty();
+			(void)dxr_midframe_fill_park();
+#endif
 		}
 
 		/*
@@ -9565,19 +15466,143 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		 * entry point rather than assume the injection worked.
 		 */
 		bool layer_live = c->vk.vkGetDeviceProcAddr != NULL &&
-		                  c->vk.vkGetDeviceProcAddr(c->vk.device, "vkGetQueueLockMarkerDXR") != NULL;
+		                  c->vk.vkGetDeviceProcAddr(c->vk.device, U_VK_QL_MARKER_FN) != NULL;
+		/*
+		 * #886: and HOW it got there — the layer reports whether it was
+		 * named in the VkInstanceCreateInfo, enabled by its implicit
+		 * manifest, or forced by the loader's env. The route itself is
+		 * logged once the state tracker says who created the device
+		 * (comp_vk_native_compositor_set_vk_device_origin).
+		 */
+		c->ql.layer_live = layer_live;
+		c->ql.activation = U_VK_QL_ACT_UNKNOWN;
+		if (layer_live) {
+			typedef uint32_t(VKAPI_PTR * PFN_ql_activation)(VkDevice device);
+			PFN_ql_activation ql_act =
+			    (PFN_ql_activation)c->vk.vkGetDeviceProcAddr(c->vk.device, U_VK_QL_ACTIVATION_FN);
+			if (ql_act != NULL) {
+				c->ql.activation = ql_act(c->vk.device);
+			}
+		}
+		c->ql.family_queue_count = 0;
+		if (c->vk.vkGetPhysicalDeviceQueueFamilyProperties != NULL) {
+			uint32_t qf_n = 0;
+			c->vk.vkGetPhysicalDeviceQueueFamilyProperties(c->vk.physical_device, &qf_n, NULL);
+			if (c->queue_family_index < qf_n && qf_n <= 64) {
+				VkQueueFamilyProperties qf_props[64];
+				c->vk.vkGetPhysicalDeviceQueueFamilyProperties(c->vk.physical_device, &qf_n, qf_props);
+				c->ql.family_queue_count = qf_props[c->queue_family_index].queueCount;
+			}
+		}
+		/*
+		 * #1905: a live layer must NOT pull a multi-queue device onto the
+		 * shared-queue tier — the repaint_queue == NULL term below is what
+		 * keeps Adreno (runtime queue idx 1) on tier 1, where the layer's
+		 * per-queue locks serialize every submitter on each queue, the
+		 * app's own included. Logged (Android only — desktop log output
+		 * stays as it was) so a device run shows the layer engaged.
+		 */
+#ifdef XRT_OS_ANDROID
+		if (layer_live && c->repaint_queue != VK_NULL_HANDLE) {
+			U_LOG_W(
+			    "#1905: VK_LAYER_DXR_queue_lock is live on a device with a runtime-owned "
+			    "queue — repaint stays on its own queue; the layer only serializes");
+		}
+#endif
 		c->repaint.shared_queue = (c->repaint_queue == VK_NULL_HANDLE && layer_live && mode_layer_ok &&
 		                           c->repaint.enabled == 1)
 		                              ? 1
 		                              : 0;
 
+		/*
+		 * #2393: a vulkan_enable1 app on the shared-queue tier weaves on ONE
+		 * thread by default.
+		 *
+		 * Under enable1 the app created the VkDevice, so the repaint has no
+		 * queue of its own and shares the app's, serialised per call by
+		 * VK_LAYER_DXR_queue_lock. With legacy ownership two threads then
+		 * weave into the one VkSwapchainKHR: the app thread inside
+		 * xrEndFrame, and the repaint thread. That is a circular wait:
+		 *
+		 *  - a fill acquires target image A, submits, and fence-parks with
+		 *    c->mutex RELEASED (#1264 S1) — still holding A unpresented;
+		 *  - on the shared queue the fill's work sits behind whatever the
+		 *    app has already submitted, so the park lasts about as long as
+		 *    the app's GPU frame — the window in which the app reaches
+		 *    xrEndFrame;
+		 *  - the app thread takes c->mutex and calls vkAcquireNextImageKHR.
+		 *    The late-weave chain on Windows is the 2-image floor
+		 *    (minImageCount 2), so only ONE image may be acquired at a time
+		 *    and A is it: the acquire cannot succeed until A is presented;
+		 *  - presenting A (or handing it back) needs c->mutex, which the
+		 *    app thread holds while it waits.
+		 *
+		 * Unbounded that is a hang; with DXR_VK_ACQUIRE_TIMEOUT_MS armed the
+		 * acquire times out, the frame fails, and the failed frames make the
+		 * app look quiet, so the repaint fills every refresh and re-forms
+		 * the cycle on the next commit — every acquire fails (field report:
+		 * an enable1 app, hosted, Windows; DXR_WEAVE_SINGLE_THREAD=1 cleared
+		 * it). Single ownership puts every acquire and present on the
+		 * repaint thread, so no thread can wait in acquire on an image
+		 * another thread holds.
+		 *
+		 * Scoped to exactly that combination: enable2 apps (the runtime made
+		 * the device) keep their validated default, and Android already
+		 * defaults to single. An explicit DXR_WEAVE_SINGLE_THREAD wins in
+		 * both directions — =0 restores the legacy ownership. Not under the
+		 * #918 split either: there the weave is the hub's, not this
+		 * VkSwapchainKHR's, and #1261 keeps that path's ownership as validated.
+		 */
+		bool split_engaged = false;
+#ifdef XRT_OS_WINDOWS
+		split_engaged = (c->split != NULL);
+#endif
+		const bool enable1_shared_queue = app_created_device && c->repaint.shared_queue == 1 && !split_engaged;
+		if (enable1_shared_queue && single_explicit && c->weave_hand.enabled == 0) {
+			// Say so, so a log of an explicit =0 run cannot be mistaken
+			// for one where the auto default failed to engage.
+			U_LOG_W(
+			    "#2393: DXR_WEAVE_SINGLE_THREAD=0 OVERRIDES the vulkan_enable1 shared-queue "
+			    "default (single ownership) — legacy two-thread ownership kept; the app-frame "
+			    "target acquire can starve behind a parked fill");
+		} else if (enable1_shared_queue && !single_explicit && c->weave_hand.enabled == 0) {
+			c->weave_hand.enabled = 1;
+			U_LOG_W(
+			    "#2393: vulkan_enable1 app with the repaint sharing its queue "
+			    "(VK_LAYER_DXR_queue_lock) — single weave-thread ownership auto-enabled "
+			    "(two weaving threads time out the target acquire; "
+			    "DXR_WEAVE_SINGLE_THREAD=0 overrides)");
+		}
+		U_LOG_W(
+		    "#1196: weave thread ownership: %s (DXR_WEAVE_SINGLE_THREAD / "
+		    "debug.dxr.weave_single_thread; 0 disables)",
+		    c->weave_hand.enabled == 1 ? "single — app frames weave on the repaint thread"
+		                               : "legacy — app thread and repaint thread both weave");
+#ifdef VK_MIDFRAME_FILL
+		// #1905 enable policy: mid-frame fill auto-enables on the same
+		// marker handshake — the layer is live in this device's chain, so the
+		// app's own submits are serialised with the fill's (see
+		// dxr_midframe_fill_resolve). Logged once with the reason.
+		c->repaint.mf.layer_live = layer_live;
+		c->repaint.mf.enabled = dxr_midframe_fill_resolve(layer_live);
+		// #1905 ask 2: the non-blocking hand-off keys on the same marker.
+		// Its serve runs on the runtime-owned queue (never the app's, where it
+		// would queue behind the app's next frame), concurrently with the
+		// app's own submits — on Adreno both share one GSL context, so the
+		// layer must serialise them, exactly as for the fill.
+		c->hand_async.enabled = dxr_async_handoff_resolve(layer_live, c->repaint_queue != VK_NULL_HANDLE,
+		                                                  c->weave_hand.enabled, &c->hand_async.forced);
+#endif
+
 		if (c->repaint_queue == VK_NULL_HANDLE && c->repaint.shared_queue == 0) {
 			if (c->repaint.enabled == 1) {
-				U_LOG_W("#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
-				        "family was saturated) and no queue-lock layer (#902 marker %s) — "
-				        "repaint disabled. Sharing the app's queue bare is undefined "
-				        "behaviour and loses the device.",
-				        layer_live ? "resolved but mode excludes it" : "absent");
+				U_LOG_W(
+				    "#868: no runtime-owned VkQueue (vulkan_enable1, or the graphics "
+				    "family was saturated) and no queue-lock layer (#902 marker %s) — "
+				    "repaint disabled. Sharing the app's queue bare is undefined "
+				    "behaviour and loses the device.%s",
+				    layer_live ? "resolved but mode excludes it" : "absent",
+				    layer_live ? "" : " For a vulkan_enable1 app: " U_VK_QL_ENABLE1_HINT " (#886).");
 			}
 			c->repaint.enabled = 0;
 		} else {
@@ -9695,11 +15720,22 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		        "heap-reuse collision.");
 		c->display_processor = NULL;
 		c->dp_atlas_encoding_latched = -1; // #1484
+		c->pq_dp_asked = NULL;             // #2340
 	}
+#ifdef XRT_OS_WINDOWS
+	// #2405: the runtime-owned window phase-snaps while the user drags it, as
+	// on the D3D11 leg (answers "no snap" while no DP exists).
+	if (c->owns_window && c->own_window != NULL) {
+		comp_d3d11_window_set_snap_provider(c->own_window, vk_own_window_snap_cb, c);
+	}
+#endif
 
-	// Determine view dimensions
-	uint32_t view_width = c->settings.preferred.width / 2;
-	uint32_t view_height = c->settings.preferred.height;
+	// Determine view dimensions (half width for a 2-view atlas), never 0 — a
+	// 0-sized atlas fails the renderer create, and with it the whole session.
+	uint32_t view_width = 1;
+	uint32_t view_height = 1;
+	u_tiling_compute_window_scaled_view(0, 0, 2, 1, c->settings.preferred.width, c->settings.preferred.height,
+	                                    &view_width, &view_height);
 
 	// If display processor is available, query display info for view dimensions
 	if (c->display_processor != NULL) {
@@ -9707,16 +15743,8 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 		int32_t disp_left = 0, disp_top = 0;
 		if (vk_dp_display_pixel_info(c, &disp_px_w, &disp_px_h, &disp_left, &disp_top) && disp_px_w > 0 &&
 		    disp_px_h > 0) {
-			uint32_t base_vw = disp_px_w / 2;
-			uint32_t base_vh = disp_px_h;
-
-			float ratio = fminf(
-			    (float)c->settings.preferred.width / (float)disp_px_w,
-			    (float)c->settings.preferred.height / (float)disp_px_h);
-			if (ratio > 1.0f) ratio = 1.0f;
-
-			view_width = (uint32_t)((float)base_vw * ratio);
-			view_height = (uint32_t)((float)base_vh * ratio);
+			u_tiling_compute_window_scaled_view(disp_px_w, disp_px_h, 2, 1, c->settings.preferred.width,
+			                                    c->settings.preferred.height, &view_width, &view_height);
 		}
 	}
 
@@ -9767,9 +15795,30 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	 */
 #ifdef XRT_OS_WINDOWS
 	if (c->split != NULL) {
-		struct comp_vk_deposit_handoff handoff = {0};
-		bool ok = comp_vk_deposit_get_handoff(comp_vk_native_renderer_get_deposit(c->renderer), &handoff) &&
-		          comp_vk_split_wire_bridge(c->split, &handoff);
+		struct comp_hub_d3d11_handoff handoff = {0};
+		struct comp_vk_deposit *a2_dep = comp_vk_native_renderer_get_deposit(c->renderer);
+		bool ok =
+		    comp_vk_deposit_get_handoff(a2_dep, &handoff) && comp_hub_d3d11_wire_bridge(c->split, &handoff);
+		if (ok) {
+			/*
+			 * #2317 P2a: on ONE adapter the hub reads the ring DIRECT. In
+			 * fence mode its reads are released on its own consumer fence,
+			 * which Vulkan must import to order a slot rewrite after them —
+			 * no import, no DIRECT (the hub moves to xbridge, one-time, before
+			 * any frame). Keyed-mutex deposits need no fence at all.
+			 */
+			void *cons = comp_hub_d3d11_get_consumer_fence_handle(c->split);
+			if (cons != NULL && !comp_vk_deposit_bind_consumer_fence(a2_dep, cons)) {
+				comp_hub_d3d11_leave_direct(c->split, COMP_HUB_INGRESS_REASON_DIRECT_FAILED);
+			}
+			if (c->display_refresh_rate > 0.0f) {
+				// #2327: the hub target's governor drives the #867 lookahead
+				// wait_frame now reads under the split.
+				comp_hub_d3d11_set_display_period(
+				    c->split, (uint64_t)(U_TIME_1S_IN_NS / c->display_refresh_rate));
+			}
+			comp_hub_d3d11_log_placement(c->split, "vk");
+		}
 		if (!ok) {
 			vk_split_retire_locked(c,
 			                       "the cross-adapter transport could not be wired to the "
@@ -9821,6 +15870,26 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 	                                                   VK_FORMAT_B8G8R8A8_UNORM);
 	if (!c->local2d_initialized) {
 		U_LOG_W("VK Local2D composite init failed — 2D-over-3D masking disabled this session");
+	} else if (!u_color_legacy_unorm_encoded()) {
+		// #1795 / ADR-044 §7 — the Local2D flattens blend in linear light:
+		// a second flatten pipeline pair whose attachment is the scratch's
+		// `_SRGB` sibling. The scratch's own format (and every reader of it)
+		// is unchanged. The legacy hatch never creates it.
+		c->local2d_srgb_flatten_ready =
+		    vk_local2d_composite_init_srgb_flatten(&c->local2d, &c->vk, VK_FORMAT_B8G8R8A8_SRGB);
+		if (!c->local2d_srgb_flatten_ready) {
+			U_LOG_W(
+			    "VK Local2D: _SRGB flatten unavailable — Local2D layers flatten byte-passthrough (#1795)");
+		}
+	}
+	// Resolves (and logs, once) DXR_VK_ZONES_COPY_TO_DRAW for the session:
+	// the zones compose hand-off and this weave snapshot both read it.
+	if (c->local2d_initialized && comp_vk_native_zones_copy_to_draw_enabled()) {
+		c->local2d_snapshot_ready =
+		    vk_local2d_composite_init_snapshot(&c->local2d, &c->vk, VK_FORMAT_B8G8R8A8_UNORM);
+		if (!c->local2d_snapshot_ready) {
+			U_LOG_W("VK Local2D: weave snapshot draw unavailable — the snapshot keeps vkCmdCopyImage");
+		}
 	}
 
 	// Populate supported swapchain formats (Vulkan formats)
@@ -9903,6 +15972,32 @@ comp_vk_native_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
 	}
 
 	return false;
+}
+
+bool
+comp_vk_native_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                               int64_t target_ns,
+                                               struct xrt_eye_positions *out_eye_pos)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	return vk_dp_eyes_at(c, target_ns, out_eye_pos) && out_eye_pos->valid;
+}
+
+bool
+comp_vk_native_compositor_slot_holds_other_screen(struct xrt_compositor *xc)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef XRT_OS_WINDOWS
+	if (c->split != NULL) {
+		return comp_hub_d3d11_slot_holds_other_screen(c->split);
+	}
+#endif
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	return comp_segments_away_slot_other(&c->seg_away);
+#else
+	(void)c;
+	return false;
+#endif
 }
 
 bool
@@ -10886,6 +16981,347 @@ vk_wayland_phase_snap(struct comp_vk_native_compositor *c)
 }
 #endif // XRT_OS_LINUX_DESKTOP && XRT_HAVE_WAYLAND && DXR_HAVE_WL_GEOM
 
+#if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
+/*!
+ * #2071: the window-geometry publisher's bus name gained an owner again — it
+ * came back after a lock screen (extensions older than version 14 are disabled
+ * there), a shell restart or a re-enable, or it first came up after this window.
+ *
+ * The provider already dropped its cache, re-took GetWindows and renewed move
+ * sync on that edge. Everything THIS compositor derived from the old publisher
+ * is re-synced here, once, so a session that lives across the gap never keeps
+ * a phase reasoned from before it:
+ *
+ *  - present origin: the baseline is forgotten, so the next weave re-feeds
+ *    the DP's set_present_origin from the fresh snapshot and logs it (the
+ *    feed itself runs every weave; this guarantees the INFO line and that the
+ *    jump is not mistaken for a drag by the #912 drag-shallow clamp);
+ *  - the 1:1 gate (vk_linux_update_surface_not_1to1) runs right after this,
+ *    on the fresh snapshot, and its one-shot "nothing to measure" /
+ *    off-panel lines are re-armed so a still-missing rect says so again;
+ *  - weave phase: a drop-snap verification in flight is abandoned (its target
+ *    came from the old publisher), and the gap is treated as a move from the
+ *    last position seen before it — so when the snapshot says the window is
+ *    still, the drop path re-asks the DP (snap_window_rect) and moves the
+ *    window onto the lattice if the gap left it off;
+ *  - move sync: the frame tag is re-sent with the next presented frame and
+ *    the extension's sync state is re-logged.
+ *
+ * One WARN per event. Never per frame: the generation moves only on a
+ * NameOwnerChanged.
+ */
+static void
+vk_wl_geom_resync_if_publisher_reappeared(struct comp_vk_native_compositor *c)
+{
+	if (!c->use_wayland || c->wl_geom == NULL) {
+		return;
+	}
+	const uint32_t gen = comp_vk_native_wl_geom_publisher_generation(c->wl_geom);
+	if (gen == c->wl_geom_publisher_gen_seen) {
+		return;
+	}
+	c->wl_geom_publisher_gen_seen = gen;
+
+	// Move sync owns the drop when the extension syncs this window: there is
+	// no drop snap to re-arm then, only the tag below.
+	const bool synced = c->wl_move_sync != NULL && c->wl_ms.active;
+	const bool rearm_snap = c->wl_snap_have_last && !synced;
+
+	U_LOG_W(
+	    "wl_geom: publisher reappeared — re-syncing geometry (#2071): present origin re-fed, 1:1 gate re-run, "
+	    "weave phase %s (%d, %d), move-sync tag %s (publisher generation %u)",
+	    rearm_snap ? "re-snap armed from the last position seen before the gap" : "baseline kept at",
+	    c->wl_snap_last_x, c->wl_snap_last_y, c->wl_move_sync != NULL ? "re-sent" : "n/a", gen);
+
+	c->have_last_present_origin = false;
+	c->warned_1to1_unknown = false;
+	c->warned_wl_window_off_panel = false;
+
+	c->wl_snap_verify_pending = false;
+	c->wl_snap_still = 0;
+	c->wl_snap_tries = 0;
+	if (rearm_snap) {
+		c->wl_snap_anchor_x = c->wl_snap_last_x;
+		c->wl_snap_anchor_y = c->wl_snap_last_y;
+		c->wl_snap_moving = true;
+	} else if (!c->wl_snap_have_last) {
+		c->wl_snap_moving = false;
+	}
+
+	comp_vk_native_wl_move_sync_resync(c->wl_move_sync);
+	c->wl_ms.logged_active = false;
+}
+
+/*!
+ * TEST HOOK, off by default (extension v10 harness): DXR_WL_TEST_TAG
+ *   off               never map the frame tag — a move-synced process that
+ *                     tags no commit (a present-owner showing only 2D)
+ *   toggle:ON_MS:OFF_MS  map it for ON_MS, then unmap it for OFF_MS, repeating
+ *                     (a 3D element scrolling in and out of view mid-drag)
+ * The registration (EnableMoveSync) is unchanged. Never for a real session.
+ *
+ * @return whether the hook allows the tag to be mapped right now.
+ */
+static bool
+vk_wl_move_sync_test_tag_allowed(void)
+{
+	static int mode = -1; // 0 = no hook, 1 = off, 2 = toggle
+	static int64_t on_ms = 0, off_ms = 0;
+	if (mode < 0) {
+		mode = 0;
+		const char *e = getenv("DXR_WL_TEST_TAG");
+		int a = 0, b = 0;
+		if (e != NULL && strcmp(e, "off") == 0) {
+			mode = 1;
+		} else if (e != NULL && sscanf(e, "toggle:%d:%d", &a, &b) == 2 && a > 0 && b > 0) {
+			mode = 2;
+			on_ms = a;
+			off_ms = b;
+		}
+		if (mode != 0) {
+			U_LOG_W("DXR_WL_TEST_TAG=%s: the frame tag is %s (test hook)", e,
+			        mode == 1 ? "never mapped" : "toggled");
+		}
+	}
+	if (mode == 0) {
+		return true;
+	}
+	if (mode == 1) {
+		return false;
+	}
+	const int64_t t_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
+	return t_ms % (on_ms + off_ms) < on_ms;
+}
+
+/*!
+ * #1748 move sync, per weave: remember the position THIS weave is woven for
+ * (the snapshot vk_get_window_metrics just used, not a newer one) so the
+ * present can tag its commit with it, and publish whether a move is running
+ * for the repaint loop's per-refresh fill.
+ *
+ * @return true when the extension syncs this window right now: nothing is
+ *         snapped then, during a drag or at the drop — every frame is shown
+ *         where it was woven for. False = the drag-lattice path, unchanged
+ *         (no extension support, DXR_WL_MOVE_SYNC=0, or the extension has
+ *         not accepted the registration yet / again).
+ */
+static bool
+vk_wl_move_sync_note_weave(struct comp_vk_native_compositor *c)
+{
+	c->wl_ms.have_pending = false;
+	c->wl_ms.last_weave_ns = os_monotonic_get_ns();
+	if (c->wl_move_sync == NULL || !c->use_wayland) {
+		c->wl_ms.active = false;
+		c->wl_ms.moving = false;
+		return false;
+	}
+	struct comp_vk_native_wl_window_rect wr = {0};
+	if (!comp_vk_native_wl_geom_last_rect(c->wl_geom, &wr)) {
+		c->wl_ms.moving = false;
+		return c->wl_ms.active;
+	}
+	// A window that covers its monitor (fullscreen) is never dragged; keep
+	// its surface single so mutter can scan it out directly.
+	const bool covers_monitor = wr.left_px == 0 && wr.top_px == 0 && wr.width_px == wr.monitor_width_px &&
+	                            wr.height_px == wr.monitor_height_px;
+	comp_vk_native_wl_move_sync_set_mapped(c->wl_move_sync, !covers_monitor && vk_wl_move_sync_test_tag_allowed());
+	c->wl_ms.have_pending = true;
+	c->wl_ms.pending_x = wr.content_logical_x;
+	c->wl_ms.pending_y = wr.content_logical_y;
+	if (wr.move_sync != c->wl_ms.active || !c->wl_ms.logged_active) {
+		c->wl_ms.logged_active = true;
+		U_LOG_W("wl_move_sync: the window-geometry extension %s this window (#1748)",
+		        wr.move_sync ? "move-syncs" : "does NOT move-sync - drag lattice for");
+	}
+	c->wl_ms.active = wr.move_sync;
+	c->wl_ms.moving = wr.move_sync && wr.have_moving && wr.moving;
+	return wr.move_sync;
+}
+
+/*!
+ * Take the position the weave in progress is woven for (see note_weave), into
+ * the caller's own storage: the fill fence-park releases c->mutex before its
+ * present, and another weave may note its own position meanwhile.
+ */
+static void
+vk_wl_move_sync_take(struct comp_vk_native_compositor *c, bool *have, int32_t *x, int32_t *y)
+{
+	*have = c->wl_ms.have_pending;
+	*x = c->wl_ms.pending_x;
+	*y = c->wl_ms.pending_y;
+	c->wl_ms.have_pending = false;
+}
+
+//! Tag the commit the next present makes. Immediately before it, under the lock.
+static void
+vk_wl_move_sync_tag_present(struct comp_vk_native_compositor *c, bool have, int32_t x, int32_t y)
+{
+	if (have && c->wl_move_sync != NULL) {
+		comp_vk_native_wl_move_sync_tag(c->wl_move_sync, x, y);
+	}
+}
+
+/*!
+ * #1748: a move-sync window advances on screen only when a frame woven for
+ * its new position lands, so while a move is running every display refresh
+ * should carry one. The app fills the slots it makes; this says a repaint
+ * should fill the one it is missing: a move is running and no weave has
+ * chosen an origin for most of a refresh period. Bypasses the repaint quiet
+ * gate (which exists to keep fills away from a PACED app's slots — during a
+ * drag the point is the opposite) but never app_frame_in_progress or the
+ * submit window, and never more than one weave per period, so the FIFO
+ * queue — the drag's lag — does not grow.
+ */
+static bool
+vk_wl_move_fill_due(const struct comp_vk_native_compositor *c, uint64_t period_ns)
+{
+	static int fill = -1;
+	if (fill < 0) {
+		const char *e = getenv("DXR_WL_MOVE_SYNC_FILL");
+		fill = (e != NULL && e[0] == '0') ? 0 : 1;
+	}
+	if (fill == 0 || c->wl_move_sync == NULL || !c->wl_ms.moving) {
+		return false;
+	}
+	const uint64_t last = c->wl_ms.last_weave_ns;
+	const uint64_t now = os_monotonic_get_ns();
+	return last == 0 || now - last >= period_ns - period_ns / 8;
+}
+#else
+static void
+vk_wl_move_sync_take(struct comp_vk_native_compositor *c, bool *have, int32_t *x, int32_t *y)
+{
+	(void)c;
+	*have = false;
+	*x = 0;
+	*y = 0;
+}
+static void
+vk_wl_move_sync_tag_present(struct comp_vk_native_compositor *c, bool have, int32_t x, int32_t y)
+{
+	(void)c;
+	(void)have;
+	(void)x;
+	(void)y;
+}
+static bool
+vk_wl_move_fill_due(const struct comp_vk_native_compositor *c, uint64_t period_ns)
+{
+	(void)c;
+	(void)period_ns;
+	return false;
+}
+#endif
+
+#ifdef XRT_OS_ANDROID
+/*!
+ * Pick the window rect the weave is fed THIS frame: the published one when its
+ * extent matches the target being woven, else the last one that did.
+ *
+ * The rect and the target reach this point down two different paths: MonadoView
+ * publishes the rect from its UI thread the moment surfaceChanged reports the
+ * new size, while the swapchain is only recreated at the next acquire that sees
+ * the surface's currentExtent move — and on a resume the surface can move FIRST
+ * (the WSI reports the new extent a frame before Java's surfaceChanged). Resuming
+ * a phone under the lock-screen status bar toggles the window 0,0 1080x2400 <->
+ * 0,99 1080x2301 two or three times in two seconds, and on every toggle the DP
+ * got a few frames of the NEW origin over the OLD-size target (or the reverse).
+ * The Leia DP anchors the lenticular phase on (rect origin, target height) —
+ * CNSDK turns it into a bottom origin of panel_h - target_h - y — so a 99-row
+ * disagreement is a visibly wrong weave on those frames.
+ *
+ * The rule: origin and extent are a MATCHED PAIR. While the newest rect's
+ * extent disagrees with the target, keep feeding the last rect that agreed —
+ * that is the geometry the buffers still being presented were laid out for —
+ * and switch the moment the target catches up.
+ *
+ * BOUNDED (@p hold_ns). A configuration in which the rect extent legitimately
+ * never equals the target would otherwise freeze the origin forever; if the
+ * hold expires the published rect is fed as before and the gate stays off until
+ * a coherent pair is seen again. Transposed extents count as matching: under
+ * Android pre-rotation the landscape target is panel-native portrait while the
+ * rect is in the current orientation (comp_vk_native_target.cpp, LOXR-730).
+ * No target (the shared-texture branch) means nothing to pair with: pass-through.
+ */
+static void
+vk_android_rect_for_weave(struct comp_vk_native_compositor *c,
+                          uint64_t generation,
+                          int32_t *x,
+                          int32_t *y,
+                          uint32_t *w,
+                          uint32_t *h,
+                          int32_t *display_id,
+                          uint32_t *disp_w,
+                          uint32_t *disp_h)
+{
+	const uint64_t hold_ns = 250ull * U_TIME_1MS_IN_NS;
+	uint32_t tw = 0, th = 0;
+	if (c->target != NULL) {
+		comp_vk_native_target_get_dimensions(c->target, &tw, &th);
+	}
+	const bool coherent = tw == 0 || th == 0 || (*w == tw && *h == th) || (*w == th && *h == tw);
+
+	if (coherent) {
+		if (c->android_rect_coherent.hold_generation != 0) {
+			const uint64_t held_ms =
+			    (os_monotonic_get_ns() - c->android_rect_coherent.hold_since_ns) / U_TIME_1MS_IN_NS;
+			c->android_rect_coherent.corrections++;
+			// One line per correction (a window toggle), never per frame;
+			// after the first few, INFO so a resize-drag cannot flood.
+			if (c->android_rect_coherent.corrections <= 4) {
+				U_LOG_W(
+				    "WINDOW_RECT: held %d,%d %ux%u for %llu ms until the target caught up with "
+				    "%d,%d %ux%u (target %ux%u) — origin/extent fed as a matched pair",
+				    c->android_rect_coherent.x, c->android_rect_coherent.y, c->android_rect_coherent.w,
+				    c->android_rect_coherent.h, (unsigned long long)held_ms, *x, *y, *w, *h, tw, th);
+			} else {
+				U_LOG_I("WINDOW_RECT: held a rect for %llu ms until the target matched %ux%u",
+				        (unsigned long long)held_ms, tw, th);
+			}
+		}
+		c->android_rect_coherent.valid = true;
+		c->android_rect_coherent.bypass = false;
+		c->android_rect_coherent.hold_generation = 0;
+		c->android_rect_coherent.x = *x;
+		c->android_rect_coherent.y = *y;
+		c->android_rect_coherent.w = *w;
+		c->android_rect_coherent.h = *h;
+		c->android_rect_coherent.display_id = *display_id;
+		c->android_rect_coherent.disp_w = *disp_w;
+		c->android_rect_coherent.disp_h = *disp_h;
+		return;
+	}
+
+	if (!c->android_rect_coherent.valid || c->android_rect_coherent.bypass) {
+		return; // nothing coherent to hold, or the gate is off: feed as published
+	}
+
+	const uint64_t now = os_monotonic_get_ns();
+	if (c->android_rect_coherent.hold_generation == 0) {
+		c->android_rect_coherent.hold_since_ns = now;
+	}
+	c->android_rect_coherent.hold_generation = generation;
+
+	if (now - c->android_rect_coherent.hold_since_ns >= hold_ns) {
+		U_LOG_W(
+		    "WINDOW_RECT: rect %d,%d %ux%u never matched the %ux%u target within %llu ms — "
+		    "feeding it as published",
+		    *x, *y, *w, *h, tw, th, (unsigned long long)(hold_ns / U_TIME_1MS_IN_NS));
+		c->android_rect_coherent.bypass = true;
+		c->android_rect_coherent.hold_generation = 0;
+		return;
+	}
+
+	*x = c->android_rect_coherent.x;
+	*y = c->android_rect_coherent.y;
+	*w = c->android_rect_coherent.w;
+	*h = c->android_rect_coherent.h;
+	*display_id = c->android_rect_coherent.display_id;
+	*disp_w = c->android_rect_coherent.disp_w;
+	*disp_h = c->android_rect_coherent.disp_h;
+}
+#endif
+
 static void
 vk_update_present_origin(struct comp_vk_native_compositor *c)
 {
@@ -10921,6 +17357,7 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 				        "(#1037/#1033)",
 				        x, y, w, h, display_id, disp_w, disp_h);
 			}
+			vk_android_rect_for_weave(c, generation, &x, &y, &w, &h, &display_id, &disp_w, &disp_h);
 			xrt_display_processor_vk_set_window_screen_rect(
 			    (struct xrt_display_processor_vk *)c->display_processor, x, y, w, h, display_id);
 			/*
@@ -10957,6 +17394,18 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 		c->last_window_px_w = m.window_pixel_width;
 		c->last_window_px_h = m.window_pixel_height;
 		c->have_last_window_size = true;
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+		// Multi-screen M2: the window's desktop rect, for the segment table.
+		// X11 root coordinates are desktop-absolute — the same space the
+		// screen registry's RandR rects are in. Windows (M6): the client
+		// area from ClientToScreen, device px — every DisplayXR executable
+		// is per-monitor DPI aware (#1201), the registry's monitor space.
+		c->seg_window.x = m.window_screen_left;
+		c->seg_window.y = m.window_screen_top;
+		c->seg_window.w = m.window_pixel_width;
+		c->seg_window.h = m.window_pixel_height;
+		c->have_seg_window = true;
+#endif
 	}
 
 	/*
@@ -10991,6 +17440,25 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	if (c->have_last_present_origin && c->target != NULL &&
 	    (ox != c->last_present_origin_x || oy != c->last_present_origin_y)) {
 		comp_vk_native_target_note_origin_motion(c->target);
+		/*
+		 * #1748 TEST HOOK, off by default: DXR_WL_TEST_STALL=N:MS sleeps MS
+		 * ms on every N-th frame whose origin moved - a slow frame (MS about
+		 * a refresh) or a stalled app (MS in the hundreds) in the middle of a
+		 * drag, without a real workload.
+		 */
+		static int stall_every = -1, stall_ms = 0;
+		static int stall_count = 0;
+		if (stall_every < 0) {
+			const char *e = getenv("DXR_WL_TEST_STALL");
+			stall_every = 0;
+			if (e != NULL && sscanf(e, "%d:%d", &stall_every, &stall_ms) != 2) {
+				stall_every = 0;
+			}
+		}
+		if (stall_every > 0 && stall_ms > 0 && ++stall_count % stall_every == 0) {
+			U_LOG_W("DXR_WL_TEST_STALL: stalling this frame %d ms (test hook)", stall_ms);
+			os_nanosleep((int64_t)stall_ms * 1000 * 1000);
+		}
 	}
 	// On-change only (a drag produces a burst, a static window logs once): the
 	// one line that lets an unattended run prove WHICH origin reached the weaver
@@ -11009,9 +17477,12 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 	c->have_last_present_origin = true;
 
 #if defined(XRT_OS_LINUX_DESKTOP) && defined(XRT_HAVE_WAYLAND) && defined(DXR_HAVE_WL_GEOM)
-	// After the feed, never before it: the snap is about where the window will
-	// be NEXT, and this frame's weave must use where it is now (#1609).
-	vk_wayland_phase_snap(c);
+	if (!vk_wl_move_sync_note_weave(c)) {
+		// After the feed, never before it: the snap is about where the
+		// window will be NEXT, and this frame's weave must use where it is
+		// now (#1609).
+		vk_wayland_phase_snap(c);
+	}
 #endif
 
 #ifdef XRT_OS_LINUX_DESKTOP
@@ -11039,11 +17510,11 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 #else
 	const bool origin_from_x11 = true;
 #endif
+	if (vk_linux_collapsed_2d(c)) {
+		return; // degraded to 2D (either arm, or auto-2D); there is no phase to anchor
+	}
 	if (origin_from_x11 && !vk_x11_present_origin_is_panel_native(c)) {
 		return; // display-scoped weaving; the DP's origin stays (0,0)
-	}
-	if (!origin_from_x11 && c->linux_surface_not_1to1) {
-		return; // degraded to 2D; there is no phase to anchor
 	}
 #endif
 
@@ -11060,17 +17531,34 @@ vk_update_present_origin(struct comp_vk_native_compositor *c)
 static bool
 vk_dp_request_display_mode(struct comp_vk_native_compositor *c, bool enable_3d)
 {
+	// #2247: the session's DP weaves the primary screen; while the window has
+	// wholly left it, that screen stays 2D (the weave restores the session's
+	// mode when it returns). The split's weaver applies its own gate.
+	const bool dp_3d = enable_3d && !c->seg_primary_uncovered;
 	U_LOG_W("HW3D_DBG vk_native request enable_3d=%d dp=%p has_slot=%d slot=%p", (int)enable_3d,
 	        (void *)c->display_processor,
 	        c->display_processor ? (int)XRT_DP_HAS_SLOT(c->display_processor, request_display_mode) : -1,
 	        c->display_processor ? (void *)c->display_processor->request_display_mode : NULL);
-	if (c->display_processor != NULL) {
-		return xrt_display_processor_request_display_mode(c->display_processor, enable_3d);
+#ifdef XRT_OS_WINDOWS
+	{
+		// ADR-047 Amendment 2: never call into a primary DP being swapped.
+		os_mutex_lock(&c->dp_swap_mutex);
+		struct xrt_display_processor *dp = c->display_processor;
+		const bool ok = dp != NULL && xrt_display_processor_request_display_mode(dp, dp_3d);
+		os_mutex_unlock(&c->dp_swap_mutex);
+		if (dp != NULL) {
+			return ok;
+		}
 	}
+#else
+	if (c->display_processor != NULL) {
+		return xrt_display_processor_request_display_mode(c->display_processor, dp_3d);
+	}
+#endif
 #ifdef XRT_OS_WINDOWS
 	// #918 VK-1: the split's D3D11 weaver owns the panel's 2D/3D state.
 	if (c->split != NULL) {
-		return comp_vk_split_request_display_mode(c->split, enable_3d);
+		return comp_hub_d3d11_request_display_mode(c->split, enable_3d);
 	}
 #endif
 	// No display processor yet. If THIS compositor will create one (it has a
@@ -11106,12 +17594,33 @@ comp_vk_native_compositor_request_display_mode(struct xrt_compositor *xc, bool e
 	if (!u_display_mode_hold_request(&c->display_mode_hold, enable_3d)) {
 		U_LOG_W(
 		    "vk_native: hardware %s requested while the runtime holds the panel in 2D "
-		    "(NOT_1TO1) — recorded, applied when the hold clears",
-		    enable_3d ? "3D" : "2D");
+		    "(%s) — recorded, applied when the hold clears",
+		    enable_3d ? "3D" : "2D", c->linux_surface_not_1to1 ? "NOT_1TO1" : "auto-2D, flat submission");
 		return true;
 	}
 #endif
 	return vk_dp_request_display_mode(c, enable_3d);
+}
+
+bool
+comp_vk_native_compositor_set_mono_2d_hold(struct xrt_compositor *xc, bool hold)
+{
+	if (xc == NULL) {
+		return false;
+	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Recorded here (the app thread, inside xrEndFrame), applied by
+	// vk_linux_update_mono_2d at the top of the composed frame under the
+	// compositor lock, where the #1595 hold is decided too. Plain write, the
+	// convention for these one-writer flags (no C11 atomics in portable code).
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->mono_2d_wanted = hold;
+	return true;
+#else
+	// The runtime hold and the tile-0 collapse exist only on desktop Linux.
+	(void)hold;
+	return false;
+#endif
 }
 
 void
@@ -11120,14 +17629,26 @@ comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint3
 	if (xc == NULL) return;
 	struct comp_vk_native_compositor *c = vk_comp(xc);
 
+#ifdef XRT_OS_WINDOWS
+	// ADR-047 Amendment 2: remembered for a swapped-in primary DP, and never
+	// sent to one being swapped.
+	os_mutex_lock(&c->dp_swap_mutex);
+	c->eye_tracking_mode = mode;
+	c->eye_tracking_mode_set = true;
 	if (c->display_processor != NULL) {
 		xrt_display_processor_set_eye_tracking_mode(c->display_processor, mode);
 	}
+	os_mutex_unlock(&c->dp_swap_mutex);
+#else
+	if (c->display_processor != NULL) {
+		xrt_display_processor_set_eye_tracking_mode(c->display_processor, mode);
+	}
+#endif
 #ifdef XRT_OS_WINDOWS
 	// #918 VK-1: under the split the weaver is the D3D11 one on the scanout
 	// adapter, and it owns the vendor's eye-tracking mode for this session.
 	if (c->split != NULL) {
-		comp_vk_split_set_eye_tracking_mode(c->split, mode);
+		comp_hub_d3d11_set_eye_tracking_mode(c->split, mode);
 	}
 #endif
 }
@@ -11151,6 +17672,133 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 	if (c->owns_window && c->own_window != NULL) {
 		comp_d3d11_window_set_system_devices(c->own_window, xsysd);
 	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #1727: the self-created XCB window feeds keyboard/mouse into qwerty, the
+	// way the Win32 window does. An app-owned window (xlib binding) handles
+	// its own input, as on Windows.
+	if (c->owns_window && c->xcb_window != NULL) {
+		comp_vk_native_window_xcb_set_system_devices(c->xcb_window, xsysd);
+	}
+#endif
+}
+
+bool
+comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out)
+{
+	if (out == NULL) {
+		return false;
+	}
+	memset(out, 0, sizeof(*out));
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	if (xc == NULL) {
+		return false;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: under the split the weave is the D3D11 one on the scanout
+	// adapter, which segments with its own manager and publishes its own
+	// table (eyes filled per query, like below).
+	if (c->split != NULL) {
+		return comp_hub_d3d11_get_segment_metrics(c->split, out) && out->count > 0;
+	}
+#endif
+	os_mutex_lock(&c->seg_pub_mutex);
+	*out = c->seg_pub;
+	// The eyes are predicted NOW, per segment: the primary from the
+	// session's own DP, every other screen from its segment DP (guarded
+	// against the weave destroying it).
+	for (uint32_t k = 0; k < out->count && k < XRT_MAX_SEGMENTS; k++) {
+		struct xrt_segment_metric *s = &out->seg[k];
+		if (s->is_primary) {
+			s->have_eyes = vk_dp_predicted_eyes(c, &s->eyes) && s->eyes.valid;
+		} else {
+			s->have_eyes = comp_vk_native_segments_get_eyes(c->segments, s->screen_id, &s->eyes);
+		}
+	}
+	os_mutex_unlock(&c->seg_pub_mutex);
+	return out->count > 0;
+#else
+	(void)xc;
+	return false;
+#endif
+}
+
+void
+comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing)
+{
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	if (xc == NULL || routing == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	os_mutex_lock(&c->seg_pub_mutex);
+	c->seg_route = *routing;
+	os_mutex_unlock(&c->seg_pub_mutex);
+#else
+	(void)xc;
+	(void)routing;
+#endif
+}
+
+void
+comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
+                                      const struct xrt_screen_list *list,
+                                      const struct xrt_system_compositor_info *info,
+                                      uint64_t pinned_display_id)
+{
+#ifdef VK_NATIVE_HAVE_SEGMENTS
+	if (xc == NULL || list == NULL || info == NULL) {
+		return;
+	}
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	struct xrt_screen_list *copy = U_TYPED_CALLOC(struct xrt_screen_list);
+	struct xrt_system_compositor_info *info_copy = U_TYPED_CALLOC(struct xrt_system_compositor_info);
+	if (copy == NULL || info_copy == NULL) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	*copy = *list;
+	*info_copy = *info;
+
+	// #1394: never block the app thread on a wedged weave.
+	if (vk_weave_blocked(c)) {
+		free(copy);
+		free(info_copy);
+		return;
+	}
+	os_mutex_lock(&c->mutex);
+	// The segment manager is rebuilt on the next weave with no fill in flight
+	// (destroying it here could free DPs a parked fill is still executing).
+	c->seg_rebuild = true;
+	// ...and nothing may frame views from the old table meanwhile.
+	os_mutex_lock(&c->seg_pub_mutex);
+	memset(&c->seg_pub, 0, sizeof(c->seg_pub));
+	c->seg_zero_copy_withheld = false; // #2218: re-answered by the next weave
+	os_mutex_unlock(&c->seg_pub_mutex);
+	free(c->seg_screens);
+	c->seg_screens = copy;
+	// #2305: the registry this list was built from, not the session-start one
+	// in c->sys_info — a screen a display hotplug added is only in this one.
+	free(c->seg_sys_info);
+	c->seg_sys_info = info_copy;
+	c->seg_pinned_display_id = pinned_display_id;
+#ifdef XRT_OS_WINDOWS
+	// #918 VK-1: under the split the D3D11 weave on the scanout adapter
+	// segments the window (ADR-047 Amendment 1); it rebuilds its manager on
+	// its next weave. The copies above stay for a retire back to Vulkan.
+	if (c->split != NULL) {
+		comp_hub_d3d11_set_screens(c->split, list, info, pinned_display_id);
+	}
+#endif
+	os_mutex_unlock(&c->mutex);
+#else
+	(void)xc;
+	(void)list;
+	(void)info;
+	(void)pinned_display_id;
 #endif
 }
 
@@ -11287,7 +17935,8 @@ vk_x11_placement_quantum(struct comp_vk_native_compositor *c)
 		U_LOG_W(
 		    "X11 placement quantum: unknown (%s) — drag snapping unchanged. "
 		    "`displayxr-cli info` shows the per-output evidence.",
-		    rep.drm_available ? "no consistent global scale" : "no DRM connector modes in sysfs");
+		    rep.drm_available ? "no consistent global scale"
+		                      : "no connector device modes (Mutter DisplayConfig / DRM sysfs)");
 		return 0;
 	}
 	c->x11_quantum = rep.verdict.quantum;
@@ -11483,6 +18132,19 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
 		return false;
 	}
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef XRT_OS_WINDOWS
+	{
+		// ADR-047 Amendment 2: the DP holding the window snaps it — another
+		// screen's segment DP while that screen holds the majority.
+		os_mutex_lock(&c->dp_swap_mutex);
+		struct xrt_display_processor *sdp = c->snap_dp != NULL ? c->snap_dp : c->display_processor;
+		const bool ok = sdp != NULL && xrt_display_processor_vk_snap_window_rect(
+		                                   (struct xrt_display_processor_vk *)sdp, origin_x, origin_y, target_x,
+		                                   target_y, out_x, out_y);
+		os_mutex_unlock(&c->dp_swap_mutex);
+		return ok;
+	}
+#endif
 	if (c->display_processor == NULL) {
 		return false;
 	}
@@ -11574,6 +18236,104 @@ struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c)
 {
 	return &c->vk;
+}
+
+void
+comp_vk_native_compositor_set_vk_device_origin(struct xrt_compositor *xc,
+                                               bool app_created_device,
+                                               bool runtime_injected)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	c->ql.origin_known = true;
+	c->ql.app_created_device = app_created_device;
+	c->ql.runtime_injected = runtime_injected;
+	c->ql.route = u_vk_ql_route_resolve(c->ql.layer_live, c->ql.activation, runtime_injected);
+
+	const char *how = "";
+	switch (c->ql.route) {
+	case U_VK_QL_ROUTE_ABSENT:
+		how = app_created_device ? "not in the app's chain — " U_VK_QL_ENABLE1_HINT
+		                         : "not in the chain — the injection at xrCreateVulkanInstanceKHR did not take "
+		                           "(see the #902 line there) or DXR_VK_QUEUE_MODE=off|queue";
+		break;
+	case U_VK_QL_ROUTE_INJECTED: how = "the runtime named it at xrCreateVulkanInstanceKHR"; break;
+	case U_VK_QL_ROUTE_APP_ENABLED: how = "the app named it in its own VkInstanceCreateInfo"; break;
+	case U_VK_QL_ROUTE_IMPLICIT: how = "implicit manifest, DXR_VK_QUEUE_LOCK=1"; break;
+	case U_VK_QL_ROUTE_LOADER_ENV:
+		how = "forced by the loader env (VK_INSTANCE_LAYERS / VK_LOADER_LAYERS_ENABLE)";
+		break;
+	case U_VK_QL_ROUTE_UNKNOWN: how = "live, but the layer predates the activation query"; break;
+	}
+	const char *tier = c->repaint.enabled != 1              ? "none (repaint off)"
+	                   : c->repaint_queue != VK_NULL_HANDLE ? "runtime-owned queue"
+	                   : c->repaint.shared_queue == 1       ? "shared app queue (serialised by the layer)"
+	                                                        : "none (repaint off)";
+	U_LOG_W(
+	    "#886: VK_LAYER_DXR_queue_lock route=%s (%s) — %s device, graphics family has %u queue(s), "
+	    "repaint tier: %s",
+	    u_vk_ql_route_str(c->ql.route), how,
+	    app_created_device ? "app-created (vulkan_enable1)" : "runtime-created (vulkan_enable2)",
+	    c->ql.family_queue_count, tier);
+}
+
+bool
+comp_vk_native_compositor_get_queue_lock_state(struct xrt_compositor *xc, bool *out_layer_live, bool *out_repaint)
+{
+	struct comp_vk_native_compositor *c = vk_comp(xc);
+	if (out_layer_live != NULL) {
+		*out_layer_live = c->ql.layer_live;
+	}
+	if (out_repaint != NULL) {
+		*out_repaint = c->repaint.enabled == 1;
+	}
+	return c->repaint.shared_queue == 1;
+}
+
+void
+comp_vk_native_compositor_note_app_swapchain(struct comp_vk_native_compositor *c, uint32_t image_count)
+{
+	/*
+	 * #886 / runtime#2039 guard — LOG ONLY. The app's swapchain depth is the
+	 * runtime's only view of how many app frames can be queued on the queue
+	 * the layer now serialises (one image is the one the compositor reads).
+	 * The #2039 collapse was later attributed to a tracked viewer and a low
+	 * GPU clock, not to the layer — so this states the condition and the A/B
+	 * switch, and changes nothing.
+	 */
+	uint32_t fif = image_count > 0 ? image_count - 1 : 0;
+	if (c->ql.serialisation_noted || !c->ql.origin_known || c->ql.family_queue_count != 1 ||
+	    !u_vk_ql_should_note_serialisation(c->ql.app_created_device, c->ql.layer_live, c->repaint.shared_queue == 1,
+	                                       fif)) {
+		return;
+	}
+	c->ql.serialisation_noted = true;
+	U_LOG_W(
+	    "#868: per-call queue serialisation in effect — a vulkan_enable1 app on a single-graphics-queue "
+	    "GPU, VK_LAYER_DXR_queue_lock live (route=%s), the repaint sharing the app's queue, and %u-deep "
+	    "app swapchains (up to %u app frames in flight on that queue). Every vkQueue* call — the app's "
+	    "and the repaint's — now takes the layer's per-queue lock. For an A/B, DXR_WEAVE_REPAINT=0 turns "
+	    "the repaint loop off (the layer stays; DXR_VK_QUEUE_LOCK_DISABLE=1 or not enabling it removes it). "
+	    "Logged, not acted on (runtime#2039).",
+	    u_vk_ql_route_str(c->ql.route), image_count, fif);
+}
+
+void
+comp_vk_native_compositor_swapchain_images_destroyed(struct comp_vk_native_compositor *c,
+                                                     const VkImage *images,
+                                                     uint32_t count)
+{
+	os_mutex_lock(&c->ws_dead.mutex);
+	for (uint32_t i = 0; i < count; i++) {
+		if (images[i] == VK_NULL_HANDLE) {
+			continue;
+		}
+		if (c->ws_dead.count >= ARRAY_SIZE(c->ws_dead.images)) {
+			c->ws_dead.overflow = true;
+			break;
+		}
+		c->ws_dead.images[c->ws_dead.count++] = images[i];
+	}
+	os_mutex_unlock(&c->ws_dead.mutex);
 }
 
 uint32_t
@@ -11761,6 +18521,149 @@ vk_destroy_rt(struct comp_vk_native_compositor *c,
 	}
 }
 
+//! #1795 — vk_destroy_rt plus the flatten scratch's `_SRGB` view, in
+//! dependency order (framebuffer, then views, then the image).
+static void
+vk_destroy_flatten_rt(struct comp_vk_native_compositor *c,
+                      VkImage *img,
+                      VkDeviceMemory *mem,
+                      VkImageView *view,
+                      VkImageView *srgb_view,
+                      VkFramebuffer *fb)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (fb != NULL && *fb != VK_NULL_HANDLE) {
+		vk->vkDestroyFramebuffer(vk->device, *fb, NULL);
+		*fb = VK_NULL_HANDLE;
+	}
+	if (*srgb_view != VK_NULL_HANDLE) {
+		vk->vkDestroyImageView(vk->device, *srgb_view, NULL);
+		*srgb_view = VK_NULL_HANDLE;
+	}
+	vk_destroy_rt(c, img, mem, view, fb);
+}
+
+/*!
+ * #1795 / ADR-044 §7 — create/reuse a Local2D FLATTEN scratch (B8G8R8A8).
+ *
+ * Honest path (local2d_srgb_flatten_ready, i.e. not the legacy hatch): the image
+ * is B8G8R8A8_UNORM + MUTABLE_FORMAT with a {UNORM, _SRGB} format list — the
+ * shape of the renderer's private compose target (#1799). @p view is its UNORM
+ * view, so every reader (the masked composite, the DP backdrop, the #73 dumps)
+ * still sees ENCODED bytes; @p srgb_view is the `_SRGB` view the flatten
+ * renders through, and @p fb is built over it and local2d.flatten_srgb_rp. The
+ * attachment does the encode — no blit, no shader arithmetic.
+ *
+ * Legacy hatch (or if the mutable image cannot be made): exactly the old
+ * vk_ensure_rt scratch, UNORM fb over local2d.flatten_rp, @p srgb_view NULL.
+ * The caller reads `*srgb_view != VK_NULL_HANDLE` as "this target is _SRGB".
+ */
+static bool
+vk_ensure_flatten_rt(struct comp_vk_native_compositor *c,
+                     VkImage *img,
+                     VkDeviceMemory *mem,
+                     VkImageView *view,
+                     VkImageView *srgb_view,
+                     VkFramebuffer *fb,
+                     uint32_t *cw,
+                     uint32_t *ch,
+                     uint32_t w,
+                     uint32_t h,
+                     VkImageUsageFlags usage,
+                     const char *what)
+{
+	struct vk_bundle *vk = &c->vk;
+	const bool honest = c->local2d_srgb_flatten_ready;
+
+	if (*img != VK_NULL_HANDLE && *cw == w && *ch == h && (*srgb_view != VK_NULL_HANDLE) == honest) {
+		return true;
+	}
+	// Any reallocation (dims, or the target kind flipping) starts from nothing:
+	// a same-dims UNORM image left behind would let vk_ensure_rt early-out
+	// with no fb.
+	vk_destroy_flatten_rt(c, img, mem, view, srgb_view, fb);
+	*cw = 0;
+	*ch = 0;
+
+	if (honest) {
+		VkFormat list[2] = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+		VkImageFormatListCreateInfo fmt_list = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+		    .viewFormatCount = 2,
+		    .pViewFormats = list,
+		};
+		VkImageCreateInfo ici = {
+		    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		    .pNext = &fmt_list,
+		    .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+		    .imageType = VK_IMAGE_TYPE_2D,
+		    .format = VK_FORMAT_B8G8R8A8_UNORM,
+		    .extent = {w, h, 1},
+		    .mipLevels = 1,
+		    .arrayLayers = 1,
+		    .samples = VK_SAMPLE_COUNT_1_BIT,
+		    .tiling = VK_IMAGE_TILING_OPTIMAL,
+		    .usage = usage,
+		    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		};
+		bool ok = vk->vkCreateImage(vk->device, &ici, NULL, img) == VK_SUCCESS;
+		if (!ok) {
+			*img = VK_NULL_HANDLE;
+		} else {
+			VkMemoryRequirements mr;
+			vk->vkGetImageMemoryRequirements(vk->device, *img, &mr);
+			uint32_t type_id = 0;
+			ok = vk_get_memory_type(vk, mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &type_id);
+			if (ok) {
+				VkMemoryAllocateInfo mai = {
+				    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+				    .allocationSize = mr.size,
+				    .memoryTypeIndex = type_id,
+				};
+				ok = vk->vkAllocateMemory(vk->device, &mai, NULL, mem) == VK_SUCCESS;
+				if (!ok) {
+					*mem = VK_NULL_HANDLE;
+				}
+				ok = ok && vk->vkBindImageMemory(vk->device, *img, *mem, 0) == VK_SUCCESS;
+			}
+		}
+		ok = ok && vk_create_view(vk, *img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_UNORM, k_color_sub,
+		                          view) == VK_SUCCESS;
+		ok = ok && vk_create_view(vk, *img, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_B8G8R8A8_SRGB, k_color_sub,
+		                          srgb_view) == VK_SUCCESS;
+		if (ok && fb != NULL) {
+			VkFramebufferCreateInfo fb_ci = {
+			    .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			    .renderPass = c->local2d.flatten_srgb_rp,
+			    .attachmentCount = 1,
+			    .pAttachments = srgb_view,
+			    .width = w,
+			    .height = h,
+			    .layers = 1,
+			};
+			ok = vk->vkCreateFramebuffer(vk->device, &fb_ci, NULL, fb) == VK_SUCCESS;
+		}
+		if (ok) {
+			*cw = w;
+			*ch = h;
+			return true;
+		}
+
+		// Fall back to the legacy scratch for the rest of the session rather
+		// than lose the 2D: the flatten pipelines are fine, the image is not.
+		U_LOG_W(
+		    "[local2d] %s: MUTABLE {UNORM,_SRGB} %ux%u scratch failed — Local2D flattens "
+		    "byte-passthrough from here (#1795)",
+		    what, w, h);
+		vk_destroy_flatten_rt(c, img, mem, view, srgb_view, fb);
+		c->local2d_srgb_flatten_ready = false;
+	}
+
+	return vk_ensure_rt(c, img, mem, view, fb, cw, ch, w, h, VK_FORMAT_B8G8R8A8_UNORM, usage, c->local2d.flatten_rp,
+	                    what);
+}
+
 #ifdef XRT_OS_WINDOWS
 /*!
  * VK-1b (#1178) — (re)build the flatten framebuffer over a bridge PLANE's image.
@@ -11878,10 +18781,20 @@ vk_local2d_begin_frame_once(struct comp_vk_native_compositor *c)
 // region. Shared by the pre-weave backdrop flatten (#491 part 3, under-layers)
 // and the post-weave overlay flatten (#439 Phase 3, over-layers) so the source
 // geometry / flip / unpremult handling stays identical between the two.
+//
+// #1795 / ADR-044 §7: @p srgb_target says @p target_fb is an `_SRGB` view built
+// over local2d.flatten_srgb_rp (vk_ensure_flatten_rt's honest scratch). The
+// SOURCE VIEW FOLLOWS THE TARGET, as on D3D11 (9d8b073d5): into an `_SRGB`
+// attachment sample the layer as its declared format — an `_SRGB` swapchain
+// decodes on sample, a UNORM one is read as the linear values it holds — so
+// the blend is linear and the attachment encodes once. Into a UNORM attachment
+// (legacy hatch, or a bridge plane) keep the non-decoding view: bytes pass
+// through exactly as before.
 static void
 vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
                              VkCommandBuffer cmd,
                              VkFramebuffer target_fb,
+                             bool srgb_target,
                              struct comp_layer *layer,
                              uint32_t region_w,
                              uint32_t region_h)
@@ -11892,10 +18805,9 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 		return;
 	}
 	uint32_t img_idx = layer->data.local_2d.sub.image_index;
-	// sRGB-passthrough: sample the layer's own view (the projection path
-	// samples the same). UNORM-sibling decode is a follow-up if a layer
-	// ever uses an _SRGB swapchain.
-	VkImageView src_view = (VkImageView)(uintptr_t)comp_vk_native_swapchain_get_image_view(sc, img_idx);
+	VkImageView src_view =
+	    (VkImageView)(uintptr_t)(srgb_target ? comp_vk_native_swapchain_get_true_image_view(sc, img_idx)
+	                                         : comp_vk_native_swapchain_get_image_view(sc, img_idx));
 	if (src_view == VK_NULL_HANDLE) {
 		return;
 	}
@@ -11936,10 +18848,156 @@ vk_flatten_one_local2d_layer(struct comp_vk_native_compositor *c,
 	}
 	bool unpremult = (layer->data.flags & XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT) != 0;
 
-	vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view, x0, y0,
-	                                  (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h,
-	                                  unpremult);
+	if (srgb_target) {
+		vk_local2d_composite_flatten_draw_srgb(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view,
+		                                       x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y,
+		                                       src_w, src_h, unpremult);
+	} else {
+		vk_local2d_composite_flatten_draw(&c->local2d, vk, cmd, target_fb, region_w, region_h, src_view, x0, y0,
+		                                  (uint32_t)(x1 - x0), (uint32_t)(y1 - y0), src_x, src_y, src_w, src_h,
+		                                  unpremult);
+	}
 }
+
+#ifdef XRT_OS_WINDOWS
+/*!
+ * #1795 / ADR-044 §7 — the HONEST flatten under the weave-on-scanout split.
+ *
+ * A bridge plane is an imported typed-UNORM D3D11 texture, so it has no `_SRGB`
+ * view to render through. Instead the selected Local2D layers flatten into the
+ * private MUTABLE scratch through its `_SRGB` view — exactly the non-split
+ * flatten — and the region is then vkCmdCopyImage'd into the plane. That copy is
+ * a raw texel copy between two B8G8R8A8 images (never a blit, which would
+ * convert), so the plane carries the same ENCODED bytes the scratch's UNORM view
+ * reads, and the output-device lerp is unchanged.
+ *
+ * It records into the caller's plane command buffer, so it lands inside the
+ * plane-write window the direct flatten used (same timeline signal/wait, same
+ * keyed-mutex timing-only ordering, #1274), and like the direct flatten it only
+ * runs on an app frame (#868/#875).
+ *
+ * Pre: @p plane's image has just been CLEARED and is in TRANSFER_DST_OPTIMAL.
+ * Post (returns true): the region has been copied in and the plane is still in
+ * TRANSFER_DST_OPTIMAL — the caller makes it SHADER_READ. Returns false having
+ * recorded nothing when the honest path is unavailable (legacy hatch, no `_SRGB`
+ * pipelines, a plane format the raw copy cannot serve, or no mutable scratch);
+ * the caller then flattens straight into the plane as before.
+ *
+ * @param under  true = the 2D-under layers (backdrop plane, backdrop_scratch);
+ *               false = the over-layers (Local2D plane, local2d_scratch).
+ */
+static bool
+vk_split_flatten_via_scratch(struct comp_vk_native_compositor *c,
+                             VkCommandBuffer cmd,
+                             const struct comp_vk_deposit_plane *plane,
+                             bool under,
+                             int32_t proj_idx,
+                             uint32_t region_w,
+                             uint32_t region_h)
+{
+	struct vk_bundle *vk = &c->vk;
+	if (!c->local2d_srgb_flatten_ready || plane == NULL || region_w == 0 || region_h == 0) {
+		return false;
+	}
+	// The scratch is B8G8R8A8: a raw copy is only the identity into the same
+	// texel layout and channel order.
+	if (plane->format != VK_FORMAT_B8G8R8A8_UNORM && plane->format != VK_FORMAT_B8G8R8A8_SRGB) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) {
+			fmt_logged = true;
+			U_LOG_W("VK split: plane format %d is not B8G8R8A8 — Local2D flattens byte-passthrough (#1795)",
+			        (int)plane->format);
+		}
+		return false;
+	}
+
+	VkImage *s_img = under ? &c->backdrop_scratch : &c->local2d_scratch;
+	VkDeviceMemory *s_mem = under ? &c->backdrop_scratch_mem : &c->local2d_scratch_mem;
+	VkImageView *s_view = under ? &c->backdrop_scratch_view : &c->local2d_scratch_view;
+	VkImageView *s_srgb = under ? &c->backdrop_scratch_srgb_view : &c->local2d_scratch_srgb_view;
+	VkFramebuffer *s_fb = under ? &c->backdrop_scratch_fb : &c->local2d_scratch_fb;
+	uint32_t *s_w = under ? &c->backdrop_scratch_w : &c->local2d_scratch_w;
+	uint32_t *s_h = under ? &c->backdrop_scratch_h : &c->local2d_scratch_h;
+	if (*s_img != VK_NULL_HANDLE && (*s_w != region_w || *s_h != region_h) && vk->vkQueueWaitIdle != NULL) {
+		// On-change only (a region resize): the plane pass runs on a ring of
+		// in-flight command buffers, so the old scratch may still be read by
+		// a previous frame's copy when vk_ensure_flatten_rt frees it.
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	if (!vk_ensure_flatten_rt(c, s_img, s_mem, s_view, s_srgb, s_fb, s_w, s_h, region_w, region_h,
+	                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                          under ? "backdrop scratch (split)" : "local2d scratch (split)") ||
+	    *s_srgb == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		U_LOG_W(
+		    "VK split: Local2D flattens in linear light into the private _SRGB scratch, raw-copied "
+		    "into the bridge plane (format %d) (#1795)",
+		    (int)plane->format);
+	}
+
+	// Scratch: clear transparent → COLOR_ATTACHMENT, flatten, → TRANSFER_SRC.
+	// The source scope covers the previous frame's copy-out and flatten of this
+	// single-buffered scratch (WAR), in case a plane pass is still in flight.
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
+	vk->vkCmdClearColorImage(cmd, *s_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+	                            k_color_sub);
+
+	for (uint32_t i = 0; i < c->layer_accum.layer_count; i++) {
+		struct comp_layer *layer = &c->layer_accum.layers[i];
+		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+			continue;
+		}
+		// Exactly the direct plane flattens' selections: the backdrop takes
+		// every Local2D layer before the projection (vk_flatten_backdrop_2d);
+		// the overlay skips those unless it is a zones frame, which has no
+		// under/over split (vk_split_flatten_local2d).
+		const bool before_proj = proj_idx >= 0 && (int32_t)i < proj_idx;
+		const bool take = under ? before_proj : !(!c->zones_frame && before_proj);
+		if (!take) {
+			continue;
+		}
+		vk_flatten_one_local2d_layer(c, cmd, *s_fb, true, layer, region_w, region_h);
+	}
+
+	vk_cmd_image_barrier_locked(vk, cmd, *s_img, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                            k_color_sub);
+
+	// Plane: order the copy after the caller's whole-surface clear (WAW, same
+	// layout), then copy the region top-left — the layout the bridge and the
+	// output-device composite assume (#464).
+	const VkImage plane_img = (VkImage)(uintptr_t)plane->image;
+	vk_cmd_image_barrier_locked(vk, cmd, plane_img, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+	VkImageCopy region = {
+	    .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .srcOffset = {0, 0, 0},
+	    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+	    .dstOffset = {0, 0, 0},
+	    .extent = {region_w < plane->width ? region_w : plane->width,
+	               region_h < plane->height ? region_h : plane->height, 1},
+	};
+	vk->vkCmdCopyImage(cmd, *s_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, plane_img,
+	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+	return true;
+}
+#endif
 
 // #491 part 3 — flatten the frame's 2D-UNDER Local2D layers (those BEFORE the
 // projection in xrEndFrame list order) into backdrop_scratch (premultiplied),
@@ -11999,8 +19057,6 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 		return VK_NULL_HANDLE;
 	}
 
-	const VkFormat scratch_fmt = VK_FORMAT_B8G8R8A8_UNORM;
-
 	/*
 	 * VK-1b (#1178) — WHERE THIS FLATTENS.
 	 *
@@ -12017,6 +19073,10 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	VkImage bd_image;
 	VkFramebuffer bd_fb;
 	VkImageView bd_view;
+	// #1795: only the private scratch can be `_SRGB`-viewed; the bridge plane is
+	// a typed-UNORM D3D11 texture, so a DIRECT plane flatten is byte-passthrough
+	// (the honest plane route is vk_split_flatten_via_scratch, below).
+	bool bd_srgb = false;
 #ifdef XRT_OS_WINDOWS
 	if (plane != NULL) {
 		bd_image = (VkImage)(uintptr_t)plane->image;
@@ -12029,17 +19089,20 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	} else
 #endif
 	{
-		if (!vk_ensure_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
-		                  &c->backdrop_scratch_fb, &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w,
-		                  region_h, scratch_fmt,
-		                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-		                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		                  c->local2d.flatten_rp, "backdrop scratch")) {
+		// #1795: same contract as the over-flatten — `_SRGB` attachment,
+		// encoded bytes through backdrop_scratch_view for the DP.
+		if (!vk_ensure_flatten_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+		                          &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb,
+		                          &c->backdrop_scratch_w, &c->backdrop_scratch_h, region_w, region_h,
+		                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+		                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+		                          "backdrop scratch")) {
 			return VK_NULL_HANDLE;
 		}
 		bd_image = c->backdrop_scratch;
 		bd_view = c->backdrop_scratch_view;
 		bd_fb = c->backdrop_scratch_fb;
+		bd_srgb = c->backdrop_scratch_srgb_view != VK_NULL_HANDLE;
 	}
 
 	vk_local2d_begin_frame_once(c);
@@ -12052,25 +19115,41 @@ vk_flatten_backdrop_2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
 	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
 	vk->vkCmdClearColorImage(cmd, bd_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	                            k_color_sub);
 
-	// Flatten ONLY the under-layers (before the projection) into the backdrop.
-	for (int32_t i = 0; i < proj_idx; i++) {
-		struct comp_layer *layer = &c->layer_accum.layers[i];
-		if (layer->data.type != XRT_LAYER_LOCAL_2D) {
-			continue;
-		}
-		vk_flatten_one_local2d_layer(c, cmd, bd_fb, layer, region_w, region_h);
+	// #1795: under the split, the honest route flattens into the private
+	// `_SRGB` scratch and raw-copies the region into the (cleared) plane.
+	bool via_scratch = false;
+#ifdef XRT_OS_WINDOWS
+	if (plane != NULL) {
+		via_scratch = vk_split_flatten_via_scratch(c, cmd, plane, /*under=*/true, proj_idx, region_w, region_h);
 	}
+#endif
+	if (via_scratch) {
+		vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	} else {
+		vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 
-	vk_cmd_image_barrier_locked(vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		// Flatten ONLY the under-layers (before the projection) into the backdrop.
+		for (int32_t i = 0; i < proj_idx; i++) {
+			struct comp_layer *layer = &c->layer_accum.layers[i];
+			if (layer->data.type != XRT_LAYER_LOCAL_2D) {
+				continue;
+			}
+			vk_flatten_one_local2d_layer(c, cmd, bd_fb, bd_srgb, layer, region_w, region_h);
+		}
+
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, bd_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+	}
 
 	static bool logged = false;
 	if (!logged) {
@@ -12357,7 +19436,7 @@ vk_split_cmd_ring_take(struct comp_vk_native_compositor *c,
  * Ordering, like the plane pass: its own command buffer, its own value claimed
  * on the deposit timeline AFTER the atlas submit, and it must run BEFORE the
  * handoff is taken — @ref comp_vk_deposit_get_handoff reports the latest claimed
- * value, so the single `Wait` @ref comp_vk_split_submit_atlas takes on the other
+ * value, so the single `Wait` @ref comp_hub_d3d11_submit_atlas takes on the other
  * adapter then covers this pass too.
  *
  * A repaint never reaches here (it replays inside the split), which is the same
@@ -12456,6 +19535,118 @@ vk_split_composite_window_space(struct comp_vk_native_compositor *c)
 }
 
 /*!
+ * #2340 — DXR_ATLAS_ENCODING=pq on the SPLIT path: re-encode the atlas as PQ
+ * for the split's D3D11 weaver, the one that weaves it. That DP is asked once
+ * through its `accepts_atlas_encoding` slot (#2294) and, if it accepts, told
+ * PQ through the split, which re-sends it to a DP swapped in later. The deposit
+ * maps the A2B10G10R10 atlas to R10G10B10A2, the format the D3D11 tier encodes.
+ *
+ * Same ordering and fencing as the window-space pass above: its own ring entry,
+ * a deposit-timeline value claimed AFTER the atlas and window-space submits and
+ * BEFORE the handoff, so the one `Wait` comp_hub_d3d11_submit_atlas takes covers
+ * it. A repaint replays inside the split over a slot already encoded.
+ *
+ * A ring with every entry still in flight skips the encode for that frame
+ * rather than stall (the #925 rule). The DP has been told PQ, so an atlas
+ * that missed the pass must not reach it: false tells the caller to release
+ * the slot without handing it over, and that frame presents nothing (#918 F4),
+ * leaving the last encoded frame on the panel. The CPU-paced frame structure
+ * the ring relies on makes it practically unreachable.
+ *
+ * @return false only when PQ is in effect and this frame's atlas was NOT
+ *         encoded; true otherwise (encoded, or PQ not in effect).
+ */
+static bool
+vk_split_encode_atlas_pq(struct comp_vk_native_compositor *c)
+{
+	struct vk_bundle *vk = &c->vk;
+
+	if (!vk_pq_requested() || c->split == NULL || c->renderer == NULL) {
+		return true;
+	}
+	if (!c->pq_split_checked) {
+		c->pq_split_checked = true;
+		c->pq_split_active =
+		    vk_pq_atlas_format_ok(c) && comp_hub_d3d11_accepts_atlas_encoding(c->split, XRT_ATLAS_ENCODING_PQ);
+		if (!c->pq_warned_format) {
+			U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): %s",
+			        c->pq_split_active ? "split D3D11 DP accepts PQ - weaving a PQ atlas"
+			                           : "split D3D11 DP does not accept PQ - keeping the sRGB atlas");
+		}
+		if (c->pq_split_active) {
+			comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_PQ);
+		}
+	}
+	if (!c->pq_split_active) {
+		return true;
+	}
+	struct comp_vk_deposit *dep = comp_vk_native_renderer_get_deposit(c->renderer);
+	if (dep == NULL) {
+		return false;
+	}
+	if (!vk_split_cmd_ring_ensure(c, &c->pq_cmd_pool, c->pq_cmd, c->pq_cmd_value, &c->pq_cmd_next, "PQ encode")) {
+		// No ring at all is permanent, unlike a busy one: stop declaring PQ.
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): no command ring for the PQ pass - PQ off");
+		c->pq_split_active = false;
+		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
+		return true;
+	}
+	const int32_t ring = vk_split_cmd_ring_take(c, dep, c->pq_cmd_value, &c->pq_cmd_next);
+	if (ring < 0) {
+		return false; // every entry still in flight: see above
+	}
+	const VkCommandBuffer cmd = c->pq_cmd[ring];
+	if (vk->vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+		return false;
+	}
+	VkCommandBufferBeginInfo begin_info = {
+	    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	};
+	vk->vkBeginCommandBuffer(cmd, &begin_info);
+	const bool encoded = comp_vk_native_renderer_encode_atlas_pq(c->renderer, cmd);
+	vk->vkEndCommandBuffer(cmd);
+	if (!encoded) {
+		// The pass cannot be built: stop declaring PQ (nothing was recorded).
+		U_LOG_W("DXR_ATLAS_ENCODING=pq (#2340, experimental): the PQ pass is unavailable - PQ off");
+		c->pq_split_active = false;
+		comp_hub_d3d11_set_atlas_encoding(c->split, XRT_ATLAS_ENCODING_ENCODED);
+		return true; // PQ is off from here on, so this sRGB atlas is declared right
+	}
+
+	VkSemaphore sem = VK_NULL_HANDLE;
+	uint64_t signal_value = 0;
+	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
+	VkTimelineSemaphoreSubmitInfo timeline_info = {
+	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
+	};
+	VkSubmitInfo submit_info = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .commandBufferCount = 1,
+	    .pCommandBuffers = &cmd,
+	};
+	if (sem != VK_NULL_HANDLE) {
+		timeline_info.signalSemaphoreValueCount = 1;
+		timeline_info.pSignalSemaphoreValues = &signal_value;
+		submit_info.pNext = &timeline_info;
+		submit_info.signalSemaphoreCount = 1;
+		submit_info.pSignalSemaphores = &sem;
+	}
+	if (vk->vkQueueSubmit(vk->main_queue->queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
+		// The claimed value would never be signalled — give it back.
+		if (sem != VK_NULL_HANDLE) {
+			comp_vk_deposit_abandon_signal(dep);
+		}
+		return false;
+	}
+	if (sem == VK_NULL_HANDLE && vk->vkQueueWaitIdle != NULL) {
+		vk->vkQueueWaitIdle(vk->main_queue->queue);
+	}
+	c->pq_cmd_value[ring] = signal_value;
+	return true;
+}
+
+/*!
  * VK-1b-2 — flatten this frame's OVER Local2D layers into the LOCAL2D plane.
  *
  * The `twod` half of vk_composite_local_2d, and ONLY that half: under the split
@@ -12492,6 +19683,17 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
 	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
 	VkClearColorValue transparent = {.float32 = {0.0f, 0.0f, 0.0f, 0.0f}};
 	vk->vkCmdClearColorImage(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &transparent, 1, &k_color_sub);
+
+	// #1795 / ADR-044 §7: the honest route flattens into the private `_SRGB`
+	// scratch and raw-copies the region into the (just cleared) plane.
+	if (vk_split_flatten_via_scratch(c, cmd, plane, /*under=*/false, proj_idx, region_w, region_h)) {
+		vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		return true;
+	}
+
 	vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -12509,7 +19711,9 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
 		if (!c->zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 			continue;
 		}
-		vk_flatten_one_local2d_layer(c, cmd, c->plane_l2d_fb, layer, region_w, region_h);
+		// #1795: legacy route — the plane is a typed-UNORM D3D11 texture
+		// (no `_SRGB` view), so a direct flatten is byte-passthrough.
+		vk_flatten_one_local2d_layer(c, cmd, c->plane_l2d_fb, false, layer, region_w, region_h);
 	}
 
 	vk_cmd_image_barrier_locked(vk, cmd, img, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
@@ -12523,10 +19727,10 @@ vk_split_flatten_local2d(struct comp_vk_native_compositor *c,
  * VK-1b-2 — resolve this frame's mask REQUEST and raster it on the out device.
  *
  * Every input is CPU-side, which is why the mask is REBUILT where it is consumed
- * rather than transported. See comp_vk_split_raster_mask for why this runs in the
+ * rather than transported. See comp_hub_d3d11_raster_mask for why this runs in the
  * deposit half here and from a captured request on the D3D12 leg.
  *
- * @return the resolved `COMP_VK_SPLIT_MASK_*` kind, or NONE when the frame needs
+ * @return the resolved `COMP_HUB_D3D11_MASK_*` kind, or NONE when the frame needs
  *         no mask (or the raster failed, which degrades only the composite).
  */
 static uint32_t
@@ -12535,7 +19739,7 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 	struct xrt_rect rects[XRT_MAX_LAYERS];
 	float feather[XRT_MAX_LAYERS];
 	uint32_t count = 0;
-	uint32_t kind = COMP_VK_SPLIT_MASK_NONE;
+	uint32_t kind = COMP_HUB_D3D11_MASK_NONE;
 
 	memset(feather, 0, sizeof(feather));
 
@@ -12557,7 +19761,7 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 		 * rasters ONE mask per frame, so a feathered frame gets the ramp and
 		 * skips the publish rather than publishing ramped geometry.
 		 */
-		kind = any_feather ? COMP_VK_SPLIT_MASK_ZONE_FEATHER : COMP_VK_SPLIT_MASK_ZONE_BINARY;
+		kind = any_feather ? COMP_HUB_D3D11_MASK_ZONE_FEATHER : COMP_HUB_D3D11_MASK_ZONE_BINARY;
 	} else {
 		for (uint32_t i = 0; i < c->layer_accum.layer_count && count < XRT_MAX_LAYERS; i++) {
 			if (c->layer_accum.layers[i].data.type != XRT_LAYER_LOCAL_2D) {
@@ -12568,14 +19772,14 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 			}
 			rects[count++] = c->layer_accum.layers[i].data.local_2d.rect;
 		}
-		kind = COMP_VK_SPLIT_MASK_IMPLICIT;
+		kind = COMP_HUB_D3D11_MASK_IMPLICIT;
 	}
 
 	if (count == 0) {
-		return COMP_VK_SPLIT_MASK_NONE;
+		return COMP_HUB_D3D11_MASK_NONE;
 	}
-	if (!comp_vk_split_raster_mask(c->split, kind, rects, feather, count, region_w, region_h)) {
-		return COMP_VK_SPLIT_MASK_NONE;
+	if (!comp_hub_d3d11_raster_mask(c->split, kind, rects, feather, count, region_w, region_h)) {
+		return COMP_HUB_D3D11_MASK_NONE;
 	}
 	return kind;
 }
@@ -12587,8 +19791,8 @@ vk_split_raster_frame_mask(struct comp_vk_native_compositor *c, int32_t proj_idx
 static void
 vk_split_unstage_planes(struct comp_vk_native_compositor *c)
 {
-	comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-	comp_vk_split_stage_no_composite(c->split);
+	comp_hub_d3d11_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+	comp_hub_d3d11_stage_no_composite(c->split);
 }
 
 static void
@@ -12649,8 +19853,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	if (region_w != c->plane_region_w || region_h != c->plane_region_h) {
 		c->plane_region_w = region_w;
 		c->plane_region_h = region_h;
-		comp_vk_split_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_BACKDROP);
-		comp_vk_split_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_LOCAL2D);
+		comp_hub_d3d11_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_BACKDROP);
+		comp_hub_d3d11_invalidate_plane(c->split, COMP_XBRIDGE_PLANE_LOCAL2D);
 	}
 
 	/*
@@ -12660,7 +19864,7 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * is what the bridge waits on. Claiming a SECOND value here — after it, on
 	 * the same monotonic timeline — makes the handoff's `fence_value` cover the
 	 * planes as well as the atlas, so the single `ID3D11DeviceContext4::Wait`
-	 * comp_vk_split_submit_atlas already takes orders BOTH.
+	 * comp_hub_d3d11_submit_atlas already takes orders BOTH.
 	 */
 	if (!vk_split_cmd_ring_ensure(c, &c->plane_cmd_pool, c->plane_cmd, c->plane_cmd_value,
 	                             &c->plane_cmd_next, "plane")) {
@@ -12756,8 +19960,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint64_t signal_value = 0;
 	comp_vk_deposit_claim_signal(dep, &sem, &signal_value);
 	const uint64_t wait_value = comp_vk_deposit_plane_wait_value(dep);
-	VkPipelineStageFlags wait_stage =
-	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+	/*
+	 * #2317 P2c: on the hub's DIRECT ingress the planes are read IN PLACE by
+	 * every weave and repaint, so this rewrite also waits out the hub's latest
+	 * read, on its consumer fence (imported as a second timeline). Fence mode
+	 * only — keyed-mutex deposits keep their timing-only planes (#1274).
+	 */
+	const VkSemaphore hub_sem = comp_vk_deposit_get_hub_timeline(dep);
+	const uint64_t hub_value = comp_hub_d3d11_get_plane_release_value(c->split);
+	VkPipelineStageFlags wait_stages[2] = {
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+	};
+	VkSemaphore wait_sems[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+	uint64_t wait_values[2] = {0, 0};
+	uint32_t wait_count = 0;
 
 	VkTimelineSemaphoreSubmitInfo timeline_info = {
 	    .sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO,
@@ -12774,11 +19991,21 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		submit_info.signalSemaphoreCount = 1;
 		submit_info.pSignalSemaphores = &sem;
 		if (wait_value != 0) {
-			timeline_info.waitSemaphoreValueCount = 1;
-			timeline_info.pWaitSemaphoreValues = &wait_value;
-			submit_info.waitSemaphoreCount = 1;
-			submit_info.pWaitSemaphores = &sem;
-			submit_info.pWaitDstStageMask = &wait_stage;
+			wait_sems[wait_count] = sem;
+			wait_values[wait_count] = wait_value;
+			wait_count++;
+		}
+		if (hub_sem != VK_NULL_HANDLE && hub_value != 0) {
+			wait_sems[wait_count] = hub_sem;
+			wait_values[wait_count] = hub_value;
+			wait_count++;
+		}
+		if (wait_count != 0) {
+			timeline_info.waitSemaphoreValueCount = wait_count;
+			timeline_info.pWaitSemaphoreValues = wait_values;
+			submit_info.waitSemaphoreCount = wait_count;
+			submit_info.pWaitSemaphores = wait_sems;
+			submit_info.pWaitDstStageMask = wait_stages;
 		}
 	}
 
@@ -12819,11 +20046,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		struct xrt_rect box = {0};
 		uint64_t hash = 0;
 		vk_local2d_digest(c, proj_idx, /*over=*/false, region_w, region_h, &box, &hash);
-		comp_vk_split_stage_backdrop(c->split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
-		                             box.offset.w, box.offset.h, (uint32_t)box.extent.w, (uint32_t)box.extent.h,
-		                             bd_w, bd_h);
+		comp_hub_d3d11_stage_backdrop(c->split, pl.shared_handle, pl.generation, pl.width, pl.height, hash,
+		                              box.offset.w, box.offset.h, (uint32_t)box.extent.w,
+		                              (uint32_t)box.extent.h, bd_w, bd_h);
 	} else {
-		comp_vk_split_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+		comp_hub_d3d11_stage_backdrop(c->split, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 	}
 
 	/*
@@ -12835,8 +20062,8 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 */
 	bool mask_is_plane = false;
 	if (mask_ok) {
-		comp_vk_split_stage_mask_plane(c->split, vk_mask_plane_seq(&plmask, amask), plmask.width,
-		                               plmask.height);
+		comp_hub_d3d11_stage_mask_plane(c->split, vk_mask_plane_seq(&plmask, amask), plmask.width,
+		                                plmask.height);
 		/*
 		 * ADR-027/#801 - in a ZONES frame an explicit wish is PUBLISH-only and
 		 * never a blend gate, so the composite there still gates on the binary
@@ -12845,11 +20072,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 		 */
 		mask_is_plane = !c->zones_frame;
 	} else {
-		comp_vk_split_stage_mask_plane(c->split, 0, 0, 0);
+		comp_hub_d3d11_stage_mask_plane(c->split, 0, 0, 0);
 	}
 
 	if (!l2d_ok) {
-		comp_vk_split_stage_no_composite(c->split);
+		comp_hub_d3d11_stage_no_composite(c->split);
 		return;
 	}
 
@@ -12864,11 +20091,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * A legacy authored mask is the composite's own gate and needs no raster -
 	 * its pixels are on the plane. Every other kind is rebuilt out-side.
 	 */
-	uint32_t mask_kind = COMP_VK_SPLIT_MASK_NONE;
+	uint32_t mask_kind = COMP_HUB_D3D11_MASK_NONE;
 	if (!mask_is_plane) {
 		mask_kind = vk_split_raster_frame_mask(c, proj_idx, region_w, region_h);
-		if (mask_kind == COMP_VK_SPLIT_MASK_NONE) {
-			comp_vk_split_stage_no_composite(c->split);
+		if (mask_kind == COMP_HUB_D3D11_MASK_NONE) {
+			comp_hub_d3d11_stage_no_composite(c->split);
 			return;
 		}
 	}
@@ -12896,10 +20123,10 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	uint64_t l2d_hash = 0;
 	vk_local2d_digest(c, proj_idx, /*over=*/true, region_w, region_h, &l2d_box, &l2d_hash);
 
-	comp_vk_split_stage_local2d(c->split, pl2d.shared_handle, pl2d.generation, pl2d.width, pl2d.height, l2d_hash,
-	                            l2d_box.offset.w, l2d_box.offset.h, (uint32_t)l2d_box.extent.w,
-	                            (uint32_t)l2d_box.extent.h, region_w, region_h, cx, cy, cw, ch, composite_mode,
-	                            opaque_present, mask_is_plane);
+	comp_hub_d3d11_stage_local2d(c->split, pl2d.shared_handle, pl2d.generation, pl2d.width, pl2d.height, l2d_hash,
+	                             l2d_box.offset.w, l2d_box.offset.h, (uint32_t)l2d_box.extent.w,
+	                             (uint32_t)l2d_box.extent.h, region_w, region_h, cx, cy, cw, ch, composite_mode,
+	                             opaque_present, mask_is_plane);
 
 	/*
 	 * ADR-027 P4 — the hardware zone WISH, on the path an active split takes.
@@ -12914,11 +20141,11 @@ vk_split_stage_planes(struct comp_vk_native_compositor *c, uint32_t tgt_w, uint3
 	 * wish is hardware geometry and stays binary (#800/#803), and this rung
 	 * rasters one mask per frame.
 	 */
-	if (c->zones_frame && (mask_ok || mask_kind == COMP_VK_SPLIT_MASK_ZONE_BINARY)) {
+	if (c->zones_frame && (mask_ok || mask_kind == COMP_HUB_D3D11_MASK_ZONE_BINARY)) {
 		c->zone_publish_seq++;
-		comp_vk_split_publish_zone_wish(c->split, c->zone_publish_seq);
+		comp_hub_d3d11_publish_zone_wish(c->split, c->zone_publish_seq);
 	} else if (!c->zones_frame) {
-		comp_vk_split_clear_zone_wish(c->split);
+		comp_hub_d3d11_clear_zone_wish(c->split);
 	}
 }
 #endif /* XRT_OS_WINDOWS */
@@ -13039,19 +20266,28 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 	}
 
 	// Resolve the `twod` source: flatten the Local2D layers into local2d_scratch.
-	if (!vk_ensure_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
-	                  &c->local2d_scratch_fb, &c->local2d_scratch_w, &c->local2d_scratch_h, region_w,
-	                  region_h, scratch_fmt,
-	                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-	                  c->local2d.flatten_rp, "local2d scratch")) {
+	// #1795 / ADR-044 §7: the flatten writes through the scratch's `_SRGB`
+	// view, so the layers blend in linear light and are encoded once on write;
+	// local2d_scratch_view (UNORM) still holds ENCODED bytes for the lerp
+	// against the raw weave snapshot. The legacy hatch keeps the UNORM scratch.
+	if (!vk_ensure_flatten_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	                          &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb, &c->local2d_scratch_w,
+	                          &c->local2d_scratch_h, region_w, region_h,
+	                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	                          "local2d scratch")) {
 		return false;
 	}
 	// Weave snapshot scratch (the lerp reads a copy; dst is RT≠SRV).
-	if (!vk_ensure_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL,
-	                  &c->weave_scratch_w, &c->weave_scratch_h, region_w, region_h, scratch_fmt,
-	                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_NULL_HANDLE,
-	                  "local2d weave")) {
+	// With the snapshot draw it is also a COLOR_ATTACHMENT with a framebuffer
+	// over snapshot_rp; TRANSFER_DST stays so a non-sampled target can still
+	// copy into it.
+	if (!vk_ensure_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view,
+	                  c->local2d_snapshot_ready ? &c->weave_scratch_fb : NULL, &c->weave_scratch_w,
+	                  &c->weave_scratch_h, region_w, region_h, scratch_fmt,
+	                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+	                      (c->local2d_snapshot_ready ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0),
+	                  c->local2d_snapshot_ready ? c->local2d.snapshot_rp : VK_NULL_HANDLE, "local2d weave")) {
 		return false;
 	}
 
@@ -13100,7 +20336,9 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 			if (!zones_frame && proj_idx >= 0 && (int32_t)i < proj_idx) {
 				continue;
 			}
-			vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb, layer, region_w, region_h);
+			vk_flatten_one_local2d_layer(c, cmd, c->local2d_scratch_fb,
+			                             c->local2d_scratch_srgb_view != VK_NULL_HANDLE, layer, region_w,
+			                             region_h);
 		}
 		vk_cmd_image_barrier_locked(vk, cmd, c->local2d_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -13490,55 +20728,112 @@ vk_composite_local_2d(struct comp_vk_native_compositor *c,
 		}
 	}
 
-	// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
-	// → COLOR_ATTACHMENT for the composite render pass.
-	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_ACCESS_TRANSFER_READ_BIT, dst_incoming,
-	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            k_color_sub);
-	// #862: snapshot only the clipped sub-rect — the shader samples the scratch
-	// 1:1 in region space and only reads inside the scissor, so the rest of the
-	// scratch is never touched. Same offsets on both sides keeps that 1:1.
-	// #862: snapshot only the rects the composite will actually read. The
-	// shader samples the scratch 1:1 in region space and only inside its
-	// scissor, so untouched scratch is never read. The clip rects are disjoint
-	// by construction, which vkCmdCopyImage requires of its regions.
-	VkImageCopy copies[8];
-	uint32_t copy_count = 0;
-	if (clip_active) {
-		for (uint32_t i = 0; i < clip_count; i++) {
+	/*
+	 * --- weave snapshot: the region (or just the #862 clip rects) of the
+	 * woven target → weave_scratch, then dst → COLOR_ATTACHMENT for the
+	 * composite render pass.
+	 *
+	 * Default: a 1:1 point-sampled REPLACE draw (DXR_VK_ZONES_COPY_TO_DRAW).
+	 * On Adreno a per-frame vkCmdCopyImage allocates and zeroes driver memory
+	 * inside the call; on the repaint thread this copy was ~30% of the
+	 * thread's CPU for the avatar demo, and the app's frame hand-off waits
+	 * on that thread. Same pixels: the draw writes exactly the rects the copy
+	 * wrote, at the same offsets, blending off. One difference, in the draw's
+	 * favour — it samples the target as ITS format and writes the scratch as
+	 * ITS format, so an R8G8B8A8 target (Android) reaches the B8G8R8A8 scratch
+	 * with its channels intact, where the raw copy swapped R and B in the
+	 * weave term (visible only through translucent 2D over the weave; the
+	 * zones band, where M = 0, never reads it).
+	 *
+	 * The copy remains for =0, for a target whose images are not SAMPLED, and
+	 * when the snapshot draw could not be built.
+	 */
+	const bool snapshot_draw = c->local2d_snapshot_ready && c->weave_scratch_fb != VK_NULL_HANDLE &&
+	                           comp_vk_native_target_images_sampled(c->target);
+	{
+		static bool snapshot_logged = false;
+		if (!snapshot_logged) {
+			snapshot_logged = true;
+			U_LOG_W("VK Local2D: weave snapshot = %s",
+			        snapshot_draw ? "point-sampled draw (no vkCmdCopyImage)"
+			                      : "vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW=0, target not SAMPLED, or "
+			                        "draw unavailable)");
+		}
+	}
+	if (snapshot_draw) {
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, dst_incoming,
+		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+		vk_local2d_composite_snapshot_draw(&c->local2d, vk, cmd, c->weave_scratch_fb, region_w, region_h,
+		                                   dst_view, dst_w, dst_h, clip_active ? clips : NULL, clip_count);
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, c->weave_scratch, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+		    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_SHADER_READ_BIT,
+		    VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
+	} else {
+		// --- weave snapshot: dst → TRANSFER_SRC, copy region → weave_scratch, dst
+		// → COLOR_ATTACHMENT for the composite render pass.
+		vk_cmd_image_barrier_locked(
+		    vk, cmd, dst_image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, dst_incoming,
+		    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+		    VK_PIPELINE_STAGE_TRANSFER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            k_color_sub);
+		// #862: snapshot only the clipped sub-rect — the shader samples the scratch
+		// 1:1 in region space and only reads inside the scissor, so the rest of the
+		// scratch is never touched. Same offsets on both sides keeps that 1:1.
+		// #862: snapshot only the rects the composite will actually read. The
+		// shader samples the scratch 1:1 in region space and only inside its
+		// scissor, so untouched scratch is never read. The clip rects are disjoint
+		// by construction, which vkCmdCopyImage requires of its regions.
+		VkImageCopy copies[8];
+		uint32_t copy_count = 0;
+		if (clip_active) {
+			for (uint32_t i = 0; i < clip_count; i++) {
+				copies[copy_count].srcSubresource =
+				    (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				copies[copy_count].srcOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+				copies[copy_count].dstSubresource =
+				    (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+				copies[copy_count].dstOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+				copies[copy_count].extent =
+				    (VkExtent3D){clips[i].extent.width, clips[i].extent.height, 1};
+				copy_count++;
+			}
+		} else {
 			copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-			copies[copy_count].srcOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
+			copies[copy_count].srcOffset = (VkOffset3D){0, 0, 0};
 			copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-			copies[copy_count].dstOffset = (VkOffset3D){clips[i].offset.x, clips[i].offset.y, 0};
-			copies[copy_count].extent =
-			    (VkExtent3D){clips[i].extent.width, clips[i].extent.height, 1};
+			copies[copy_count].dstOffset = (VkOffset3D){0, 0, 0};
+			copies[copy_count].extent = (VkExtent3D){region_w, region_h, 1};
 			copy_count++;
 		}
-	} else {
-		copies[copy_count].srcSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-		copies[copy_count].srcOffset = (VkOffset3D){0, 0, 0};
-		copies[copy_count].dstSubresource = (VkImageSubresourceLayers){VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-		copies[copy_count].dstOffset = (VkOffset3D){0, 0, 0};
-		copies[copy_count].extent = (VkExtent3D){region_w, region_h, 1};
-		copy_count++;
+		vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
+		                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy_count, copies);
+		vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
+		                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
+		vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_TRANSFER_READ_BIT,
+		                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+		                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 	}
-	vk->vkCmdCopyImage(cmd, dst_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->weave_scratch,
-	                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, copy_count, copies);
-	vk_cmd_image_barrier_locked(vk, cmd, c->weave_scratch, VK_ACCESS_TRANSFER_WRITE_BIT,
-	                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, k_color_sub);
-	vk_cmd_image_barrier_locked(vk, cmd, dst_image, VK_ACCESS_TRANSFER_READ_BIT,
-	                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-	                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
-	                            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, k_color_sub);
 
 	// --- composite target framebuffer (over the rotating dst view).
 	if (c->composite_target_fb_view != dst_view || c->composite_fb_w != dst_w ||
@@ -13661,11 +20956,11 @@ vk_release_local2d_state(struct comp_vk_native_compositor *c)
 		c->composite_target_fb = VK_NULL_HANDLE;
 		c->composite_target_fb_view = VK_NULL_HANDLE;
 	}
-	vk_destroy_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
-	              &c->local2d_scratch_fb);
-	vk_destroy_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
-	              &c->backdrop_scratch_fb);
-	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, NULL);
+	vk_destroy_flatten_rt(c, &c->local2d_scratch, &c->local2d_scratch_mem, &c->local2d_scratch_view,
+	                      &c->local2d_scratch_srgb_view, &c->local2d_scratch_fb);
+	vk_destroy_flatten_rt(c, &c->backdrop_scratch, &c->backdrop_scratch_mem, &c->backdrop_scratch_view,
+	                      &c->backdrop_scratch_srgb_view, &c->backdrop_scratch_fb);
+	vk_destroy_rt(c, &c->weave_scratch, &c->weave_scratch_mem, &c->weave_scratch_view, &c->weave_scratch_fb);
 	vk_destroy_rt(c, &c->implicit_mask_tex, &c->implicit_mask_mem, &c->implicit_mask_view,
 	              &c->implicit_mask_fb);
 	vk_destroy_rt(c, &c->feather_mask_tex, &c->feather_mask_mem, &c->feather_mask_view,
@@ -13713,10 +21008,10 @@ vk_zone_dp_supported(struct comp_vk_native_compositor *c)
  * advertise zone slots, the tier-1 fallback fires on the first zones frame, and the
  * hardware-3D request it makes silently overrides the app's 2D rendering mode for
  * the rest of the session. The mask leg itself was never affected -- it publishes
- * through the arm (@ref comp_vk_split_publish_zone_wish), which is why this only
+ * through the arm (@ref comp_hub_d3d11_publish_zone_wish), which is why this only
  * ever showed up as "2D does not stick", never as a lost mask.
  *
- * `comp_vk_split_zone_dp_supported` exists for exactly this question; its doc says
+ * `comp_hub_d3d11_zone_dp_supported` exists for exactly this question; its doc says
  * outright that the compositor cannot answer it for a split session.
  */
 static bool
@@ -13727,7 +21022,7 @@ vk_zone_dp_supported_weaving_arm(struct comp_vk_native_compositor *c)
 #ifdef XRT_OS_WINDOWS
 	weaver_on_arm = (c->split != NULL);
 	if (weaver_on_arm) {
-		arm_consumes = comp_vk_split_zone_dp_supported(c->split);
+		arm_consumes = comp_hub_d3d11_zone_dp_supported(c->split);
 	}
 #endif
 	// The dispatch is shared with the d3d12 tier and unit-tested without a GPU:
@@ -13846,7 +21141,7 @@ vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_n
 	struct comp_vk_deposit *dep = (c->renderer != NULL) ? comp_vk_native_renderer_get_deposit(c->renderer) : NULL;
 	if (mask == NULL || dep == NULL) {
 		// No authored mask this frame: drop the plane. Not a failure.
-		return comp_vk_split_bind_mask_plane(c->split, NULL, 0, 0, 0);
+		return comp_hub_d3d11_bind_mask_plane(c->split, NULL, 0, 0, 0);
 	}
 	if (!comp_vk_deposit_plane_ensure(dep, COMP_VK_DEPOSIT_PLANE_MASK, mask->w, mask->h, VK_FORMAT_R8_UNORM)) {
 		return false;
@@ -13855,7 +21150,7 @@ vk_split_ensure_mask_plane(struct comp_vk_native_compositor *c, struct comp_vk_n
 	if (!comp_vk_deposit_plane_get(dep, COMP_VK_DEPOSIT_PLANE_MASK, &pl)) {
 		return false;
 	}
-	return comp_vk_split_bind_mask_plane(c->split, pl.shared_handle, pl.generation, pl.width, pl.height);
+	return comp_hub_d3d11_bind_mask_plane(c->split, pl.shared_handle, pl.generation, pl.width, pl.height);
 }
 
 /*!
@@ -13932,6 +21227,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_create(struct xrt_compositor *xc, uint32_t w, uint32_t h, void **out_mask)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	if (out_mask == NULL || !c->local2d_initialized) {
 		return XRT_ERROR_ALLOCATION;
@@ -14006,6 +21309,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_set_whole(struct xrt_compositor *xc, void *mask_ptr, bool enable_3d)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE) {
@@ -14034,6 +21345,14 @@ comp_vk_native_compositor_zone_mask_set_rects(struct xrt_compositor *xc,
                                               const struct xrt_rect *rects)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->fb == VK_NULL_HANDLE || (count > 0 && rects == NULL)) {
@@ -14065,6 +21384,14 @@ comp_vk_native_compositor_zone_mask_acquire_rt(struct xrt_compositor *xc,
                                                uint32_t *out_h)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || out_image == NULL || out_image_view == NULL ||
@@ -14097,6 +21424,14 @@ xrt_result_t
 comp_vk_native_compositor_zone_mask_submit(struct xrt_compositor *xc, void *mask_ptr)
 {
 	struct comp_vk_native_compositor *c = vk_comp(xc);
+#ifdef VK_MIDFRAME_FILL
+	// #1905 ask 2: these record on the renderer's command pool and submit on
+	// the app queue, as the outstanding weave's tail may (trigger-gated
+	// captures), and they change zone state the tail reads — drain it first.
+	if (!vk_async_handoff_quiesce(c)) {
+		return XRT_ERROR_VULKAN;
+	}
+#endif
 	struct vk_bundle *vk = &c->vk;
 	struct comp_vk_native_zone_mask *mask = (struct comp_vk_native_zone_mask *)mask_ptr;
 	if (mask == NULL || mask->tex == VK_NULL_HANDLE || mask->staged == VK_NULL_HANDLE) {
@@ -14152,6 +21487,21 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (mask == NULL) {
 		return;
 	}
+#ifdef VK_MIDFRAME_FILL
+	/*
+	 * #1905 ask 2: an outstanding non-blocking weave runs its tail
+	 * (vk_sync_zone_mask_to_dp -> active_zone_mask) on the weave thread, so
+	 * drain it, then unhook the mask under c->mutex — the lock that tail (and
+	 * every weave) reads it under — before freeing. Skipped only while the
+	 * weave is wedged holding c->mutex (#1394): blocking there would hang the
+	 * app, and a parked weave reads nothing.
+	 */
+	(void)vk_async_handoff_quiesce(c);
+	const bool zm_locked = !vk_weave_blocked(c);
+	if (zm_locked) {
+		os_mutex_lock(&c->mutex);
+	}
+#endif
 	vk->vkDeviceWaitIdle(vk->device); // mask may be in flight
 	if (c->active_zone_mask == mask) {
 		c->active_zone_mask = NULL; // revert to implicit / legacy behavior
@@ -14168,6 +21518,11 @@ comp_vk_native_compositor_zone_mask_destroy(struct xrt_compositor *xc, void *mas
 	if (c->zone_wish_view == mask->staged_view) {
 		c->zone_wish_view = VK_NULL_HANDLE;
 	}
+#ifdef VK_MIDFRAME_FILL
+	if (zm_locked) {
+		os_mutex_unlock(&c->mutex);
+	}
+#endif
 	vk_destroy_rt(c, &mask->staged, &mask->staged_mem, &mask->staged_view, NULL);
 	vk_destroy_rt(c, &mask->tex, &mask->tex_mem, &mask->tex_view, &mask->fb);
 	free(mask);

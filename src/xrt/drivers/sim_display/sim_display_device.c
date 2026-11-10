@@ -13,8 +13,12 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_eyes.h"
+#include "sim_display_settings.h"
+#include "sim_display_monitor_geometry.h"
 
 #include "xrt/xrt_compiler.h"
+#include "xrt/xrt_config_os.h"
 #include "xrt/xrt_device.h"
 
 #include "os/os_time.h"
@@ -141,38 +145,90 @@ sim_display_get_view_count(void)
 bool
 sim_display_fake_tracking_enabled(void)
 {
-	// Dev-only override (#441) — product gates live in the registry, but
-	// this is a test harness knob, so an env var is the right shape.
-	static int cached = -1;
-	if (cached < 0) {
-		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING");
-		cached = (e != NULL && e[0] != '\0' && e[0] != '0') ? 1 : 0;
-	}
-	return cached == 1;
+	// Dev-only knob (#441), read through the host iface since N3c
+	// (`dp set sim-display TRACKING 1`, or DXR_DP_SIM_DISPLAY_TRACKING=1 in
+	// the hosting process; SIM_DISPLAY_FAKE_TRACKING stays an alias for one
+	// release). The shim caches it per process.
+	return sim_display_setting_on("TRACKING");
 }
 
 bool
 sim_display_fake_tracking_is_tracking(void)
 {
+	return sim_display_fake_tracking_sample(NULL);
+}
+
+bool
+sim_display_fake_tracking_sample(uint64_t *out_edges)
+{
+	return sim_display_fake_tracking_sample_at((int64_t)os_monotonic_get_ns(), out_edges);
+}
+
+bool
+sim_display_fake_tracking_sample_at(int64_t target_ns, uint64_t *out_edges)
+{
+	if (out_edges != NULL) {
+		*out_edges = 0;
+	}
 	if (!sim_display_fake_tracking_enabled()) {
 		return false; // Honest: sim_display never really tracks.
 	}
 
 	static int64_t period_ms = -1;
 	if (period_ms < 0) {
-		const char *e = getenv("SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS");
-		period_ms = (e != NULL) ? atol(e) : 0;
+		period_ms = (int64_t)sim_display_setting_num("TRACKING_PERIOD_MS", 0);
 		if (period_ms < 0) {
 			period_ms = 0;
 		}
 	}
-	if (period_ms == 0) {
-		return true; // Toggle on, no period: always tracking.
+	// Toggle on, no period: always tracking; else the square wave at the target.
+	return sim_fake_tracking_at(period_ms, target_ns, out_edges);
+}
+
+bool
+sim_display_eyes_at(struct xrt_eye_positions *out,
+                    uint32_t view_count,
+                    float nominal_x_m,
+                    float nominal_y_m,
+                    float nominal_z_m,
+                    float ipd_m,
+                    int64_t target_ns,
+                    bool *webcam_dp_ref)
+{
+	// The sway knobs (N6 Part 1): read once through the host iface
+	// (`dp set sim-display TRACKING_SWAY_MM 20`). Only a fake-tracked viewer
+	// moves — with TRACKING off the eyes are the static nominal viewer
+	// sim_display always reported.
+	static float sway_m = -1.0f;
+	static int64_t sway_period_ns = 0;
+	if (sway_m < 0.0f) {
+		float mm = sim_display_setting_float("TRACKING_SWAY_MM", 0.0f);
+		if (!(mm >= 0.0f) || mm > 500.0f) {
+			mm = 0.0f;
+		}
+		long period_ms = sim_display_setting_num("TRACKING_SWAY_PERIOD_MS", 4000);
+		if (period_ms < 100) {
+			period_ms = 100;
+		}
+		sway_period_ns = (int64_t)period_ms * 1000000;
+		sway_m = mm / 1000.0f;
 	}
 
-	// Square wave: tracking for one period, lost for the next.
-	int64_t now_ms = (int64_t)(os_monotonic_get_ns() / 1000000);
-	return ((now_ms / period_ms) % 2) == 0;
+	struct sim_fake_eyes_params p = {
+	    .nominal_x_m = nominal_x_m,
+	    .nominal_y_m = nominal_y_m,
+	    .nominal_z_m = nominal_z_m,
+	    .ipd_m = ipd_m,
+	    .sway_m = sim_display_fake_tracking_enabled() ? sway_m : 0.0f,
+	    .sway_period_ns = sway_period_ns,
+	};
+	sim_fake_eyes_at(&p, view_count, target_ns, out);
+	out->is_tracking = sim_display_fake_tracking_sample_at(target_ns, NULL); // false unless TRACKING (#441)
+	// #1855: opt-in webcam tracking overrides the synthetic eyes (no-op unless
+	// WEBCAM_TRACKING; a screen-bound segment DP passes NULL and stays nominal).
+	sim_display_webcam_tracking_apply_at(out, nominal_x_m, nominal_y_m, nominal_z_m, ipd_m, target_ns,
+	                                     webcam_dp_ref);
+	return true;
 }
 
 void
@@ -188,19 +244,25 @@ sim_display_set_view_count(uint32_t count)
  *
  */
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_width_m, "SIM_DISPLAY_WIDTH_M", 0.344f)
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_height_m, "SIM_DISPLAY_HEIGHT_M", 0.194f)
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_w, "SIM_DISPLAY_PIXEL_W", 1920)
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_pixel_h, "SIM_DISPLAY_PIXEL_H", 1080)
+/*
+ * Every knob below is read through the host iface (N3c, `sim_display_settings.h`:
+ * `dp set sim-display <KEY> <value>` / DXR_DP_SIM_DISPLAY_<KEY>; the former
+ * SIM_DISPLAY_<KEY> environment names stay aliases for one release), cached
+ * per process exactly like the DEBUG_GET_ONCE options they replaced.
+ */
+#define debug_get_float_option_sim_display_width_m() sim_display_setting_float("WIDTH_M", 0.344f)
+#define debug_get_float_option_sim_display_height_m() sim_display_setting_float("HEIGHT_M", 0.194f)
+#define debug_get_float_option_sim_display_nominal_z_m() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
+#define debug_get_num_option_sim_display_pixel_w() sim_display_setting_num("PIXEL_W", 1920)
+#define debug_get_num_option_sim_display_pixel_h() sim_display_setting_num("PIXEL_H", 1080)
 //! Dev/test knob: pin the active rendering mode to an explicit unified index —
 //! 0=2D, 1=Anaglyph, 2=Cropped SBS, 3=Squeezed SBS, 4=Quad — overriding the
-//! SIM_DISPLAY_OUTPUT-derived default AND every later mode request (see the
-//! guard in sim_display_hmd_set_property). -1 (unset) = normal behaviour. This
-//! is plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
+//! OUTPUT-derived default AND every later mode request (see the guard in
+//! sim_display_hmd_set_property). -1 (unset) = normal behaviour. This is
+//! plug-in-wide: it holds ANY sim_display app in the chosen view layout, so
 //! e.g. a zones app can be forced to 4-view Quad for atlas inspection despite
 //! the session-begin/zone reconciliation that would otherwise select 2 views.
-DEBUG_GET_ONCE_NUM_OPTION(sim_display_force_mode, "SIM_DISPLAY_FORCE_MODE", -1)
+#define debug_get_num_option_sim_display_force_mode() sim_display_setting_num("FORCE_MODE", -1)
 
 
 /*
@@ -538,10 +600,11 @@ sim_display_hmd_get_property(struct xrt_device *xdev,
 struct xrt_device *
 sim_display_hmd_create(void)
 {
-	// Parse output mode from env var early so it's available when
+	// Parse the OUTPUT setting early so it's available when
 	// target_instance.c queries sim_display_get_output_mode() for scale values.
 	{
-		const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
+		char mode_buf[32];
+		const char *mode_str = sim_display_setting("OUTPUT", mode_buf, sizeof(mode_buf)) ? mode_buf : NULL;
 		if (mode_str) {
 			if (strcmp(mode_str, "sbs") == 0)
 				sim_display_set_output_mode(SIM_DISPLAY_OUTPUT_SBS);
@@ -612,12 +675,53 @@ sim_display_hmd_create(void)
 		dm.dmSize = sizeof(dm);
 		if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmPelsWidth > 0 &&
 		    dm.dmPelsHeight > 0) {
-			if (getenv("SIM_DISPLAY_PIXEL_W") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_W")) {
 				pixel_w = (int)dm.dmPelsWidth;
 			}
-			if (getenv("SIM_DISPLAY_PIXEL_H") == NULL) {
+			if (!sim_display_setting_is_set("PIXEL_H")) {
 				pixel_h = (int)dm.dmPelsHeight;
 			}
+		}
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Desktop-Linux twin of the Windows block above (#369 class): adopt the
+	// real monitor's DEVICE pixels and EDID physical size, from the same
+	// RandR <-> DRM-sysfs records the plug-in loader logs as "monitor N
+	// output=... connector=..." (aux_os, statically linked into this
+	// plug-in, so no runtime internals). Device pixels, not the scaled
+	// logical desktop size: the service window presents 1:1 device pixels,
+	// so a 2880x1800 eDP at 167% is a 2880x1800 panel, not 3456x2160 (and
+	// never the fixed 1920x1080). Explicit env overrides still win, per
+	// variable. The nominal viewer (SIM_DISPLAY_NOMINAL_Z_M, 10 cm eye
+	// height) is left alone, as on Windows and macOS.
+	{
+		struct os_display_edid_list mons;
+		struct sim_display_monitor_geometry geo;
+		if (os_display_edid_enumerate(&mons) && sim_display_pick_monitor_geometry(&mons, &geo)) {
+			const struct os_display_edid_monitor *m = &mons.monitors[geo.index];
+			if (!sim_display_setting_is_set("PIXEL_W")) {
+				pixel_w = (int)geo.pixel_width;
+			}
+			if (!sim_display_setting_is_set("PIXEL_H")) {
+				pixel_h = (int)geo.pixel_height;
+			}
+			if (geo.physical_width_mm > 0 && !sim_display_setting_is_set("WIDTH_M")) {
+				display_w_m = (float)geo.physical_width_mm / 1000.0f;
+			}
+			if (geo.physical_height_mm > 0 && !sim_display_setting_is_set("HEIGHT_M")) {
+				display_h_m = (float)geo.physical_height_mm / 1000.0f;
+			}
+			U_LOG_W(
+			    "sim_display: adopting monitor %u (%s) output='%s' connector='%s' %ux%u px (%s) %ux%u mm "
+			    "-> panel %dx%d px, %.3fx%.3f m (SIM_DISPLAY_* env overrides win)",
+			    geo.index, geo.reason, m->output_name, m->connector, geo.pixel_width, geo.pixel_height,
+			    geo.pixel_is_native ? "connector mode" : "desktop mode", geo.physical_width_mm,
+			    geo.physical_height_mm, pixel_w, pixel_h, display_w_m, display_h_m);
+		} else {
+			U_LOG_W("sim_display: no monitor enumerated, keeping %dx%d px, %.3fx%.3f m", pixel_w, pixel_h,
+			        display_w_m, display_h_m);
 		}
 	}
 #endif
@@ -768,7 +872,8 @@ sim_display_hmd_create(void)
 	// SIM_DISPLAY_FAKE_TRACKING toggle the 3D modes claim HAS_TRACKING so
 	// the MANUAL path + tracking-state event are exercisable without
 	// hardware (matches the MANUAL_BIT the plug-in then advertises).
-	if (sim_display_fake_tracking_enabled()) {
+	// Opt-in webcam tracking (#1855) makes them tracked for real (MANAGED).
+	if (sim_display_fake_tracking_enabled() || sim_display_webcam_tracking_enabled()) {
 		for (uint32_t m = 1; m < hmd->base.rendering_mode_count; m++) {
 			hmd->base.rendering_modes[m].mode_flags |= XRT_RENDERING_MODE_FLAG_HAS_TRACKING;
 		}
@@ -927,4 +1032,26 @@ sim_display_hmd_create(void)
 	        display_w_m, display_h_m, eye_y, eye_z, ipd * 1000.0f);
 
 	return &hmd->base;
+}
+
+
+/*
+ *
+ * Per-monitor defaults (multi-screen M1).
+ *
+ */
+
+void
+sim_display_get_default_viewer(float *out_w_m, float *out_h_m, float *out_nominal_y_m, float *out_nominal_z_m)
+{
+	// The same env-configurable defaults sim_display_hmd_create() starts from,
+	// and the same 10 cm eye height it gives its static pose.
+	if (out_w_m != NULL)
+		*out_w_m = debug_get_float_option_sim_display_width_m();
+	if (out_h_m != NULL)
+		*out_h_m = debug_get_float_option_sim_display_height_m();
+	if (out_nominal_y_m != NULL)
+		*out_nominal_y_m = 0.1f;
+	if (out_nominal_z_m != NULL)
+		*out_nominal_z_m = debug_get_float_option_sim_display_nominal_z_m();
 }

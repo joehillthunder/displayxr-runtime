@@ -24,6 +24,10 @@
 #include "oxr_objects.h"
 #include "oxr_logger.h"
 #include "oxr_two_call.h"
+#ifdef XRT_OS_ANDROID
+
+#include <sys/system_properties.h>
+#endif
 
 /*
  * A Wayland-enabled build whose Vulkan headers were included without
@@ -200,10 +204,14 @@ static const char *optional_vk_instance_extensions[] = {
 // VK_KHR_SWAPCHAIN_EXTENSION_NAME
 static const char *required_vk_device_extensions[] = {
     VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,      //
-    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,            //
     VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,           //
-    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,        //
     VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME, //
+#if !defined(XRT_GRAPHICS_SYNC_HANDLE_IS_WIN32_HANDLE)
+    // Windows: optional-if-present, with the Win32 trio — see
+    // optional_filtered_device_extensions[] below.
+    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,     //
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, //
+#endif
 
 // Platform version of "external_memory"
 #if defined(XRT_GRAPHICS_BUFFER_HANDLE_IS_FD)
@@ -286,6 +294,16 @@ static const char *optional_filtered_device_extensions[] = {
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,    //
     VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME, //
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,     //
+    /*
+     * The base sync pair, optional on Windows for the same reason as the trio:
+     * only the IPC client imports semaphores/fences, and it already fails with
+     * a named error without the Win32 variants. Both are core since Vulkan 1.1,
+     * and the Qualcomm Adreno X driver (Windows on ARM, Vulkan 1.4) does not
+     * list either name — requiring them failed vkCreateDevice with
+     * VK_ERROR_EXTENSION_NOT_PRESENT for every Vulkan app on Snapdragon.
+     */
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, //
+    VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,     //
 };
 
 /*!
@@ -297,7 +315,7 @@ static const char *optional_filtered_device_extensions[] = {
  */
 DEBUG_GET_ONCE_BOOL_OPTION(vk_require_optional_filtered, "DXR_VK_REQUIRE_WIN32_EXTERNAL", false)
 #define OXR_OPTIONAL_FILTERED_ENV "DXR_VK_REQUIRE_WIN32_EXTERNAL"
-#define OXR_OPTIONAL_FILTERED_WHAT "Win32 external memory/semaphore/fence"
+#define OXR_OPTIONAL_FILTERED_WHAT "external semaphore/fence + Win32 external memory/semaphore/fence"
 /*!
  * On Windows #1539 moved the trio OUT of `required_vk_device_extensions[]`, so
  * the kill switch has to put it back there for `xrCreateVulkanDeviceKHR` too.
@@ -357,6 +375,8 @@ static const char *optional_device_extensions[] = {
      */
     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
     VK_KHR_EXTERNAL_FENCE_WIN32_EXTENSION_NAME,
+    // Base pair: core since 1.1, unlisted by Adreno X (see the filtered list).
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME, VK_KHR_EXTERNAL_FENCE_EXTENSION_NAME,
 
 #else
 #error "Need port!"
@@ -645,6 +665,19 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 	 * shared-queue tier only after resolving the layer's marker entry point on
 	 * the created device (handshake, not hope) — so a failed injection
 	 * degrades, never breaks. DXR_VK_QUEUE_MODE=off|queue skips injection.
+	 *
+	 * Android (#1905): same injection, different job. There the layer's
+	 * per-queue locks serialize the app's own vkQueue* calls with every
+	 * other submitter on the same queue (unsynchronised same-queue calls
+	 * corrupt Adreno's GSL context timestamp; measured cleared by per-queue
+	 * scope). The marker resolving there does NOT move the repaint onto the
+	 * app's queue: the compositor only takes the shared-queue tier when it
+	 * has NO runtime-owned queue, and Adreno gives it idx 1 — so the repaint
+	 * keeps its own queue. Discovery: the loader finds
+	 * libVkLayer_DXR_queue_lock.so only on its layer search path (the app's
+	 * own lib dir, or gpu_debug_layer_app's on a debug setup); when it is
+	 * absent the create fails VK_ERROR_LAYER_NOT_PRESENT and the retry below
+	 * restores today's behaviour exactly.
 	 */
 	const char **merged_layers = NULL;
 	{
@@ -669,6 +702,9 @@ oxr_vk_create_vulkan_instance(struct oxr_logger *log,
 	}
 
 	*vulkanResult = CreateInstance(&modified_info, createInfo->vulkanAllocator, vulkanInstance);
+
+	// #886: remember who put the layer there, for the compositor's route log.
+	sys->vulkan_queue_lock_injected = (merged_layers != NULL && *vulkanResult == VK_SUCCESS);
 
 	/*
 	 * #902: the layer is an optimization, never a break. If the FIRST attempt
@@ -808,6 +844,68 @@ vk_find_struct_in_chain(const VkBaseInStructure *base, VkStructureType type)
 	}
 	return NULL;
 }
+#ifdef XRT_OS_ANDROID
+
+/*!
+ * #1905: the relative priority (pQueuePriorities) of the runtime-owned queue
+ * on Android, where it carries the app's own weave (the non-blocking hand-off
+ * serves it there) rather than only optional repaints — so it is raised to the
+ * top of the range instead of the desktop's 0.5 below the app.
+ *
+ * GLOBAL priority cannot express the same split. It is set per
+ * VkDeviceQueueCreateInfo, and VUID-VkDeviceCreateInfo-pQueueCreateInfos-06654
+ * requires every element of pQueueCreateInfos sharing a queueFamilyIndex to
+ * carry the same global priority level; two elements may share a family only
+ * when their `flags` differ (VUID-VkDeviceCreateInfo-queueFamilyIndex-02802,
+ * i.e. protected vs not). Adreno 740 exposes one usable graphics family, so the
+ * app's queue and this one are always the same global level: whatever the app
+ * chained, or the implicit MEDIUM. (The "QUEUE_GLOBAL_PRIORITY_HIGH" device in
+ * the log is the null system compositor's own VkDevice, not the app's.)
+ * pQueuePriorities is the only per-queue lever left, and the spec leaves its
+ * effect implementation-dependent ("may be allotted more processing time").
+ *
+ * DXR_RT_QUEUE_PRIORITY / debug.dxr.rt_queue_priority: a float in [0, 1]
+ * overrides it, for A/B on device. Logged once per device creation.
+ */
+static float
+oxr_vk_runtime_queue_priority(struct oxr_logger *log, const VkDeviceQueueCreateInfo *qci)
+{
+	float prio = 1.0f;
+	const char *src = "default";
+	char sp[PROP_VALUE_MAX] = {0};
+	const char *e = getenv("DXR_RT_QUEUE_PRIORITY");
+	if (e == NULL || e[0] == '\0') {
+		e = __system_property_get("debug.dxr.rt_queue_priority", sp) > 0 ? sp : NULL;
+	}
+	if (e != NULL && e[0] != '\0') {
+		char *end = NULL;
+		const float v = strtof(e, &end);
+		if (end != e && v >= 0.0f && v <= 1.0f) {
+			prio = v;
+			src = "override";
+		}
+	}
+
+	int app_global = -1; // -1: not chained, implicit MEDIUM
+	const VkBaseInStructure *gp = vk_find_struct_in_chain(
+	    (const VkBaseInStructure *)qci, VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_EXT);
+	if (gp != NULL) {
+		app_global = (int)((const VkDeviceQueueGlobalPriorityCreateInfoEXT *)gp)->globalPriority;
+	}
+	const float app_prio = qci->pQueuePriorities != NULL ? qci->pQueuePriorities[0] : 1.0f;
+	U_LOG_W(
+	    "#1905: runtime-owned queue relative priority %.2f (%s), app queue %.2f; global priority %s for "
+	    "BOTH (one family; per-queue global priority is not expressible, VUID-06654)",
+	    prio, src, app_prio,
+	    app_global < 0       ? "MEDIUM (implicit)"
+	    : app_global >= 1024 ? "REALTIME"
+	    : app_global >= 512  ? "HIGH"
+	    : app_global >= 256  ? "MEDIUM"
+	                         : "LOW");
+	(void)log;
+	return prio;
+}
+#endif // XRT_OS_ANDROID
 
 XrResult
 oxr_vk_create_vulkan_device(struct oxr_logger *log,
@@ -1027,6 +1125,9 @@ oxr_vk_create_vulkan_device(struct oxr_logger *log,
 					// Lower priority than the app's: the repaint must never
 					// out-schedule the frame it stands in for.
 					mod_prios[want - 1] = 0.5f;
+#ifdef XRT_OS_ANDROID
+					mod_prios[want - 1] = oxr_vk_runtime_queue_priority(log, &mod_queues[i]);
+#endif
 
 					sys->vulkan_runtime_queue_family = (int32_t)fam;
 					sys->vulkan_runtime_queue_index = (int32_t)mod_queues[i].queueCount;

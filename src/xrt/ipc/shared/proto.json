@@ -320,6 +320,12 @@
 		]
 	},
 
+	"system_enumerate_displays": {
+		"out": [
+			{"name": "list", "type": "struct xrt_screen_list"}
+		]
+	},
+
 	"session_create": {
 		"in": [
 			{"name": "xsi", "type": "struct xrt_session_info"},
@@ -489,7 +495,16 @@
 		]
 	},
 
+	"compositor_set_fixed_viewer": {
+		"in": [
+			{"name": "fixed", "type": "bool"}
+		]
+	},
+
 	"compositor_get_predicted_eye_positions": {
+		"in": [
+			{"name": "target_ns", "type": "int64_t"}
+		],
 		"out": [
 			{"name": "eye_positions", "type": "struct xrt_eye_positions"}
 		]
@@ -615,7 +630,8 @@
 			{"name": "id", "type": "uint32_t"},
 			{"name": "image_count", "type": "uint32_t"},
 			{"name": "size", "type": "uint64_t"},
-			{"name": "use_dedicated_allocation", "type": "bool"}
+			{"name": "use_dedicated_allocation", "type": "bool"},
+			{"name": "is_d3d11_texture", "type": "bool"}
 		],
 		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
 	},
@@ -725,7 +741,11 @@
 			{"name": "origin_y", "type": "int32_t"},
 			{"name": "client_w", "type": "uint32_t"},
 			{"name": "client_h", "type": "uint32_t"},
-			{"name": "display_id", "type": "int32_t"}
+			{"name": "display_id", "type": "int32_t"},
+			{"name": "logical_valid", "type": "uint32_t"},
+			{"name": "logical_x", "type": "int32_t"},
+			{"name": "logical_y", "type": "int32_t"},
+			{"name": "logical_scale", "type": "float"}
 		]
 	},
 
@@ -738,9 +758,31 @@
 			{"name": "width", "type": "uint32_t"},
 			{"name": "height", "type": "uint32_t"},
 			{"name": "fence_value", "type": "uint64_t"},
-			{"name": "eyes", "type": "struct xrt_eye_positions"}
+			{"name": "eyes", "type": "struct xrt_eye_positions"},
+			{"name": "segment_count", "type": "uint32_t"},
+			{"name": "lift_cursor_mask", "type": "uint32_t"},
+			{"name": "origin", "type": "struct ipc_weave_woven_origin"}
 		],
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"weave_cursor_request": {
+		"in": [
+			{"name": "req", "type": "struct xrt_weave_cursor_request"}
+		]
+	},
+
+	"weave_cursor_sprite_texture": {
+		"in": [
+			{"name": "info", "type": "struct xrt_weave_cursor_sprite_texture"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"weave_cursor_state": {
+		"out": [
+			{"name": "state", "type": "struct xrt_weave_cursor_state"}
+		]
 	},
 
 	"weave_get_output": {
@@ -769,7 +811,30 @@
 			{"name": "width", "type": "uint32_t"},
 			{"name": "height", "type": "uint32_t"},
 			{"name": "fence_value", "type": "uint64_t"},
-			{"name": "eyes", "type": "struct xrt_eye_positions"}
+			{"name": "eyes", "type": "struct xrt_eye_positions"},
+			{"name": "origin", "type": "struct ipc_weave_woven_origin"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"},
+		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}
+	},
+
+	"weave_set_acquire_fence": {
+		"in_handles": {"type": "xrt_graphics_sync_handle_t", "name": "acquire_fences"}
+	},
+
+	"weave_submit_sync": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_weave_submit"},
+			{"name": "want_release_fence", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "fence_value", "type": "uint64_t"},
+			{"name": "eyes", "type": "struct xrt_eye_positions"},
+			{"name": "segment_count", "type": "uint32_t"},
+			{"name": "lift_cursor_mask", "type": "uint32_t"}
 		],
 		"in_handles": {"type": "xrt_graphics_buffer_handle_t"},
 		"out_handles": {"type": "xrt_graphics_sync_handle_t", "name": "release_fences"}
@@ -818,6 +883,130 @@
 		"out": [
 			{"name": "declined", "type": "bool"},
 			{"name": "point_count", "type": "uint32_t"}
+		]
+	},
+
+	"lift_get_properties": {
+		"out": [
+			{"name": "props", "type": "struct ipc_lift_properties"}
+		]
+	},
+
+	"lift_stream_create": {
+		"in": [
+			{"name": "mode", "type": "uint32_t"},
+			{"name": "content_hint", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"},
+			{"name": "aux_outputs", "type": "uint32_t"},
+			{"name": "aux_depth_format", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"lift_stream_destroy": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"lift_submit_frame": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_submit"}
+		],
+		"out": [
+			{"name": "frame_id", "type": "uint64_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"lift_acquire_result": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "lift_result", "type": "struct ipc_lift_result"}
+		]
+	},
+
+	"lift_get_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"lift_get_depth_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_depth", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"lift_get_fence": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_fence", "type": "bool"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"lift_acquire_blob": {
+		"varlen": true,
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "capacity", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "frame_id", "type": "uint64_t"},
+			{"name": "source_time", "type": "int64_t"},
+			{"name": "format", "type": "uint32_t"},
+			{"name": "byte_count", "type": "uint64_t"}
+		]
+	},
+
+	"lift_stream_set_priority": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"},
+			{"name": "priority", "type": "uint32_t"}
+		]
+	},
+
+	"lift_stream_stats": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "stats", "type": "struct xrt_lift_stream_stats"}
+		]
+	},
+
+	"lift_weave_rect_viewpoints": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_rect_viewpoints"}
+		]
+	},
+
+	"lift_weave_rects": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_weave_rects"}
 		]
 	},
 
@@ -1084,6 +1273,455 @@
 		],
 		"out": [
 			{"name": "accepted", "type": "uint32_t"}
+		]
+	},
+
+	"stereo_camera_count": {
+		"out": [
+			{"name": "count", "type": "uint32_t"}
+		]
+	},
+
+	"stereo_camera_get_properties": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "props", "type": "struct xrt_stereo_camera_properties"}
+		]
+	},
+
+	"stereo_camera_get_calibration": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"},
+			{"name": "output", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "calib", "type": "struct xrt_stereo_camera_calibration"}
+		]
+	},
+
+	"stereo_camera_stream_create": {
+		"in": [
+			{"name": "req", "type": "struct xrt_stereo_camera_stream_request"}
+		],
+		"out": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_destroy": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_start": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_stop": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"stereo_camera_stream_get_section": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "layout", "type": "struct xrt_stereo_camera_stream_layout"}
+		],
+		"out_handles": {"type": "xrt_shmem_handle_t"}
+	},
+
+	"stereo_camera_stream_get_wake": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"stereo_camera_acquire": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "frame", "type": "struct xrt_stereo_camera_frame_info"},
+			{"name": "app", "type": "struct xrt_app_share_frame_info"}
+		]
+	},
+
+	"stereo_camera_get_app_source": {
+		"in": [
+			{"name": "camera_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "info", "type": "struct xrt_app_share_source_info"}
+		]
+	},
+
+	"stereo_camera_stream_stats": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "stats", "type": "struct xrt_stereo_camera_stream_stats"}
+		]
+	},
+
+	"stereo_camera_poll_event": {
+		"out": [
+			{"name": "has", "type": "bool"},
+			{"name": "event", "type": "struct xrt_stereo_camera_event"}
+		]
+	},
+
+	"stereo_camera_control": {
+		"in": [
+			{"name": "op", "type": "uint32_t"},
+			{"name": "arg", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "value", "type": "uint32_t"}
+		]
+	},
+
+	"compositor_segments_enable": {
+		"in": [
+			{"name": "pinned_display_id", "type": "uint64_t"}
+		]
+	},
+
+	"compositor_get_segment_metrics": {
+		"out": [
+			{"name": "metrics", "type": "struct xrt_segment_metrics"}
+		]
+	},
+
+	"compositor_set_view_routing": {
+		"in": [
+			{"name": "routing", "type": "struct xrt_segment_view_routing"}
+		]
+	},
+
+	"system_get_status_generation": {
+		"out": [
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"system_get_status_snapshot": {
+		"in": [
+			{"name": "screen_index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "head", "type": "struct xrt_status_head"},
+			{"name": "screen", "type": "struct xrt_status_screen"}
+		]
+	},
+
+	"system_get_client_segments": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "client", "type": "struct xrt_status_client"},
+			{"name": "metrics", "type": "struct xrt_segment_metrics"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"system_request_display_reprobe": {
+	},
+
+	"system_reload_service_config": {
+	},
+
+	"system_workspace_launch": {
+		"in": [
+			{"name": "controller", "type": "struct ipc_workspace_controller_id"}
+		],
+		"out": [
+			{"name": "status", "type": "uint32_t"}
+		]
+	},
+
+	"system_workspace_hotkey_suspend": {
+		"in": [
+			{"name": "suspend", "type": "bool"}
+		]
+	},
+
+	"weave_get_segments": {
+		"out": [
+			{"name": "metrics", "type": "struct xrt_segment_metrics"}
+		]
+	},
+
+	"workspace_enumerate_screens": {
+		"out": [
+			{"name": "list", "type": "struct ipc_workspace_screen_list"}
+		]
+	},
+
+	"workspace_set_window_placement": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"},
+			{"name": "placement", "type": "struct ipc_workspace_window_placement"}
+		]
+	},
+
+	"workspace_get_window_placement": {
+		"in": [
+			{"name": "client_id", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "placement", "type": "struct ipc_workspace_window_placement"}
+		]
+	},
+
+	"workspace_set_overlay_on_screen": {
+		"in": [
+			{"name": "info", "type": "struct ipc_workspace_overlay_info"},
+			{"name": "screen_id", "type": "uint64_t"}
+		]
+	},
+
+	"system_get_conv_provider_row": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "row", "type": "struct xrt_status_conv_provider"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"system_get_conv_task_row": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "row", "type": "struct xrt_status_conv_task"},
+			{"name": "generation", "type": "struct xrt_status_generation"}
+		]
+	},
+
+	"conv_hint_interest": {
+		"in": [
+			{"name": "hint", "type": "struct xrt_conv_wire_hint_interest"}
+		]
+	},
+
+	"compositor_set_cursor_draw_request": {
+		"in": [
+			{"name": "request", "type": "struct ipc_cursor_draw_request"}
+		],
+		"out": [
+			{"name": "outcome", "type": "struct ipc_cursor_draw_outcome"}
+		]
+	},
+
+	"compositor_set_cursor_measure_request": {
+		"in": [
+			{"name": "request", "type": "struct ipc_cursor_measure_request"}
+		],
+		"out": [
+			{"name": "measurement", "type": "struct ipc_cursor_measure_result"}
+		]
+	},
+
+	"system_request_component_reselect": {
+		"in": [
+			{"name": "component_class", "type": "uint32_t"}
+		]
+	},
+
+	"conv_warm": {
+		"in": [
+			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
+		],
+		"out": [
+			{"name": "prev_state", "type": "uint32_t"},
+			{"name": "state", "type": "uint32_t"}
+		]
+	},
+
+	"conv_get_generation": {
+		"out": [
+			{"name": "generation", "type": "struct xrt_conv_wire_generation"}
+		]
+	},
+
+	"conv_enum_task": {
+		"in": [
+			{"name": "task", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "desc", "type": "struct xrt_conv_wire_task_desc"},
+			{"name": "image_kinds", "type": "uint64_t"},
+			{"name": "export_kinds", "type": "uint64_t"}
+		]
+	},
+
+	"conv_request_warm": {
+		"in": [
+			{"name": "request", "type": "struct xrt_conv_wire_task_request"}
+		]
+	},
+
+	"conv_stream_create": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_conv_wire_stream_desc"},
+			{"name": "required_outputs", "type": "uint64_t"},
+			{"name": "legacy_mode", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"}
+		],
+		"out": [
+			{"name": "created", "type": "struct xrt_conv_wire_stream_created"}
+		]
+	},
+
+	"conv_stream_reset": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		]
+	},
+
+	"conv_acquire_result": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "ready", "type": "bool"},
+			{"name": "discontinuity", "type": "bool"},
+			{"name": "lift_result", "type": "struct ipc_lift_result"},
+			{"name": "meta", "type": "struct xrt_conv_wire_result"}
+		]
+	},
+
+	"conv_poll_event": {
+		"out": [
+			{"name": "has_event", "type": "bool"},
+			{"name": "event", "type": "struct xrt_conv_wire_event"}
+		]
+	},
+
+	"conv_submit_frame": {
+		"in": [
+			{"name": "args", "type": "struct ipc_arg_lift_submit"},
+			{"name": "image", "type": "struct xrt_conv_wire_image"},
+			{"name": "region_x", "type": "uint32_t"},
+			{"name": "region_y", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "frame_id", "type": "uint64_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"conv_get_cpu_output": {
+		"in": [
+			{"name": "stream_id", "type": "uint64_t"}
+		],
+		"out": [
+			{"name": "have_output", "type": "bool"},
+			{"name": "width", "type": "uint32_t"},
+			{"name": "height", "type": "uint32_t"},
+			{"name": "format", "type": "uint32_t"},
+			{"name": "bytes", "type": "uint64_t"}
+		],
+		"out_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"input_providers_enumerate": {
+		"in": [
+			{"name": "start", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "page", "type": "struct xrt_input_provider_page"}
+		]
+	},
+
+	"input_set_provider_preference": {
+		"in": [
+			{"name": "family", "type": "uint32_t"},
+			{"name": "provider", "type": "struct ipc_input_provider_id"},
+			{"name": "persist", "type": "bool"}
+		]
+	},
+
+	"system_get_input_holders": {
+		"in": [
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "holders", "type": "struct xrt_input_client_holders"}
+		]
+	},
+
+	"conv_enum_candidates": {
+		"in": [
+			{"name": "task", "type": "uint32_t"},
+			{"name": "index", "type": "uint32_t"}
+		],
+		"out": [
+			{"name": "count", "type": "uint32_t"},
+			{"name": "generation", "type": "struct xrt_conv_wire_generation"},
+			{"name": "candidate", "type": "struct xrt_conv_wire_candidate"}
+		]
+	},
+
+	"conv_stream_create_v5": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_conv_wire_stream_desc"},
+			{"name": "required_outputs", "type": "uint64_t"},
+			{"name": "legacy_mode", "type": "uint32_t"},
+			{"name": "input_scale", "type": "float"},
+			{"name": "pref", "type": "struct xrt_conv_wire_provider_pref"}
+		],
+		"out": [
+			{"name": "created", "type": "struct xrt_conv_wire_stream_created"}
+		]
+	},
+
+	"service_link_register": {
+		"in": [
+			{"name": "reg", "type": "struct xrt_share_link_registration"}
+		]
+	},
+
+	"service_link_share_poll": {
+		"out": [
+			{"name": "poll", "type": "struct xrt_share_link_poll"}
+		]
+	},
+
+	"service_link_share_publish_ring": {
+		"in": [
+			{"name": "desc", "type": "struct xrt_share_link_ring_desc"}
+		],
+		"in_handles": {"type": "xrt_graphics_buffer_handle_t"}
+	},
+
+	"service_link_share_publish_fence": {
+		"in": [
+			{"name": "generation", "type": "uint32_t"}
+		],
+		"in_handles": {"type": "xrt_graphics_sync_handle_t"}
+	},
+
+	"service_link_share_frame_ready": {
+		"in": [
+			{"name": "frame", "type": "struct xrt_share_link_frame"}
+		],
+		"out": [
+			{"name": "poll", "type": "struct xrt_share_link_poll"}
 		]
 	}
 }

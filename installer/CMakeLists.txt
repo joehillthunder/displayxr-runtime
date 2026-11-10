@@ -28,6 +28,12 @@ set(DISPLAYXR_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
 set(DISPLAYXR_VERSION_MINOR ${PROJECT_VERSION_MINOR})
 set(DISPLAYXR_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(DISPLAYXR_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}")
+# What the installer is NAMED after (#1790): X.Y.Z on a release tag, else
+# X.Y.Z+<n>.g<sha> so a main/PR build can never pass for the release. Values
+# other tools parse as a version (HKLM ...\Runtime\Version, which the Leia
+# plug-in and browser installers gate on; ARP DisplayVersion; VIProductVersion)
+# keep the plain X.Y.Z above.
+set(DISPLAYXR_VERSION_LABEL "${DXR_RUNTIME_VERSION_PACKAGE}")
 
 # Build number (from CI or default to 0)
 if(NOT DEFINED BUILD_NUM)
@@ -58,12 +64,36 @@ configure_file(
 # Paths to build artifacts (use install prefix, not build dir)
 set(DISPLAYXR_BIN_DIR "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}")
 
+# #2234: the default conversion model pack is the open provider's
+# packs/dxr-open-default.models.json at the tag versions.json pins
+# (`conversion_open`, auto-bumped on every provider release), so the URL the
+# installer falls back to always names a file that exists. The .nsi keeps a
+# literal default for a makensis run outside CMake.
+file(READ "${CMAKE_SOURCE_DIR}/versions.json" _dxr_versions_json)
+string(JSON DXR_CONVERSION_OPEN_TAG ERROR_VARIABLE _dxr_conv_open_err GET "${_dxr_versions_json}" conversion_open)
+if(_dxr_conv_open_err)
+	message(FATAL_ERROR "versions.json has no conversion_open pin: ${_dxr_conv_open_err}")
+endif()
+
 # Create installer target
 # White icon is set via MUI_ICON in the .nsi script (visible in dark mode Explorer).
 # Do NOT use rcedit post-build — it corrupts NSIS self-extracting executables.
+# ADR-054 N4b (PR B): the provenance allowlist rows for the plug-in DLL(s) the
+# installer ships, computed from the exact bytes in the install prefix right
+# before makensis runs (see gen_allowlist_nsh.cmake).
+set(DISPLAYXR_ALLOWLIST_NSH "${CMAKE_CURRENT_BINARY_DIR}/Allowlist.nsh")
+# makensis resolves `!include` against a native (backslash) path only.
+file(TO_NATIVE_PATH "${DISPLAYXR_ALLOWLIST_NSH}" DISPLAYXR_ALLOWLIST_NSH_NATIVE)
+
 add_custom_target(installer
+	COMMAND "${CMAKE_COMMAND}"
+		"-DBIN_DIR=${DISPLAYXR_BIN_DIR}"
+		"-DVERSION=${DISPLAYXR_VERSION}"
+		"-DOUT=${DISPLAYXR_ALLOWLIST_NSH}"
+		-P "${CMAKE_CURRENT_SOURCE_DIR}/gen_allowlist_nsh.cmake"
 	COMMAND "${NSIS_EXECUTABLE}"
 		"/DVERSION=${DISPLAYXR_VERSION}"
+		"/DVERSION_LABEL=${DISPLAYXR_VERSION_LABEL}"
 		"/DVERSION_MAJOR=${DISPLAYXR_VERSION_MAJOR}"
 		"/DVERSION_MINOR=${DISPLAYXR_VERSION_MINOR}"
 		"/DVERSION_PATCH=${DISPLAYXR_VERSION_PATCH}"
@@ -72,6 +102,8 @@ add_custom_target(installer
 		"/DSOURCE_DIR=${CMAKE_SOURCE_DIR}"
 		"/DOUTPUT_DIR=${CMAKE_INSTALL_PREFIX}"
 		"/DSIGN_CMD=${SIGN_CMD}"
+		"/DALLOWLIST_NSH=${DISPLAYXR_ALLOWLIST_NSH_NATIVE}"
+		"/DDXR_CONVERSION_OPEN_TAG=${DXR_CONVERSION_OPEN_TAG}"
 		"${CMAKE_CURRENT_SOURCE_DIR}/DisplayXRInstaller.nsi"
 	WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
 	COMMENT "Building DisplayXR installer..."
@@ -85,11 +117,16 @@ endif()
 if(TARGET displayxr-service)
 	add_dependencies(installer displayxr-service)
 endif()
+# ADR-053 P2: the conversion-host satellite ships beside the service.
+if(TARGET displayxr-conversion-host)
+	add_dependencies(installer displayxr-conversion-host)
+endif()
+# Tracking-provider-discovery §4a: the viewer-tracking host ships beside the service.
+if(TARGET displayxr-tracking-host)
+	add_dependencies(installer displayxr-tracking-host)
+endif()
 if(TARGET cli)
 	add_dependencies(installer cli)
-endif()
-if(TARGET control_panel)
-	add_dependencies(installer control_panel)
 endif()
 # Vendor plug-in: sim-display. The runtime installer ships this DLL as
 # the vendor-neutral fallback (ADR-019 / issue #256); vendor plug-ins

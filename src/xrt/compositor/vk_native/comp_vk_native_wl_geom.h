@@ -24,6 +24,15 @@
  * fractionally-scaled desktop produced no present origin at all rather than a
  * converted one.
  *
+ * "Logical" is Mutter's STAGE coordinates, and the stage is logical px only in
+ * Mutter's LOGICAL layout mode. In its PHYSICAL mode (Ubuntu 24.04 / GNOME 46
+ * at an integer scale) the stage already is device px, and the monitor scale
+ * must not be applied: it read a 3840x2160 panel at 200 % as 7680x4320. The
+ * factor is therefore resolved per window (u_wl_stage_to_device_scale): the
+ * publisher's `monitor.device_scale`, else its `layout_mode`, else Mutter's own
+ * `layout-mode` (DisplayConfig.GetCurrentState, for a publisher older than
+ * extension version 11), else the monitor scale.
+ *
  * Degradation: extension absent / bus unreachable / no matching window / the
  * window is on no monitor → comp_vk_native_wl_geom_get_window_rect returns
  * false and the compositor stays display-scoped, exactly the pre-#817 Wayland
@@ -75,6 +84,10 @@ struct comp_vk_native_wl_window_rect
 	 * Mutter's buffer rect when the publisher reports it, else the frame
 	 * (#1654): with client-side decorations the frame includes a title bar
 	 * that is not part of the surface. Undecorated, the two are equal.
+	 *
+	 * When the publisher sends `buffer_device` (#1991), this is that rect
+	 * as sent — where the compositor paints the surface — and no
+	 * conversion is involved (@ref from_buffer_device).
 	 */
 	int32_t left_px, top_px;
 	//! Content size in DEVICE px (same source as the origin).
@@ -84,8 +97,17 @@ struct comp_vk_native_wl_window_rect
 	//! at all — the check that would have caught the 2026-09-20 session, where
 	//! the surface fullscreened on the laptop and wove anyway.
 	uint32_t monitor_width_px, monitor_height_px;
-	//! The factor applied. 1.0 means the wire values were already device px.
+	//! The factor applied: device px per STAGE px (the `*_logical` fields
+	//! below). The monitor scale in Mutter's LOGICAL layout mode, 1.0 in its
+	//! PHYSICAL mode — where the wire values already are device px.
 	float scale;
+	//! The monitor's own scale as Mutter reports it (get_monitor_scale), in
+	//! either layout mode: the scale the desktop draws its cursor at there
+	//! (#2102). Unlike @ref scale it is not 1.0 in PHYSICAL mode.
+	float monitor_scale;
+	//! left_px..height_px are the publisher's `buffer_device` (#1991), not
+	//! the conversion of the logical content rect.
+	bool from_buffer_device;
 	//! The committed SURFACE's size in DEVICE px (the compositor's buffer rect
 	//! for the window), or 0 when the publisher does not report it. Differs
 	//! from width_px/height_px when the client's buffer is not mapped to its
@@ -114,7 +136,11 @@ struct comp_vk_native_wl_window_rect
 	 * publisher's global layout. `left_px == u_wl_logical_to_px(
 	 * content_logical_x - mon_logical_x, scale)`: what a logical move of the
 	 * window does in device pixels at ANY scale (#1609), which is what the
-	 * drop-time snap searches over.
+	 * drop-time snap searches over. With @ref from_buffer_device that
+	 * equality can be one pixel off at rest (a compositor that keeps window
+	 * positions fractional), and holds again after a
+	 * @ref comp_vk_native_wl_geom_move_window: the publisher places the frame
+	 * so the content lands on exactly that conversion (spec §7.1).
 	 */
 	int32_t content_logical_x, content_logical_y;
 	int32_t mon_logical_x, mon_logical_y;
@@ -136,6 +162,16 @@ struct comp_vk_native_wl_window_rect
 	 * two owners of the last 2 px is how a drop ping-pongs. False when absent.
 	 */
 	bool lattice_drop;
+
+	/*!
+	 * The publisher runs move sync for this process (publisher version 9,
+	 * after @ref comp_vk_native_wl_geom_enable_move_sync): it shows each
+	 * committed frame at the position its tag names, so nothing is snapped —
+	 * not during a drag, not at the drop. False when absent, and whenever the
+	 * publisher has not (yet, or again) accepted the registration: the
+	 * caller then runs the drag-lattice path, unchanged.
+	 */
+	bool move_sync;
 };
 
 /*!
@@ -174,6 +210,54 @@ comp_vk_native_wl_geom_get_window_rect(struct comp_vk_native_wl_geom *g,
  */
 bool
 comp_vk_native_wl_geom_move_window(struct comp_vk_native_wl_geom *g, int32_t frame_logical_x, int32_t frame_logical_y);
+
+/*!
+ * The rect the most recent successful @ref comp_vk_native_wl_geom_get_window_rect
+ * returned, without pumping the bus. The weave's present origin comes from that
+ * call, so this is the one snapshot the frame was woven for (#1748: the
+ * move-sync frame tag must name exactly that position, not a newer one).
+ */
+bool
+comp_vk_native_wl_geom_last_rect(struct comp_vk_native_wl_geom *g, struct comp_vk_native_wl_window_rect *out_rect);
+
+//! What the publisher answered to @ref comp_vk_native_wl_geom_enable_move_sync.
+enum comp_vk_native_wl_move_sync_reply
+{
+	//! Registered: the publisher syncs this process's window moves.
+	COMP_VK_NATIVE_WL_MOVE_SYNC_ACCEPTED,
+	//! No publisher answered (not running yet, or a timeout). The request is
+	//! remembered and sent again whenever the publisher appears.
+	COMP_VK_NATIVE_WL_MOVE_SYNC_UNREACHABLE,
+	//! The publisher cannot sync (older than version 9, or it refused).
+	COMP_VK_NATIVE_WL_MOVE_SYNC_UNSUPPORTED,
+};
+
+/*!
+ * #1748: ask the publisher to hold this process's window during a compositor
+ * move until a frame woven for the new position is committed
+ * (WindowPlacement1.EnableMoveSync, publisher capability bit 2). The caller
+ * must tag every commit (comp_vk_native_wl_move_sync). The registration lives
+ * as long as this provider's bus connection; the provider renews it when the
+ * publisher restarts. Whether it is live right now is
+ * comp_vk_native_wl_window_rect::move_sync, per snapshot.
+ */
+enum comp_vk_native_wl_move_sync_reply
+comp_vk_native_wl_geom_enable_move_sync(struct comp_vk_native_wl_geom *g);
+
+/*!
+ * #2071: how many times the publisher's bus name has GAINED an owner since this
+ * provider was created — a NameOwnerChanged to a non-empty owner, i.e. the
+ * extension (re)appeared after a lock screen, a shell restart, a re-enable, or
+ * first came up after this window did. Pumps the bus first (non-blocking).
+ *
+ * The provider already drops its cache and re-takes GetWindows on that edge
+ * (and renews move sync); what it cannot do is reset the COMPOSITOR's own
+ * state derived from the old publisher (the drop-snap anchor, the move-sync
+ * frame tag, the present-origin baseline, one-shot gate warnings). A caller
+ * that sees this number move treats the frame as a geometry re-sync.
+ */
+uint32_t
+comp_vk_native_wl_geom_publisher_generation(struct comp_vk_native_wl_geom *g);
 
 void
 comp_vk_native_wl_geom_destroy(struct comp_vk_native_wl_geom **g_ptr);

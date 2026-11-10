@@ -1,0 +1,217 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+//
+// Unit test for the GNOME Shell extension's workspace-hotkey bookkeeping
+// (WorkspaceHotkey in contrib/gnome-shell/window-geometry@displayxr.org/lib.js,
+// extension version 13, org.displayxr.WorkspaceHotkey1).
+//
+// Hermetic: plain gjs, no GNOME Shell. WorkspaceHotkey lives outside lib.js's
+// GI-dependent build(), so this drives the shipped code directly.
+//
+//   gjs scripts/test_gnome_extension_workspace_hotkey.js
+//
+// What it checks:
+//   1. Accelerator / unit validation (what Configure accepts), including every
+//      accelerator the runtime's service_hotkey_to_accelerator can produce.
+//   2. A press with the client registered only emits Activated.
+//   3. A press with the client gone emits AND starts its unit, and the next
+//      Configure reports it as pending exactly once, within 30 s only.
+//   4. Configure("") releases, forgets the unit and never reports pending.
+//   5. Suspend: no grab, no press; capped at 60 s; resumes by itself.
+//   6. The cache file round trip never registers an owner.
+//   7. Bootstrap of a newly installed controller.
+//   8. The lock screen (version 14, #2071): no grab, no press, no bootstrap.
+'use strict';
+
+const GLib = imports.gi.GLib;
+
+const here = GLib.path_get_dirname(imports.system.programPath ?? imports.system.programInvocationName);
+imports.searchPath.unshift(GLib.build_filenamev([here, '..', 'contrib', 'gnome-shell',
+    'window-geometry@displayxr.org']));
+imports.lib; // side effect: globalThis.displayxrWindowGeometry
+const WH = globalThis.displayxrWindowGeometry.WorkspaceHotkey;
+
+let failed = 0;
+function check(cond, what) {
+    if (cond) {
+        print(`  ok   ${what}`);
+    } else {
+        print(`  FAIL ${what}`);
+        failed++;
+    }
+}
+
+print('1. validation');
+{
+    // The runtime's mapping (service_hotkey_to_accelerator) writes these.
+    const runtime = ['<Control>space', '<Control><Shift>F5', '<Alt><Super>a', '<Super>Page_Down',
+        '<Control>equal', '<Control>Return', '<Control>apostrophe', '<Control>grave', '<Shift><Alt>7',
+        '<Control><Shift><Alt><Super>bracketright'];
+    check(runtime.every(a => WH.validAccelerator(a)), 'every runtime-produced accelerator is accepted');
+    check(WH.validAccelerator(''), '"" (release) is accepted');
+    check(!WH.validAccelerator('space'), 'no modifier is refused');
+    check(!WH.validAccelerator('<Control><Control>space'), 'a repeated modifier is refused');
+    check(!WH.validAccelerator('<Hyper>space'), 'an unknown modifier is refused');
+    check(!WH.validAccelerator('<Control>'), 'no key is refused');
+    check(!WH.validAccelerator('<Control>space extra'), 'trailing junk is refused');
+    check(!WH.validAccelerator(42), 'a non-string is refused');
+    check(WH.validUnit('') && WH.validUnit('displayxr.service') && WH.validUnit('displayxr-dev.service'),
+        'plain .service units are accepted');
+    check(WH.validUnit('foo\\x2dbar.service'), 'a systemd-escaped unit name is accepted');
+    check(!WH.validUnit('displayxr.socket'), 'a non-service unit is refused');
+    check(!WH.validUnit('../evil.service') && !WH.validUnit('a b.service'), 'paths and spaces are refused');
+}
+
+print('2. registered client: a press only emits');
+{
+    const st = WH.create();
+    check(!WH.wantGrab(st, 0), 'nothing grabbed before a Configure');
+    check(WH.press(st, 0).emit === false, 'an unconfigured press does nothing');
+    check(WH.configure(st, ':1.42', '<Control>space', 'displayxr.service', 1000) === false,
+        'first Configure: nothing pending');
+    check(WH.wantGrab(st, 1000), 'configured -> grabbed');
+    const r = WH.press(st, 2000);
+    check(r.emit && r.startUnit === null, 'press with the client alive: emit, no StartUnit');
+    check(st.pendingUntil === 0, 'nothing becomes pending');
+}
+
+print('3. client gone: a press starts the unit and is carried to the next Configure');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.42', '<Control>space', 'displayxr.service', 0);
+    check(WH.ownerGone(st, ':1.7') === false, 'an unrelated name vanishing is ignored');
+    check(WH.ownerGone(st, ':1.42') === true && st.owner === null, 'the client vanishing unregisters it');
+    check(WH.wantGrab(st, 10), 'the grab survives the client (the cold-start path)');
+    const r = WH.press(st, 10000);
+    check(r.emit && r.startUnit === 'displayxr.service', 'press: emit + StartUnit(displayxr.service)');
+    check(WH.configure(st, ':1.99', '<Control>space', 'displayxr.service', 12000) === true,
+        'the restarted service is told about the press');
+    check(WH.configure(st, ':1.99', '<Control>space', 'displayxr.service', 12500) === false,
+        'exactly once');
+
+    WH.ownerGone(st, ':1.99');
+    WH.press(st, 20000);
+    check(WH.configure(st, ':1.100', '<Control>space', 'displayxr.service', 20000 + WH.PENDING_MS + 1) === false,
+        'a press older than 30 s is dropped');
+
+    const noUnit = WH.create();
+    WH.configure(noUnit, ':1.5', '<Control>space', '', 0);
+    WH.ownerGone(noUnit, ':1.5');
+    const r2 = WH.press(noUnit, 100);
+    check(r2.emit && r2.startUnit === null, 'no unit (service run by hand): emit only');
+}
+
+print('4. Configure("") releases');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.42', '<Control>space', 'displayxr.service', 0);
+    WH.ownerGone(st, ':1.42');
+    WH.press(st, 100); // pending
+    check(WH.configure(st, ':1.43', '', 'displayxr.service', 200) === false, 'release never reports pending');
+    check(!WH.wantGrab(st, 200) && st.unit === '', 'released: no grab, unit forgotten');
+    check(WH.press(st, 300).emit === false, 'a released hotkey does nothing');
+}
+
+print('5. suspend');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.42', '<Control>space', 'displayxr.service', 0);
+    check(WH.suspend(st, true, 60000, 1000) === 60000, 'suspend for 60 s');
+    check(!WH.wantGrab(st, 1000) && WH.press(st, 1000).emit === false, 'suspended: no grab, no press');
+    check(WH.wantGrab(st, 61001), 'resumes by itself after the timeout');
+    check(WH.suspend(st, true, 10 * 60000, 0) === WH.MAX_SUSPEND_MS, 'a longer ask is capped at 60 s');
+    check(WH.suspend(st, true, 0, 0) === WH.MAX_SUSPEND_MS, 'timeout 0 means the maximum');
+    check(WH.suspend(st, false, 0, 5) === 0 && WH.wantGrab(st, 5), 'explicit resume');
+}
+
+print('6. cache round trip');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.42', '<Control><Alt>w', 'displayxr.service', 0);
+    const text = WH.serialize(st);
+    const back = WH.create();
+    check(WH.deserialize(back, text), 'deserialize accepts what serialize wrote');
+    check(back.accelerator === '<Control><Alt>w' && back.unit === 'displayxr.service', 'fields restored');
+    check(back.owner === null, 'a restored hotkey has no owner (the client must Configure again)');
+    const bad = WH.create();
+    check(!WH.deserialize(bad, '{"version":1,"accelerator":"space","unit":""}') && bad.accelerator === '',
+        'a malformed accelerator is not restored');
+    check(!WH.deserialize(bad, 'not json') && !WH.deserialize(bad, '{"version":2}'),
+        'junk and unknown versions are refused');
+}
+
+print('7. bootstrap: arm a newly installed controller without a prior service run');
+{
+    // Roots: the runtime's service_workspace_registry.c POSIX order.
+    const r = WH.controllerRoots({XRT_WORKSPACE_CONTROLLER_PATH: '/dev/a:/dev/b:', XDG_DATA_HOME: '/x',
+        HOME: '/home/u'});
+    check(JSON.stringify(r) === JSON.stringify(['/dev/a', '/dev/b', '/x/DisplayXR/WorkspaceControllers',
+        '/usr/local/share/displayxr/WorkspaceControllers', '/usr/share/displayxr/WorkspaceControllers']),
+    'roots: override list, XDG_DATA_HOME, /usr/local/share, /usr/share');
+    const r2 = WH.controllerRoots({HOME: '/home/u'});
+    check(r2[0] === '/home/u/.local/share/DisplayXR/WorkspaceControllers' && r2.length === 3,
+        'roots: ~/.local/share without XDG_DATA_HOME');
+
+    check(WH.fingerprint([]) === '' && WH.fingerprint(['/r/readme.txt']) === '', 'no *.json -> empty fingerprint');
+    const fp = WH.fingerprint(['/usr/share/displayxr/WorkspaceControllers/shell.json', '/r/x.txt']);
+    check(fp === '/usr/share/displayxr/WorkspaceControllers/shell.json', 'fingerprint keeps only manifests');
+    check(WH.fingerprint(['/b.json', '/a.json']) === WH.fingerprint(['/a.json', '/b.json', '/a.json']),
+        'fingerprint is order- and duplicate-independent');
+
+    // Fresh box: shell installed, no cache, service never ran.
+    const st = WH.create();
+    check(!WH.needBootstrap(st, ''), 'no manifests -> never starts anything');
+    check(WH.needBootstrap(st, fp), 'manifest + no cache -> start the unit');
+    check(WH.bootstrapUnit(st) === 'displayxr.service', 'default unit displayxr.service');
+    check(!WH.needBootstrap(st, fp), 'once per manifest set per shell session (idempotent)');
+
+    // The service came up and configured: recorded with the manifest set.
+    WH.configure(st, ':1.9', '<Control>space', 'displayxr-dev.service', 0, fp);
+    WH.ownerGone(st, ':1.9');
+    const after = WH.create();
+    WH.deserialize(after, WH.serialize(st));
+    check(!WH.needBootstrap(after, fp), 'next login, same set -> nothing to do');
+    const fp2 = WH.fingerprint([fp, '/home/u/.local/share/DisplayXR/WorkspaceControllers/acme.json']);
+    check(WH.needBootstrap(after, fp2), 'a newly installed controller -> start once more');
+    check(WH.bootstrapUnit(after) === 'displayxr-dev.service', 'the unit last configured is reused');
+
+    // A service that saw no usable controller pushes "": recorded, no repeat.
+    const none = WH.create();
+    WH.configure(none, ':1.10', '', 'displayxr.service', 0, fp);
+    const reload = WH.create();
+    check(WH.deserialize(reload, WH.serialize(none)) && reload.hasCache, 'a released hotkey is cached too');
+    check(!WH.needBootstrap(reload, fp), 'released for this set -> no start at every login');
+    check(WH.bootstrapUnit(reload) === 'displayxr.service', 'released cache still remembers the unit');
+
+    // A registered (running) client is never bootstrapped.
+    const live = WH.create();
+    WH.configure(live, ':1.11', '<Control>space', 'displayxr.service', 0, '');
+    check(!WH.needBootstrap(live, fp), 'client registered -> no StartUnit');
+
+    // A v13-early cache without `manifests` bootstraps once.
+    const old = WH.create();
+    WH.deserialize(old, '{"version":1,"accelerator":"<Control>space","unit":"displayxr.service"}');
+    check(WH.needBootstrap(old, fp), 'cache without a manifest record -> one start');
+}
+
+print('8. lock screen (version 14, #2071): no grab, no press, no bootstrap');
+{
+    const st = WH.create();
+    WH.configure(st, ':1.20', '<Control>space', 'displayxr.service', 0, '');
+    check(WH.wantGrab(st, 10, false) && !WH.wantGrab(st, 10, true), 'locked -> grab released');
+    check(WH.wantGrab(st, 10), 'locked defaults to false (callers without a session mode)');
+    const r = WH.press(st, 10, true);
+    check(r.emit === false && r.startUnit === null, 'a press while locked is not acted on');
+    check(WH.press(st, 10, false).emit === true, 'unlocked -> a press emits again');
+    WH.ownerGone(st, ':1.20');
+    const gone = WH.press(st, 20, true);
+    check(gone.startUnit === null && st.pendingUntil === 0,
+        'client gone + locked: no StartUnit, nothing carried as pending');
+    check(!WH.mayBootstrap(true) && WH.mayBootstrap(false), 'bootstrap waits for the unlock');
+}
+
+if (failed > 0) {
+    print(`FAILED: ${failed} check(s)`);
+    imports.system.exit(1);
+}
+print('all workspace-hotkey checks passed');

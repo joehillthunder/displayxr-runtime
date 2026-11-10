@@ -11,13 +11,32 @@ add_library(
 			    target_builder_qwerty_input.c target_builder_qwerty_input.h
 			    target_lists.c target_lists.h
 			    target_input_arbiter.c target_input_arbiter.h
-			    target_input_plugin_loader.c target_input_plugin_loader.h
+			    target_component_loader.c target_component_loader.h
+			    target_input_plugin_loader.c target_input_plugin_loader.h target_input_pref.h
+			    target_conversion_plugin_loader.c target_conversion_plugin_loader.h
+			    target_tracking_plugin_loader.c target_tracking_plugin_loader.h
+			    target_camera_pose.c target_camera_pose.h
+			    target_viewer_tracking.c target_viewer_tracking.h
+			    target_viewer_host.c target_viewer_host.h
+			    target_conv_status.c target_conv_status.h
+			    target_conv_store.c
 			    target_plugin_loader.c target_plugin_loader.h
+			    target_screens.c target_screens.h
+			    target_display_hotplug.c target_display_hotplug.h
+			    target_status_snapshot.c target_status_snapshot.h
+			    target_screen_pin.c target_screen_pin.h
 			    target_plugin_preload_sanitize.c target_plugin_preload_sanitize.h
 			    target_plugin_path_guard.c target_plugin_path_guard.h
 			    target_rig_composer.c target_rig_composer.h
 	)
 target_link_libraries(target_lists PRIVATE xrt-interfaces aux_util aux_util_sink drv_includes)
+# ADR-053 #2006: target_conv_status.c runs the conversion core's registry +
+# selection headless (selftest `conversion_providers`, `conv list`, the
+# headless status snapshot's conversion rows).
+target_link_libraries(target_lists PRIVATE displayxr::conversion_core)
+# ADR-053 P4 (#2108): target_conv_store.c (the hosts' model store packs). Only the
+# service and the satellite host reference it, so only they pull the store in.
+target_link_libraries(target_lists PRIVATE displayxr::conversion_store)
 # #1243: target_plugin_loader.c calls vk_bundle_get_abi_size() (defined in
 # aux_vk) to fingerprint-check VK DP plug-ins. Linked here so every consumer
 # of the loader resolves it; guarded because aux_vk only exists with Vulkan.
@@ -160,5 +179,35 @@ if(ANDROID)
 
 	if(XRT_FEATURE_HYBRID_MODE)
 		target_link_libraries(target_instance_hybrid PRIVATE aux_android)
+	endif()
+endif()
+
+####
+# Workspace-controller launch settings (display dashboard phase 8): service.json,
+# the launch-hotkey grammar and the controller registry enumerator. Shared by
+# displayxr-service (which applies them) and displayxr-cli (`workspace list|set|
+# launch`, `info --json`), and unit-tested on their own. The sources stay in
+# targets/service; only the library lives here, because targets/cli is
+# configured whether or not the service is.
+if(NOT ANDROID)
+	set(_dxr_svc_dir ${CMAKE_CURRENT_SOURCE_DIR}/../service)
+	add_library(
+		target_workspace_config STATIC
+		${_dxr_svc_dir}/service_config.c
+		${_dxr_svc_dir}/service_config.h
+		${_dxr_svc_dir}/service_hotkey.c
+		${_dxr_svc_dir}/service_hotkey.h
+		${_dxr_svc_dir}/service_workspace_registry.c
+		${_dxr_svc_dir}/service_workspace_registry.h
+		)
+	target_link_libraries(
+		target_workspace_config
+		PUBLIC xrt-interfaces
+		PRIVATE aux_util xrt-external-cjson
+		)
+	target_include_directories(target_workspace_config PUBLIC ${_dxr_svc_dir})
+	if(WIN32)
+		# SHGetFolderPathA (service.json path); Reg* (the registry enumerator).
+		target_link_libraries(target_workspace_config PRIVATE shell32 advapi32)
 	endif()
 endif()

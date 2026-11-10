@@ -15,6 +15,7 @@
 
 #include <stdlib.h>
 
+#include "util/comp_dp_factory.h"
 #include "util/u_misc.h"
 #include "util/u_logging.h"
 #include "util/u_debug.h"
@@ -101,6 +102,7 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
                                   bool offscreen,
                                   void *shared_texture_handle,
                                   bool transparent_background,
+                                  uint64_t bound_display_id,
                                   struct oxr_session *sess)
 {
 	struct xrt_device *xdev = get_role_head(sess->sys);
@@ -109,7 +111,8 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 	// Get Metal display processor factory from system compositor info
 	void *dp_factory_metal = NULL;
 	if (sys->xsysc != NULL) {
-		dp_factory_metal = sys->xsysc->info.dp_factory_metal;
+		// #2218: a session bound to a display takes that monitor's plug-in.
+		dp_factory_metal = comp_dp_factory_for_session(&sys->xsysc->info, bound_display_id, COMP_DP_API_METAL);
 	}
 
 	// Create the Metal native compositor
@@ -123,6 +126,11 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 
 	// Set system devices for qwerty driver support
 	comp_metal_compositor_set_system_devices(&xcn->base, sess->sys->xsysd);
+
+#ifdef OXR_HAVE_DXR_depth_budget
+	// XR_DXR_depth_budget: latch the extension opt-in (same as vk_native).
+	comp_metal_compositor_set_rear_budget_requested(&xcn->base, sys->inst->extensions.DXR_depth_budget);
+#endif
 
 	// Set system compositor info for HUD (display dimensions, nominal viewer)
 	if (sys->xsysc != NULL) {
@@ -142,6 +150,15 @@ oxr_session_populate_metal_native(struct oxr_logger *log,
 	U_LOG_IFL_I(U_LOGGING_INFO, "Using Metal native compositor (bypassing Vulkan)");
 
 	return XR_SUCCESS;
+}
+
+void
+oxr_session_metal_native_setup_window_placement(struct oxr_session *sess, bool app_owned)
+{
+	if (sess == NULL || sess->xcn == NULL || !sess->is_metal_native_compositor) {
+		return;
+	}
+	comp_metal_compositor_setup_window_placement(&sess->xcn->base, app_owned);
 }
 
 #endif /* XRT_HAVE_METAL_NATIVE_COMPOSITOR */

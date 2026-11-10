@@ -13,6 +13,7 @@
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_instance.h"
+#include "xrt/xrt_stereo_camera.h"
 
 #include "math/m_mathinclude.h"
 #include "util/u_var.h"
@@ -334,6 +335,14 @@ oxr_instance_create(struct oxr_logger *log,
 	xrt_result_t xret;
 	XrResult ret;
 
+#ifdef OXR_HAVE_DXR_app_share
+	// XR_DXR_app_share spec §2: a dependent extension of XR_DXR_stereo_camera.
+	if (extensions->DXR_app_share && !extensions->DXR_stereo_camera) {
+		return oxr_error(log, XR_ERROR_EXTENSION_DEPENDENCY_NOT_ENABLED,
+		                 "XR_DXR_app_share requires XR_DXR_stereo_camera to be enabled too");
+	}
+#endif
+
 	OXR_ALLOCATE_HANDLE_OR_RETURN(log, inst, OXR_XR_DEBUG_INSTANCE, oxr_instance_destroy, NULL);
 
 #ifdef XRT_OS_WINDOWS
@@ -524,6 +533,28 @@ oxr_instance_create(struct oxr_logger *log,
 	    .ext_weave_enabled = extensions->DXR_weave,
 #endif
 	};
+	// #1744: an app that binds its OWN window/surface is not a present-owner
+	// even when it enables XR_DXR_weave (the Linux demos do, only for the
+	// in-process xrWeaveSnapWindowRectDXR / ...GridDXR). The hybrid router in
+	// xrt_instance_create reads this. Enabling the extension is the signal —
+	// whether a binding struct actually reaches xrCreateSession is not known
+	// yet here. Not in app_info: that struct is the IPC wire (see the field).
+	i_info.window_binding_enabled = false;
+#ifdef OXR_HAVE_DXR_wayland_surface_binding
+	i_info.window_binding_enabled |= extensions->DXR_wayland_surface_binding;
+#endif
+#ifdef OXR_HAVE_DXR_xlib_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_xlib_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_win32_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_win32_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_cocoa_window_binding
+	i_info.window_binding_enabled |= extensions->DXR_cocoa_window_binding;
+#endif
+#ifdef OXR_HAVE_DXR_android_surface_binding
+	i_info.window_binding_enabled |= extensions->DXR_android_surface_binding;
+#endif
 	// #960: declare the IPC client class from the enabled extension set. The
 	// service verifies the claim (ADR-035 D1); an unverifiable claim is demoted
 	// to APP server-side, never trusted.
@@ -539,6 +570,35 @@ oxr_instance_create(struct oxr_logger *log,
 	else if (i_info.app_info.ext_weave_enabled) {
 		i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_PRESENT_OWNER;
 	}
+#ifdef OXR_HAVE_DXR_stereo_camera
+	// ADR-043 R3: a camera-only consumer says so explicitly (a browser's
+	// video-capture utility process, `displayxr-cli camera`). It outranks the
+	// weave-derived PRESENT_OWNER claim: such a process never presents, so it
+	// must not take a panel-owner slot. The service refuses it any session.
+	if (extensions->DXR_stereo_camera) {
+		const XrStereoCameraClientInfoDXR *ci = OXR_GET_INPUT_FROM_CHAIN(
+		    createInfo, XR_TYPE_STEREO_CAMERA_CLIENT_INFO_DXR, XrStereoCameraClientInfoDXR);
+		if (ci != NULL && (ci->flags & XR_STEREO_CAMERA_CLIENT_CONSUMER_ONLY_BIT_DXR) != 0) {
+			i_info.app_info.declared_client_class = XRT_CLIENT_CLASS_CAMERA_CONSUMER;
+		}
+		// Spec v3: the flags travel to the service as declared (same bit
+		// values as XRT_STEREO_CAMERA_CLIENT_*); it acts on
+		// DECLINE_DELEGATION_BIT and ignores bits it does not know. Only the
+		// public bits: the high ones are the runtime's own (below).
+		if (ci != NULL) {
+			i_info.app_info.stereo_camera_client_flags =
+			    (uint64_t)ci->flags & XRT_STEREO_CAMERA_CLIENT_PUBLIC_MASK;
+		}
+	}
+#endif
+#ifdef OXR_HAVE_DXR_app_share
+	// ADR-061 decision 3: enabling XR_DXR_app_share IS the declaration that
+	// this instance wants running apps listed — an internal client flag, never
+	// a public bit.
+	if (extensions->DXR_app_share) {
+		i_info.app_info.stereo_camera_client_flags |= XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
+	}
+#endif
 	// #964 Phase A: is this process part of a workspace session? The workspace
 	// controller sets DISPLAYXR_WORKSPACE_SESSION=1 for the apps it launches
 	// (so does the service orchestrator's spawn), and ONLY those clients are
@@ -569,6 +629,10 @@ oxr_instance_create(struct oxr_logger *log,
 	 */
 
 	xret = xrt_instance_create(&i_info, &inst->xinst);
+	if (xret == XRT_SUCCESS && inst->xinst != NULL) {
+		// Nothing below the state tracker stores it: the service link names the app from here.
+		inst->xinst->instance_info = i_info;
+	}
 	if (xret == XRT_ERROR_CLIENT_LIMIT_REACHED) {
 		// #960: the service refused us at the class quota / client cap.
 		ret = oxr_error(log, XR_ERROR_LIMIT_REACHED,
@@ -748,7 +812,9 @@ oxr_instance_create(struct oxr_logger *log,
 	// env-var-overrides: install the MCP Tools package (writes the
 	// capability marker — REG_DWORD Enabled=1 on Windows, a one-byte
 	// file under /Library/Application Support/DisplayXR/Capabilities/MCP/
-	// on macOS) and the MCP server starts in every handle-app process.
+	// on macOS, ~/.config/displayxr/capabilities/mcp/Enabled or
+	// /etc/displayxr/capabilities/mcp/Enabled on Linux) and the MCP server
+	// starts in every handle-app process.
 	// DISPLAYXR_MCP=1/0 in the environment wins as an explicit override
 	// (CI, dev iteration, quick disable). No marker + no env var ⇒
 	// zero runtime cost. See oxr_mcp_capability_enabled().

@@ -60,9 +60,6 @@ cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
   -DXRT_HAVE_SDL2=OFF \
-  -DXRT_HAVE_OPENCV=OFF \
-  -DXRT_HAVE_LIBUSB=OFF \
-  -DXRT_BUILD_DRIVER_EUROC=OFF \
   ${MACOS_SDK:+-DCMAKE_OSX_SYSROOT="$MACOS_SDK"}
 cmake --build "$BUILD_DIR"
 
@@ -213,6 +210,87 @@ else
   echo "Note: DisplayXR-SimInput.dylib not found — no input provider in dev tree (qwerty keeps the hand roles)."
 fi
 
+# Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer. The
+# `-tracking-provider.json` suffix routes it to the tracking loader. Safe to
+# stage: sim-tracking's probe() declines unless its ENABLE setting is on
+# (`displayxr-cli tracking set sim-tracking ENABLE 1`).
+SIMTRACK_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimTracking.dylib" -type f | head -1)
+if [ -n "$SIMTRACK_PLUGIN" ] && [ -f "$SIMTRACK_PLUGIN" ]; then
+  cp "$SIMTRACK_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/200-sim-tracking-tracking-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-tracking",
+        "display_name": "DisplayXR Sim Tracking",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimTracking.dylib",
+        "probe_order":  200
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimTracking.dylib" 2>/dev/null || true
+fi
+
+# Gamepad input provider (ADR-034 / ADR-054): GameController.framework on
+# macOS. Presence-gated — staging it changes nothing until a pad is paired,
+# then the pad takes the gamepad role, drives the rig and (by default) holds
+# the hand roles with an emulated controller pair. ProbeOrder 150: below a
+# real tracking vendor (50), above sim-input (200).
+GAMEPAD_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.dylib" -type f | head -1)
+if [ -n "$GAMEPAD_PLUGIN" ] && [ -f "$GAMEPAD_PLUGIN" ]; then
+  cp "$GAMEPAD_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  cat > "$PKG_DIR/lib/displayxr/plugins/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-Gamepad.dylib",
+        "probe_order":  150
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-Gamepad.dylib" 2>/dev/null || true
+else
+  echo "Note: DisplayXR-Gamepad.dylib not found — no gamepad provider in dev tree."
+fi
+
+# Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
+# The `-conversion-provider.json` suffix routes the manifest to the conversion
+# loader. Harmless to stage: probe() declines unless its ENABLE setting is 1
+# (DXR_CONV_SIM_CONVERSION_ENABLE=1); FALLBACK at ProbeOrder 250.
+SIMCONV_PLUGIN=$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.dylib" -type f | head -1)
+if [ -n "$SIMCONV_PLUGIN" ] && [ -f "$SIMCONV_PLUGIN" ]; then
+  cp "$SIMCONV_PLUGIN" "$PKG_DIR/lib/displayxr/plugins/"
+  # ADR-053 P4 (#2108): its fake model pack (the DOWNLOAD_MS knob's file:// source).
+  SIMCONV_DIR="$(dirname "$SIMCONV_PLUGIN")"
+  if [ -f "$SIMCONV_DIR/sim-conversion.models.json" ]; then
+    cp "$SIMCONV_DIR/sim-conversion.models.json" "$PKG_DIR/lib/displayxr/plugins/"
+    cp -r "$SIMCONV_DIR/sim-conversion-blobs" "$PKG_DIR/lib/displayxr/plugins/"
+  fi
+  cat > "$PKG_DIR/lib/displayxr/plugins/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimConversion.dylib",
+        "probe_order":  250,
+        "packs":        ["sim-conversion.models.json"]
+    }
+}
+EOF
+  install_name_tool -add_rpath @loader_path/../.. "$PKG_DIR/lib/displayxr/plugins/DisplayXR-SimConversion.dylib" 2>/dev/null || true
+else
+  echo "Note: DisplayXR-SimConversion.dylib not found — no conversion provider in dev tree."
+fi
+
 # Copy test app binaries
 # Stage every built app binary (executables land directly in test_apps/build/bin).
 for _b in "$TA_BIN"/*; do
@@ -340,6 +418,95 @@ if [ "$SERVICE_MODE" = "ON" ] && [ -f "$SERVICE_BIN" ]; then
   install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
   codesign --force --sign - "$PKG_DIR/bin/displayxr-service" 2>/dev/null || true
   echo "Staged displayxr-service (SERVICE build) into _package bin/"
+fi
+
+# ADR-053 P2: the conversion-host satellite ships beside the service (the
+# service spawns it from its own directory). Same rpath treatment.
+HOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-conversion-host -type f 2>/dev/null | head -1 || true)"
+if [ "$SERVICE_MODE" = "ON" ] && [ -n "$HOST_BIN" ]; then
+  cp "$HOST_BIN" "$PKG_DIR/bin/displayxr-conversion-host"
+  chmod u+w "$PKG_DIR/bin/displayxr-conversion-host"
+  # Its Vulkan/cJSON deps get the same retarget as the service's — without it
+  # the installed host still names Homebrew's libvulkan and never starts on a
+  # Mac without Homebrew.
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-conversion-host" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-conversion-host" 2>/dev/null || true
+  echo "Staged displayxr-conversion-host into _package bin/"
+fi
+
+# Tracking-provider-discovery §4a: the viewer-tracking host ships beside the
+# service too (it spawns it from its own directory). A provider dylib imports
+# @rpath/openxr_displayxr.dylib, so the host needs @executable_path/../lib.
+TRACKHOST_BIN="$(find "$BUILD_DIR/src/xrt/targets" -maxdepth 2 -name displayxr-tracking-host -type f 2>/dev/null | head -1 || true)"
+if [ "$SERVICE_MODE" = "ON" ] && [ -n "$TRACKHOST_BIN" ]; then
+  cp "$TRACKHOST_BIN" "$PKG_DIR/bin/displayxr-tracking-host"
+  chmod u+w "$PKG_DIR/bin/displayxr-tracking-host"
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-tracking-host" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-tracking-host" 2>/dev/null || true
+  echo "Staged displayxr-tracking-host into _package bin/"
+fi
+
+# displayxr-cli ships in the .pkg too: on macOS it is the only installed way to
+# run selftest / status and to calibrate a camera (the Dashboard is Windows-only).
+# It links the same bundled Vulkan loader + cJSON as the service, and runs the
+# runtime headless in-process, so it needs the same rpath. Service or not.
+CLI_BIN="$BUILD_DIR/src/xrt/targets/cli/displayxr-cli"
+if [ -f "$CLI_BIN" ]; then
+  cp "$CLI_BIN" "$PKG_DIR/bin/displayxr-cli"
+  chmod u+w "$PKG_DIR/bin/displayxr-cli"
+  install_name_tool -change "$BREW_PREFIX/opt/vulkan-loader/lib/libvulkan.1.dylib" \
+                            @rpath/libvulkan.1.dylib \
+                            "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  install_name_tool -change "$BREW_PREFIX/opt/cjson/lib/libcjson.1.dylib" \
+                            @rpath/libcjson.1.dylib \
+                            "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  for r in $(otool -l "$PKG_DIR/bin/displayxr-cli" \
+             | awk '/LC_RPATH/{f=1} f && /path /{print $2; f=0}'); do
+    case "$r" in
+      /opt/homebrew/*|/usr/local/*|/tmp/*)
+        install_name_tool -delete_rpath "$r" "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true ;;
+    esac
+  done
+  install_name_tool -add_rpath @executable_path/../lib "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  codesign --force --sign - "$PKG_DIR/bin/displayxr-cli" 2>/dev/null || true
+  echo "Staged displayxr-cli into _package bin/"
+fi
+
+# #2264: the desktop-capture helper (the one process that holds the Screen
+# Recording grant; in-process Metal compositors reach it over XPC by Mach
+# service name, so it ships with or without the service). It links only system
+# frameworks — no rpath fixup. build_installer.sh adds its on-demand LaunchAgent.
+CAPTURE_APP="$BUILD_DIR/src/xrt/targets/desktop_capture_macos/DisplayXRDesktopCapture.app"
+if [ -d "$CAPTURE_APP" ]; then
+  rm -rf "$PKG_DIR/bin/DisplayXRDesktopCapture.app"
+  cp -R "$CAPTURE_APP" "$PKG_DIR/bin/"
+  echo "Staged DisplayXRDesktopCapture.app into _package bin/"
 fi
 
 # Create MoltenVK ICD manifest
@@ -507,16 +674,21 @@ chmod +x "$PKG_DIR/run_cube_hosted_legacy_vk.sh"
 
 
 # Step 5: Build .pkg installer (optional). Versioned filename mirrors
-# Windows' `DisplayXRSetup-X.Y.Z.NNN.exe`; DISPLAYXR_VERSION is also
-# baked into the .pkg's internal version + the sim-display manifest,
-# so it's the single source of truth across the artifact.
+# Windows' `DisplayXRSetup-X.Y.Z.exe`; the version is also baked into the
+# .pkg's internal version + the sim-display manifest.
 #
-# Falls back to a sha-suffixed dev string for local builds with no
-# explicit version set — matches build-macos.yml's BuildInstaller job.
+# The version is the one the runtime was BUILT with (#1790):
+# cmake/DisplayXRVersion.cmake writes it next to the build -- X.Y.Z on a
+# release tag, X.Y.Z+<n>.g<sha> on any other commit -- so the .pkg name and
+# the runtimeVersion the installed runtime reports cannot disagree. An explicit
+# DISPLAYXR_VERSION still wins (a caller that knows better).
 if [ "$BUILD_INSTALLER" = "ON" ]; then
   if [ -z "${DISPLAYXR_VERSION:-}" ]; then
-    GIT_SHA=$(git -C "$ROOT" rev-parse --short=8 HEAD 2>/dev/null || echo "local")
-    INSTALLER_VERSION="0.0.0-dev.$GIT_SHA"
+    INSTALLER_VERSION="$(sed -n 's/^DXR_RUNTIME_VERSION_PACKAGE=//p' "$BUILD_DIR/displayxr-version.txt" 2>/dev/null || true)"
+    if [ -z "$INSTALLER_VERSION" ]; then
+      echo "error: no DXR_RUNTIME_VERSION_PACKAGE in $BUILD_DIR/displayxr-version.txt (#1790)" >&2
+      exit 1
+    fi
   else
     INSTALLER_VERSION="$DISPLAYXR_VERSION"
   fi

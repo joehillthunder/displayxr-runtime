@@ -62,6 +62,46 @@ uint64_t
 comp_vk_native_swapchain_get_image(struct xrt_swapchain *xsc, uint32_t index);
 
 /*!
+ * The sampling view in the format the APP ASKED FOR (#1589/#1610).
+ *
+ * @ref comp_vk_native_swapchain_get_image_view returns the NON-decoding view
+ * (the UNORM sibling of an sRGB swapchain) that the blit path needs. The
+ * compose render pass composites in linear light and wants the opposite: the
+ * GPU decoding an `_SRGB` source on sample. Identical for a non-sRGB
+ * swapchain.
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_true_image_view(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * Was this swapchain created with an `_SRGB` colour format?
+ *
+ * Answered from the app's requested format, NEVER from the image's: the image
+ * is the UNORM sibling whenever DXR_VK_SWAPCHAIN_TRUE_FORMAT is off, so
+ * `comp_vk_native_swapchain_is_true_srgb()` (which asks about the IMAGE) is a
+ * different question and the wrong one for a colour decision.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_swapchain_is_srgb(struct xrt_swapchain *xsc);
+
+/*!
+ * The VkFormat the app REQUESTED for this swapchain (#1795).
+ *
+ * A view in this format is always legal on the swapchain's images: either it
+ * is the image's own format, or the image is the UNORM sibling created
+ * MUTABLE_FORMAT with both siblings in its format list (#1559/#1572). Use it
+ * to sample the app's bytes as what they are.
+ *
+ * @ingroup comp_vk_native
+ */
+int32_t
+comp_vk_native_swapchain_get_declared_format(struct xrt_swapchain *xsc);
+
+/*!
  * Get the dimensions of a swapchain.
  *
  * @param xsc The swapchain.
@@ -86,17 +126,90 @@ uint32_t
 comp_vk_native_swapchain_get_array_size(struct xrt_swapchain *xsc);
 
 /*!
+ * #2095 / ADR-055: the commit serial of the last chained in-process weave
+ * that reads image @p index (0 = none). Call under the compositor's
+ * weave-sync lock — see comp_vk_native_compositor_wait_swapchain_read().
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_read_serial(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * #2095 / ADR-055: record that chained commit @p serial reads image @p index
+ * (monotone: an older serial never overwrites a newer one). Same lock rule.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_note_read(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
+
+/*!
+ * #2356: the serial of the last commit-time window-space stamp that reads
+ * image @p index (0 = none). Call under the compositor's ws_stamp lock — see
+ * comp_vk_native_compositor_wait_swapchain_read().
+ *
+ * @ingroup comp_vk_native
+ */
+uint64_t
+comp_vk_native_swapchain_get_stamp_serial(struct xrt_swapchain *xsc, uint32_t index);
+
+/*!
+ * #2356: record that commit-time stamp @p serial reads image @p index
+ * (monotone). Same lock rule.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_swapchain_note_stamp(struct xrt_swapchain *xsc, uint32_t index, uint64_t serial);
+
+/*!
  * #1559: true when this swapchain's `VkImage`s really are in the `*_SRGB`
  * format the app asked for, rather than the UNORM sibling the runtime reads.
  *
- * Two callers care: the compose blit (which must stage a raw copy first, see
- * comp_vk_native_swapchain_stage_unorm_copy()) and the zero-copy gate, which
+ * Two callers care: the compose fast path (which must read it through the
+ * UNORM view — a draw, #1935 — or, with that switched off, stage a raw copy
+ * first, see comp_vk_native_swapchain_stage_unorm_copy()) and the zero-copy
+ * gate, which
  * must stay off for these so no display processor is handed an sRGB image.
  *
  * @ingroup comp_vk_native
  */
 bool
 comp_vk_native_swapchain_is_true_srgb(struct xrt_swapchain *xsc);
+
+/*!
+ * #1935: true (the default) when the compose fast path reads a truthful-sRGB
+ * swapchain by sampling its UNORM mutable-format view (the swapchain's
+ * comp_vk_native_swapchain_get_image_view()) in a draw, instead of staging
+ * comp_vk_native_swapchain_stage_unorm_copy() + a blit every frame.
+ * `DXR_VK_SRGB_MUTABLE_VIEW=0` / Android `debug.dxr.vk_srgb_mutable_view=0`
+ * turns it off. Resolved once per process.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_srgb_mutable_view_enabled(void);
+
+/*!
+ * Kill switch for the zones / Local2D per-frame copies (runtime issue on the
+ * avatar's ~35 fps cap). True (the default) when
+ *
+ *  - the zones compose pass hands its private target to the atlas with a
+ *    REPLACE draw sampling the target's UNORM view (renderer), and
+ *  - the post-weave Local2D composite snapshots the weave target into
+ *    `weave_scratch` with a 1:1 point-sampled draw (compositor),
+ *
+ * instead of a vkCmdCopyImage each — on Adreno every such copy allocates and
+ * zeroes driver memory inside the call. `DXR_VK_ZONES_COPY_TO_DRAW=0` /
+ * Android `debug.dxr.vk_zones_copy_to_draw=0` restores both copies. The env,
+ * when set non-empty, wins over the property. Resolved (and logged) once per
+ * process.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_zones_copy_to_draw_enabled(void);
 
 /*!
  * #1559: record a raw copy of a source rect into this swapchain's UNORM

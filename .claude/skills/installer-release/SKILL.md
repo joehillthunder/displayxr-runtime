@@ -201,6 +201,9 @@ Confirm:
 - Assets contain `DisplayXRBundle-*.pkg` (macOS, non-zero size)
 - Assets contain `DisplayXRBundle-*.exe` (Windows, non-zero size)
 - Assets contain `DisplayXRBundle-*-linux-amd64.tar.gz` (non-zero size)
+- Assets contain `SHA256SUMS` (written by CI since DisplayXR/displayxr-installer#89; its `.exe`
+  line is for the unsigned exe until Step 4.5.3 refreshes it — an older release has none,
+  and Step 4.5.3 generates it)
 - Prerelease flag matches input (the gh field is `isPrerelease`, NOT `prerelease` —
   the latter is rejected as an invalid field and the whole query fails)
 
@@ -232,7 +235,77 @@ fi
 ```
 
 ### Step 4.5.2: Download → dispatch `sign-artifact` → re-upload
+**Track the signing run by identity, never as "the newest run".** `sign-artifact` is
+shared with every other release (the `/dxr-release` unity path, the browser's publish lane)
+and serialises on one concurrency group that keeps a single *waiting* run, so a parallel
+dispatch **cancels** ours while it waits, and "newest run since `$SINCE`" then resolves to
+someone else's (2026-10-11 incident — `/dxr-release` Phase 3.5,
+`docs/specs/runtime/release-signing.md` § Concurrency). So: track the run URL `gh workflow
+run` prints (fallback: a run whose log echoes our `$SIGN_TAG`); re-dispatch **once** after
+the workflow goes idle if ours was `cancelled`; and upload only a file named exactly
+`DisplayXRBundle-<version>.exe` that is **our payload plus a signature** (the bundle exe
+carries no version string, so the byte comparison is the identity proof).
 ```bash
+# ── Signing-run identity helpers ────────────────────────────────────────────
+# sign_dispatch <workflow> <marker> [-f k=v ...]  → sets SIGN_RUN ("" = not located)
+sign_dispatch() {
+  local wf="$1" marker="$2" since out id cand st; shift 2
+  since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  out=$(gh workflow run "$wf" -R "$SIGN_REPO" "$@" 2>&1); printf '%s\n' "$out"
+  # 1) The run gh printed. Recent gh prints the new run's URL on dispatch.
+  id=$(printf '%s\n' "$out" | sed -nE 's#.*/actions/runs/([0-9]+).*#\1#p' | head -1)
+  # 2) Fallback ONLY when nothing was printed: a run created since $since that
+  #    PROVABLY carries our marker — in its job step names (build-signed-release's
+  #    first step is "Checkout <repo> @ <ref>") or, once completed, in its log
+  #    (sign-artifact's log echoes the release_tag). NEVER the bare newest run:
+  #    under parallel releases that is another component's. A run that has not
+  #    started yet shows neither, so keep polling (<= 40 min).
+  if [ -z "$id" ]; then
+    for _ in $(seq 1 160); do
+      while read -r cand st; do
+        [ -n "$cand" ] || continue
+        if gh api "repos/$SIGN_REPO/actions/runs/$cand/jobs" --jq '.jobs[].steps[].name' 2>/dev/null | grep -qF -- "$marker" \
+           || { [ "$st" = completed ] && gh run view "$cand" -R "$SIGN_REPO" --log 2>/dev/null | grep -qF -- "$marker"; }; then
+          id="$cand"; break 2
+        fi
+      done <<RUNS
+$(gh run list -R "$SIGN_REPO" --workflow "$wf" --event workflow_dispatch --limit 20 \
+    --json databaseId,createdAt,status \
+    --jq "[.[]|select(.createdAt>=\"$since\")]|.[]|\"\(.databaseId) \(.status)\"")
+RUNS
+      sleep 15
+    done
+  fi
+  SIGN_RUN="$id"
+}
+
+# sign_track <workflow> <marker> [-f k=v ...]  → dispatch, wait, and re-dispatch ONCE if
+# the run was cancelled. Returns 0 only on conclusion=success; SIGN_RUN/SIGN_CONCL set.
+sign_track() {
+  local wf="$1" marker="$2" attempt; shift 2
+  SIGN_RUN=""; SIGN_CONCL=""
+  for attempt in 1 2; do
+    sign_dispatch "$wf" "$marker" "$@"
+    [ -n "$SIGN_RUN" ] || { SIGN_CONCL=unlocated; return 1; }
+    echo "tracking $wf run $SIGN_RUN (attempt $attempt)"
+    until [ "$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json status --jq .status 2>/dev/null)" = completed ]; do sleep 30; done
+    SIGN_CONCL=$(gh run view "$SIGN_RUN" -R "$SIGN_REPO" --json conclusion --jq .conclusion)
+    [ "$SIGN_CONCL" = cancelled ] && [ "$attempt" = 1 ] || break
+    echo "run $SIGN_RUN was CANCELLED (another release's dispatch displaced it) — waiting for $wf to go idle, then re-dispatching once"
+    while [ "$(gh run list -R "$SIGN_REPO" --workflow "$wf" --limit 20 --json status \
+                --jq '[.[]|select(.status!="completed")]|length')" != 0 ]; do sleep 30; done
+    sleep $((RANDOM % 30))   # de-synchronise agents that idle-waited together
+  done
+  [ "$SIGN_CONCL" = success ]
+}
+
+# signed_is_our_payload <signed> <original> — <signed> is <original> plus an Authenticode
+# signature (signing rewrites only PE-header fields in the first 1 KiB and appends).
+signed_is_our_payload() {
+  python3 -I -c 'import sys
+s=open(sys.argv[1],"rb").read(); o=open(sys.argv[2],"rb").read()
+sys.exit(0 if len(s)>len(o) and s[1024:len(o)]==o[1024:] else 1)' "$1" "$2"; }
+
 if [ "$SIGNED" = yes ]; then
   D=$(mktemp -d)
   # startswith/endswith, NOT test("...\\.exe$"): that regex needs a \\ that survives only in
@@ -242,7 +315,27 @@ if [ "$SIGNED" = yes ]; then
   EXE=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
          --jq '.assets[].name | select(startswith("DisplayXRBundle-") and endswith(".exe"))')
   [ -n "$EXE" ] || { echo "No DisplayXRBundle-*.exe on $TAG — cannot sign"; exit 1; }
-  gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in"
+  [ "$EXE" = "DisplayXRBundle-${TAG#v}.exe" ] || { echo "REFUSING: release $TAG carries '$EXE', expected exactly DisplayXRBundle-${TAG#v}.exe — not signing"; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
+  # PROVE the download is whole before signing it. On a slow link `gh release download`
+  # can stop early and still leave a file behind; signing and re-uploading that file then
+  # REPLACES a good release asset with a truncated installer. (Bundle v2.5.8, 2026-10-03:
+  # 26.77 of 63.95 MB was signed and shipped, and the live .exe was broken for ~20 min.)
+  ORIG=$(gh release view "$TAG" -R DisplayXR/displayxr-installer --json assets \
+          --jq ".assets[] | select(.name==\"$EXE\") | .size")
+  for i in 1 2 3 4; do
+    rm -rf "$D/in"
+    gh release download "$TAG" -R DisplayXR/displayxr-installer -p "$EXE" -D "$D/in" && \
+      HAVE=$(stat -f%z "$D/in/$EXE" 2>/dev/null || stat -c%s "$D/in/$EXE")
+    [ -n "$ORIG" ] && [ "$HAVE" = "$ORIG" ] && break
+    echo "download attempt $i: got ${HAVE:-nothing}, release asset is $ORIG bytes — retrying"; HAVE=""; sleep $((i*15))
+  done
+  [ -n "$HAVE" ] && [ "$HAVE" = "$ORIG" ] || { echo "ERROR: could not download the whole $EXE ($HAVE vs $ORIG) — NOT signing; the release keeps its CI asset."; SIGNED=no; }
+fi
+
+if [ "$SIGNED" = yes ]; then
 
   # Zip the finished .exe and hand it to the provider's folder-sign workflow.
   # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
@@ -258,17 +351,13 @@ if [ "$SIGNED" = yes ]; then
   SIGN_TAG="sign-bundle-$(date +%s)-$$"
   gh release create "$SIGN_TAG" -R "$SIGN_REPO" --prerelease --title "$SIGN_TAG" \
      --notes "temp bundle-signing payload (auto-deleted)" "$D/unsigned.zip"
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$SIGN_TAG"
-
-  RID=""
-  for _ in $(seq 1 20); do
-    RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
-            --limit 8 --json databaseId,createdAt \
-            --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-    [ -n "$RID" ] && break; sleep 4
-  done
-  if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+  # Identity-tracked: printed URL, else a run whose log echoes $SIGN_TAG; a displaced
+  # (cancelled) run is re-dispatched once after the workflow goes idle.
+  if sign_track sign-artifact "$SIGN_TAG" -f release_tag="$SIGN_TAG"; then
+    RID="$SIGN_RUN"
+    # Clear the download dirs first: a stale signed.zip left in $D/out (e.g. when $D is a
+    # reused scratch folder) makes unzip extract the WRONG file and the identity check refuse it.
+    rm -rf "$D/out" "$D/signed"
     gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
     # portable unzip (git-bash on Windows has no `unzip`).
     if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
@@ -277,6 +366,15 @@ if [ "$SIGNED" = yes ]; then
     # the suffixed path fails the upload guard, and the UNSIGNED CI bundle silently stays
     # published (bit v2.0.15 for real). Test the path / use find instead.
     SIGNED_EXE="$D/signed/$EXE"; [ -f "$SIGNED_EXE" ] || SIGNED_EXE=$(find "$D/out" -type f -name "$EXE" 2>/dev/null | head -1)
+    # A signature only ADDS bytes. A "signed" file no bigger than the original means the
+    # wrong or truncated input went through the signer — never upload it over the release.
+    if [ -n "$SIGNED_EXE" ] && [ "$(stat -f%z "$SIGNED_EXE" 2>/dev/null || stat -c%s "$SIGNED_EXE")" -le "$ORIG" ]; then
+      echo "ERROR: signed $EXE is not larger than the original ($ORIG bytes) — not uploading."; SIGNED_EXE=""
+    fi
+    # Identity: the returned file must be OUR payload plus a signature, not another job's file.
+    if [ -n "$SIGNED_EXE" ] && ! signed_is_our_payload "$SIGNED_EXE" "$D/in/$EXE"; then
+      echo "REFUSING: sign-artifact run $RID returned a $EXE that is not our payload + signature — not uploading."; SIGNED_EXE=""
+    fi
     if [ -n "$SIGNED_EXE" ]; then
       # `--clobber` DELETES the CI asset first, then uploads. On a flaky link the delete
       # succeeds and the 60 MB upload dies (TLS timeout) — the release is then .exe-LESS
@@ -300,62 +398,71 @@ if [ "$SIGNED" = yes ]; then
       echo "⚠ signed .exe not returned — leaving the unsigned CI bundle."; SIGNED=no
     fi
   else
-    echo "⚠ sign-artifact run failed/absent — leaving the unsigned CI bundle."; SIGNED=no
+    echo "⚠ sign-artifact run ${SIGN_RUN:-<none>} ended '$SIGN_CONCL' — leaving the unsigned CI bundle."; SIGNED=no
   fi
   # Always clean up the temp signing release/tag on the provider.
   gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 fi
 ```
 
-Only the Windows `.exe` is covered; the macOS `.pkg` uses an Apple Developer ID
-cert + notarization (separate track). Carry `SIGNED` into the report.
+### Step 4.5.3: Refresh `SHA256SUMS` for the signed .exe (fail-soft)
 
----
-
-## PHASE 4.6: MIRROR THE SIGNED BUNDLE TO ONEDRIVE
-
-`publish-bundle.yml` no longer uploads to OneDrive — it ran BEFORE this
-skill's signing, so it always mirrored the UNSIGNED bundle (the very gap that
-shipped an unsigned v2.0.5 to OneDrive). The upload now lives in
-`upload-bundle-onedrive.yml` (workflow_dispatch), which downloads the release's
-`DisplayXRBundle-*.exe` — signed by Phase 4.5 above — and pushes it. Fire it
-here so OneDrive matches the signed GitHub release.
-
-Only run this when `SIGNED = yes` (never mirror an unsigned bundle). The
-workflow itself also fail-closes: it re-verifies the downloaded `.exe` carries
-a signature and errors out if not, so a mis-fire can't push an unsigned bundle.
+`publish-bundle.yml` attaches a `SHA256SUMS` (`sha256sum` format, bare filenames, order
+`.pkg`, `.exe`, `-linux-amd64.tar.gz`, `.apk`) — but CI hashed the **unsigned** exe, so
+the moment Step 4.5.2 uploads the signed one over it, the `.exe` line is wrong and
+`sha256sum -c SHA256SUMS` fails for every Windows downloader. Rewrite that one line from
+the signed file. Runs only when the signed upload landed (`SIGNED=yes`; the restore-unsigned
+path sets `SIGNED=no`, and then CI's line is still right). An older workflow published no
+`SHA256SUMS` — then generate the whole file from the four release assets. **Never fails the
+release:** every problem logs a `⚠ SHA256SUMS:` line and moves on; carry `SUMS` into the report.
 
 ```bash
+SUMS="untouched (bundle not signed — CI's SHA256SUMS still matches the published .exe)"
 if [ "$SIGNED" = yes ]; then
-  # Stamp SINCE *BEFORE* the dispatch. Stamping it after means every candidate
-  # run has createdAt < SINCE, the filter matches nothing, and the loop burns its
-  # 20 tries and reports the mirror as failed even when it succeeded (hit for real
-  # on bundle v2.3.2). The same ordering applies to the Phase 4.5 loop above.
-  SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag="$TAG"
-  # Locate + watch the dispatched run so the report reflects the real outcome.
-  OD_RUN=""
-  for _ in $(seq 1 20); do
-    OD_RUN=$(gh run list -R DisplayXR/displayxr-installer --workflow upload-bundle-onedrive.yml \
-              --event workflow_dispatch --limit 8 --json databaseId,createdAt \
-              --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
-    [ -n "$OD_RUN" ] && break; sleep 5
-  done
-  if [ -n "$OD_RUN" ] && gh run watch "$OD_RUN" -R DisplayXR/displayxr-installer --interval 20 --exit-status; then
-    ONEDRIVE=synced
+  R=DisplayXR/displayxr-installer; K="$D/sums"; rm -rf "$K"; mkdir -p "$K"
+  NEW=$(sha256sum "$SIGNED_EXE" 2>/dev/null | cut -d' ' -f1)
+  [ -n "$NEW" ] || NEW=$(shasum -a 256 "$SIGNED_EXE" | cut -d' ' -f1)   # macOS has no sha256sum
+  if gh release download "$TAG" -R "$R" -p SHA256SUMS -D "$K" 2>/dev/null && [ -s "$K/SHA256SUMS" ]; then
+    if awk -v f="$EXE" '$2==f || $2=="*"f {n=1} END {exit !n}' "$K/SHA256SUMS"; then
+      # Replace ONLY the exe line, in place — keeps the other lines and their order.
+      awk -v f="$EXE" -v h="$NEW" '$2==f || $2=="*"f {print h"  "f; next} {print}' \
+        "$K/SHA256SUMS" > "$K/SHA256SUMS.new" && mv "$K/SHA256SUMS.new" "$K/SHA256SUMS"
+      SUMS="refreshed .exe line → $NEW"
+    else
+      echo "⚠ SHA256SUMS: no line for $EXE in the release's file — appending one"
+      printf '%s  %s\n' "$NEW" "$EXE" >> "$K/SHA256SUMS"; SUMS="appended .exe line → $NEW"
+    fi
   else
-    ONEDRIVE=failed   # token expiry / secret unset / dispatch miss — flag in report, release still good
-    echo "⚠ OneDrive mirror did not complete — the SIGNED GitHub release is authoritative."
-    echo "  Retry: gh workflow run upload-bundle-onedrive.yml -R DisplayXR/displayxr-installer -f tag=$TAG"
+    # Older workflow (no SHA256SUMS asset): build it from all four assets, signed exe included.
+    echo "SHA256SUMS: not on $TAG — generating it from the release assets"
+    rm -f "$K/SHA256SUMS"
+    if gh release download "$TAG" -R "$R" -p 'DisplayXRBundle-*.pkg' -p 'DisplayXRBundle-*-linux-amd64.tar.gz' \
+         -p 'DisplayXR-Installer-*.apk' -D "$K/a" && cp "$SIGNED_EXE" "$K/a/$EXE"; then
+      ( cd "$K/a" && set -- DisplayXRBundle-*.pkg "$EXE" DisplayXRBundle-*-linux-amd64.tar.gz DisplayXR-Installer-*.apk
+        for f in "$@"; do [ -f "$f" ] || { echo "⚠ SHA256SUMS: $f missing — skipped"; continue; }
+          printf '%s  %s\n' "$( (sha256sum "$f" 2>/dev/null || shasum -a 256 "$f") | cut -d' ' -f1)" "$f"; done ) > "$K/SHA256SUMS"
+      SUMS="generated ($(wc -l < "$K/SHA256SUMS" | tr -d ' ') lines; release had none)"
+    else
+      echo "⚠ SHA256SUMS: could not download the release assets — leaving the release without one"
+    fi
   fi
-else
-  ONEDRIVE=skipped     # bundle unsigned → never mirror
+  if [ -s "$K/SHA256SUMS" ]; then
+    echo "--- SHA256SUMS for $TAG ---"; cat "$K/SHA256SUMS"
+    if gh release upload "$TAG" "$K/SHA256SUMS" --clobber -R "$R"; then
+      echo "SHA256SUMS: $SUMS — uploaded"
+    else
+      echo "⚠ SHA256SUMS: upload failed — the release's file is stale for $EXE; re-upload $K/SHA256SUMS by hand"
+      SUMS="⚠ upload FAILED (stale for the .exe; file left at $K/SHA256SUMS)"
+    fi
+  else
+    SUMS="⚠ not refreshed (see log above)"
+  fi
 fi
+echo "SHA256SUMS: $SUMS"
 ```
 
-If the mirror fails on `invalid_grant`, the OneDrive token expired — refresh the
-`RCLONE_CONFIG` secret (see the comment in `upload-bundle-onedrive.yml`) and
-re-run the one-liner above; no need to re-cut the bundle.
+Only the Windows `.exe` is covered; the macOS `.pkg` uses an Apple Developer ID
+cert + notarization (separate track). Carry `SIGNED` into the report.
 
 ---
 
@@ -376,9 +483,10 @@ Release:    https://github.com/DisplayXR/displayxr-installer/releases/tag/$TAG
 Assets:     DisplayXRBundle-X.Y.Z.pkg (~N MB)
             DisplayXRBundle-X.Y.Z.exe (~N MB)
             DisplayXRBundle-X.Y.Z-linux-amd64.tar.gz (~N MB)
+            SHA256SUMS
 Prerelease: true/false
+Checksums:  $SUMS
 Signing:    [signed → "bundle .exe signed on the provider runner (run $RID) and re-uploaded"] | [none → "⚠ bundle UNSIGNED — provider unreachable; set DXR_SIGN_REPO or ship unsigned"]  (macOS .pkg: unsigned, TODO)
-OneDrive:   [synced → "signed bundle mirrored to OneDrive (upload-bundle-onedrive.yml run $OD_RUN)"] | [failed → "⚠ OneDrive mirror failed — signed GitHub release is authoritative; retry the dispatch"] | [skipped → "not mirrored (bundle unsigned)"]
 
 Source of truth verification:
   installer/versions.json == runtime/versions.json    ✓

@@ -16,14 +16,16 @@ the user-level tarball from `scripts/package_linux.sh` (#705/#713); the `.deb` i
 built with `libwayland-dev` + `libdbus-1-dev` like every other Linux artifact, so
 it carries the Wayland present path and the #817 window-geometry provider (only
 `libdbus-1-3` lands in its derived `Depends` — no `wl_*` symbol is referenced, so
-`--as-needed` drops `-lwayland-client`).
+`--as-needed` drops `-lwayland-client`). Since **#1744** both artifacts ship the
+**hybrid** runtime plus `displayxr-service`, socket-activated per user by a
+systemd user unit — see [Phase 4b](#phase-4b--the-service-in-the-installed-artifacts-1744).
 
 **Supported releases and what CI actually gates:** see [Supported
 releases](#supported-releases) below.
 
 **Still open** — none of these gate an in-process `_handle`/`_hosted` app, which
 is the shipping path: Phase 2b service-side render (**#710**, service/IPC mode
-only); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
+only — code-complete on the shared spatial surface, panel run pending); windowed-3D phase origin (**#729/#730**, twin of Windows #85); Wayland
 windowed weaving (**#817**) — the extension + runtime consumer are validated
 live on GNOME 50 / Ubuntu 26.04 (2026-09-19), and the logical→device conversion
 that actually feeds the phase landed with **#1596** (plus **#1595**, which
@@ -67,7 +69,10 @@ configurations are detected (RandR vs DRM on every output) and reported by
 `displayxr-cli info` → *X11 coordinate space*. Under a quantum the runtime snaps on the
 reachable lattice: coarser drag steps, phase kept. When X11 pixels are not panel pixels
 at all, the snap is refused. The app helper checks every landing and says so when the
-display drops its snaps. Weaving itself is never stopped for this. Full mechanism, the
+display drops its snaps. A placement quantum never stops weaving; a *resample* does —
+when the panel's X11 rect is not its device mode (its scale is not the X screen's), every
+X11 window there is downsampled by the compositor and presents 2D (#1831; the panel is
+identified by its connector's mode, so it is still found). Full mechanism, the
 solver's blind spot, and the assessment of what a truly scale-proof design would take
 (a fixed-origin surface, i.e. the shell's compose model):
 [linux-display-scaling.md](../reference/linux-display-scaling.md).
@@ -291,6 +296,19 @@ override, checked **before** the plug-in value (dev boxes, sim_display):
 The same knob and plug-in plumbing apply to the macOS vk_native self-owned
 window (`comp_vk_native_window_macos.m`).
 
+**Hosted Windows apps under a translation layer — adopt-own-window mode (#2322).** A Windows
+OpenXR app run through a compatibility layer reaches the runtime as a hosted app: it has an HWND,
+not an X11 window, so it cannot use `XR_DXR_xlib_window_binding`. Rather than opening a second
+fullscreen top-level that fights the app's own window (the covered one starves under FIFO, and the
+app drops to background mode when the runtime window holds focus), the runtime finds the process's
+own largest viewable top-level (`_NET_WM_PID == getpid()`) and creates its hosted window as a
+**child** of it, with an empty input region (xcb-shape) so input falls through. The mode is
+automatic when the app's `VkInstance` has no `VK_KHR_xcb_surface` — the translation layer's host
+instance enables `VK_KHR_xlib_surface` only — and in that case the Vulkan native target also builds
+its surface with `vkCreateXlibSurfaceKHR` over the same window. `DXR_XCB_ADOPT_OWN_WINDOW=1` forces
+the mode, `=0` disables it. With no viewable window of its own, the process gets the usual
+runtime-owned top-level.
+
 ### Phase 2 — Service / IPC path
 
 **Phase 2a — build-green on Linux CI ✅ (done).** `displayxr-service` + the
@@ -320,30 +338,81 @@ DP plug-in weave** (macOS is the exact analog); vk_native is instantiated
 in-process only (`oxr_session_gfx_vk_native.c`). The DP-weave path is
 platform-neutral and needs no VkSurface.
 
-**Phase 2b — on-screen out-of-process present (pending Linux hardware, with
-Phase 1b).** Validate with `displayxr-service` + a client under
-`XRT_FORCE_MODE=ipc` (swapchain-image fd-passing over the unix socket). Known
-gaps to wire when a display exists, all mirroring the macOS arms:
+**Phase 2b — on-screen out-of-process present + the spatial workspace (#710,
+#967) — code-complete, headless-verified; first panel run pending.** The Linux
+service now renders through the **comp_multi shared spatial surface**, the
+macOS model (#59), not a per-session target:
 
-1. **No `comp_window_xcb` comp_target** — `compositor/main/` only has
-   `comp_window_android.c` / `comp_window_macos.m`. A Linux service-owned
-   window target should reuse the Phase 1 XCB helper
-   (`comp_vk_native_window_xcb.c`).
-2. **`null_compositor_init_target_service` has no Linux arm**
-   (`null_compositor.c`, WIN32/ANDROID/MACOS only) —
-   `create_from_window` stays NULL, so the service can't own a present window.
-3. **`ipc_server_handler.c` server-side present/Kooima block is fenced
-   `XRT_OS_ANDROID || XRT_OS_MACOS`** (the `comp_multi_private.h` include and
-   the ~500-line block at 903-1394, plus sibling fence sites) — extend with
-   `XRT_OS_LINUX_DESKTOP` and mirror the APPLE `aux_vk` link in
-   `ipc/CMakeLists.txt`.
-4. The Linux service orchestrator stubs (`service_orchestrator.c:1634+`) are
-   fine for MVP (no child auto-spawn) — note they aren't even compiled on
-   Linux; `targets/service/CMakeLists.txt` has no Linux source arm and
-   `main.c`'s non-macOS path never calls them.
+1. **Service window target** — `compositor/main/comp_window_linux.{c,h}`
+   (lib `comp_linux_window`, the `comp_macos_window` twin): a
+   `comp_target_swapchain` over a service-owned window, two backends
+   (`DXR_SERVICE_WINDOW_BACKEND=x11|wayland` overrides the automatic pick):
+   - **native Wayland** (`comp_window_linux_wayland.c`, the default when the
+     compositor offers xdg-shell + `wp_viewporter` + `wp_fractional_scale_v1`):
+     an xdg_toplevel fullscreened on the panel's `wl_output` (matched by mode,
+     `u_wl_monitor_is_panel`; mapped windowed first because mutter drops the
+     output of a pre-map `set_fullscreen`), the swapchain at the output's mode
+     and the viewport destination at the logical size — 1:1 on a fractionally
+     scaled panel, where an XWayland window is resampled and the weave breaks —
+     plus an opaque region (direct scanout, #1698) and `wl_seat` input (keys by
+     evdev position, no libxkbcommon). Protocol XML vendored in
+     `src/external/wayland-protocols/` (22.04's wayland-protocols predates
+     fractional-scale-v1).
+   - **X11** (`comp_window_linux.c`; Xorg, or XWayland as the fallback):
+     fullscreen on the panel's RandR monitor with the #715 EWMH recipe.
 
-**Done when:** a handle/hosted app runs out-of-process against
-`displayxr-service` on Linux.
+   Both own an event thread that decodes keys (as **Windows VK codes**),
+   buttons, motion and wheel into a process-wide sink.
+2. **Null compositor Linux arm** — `create_from_window` / `destroy_target`
+   create that window; the panel placement rides the handle slot
+   (`struct comp_window_linux_placement`, from `xsysc->info.display_screen_*`).
+3. **Shared surface on Linux** — the former `XRT_OS_MACOS` block in
+   `comp_multi_system.c` (and the rounded-corner content pipeline) is gated on
+   `COMP_MULTI_SHARED_SURFACE` (`macOS || XRT_OS_LINUX_DESKTOP`,
+   `comp_multi_interface.h`): one window, one atlas, one DP, one present; a lone
+   IPC client with no controller is drawn flat at full display. Only the
+   visibility toggle and (Linux) OS-pointer hide are platform calls. The
+   shared DP now also takes the client's hardware 2D/3D wish (D-5 of
+   `comp-multi-one-pipeline.md`), following the focused (or lone) client, and
+   serves predicted eyes to shared-surface clients' locates.
+4. **Workspace handler arms** — every `workspace_*` arm that served macOS
+   serves `COMP_MULTI_SHARED_SURFACE` (pose, visibility, focus, chrome, cursor,
+   overlays, style, client info, exit, input grab / capture / drain), plus the
+   placed-window per-window Kooima and the legacy `device_get_view_poses`
+   routing. Controller deactivate / disconnect hides the surface and drops its
+   cursor, overlays, focus, grab and capture.
+5. **Input** — `ipc_server_linux_input.c` installs the window's sink;
+   `ipc_server_input_route()` (the #61 policy, `ipc_server_input_queue.c`)
+   feeds the per-target queues: controller always, content under the cursor
+   (pointer / motion; scroll exclusively), keys to the focused client except
+   workspace chords. `ipc_server_input_queue_push_controller_key()` lets the
+   orchestrator forward its launch hotkey (grabbed outside the window) to the
+   controller.
+6. **Wakeup event (POSIX form, proposal)** — `xrAcquireWorkspaceWakeupEventDXR`
+   returns an eventfd readable on every controller-queue push (poll + read 8
+   bytes to reset). The public header text ("non-Windows returns
+   FEATURE_UNSUPPORTED") is unchanged pending review.
+
+Verified **headless** — a private `gnome-shell --headless --virtual-monitor`
+with its own XWayland, sim-display only, nothing on a real output: a forced-IPC
+hosted Vulkan cube composites through the service surface; a Vulkan controller
+probe activates the workspace, places / focuses the client (pose round-trip,
+tiled with rounded corners in the atlas), receives KEY / POINTER / MOTION
+events from synthetic X events on the surface, and wakes on the eventfd; the
+surface hides when the controller leaves. The native-Wayland backend was run
+on the same headless session with the virtual monitor at 1.0 and 1.6667
+(1920x1080 buffer -> 1152x648 logical viewport, fullscreen on the matched
+output, hide / re-show), with real seat input injected through mutter's
+RemoteDesktop API arriving in device pixels. **Not yet verified:** a real panel
+(Leia DP weave of the shared atlas, lens 2D/3D), chrome / cursor / overlay
+composition from a real controller (the Linux shell port), fractional-scale
+XWayland on the X11 fallback (150 % is known to break X11 weaving — the
+native-Wayland backend is the fix and the default), and `CLIENT_CONNECTED` /
+`FRAME_TICK` events (not emitted by the comp_multi platforms; macOS has none
+either).
+
+**Done when:** the Linux shell drives N Vulkan clients on the panel through
+`displayxr-service`.
 
 **Phase 2c — `XR_DXR_weave` present-owner engine on the service (#1699) — stages A
 and B landed.** `comp_multi_weave_linux.c` (built by default,
@@ -379,7 +448,11 @@ per-window Kooima (`ipc_try_get_oop_view_poses`, now built on Linux too);
   correct, fd counts flat), and a `--no-release-wait` negative control reads
   stale frames (the fence is doing work). This is the path Chromium's (GL)
   GPU process needs; stage A only serves a Vulkan client on the service's own
-  GPU. Still to prove: a real GL producer and a real panel.
+  GPU. Still to prove: a real GL producer and a real panel. The fences are
+  switchable: `DXR_LINUX_WEAVE_SYNC_FD` (unset = on, except **off on NVIDIA**,
+  where the EGL-fence <-> Vulkan SYNC_FD hand-off is suspected of a ~2 fps
+  inline-3D path; `1` / `0` force) — off, stage B CPU-polls the acquire fence
+  and completes synchronously, as on a device without SYNC_FD.
 - **Windowed present-owner (headless-verified; first panel run pending):**
   `test_apps/weave/weave_present_vk_linux` is the browser's GPU process in
   miniature and the vehicle for the first woven frame on a panel through the
@@ -456,8 +529,11 @@ sim-display weaves anaglyph/SBS to a normal monitor. One command:
 
 It builds the runtime (`build_linux.sh --apps`), wires `XR_RUNTIME_JSON` +
 `XRT_PLUGIN_SEARCH_PATH` at that build, and delegates to the target's own run
-script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service`, start
-`displayxr-service`, run a client with `XRT_FORCE_MODE=ipc`.
+script. Service/IPC (Phase 2b): `./scripts/build_linux.sh --service` (IPC-only
+runtime: every app goes through the service), start `displayxr-service`, run a
+client with `XRT_FORCE_MODE=ipc`. `./scripts/build_linux.sh --hybrid` is the
+shipped configuration (#1744): ordinary apps in-process, present-owners and
+workspace controllers over IPC, no env var needed.
 
 ### Phase 4 — Packaging / installer (#705 — tarball MVP SHIPPED)
 
@@ -469,14 +545,81 @@ install: runtime tree → `$XDG_DATA_HOME/displayxr`, OpenXR `ActiveRuntime` →
 `$XDG_CONFIG_HOME/openxr/1/active_runtime.json`, plug-in + manifest →
 `$XDG_DATA_HOME/DisplayXR/DisplayProcessors/` (the shared discovery root — a
 vendor plug-in installer drops its own `.so` + manifest alongside, lower
-probe-order wins), and a systemd `--user` unit for `displayxr-service`
-(gracefully skipped without a user bus). `sudo ./install.sh --system` targets
-`/usr/local` + `/etc/xdg/openxr/1/` (no unit, v1). CI's `Package` job
+probe-order wins), and the socket-activated systemd user units for
+`displayxr-service` (#1744; gracefully skipped without a user manager).
+`sudo ./install.sh --system` targets `/usr/local` + `/etc/xdg/openxr/1/`, with
+the units under `/usr/local/lib/systemd/user/` enabled via `systemctl --global`. CI's `Package` job
 (`build-linux.yml`) builds in the **22.04 container** (the oldest supported
 release — #1656; the newest-toolchain coverage it used to give moved to the
 `Newest` job's 26.04 container), installs from the tarball, and gates on
 `displayxr-cli selftest` resolving everything from the installed XDG paths only.
 Remaining staged scope (#705): `.deb` → demo AppImages.
+
+### Phase 4b — the service in the installed artifacts (#1744)
+
+Until #1744 the `.deb` shipped the **in-process-only** runtime and no
+`displayxr-service`, so on an installed box every `XR_DXR_weave` call returned
+`XR_ERROR_FEATURE_UNSUPPORTED — the weave service is only available on the
+out-of-process (service) path`: the DisplayXR browser (a present-owner) could
+not weave, while the same tag built with `--service` worked on the panel. The
+tarball had the opposite problem — an IPC-only runtime from a plain `--service`
+build, and a `displayxr.service` unit that could never start (below).
+
+- **Hybrid runtime** (`build_linux.sh --hybrid` → `XRT_FEATURE_HYBRID_MODE`,
+  now allowed on Linux): one `openxr_displayxr.so` with the in-process native
+  Vulkan compositor *and* the IPC client, choosing per process at
+  `xrCreateInstance` (`targets/openxr/target.c`). Ordinary apps stay
+  in-process — the rules are Windows/macOS's (`XRT_FORCE_MODE`,
+  `DISPLAYXR_WORKSPACE_SESSION`, workspace controllers → IPC). New on desktop
+  Linux, mirroring Android: a **present-owner** — a session that enables
+  `XR_DXR_weave` **and no window/surface binding extension** — goes to the
+  service **when its socket exists**, with no env var. An app that binds its
+  own window (`XR_DXR_xlib_window_binding` / `XR_DXR_wayland_surface_binding`)
+  and enables weave only for the in-process drag phase-snap
+  (`xrWeaveSnapWindowRectDXR` / `…GridDXR` — the demos, `cube_handle_vk_linux`)
+  is not a present-owner and stays in-process; v2.21.7 routed it to the service,
+  where it became a HOSTED session whose own window never mapped. A window-bound
+  app that really wants the service sets `XRT_FORCE_MODE=ipc`. The decision is
+  `u_sandbox_linux_present_owner_route()` (`tests_aux_present_owner_route`).
+  When the socket does not exist (a
+  from-source runtime, a container, the unit disabled) it falls back to
+  in-process, i.e. the old behaviour, instead of failing `xrCreateInstance`. A
+  service that *answers* and refuses (version skew, client quota) is propagated.
+  Both packagers refuse a runtime that lacks the router.
+- **Start mechanism: systemd user socket activation.**
+  `/usr/lib/systemd/user/displayxr.socket` listens on `%t/displayxr_comp_ipc`
+  (= `$XDG_RUNTIME_DIR/displayxr_comp_ipc`, where clients dial) and is enabled
+  for every user by `postinst` (`systemctl --global enable`, then started in the
+  user managers already running, so no re-login is needed). The first client
+  that dials it starts `displayxr.service`; it runs with `IPC_EXIT_WHEN_IDLE=1`
+  (30 s grace) and exits once its last client leaves. Chosen over an always-on
+  user service or an XDG autostart entry because the service owns a Vulkan
+  device and the display processor (a vendor plug-in may run an eye tracker):
+  with the socket, a user who never runs a present-owner never starts it, and
+  one who does gets it without a login-time cost. `prerm` stops and disables it
+  on remove — not on upgrade, where a live service keeps serving its clients
+  and the next connect after its idle exit starts the new binary.
+- **Service fixes that make it startable detached.** The Linux mainloop now
+  reads the socket-activation hand-off itself (`LISTEN_PID`/`LISTEN_FDS`, the
+  whole `sd_listen_fds(3)` protocol) — `ipc_server` no longer links libsystemd,
+  which only some build hosts had and which is not on the `.deb`'s
+  `STABLE_SONAMES`. A stdin that cannot be polled (`/dev/null` → `EPERM`,
+  closed → `EBADF`) is no longer fatal: it used to kill the service with
+  `epoll_ctl(stdin) failed` under systemd, autostart or `nohup`, which is why
+  it only ran as `sleep infinity | displayxr-service` — and why the tarball's
+  old unit could never start. SIGTERM/SIGINT now stop it cleanly (a self-pipe in
+  the epoll set) so a bound socket is unlinked, and a socket left by a service
+  that died anyway is detected with a connect probe and replaced instead of
+  blocking every later start.
+- **CI.** `DebInstall` asserts the service + units are installed and runs
+  `scripts/smoke_service_linux.sh` on all three releases: detached start with
+  stdin `</dev/null`, an IPC handshake (`displayxr-cli clients`), clean SIGTERM,
+  stale-socket recovery, and socket activation (the `sd_listen_fds` hand-off,
+  emulated with `perl-base` since the containers have no systemd) + idle exit.
+  The `Package` job runs the same smoke on the installed tarball. Neither needs
+  a GPU: the service starts without a Vulkan ICD. The pixel path
+  (`weave_probe_vk_linux --dmabuf` against the packaged tree) needs a GPU and
+  is a dev-box check, not CI.
 
 **One artifact for 22.04 / 24.04 / 26.04 (#1656).** A binary's glibc floor is
 its build host's, so both release artifacts are built in the **oldest**
@@ -501,6 +644,27 @@ whether it loads, GNOME 42 has no `wp_fractional_scale_v1`, so a native-Wayland
 window on a scaled 22.04 desktop cannot present a 1:1 buffer and the runtime
 degrades it to flat 2D (see *Refuse rather than resample*, #1595). **X11 is the
 recommended session on 22.04.**
+
+### Phase 4c — workspace orchestration (the Linux shell)
+
+The service orchestrates a registered workspace controller (the DisplayXR Shell's
+Linux port) like Windows and macOS: discovery from the POSIX manifest roots
+(`/usr/share/displayxr/WorkspaceControllers/` for a `.deb`), spawn with
+`--service-managed` on the launch hotkey / the dashboard's *Launch now* /
+`displayxr-cli workspace launch`, crash respawn in the legacy `enable` mode, live
+`service.json` reload, the hotkey-capture suspend, and `workspace_activate`
+authenticated against the spawned PID. The launch chord is held by the GNOME Shell
+extension (version 13, `org.displayxr.WorkspaceHotkey1`), not the service: the service
+is socket-activated and idle-exits, so a press with no service running makes the
+extension start `displayxr.service` and hand the press to it. X11 without the
+extension: a root-window grab while the service runs. Design and lifecycle:
+`docs/specs/runtime/workspace-controller-registration.md` § *Linux*. Unit-tested
+(`tests_service_orchestrator_linux`, `tests_service_hotkey_linux[_dbus]`,
+`tests_service_client_class`, `scripts/test_gnome_extension_workspace_hotkey.js`);
+The Linux shell build exists since shell v2.4.x (2026-10-11, `displayxr-shell_*_amd64.deb`
+on every shell release), so the spawn path has a real controller, and the extension has
+since run on a GNOME desktop: version 14 shipped with the lock-screen fix (#2072, three
+suspend/lock cycles with a weaving app, extension active throughout).
 
 ### Conformance — the Linux CTS arms (#1527)
 
@@ -548,6 +712,21 @@ with it:
 ./scripts/fetch_build_cts.sh --apt
 ./scripts/run_cts.sh -g vulkan --scope full --conformance-layer
 ```
+
+**The interactive categories now have a Linux harness too** (#1727):
+`run_cts.sh --interactive composition|scenario|actions` plus the X11 driver
+`scripts/cts_drive.py` (focus-free XSendEvent input, window and atlas capture,
+the gradient/alpha/diff oracles, a one-click-one-case check, the unattended
+actions responder). Its first real-GPU run was 2026-09-25: Intel iGPU, GNOME 50
+Wayland session with the runtime's XCB window on Xwayland, dev tree built with
+`--qwerty`, `sim_display` 2d. Result: composition **16 / 0 / 11**, actions
+(`khr/simple_controller`) **14 / 0 / 11**, scenario **7 / 1 / 41**, the one
+failure being `InteractiveThrow`, which a keyboard rig cannot complete
+(rig-limited on every platform). That is the Windows d3d11 standing: 0
+runtime-attributable failures. Still not covered by a hardware run: the
+installed `.deb`/tarball runtime, direct scanout, a native-Wayland CTS window,
+and 22.04. Procedure and traps:
+`docs/reference/cts-interactive-procedure.md` § 12.
 
 Full detail, including exactly what is and is not ported from the Windows
 harness: `docs/roadmap/cts-windows-handoff.md` § *Linux arms*.
@@ -648,11 +827,13 @@ source comments and, until this section, in no document at all.
   destination extent to compare against and behaves exactly as it did before
   the gate existed. The Wayland present-origin feed is gated on the same flag,
   so a degraded session cannot leave a stale phase latched on the DP.
-  Deliberately **Wayland-only**: X11's only available signal is
-  `display_desktop_rect_is_panel`, which is false on every dev box by
-  construction (sim_display declares a 1920x1080 panel that no real desktop
-  rect matches), so gating the weave on it would put every X11 sim session into
-  flat 2D.
+  The X11 arm (#1831, `vk_x11_update_not_1to1()`) does not use
+  `display_desktop_rect_is_panel` (false on every dev box by construction). It
+  acts only on positive evidence: the resolver identified the panel by its
+  connector's device mode (Mutter DisplayConfig, else DRM sysfs), and the
+  panel's X11 rect differs from that mode, so XWayland resamples every X11
+  window there. One `NOT_1TO1 (X11):` WARN, evaluated once per session; an
+  integer-scale panel logs `X11 1:1 gate: ... weaving as before`.
 - **Fullscreen-on-panel is the validated shape.** A Wayland surface has no
   intrinsic size and no XCB geometry to poll, so the app declares its buffer
   size (`XrWaylandSurfaceGeometryDXR` / `xrSetWaylandSurfaceGeometryDXR`, spec
@@ -708,13 +889,51 @@ source comments and, until this section, in no document at all.
   over the panel is resampled and the whole session degrades to 2D — the
   refuse-rather-than-resample rule, #1595), and a compositor that is not
   publishing geometry at all. Kill switch `DXR_WAYLAND_SPAN_2D=0`.
+  The service weave engine (`comp_multi_weave_linux.c`, the `XR_DXR_weave`
+  present-owner path the browser uses) does the same on X11 and Wayland alike,
+  from the caller-published window geometry: each off-panel band of the woven
+  output is painted with the centre view of the pre-weave atlas, before the v4
+  overlay, and a window entirely off the panel skips the weave; kill switch
+  `DXR_SPAN_2D=0` (either name works on both paths), headless proof
+  `weave_probe_vk_linux --span2d`.
+  **Multi-screen M2 (X11/XWayland, in-process Vulkan) replaces the band with a
+  real segment wherever the other monitor has a display processor.** A window
+  spanning screens is split into segments (`canvas ∩ screen`,
+  `util/comp_segments.h`); each segment is woven by its own screen's DP
+  (created from that screen's registry factory, `create_dp_vk_for_screen`)
+  with `canvas = segment`, a pre-cropped atlas and its own present origin, and
+  composited into the one surface (`comp_vk_native_segments.c`). Only a
+  segment with no DP (a monitor no plug-in claimed, a mixed-vendor layout —
+  that is M4) or whose DP needs 1:1 pixels on a resampled screen keeps the flat
+  2D view. sim_display's anaglyph tolerates a resample, so with
+  `DXR_PLUGIN_EXCLUSIVE=sim-display` a window across eDP-1 and the DS1 is
+  anaglyph on both halves. The window entirely on the primary screen is the
+  shipped single-DP path, unchanged. Native Wayland keeps the band until the
+  geometry service publishes every monitor
+  (`docs/specs/runtime/wayland-window-geometry.md` §5); the X11 1:1 gate
+  (#1831) and the Wayland resample reasons of #1595 no longer degrade a DP
+  that declares `XRT_DP_SCANOUT_FLAG_TOLERATES_RESAMPLE`. Kill switch
+  `DXR_SEGMENTS=0`. Design: `docs/architecture/comp-segments.md`.
+- **Flat regions on the weave service are painted flat, not wished (spec v8,
+  browser#88).** The caller's flat regions — each submit's
+  `XrWeaveSubmitFlatRegionsDXR` plus the sticky screen-space
+  `xrWeaveSetScreenFlatRegionsDXR` latch, unioned and clipped to the bound
+  window — come back flat in the woven output: the input page pixels 1:1 for a
+  batch submit (a popup / menu drawn over inline 3D is page content), the centre
+  view for v6. Painted after the off-panel bands and under the v4 overlay.
+  Windows instead subtracts them from a per-region hardware *wish* and leaves
+  the pixels alone; no desktop-Linux DP has a per-region lens (the Leia Linux
+  DP's `publish_local_zone_mask` collapses to one global on/off), so a wish
+  would change nothing while the region stayed interlaced. Kill switch
+  `DXR_WEAVE_FLAT_2D=0`, headless proof `weave_probe_vk_linux --flat-regions`.
 
 ### Where the detail lives
 
 - `docs/specs/runtime/wayland-window-geometry.md` — the #817 provider: D-Bus
   interface, JSON schema + versioning, degradation ladder, and the packaging
-  contract (the publisher is a shared asset; exactly one installed owner via
-  the `displayxr-window-geometry-publisher` virtual package).
+  contract (the publisher is a shared asset; exactly one installed owner per
+  compositor via `displayxr-window-geometry-publisher-<compositor>`, while
+  consumers depend on the generic `displayxr-window-geometry-publisher`).
 - `contrib/gnome-shell/window-geometry@displayxr.org/README.md` — install,
   verify with `gdbus call`, and the distributor notes.
 - `docs/specs/extensions/XR_DXR_wayland_surface_binding.md` — the extension

@@ -2,15 +2,15 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  Persisted runtime settings — the store the Control Panel writes and
+ * @brief  Persisted runtime settings — the store the Dashboard writes and
  *         the runtime reads *inside the app's own process*.
  * @ingroup aux_util
  *
  * ## Why this exists
  *
- * Every runtime tuning lever is an environment variable, and the Control Panel
- * cannot set one for an app it does not launch — which is every app. The panel
- * is a separate, non-elevated process; the runtime DLL lives in the app's. So
+ * Every runtime tuning lever is an environment variable, and the Dashboard
+ * cannot set one for an app it does not launch — which is every app. The
+ * Dashboard is a separate, non-elevated process; the runtime DLL lives in the app's. So
  * the only channel that reaches an arbitrary app is a store the runtime reads
  * from inside that process. This is that store.
  *
@@ -63,7 +63,7 @@ enum u_setting_source
 {
 	U_SETTING_SOURCE_DEFAULT = 0, //!< Nothing set it; the caller's own default stands.
 	U_SETTING_SOURCE_ENV,         //!< Environment variable / Android system property.
-	U_SETTING_SOURCE_USER,        //!< Per-user settings file (what the Control Panel writes).
+	U_SETTING_SOURCE_USER,        //!< Per-user settings file (what the Dashboard writes).
 	U_SETTING_SOURCE_MACHINE,     //!< Machine-wide default (HKLM; needs admin to write).
 };
 
@@ -103,7 +103,7 @@ u_setting_managed_name(uint32_t index);
 
 /*
  *
- * Writing the per-user store. Used by `displayxr-cli perf`; the Control Panel
+ * Writing the per-user store. Used by `displayxr-cli perf`; the Dashboard
  * goes through the CLI rather than writing the file itself, so there is one
  * writer (the same shape as the `PreferredPlugin` override).
  *
@@ -147,6 +147,103 @@ u_setting_user_written(char *buf, size_t cap);
  */
 void
 u_setting_reload(void);
+
+/*
+ *
+ * Per-screen display-processor preference (display dashboard phase 7).
+ *
+ * Not a scalar option, so not on the allow-list above: it is allow-listed by
+ * construction — this accessor reads exactly one JSON object, one environment
+ * variable and one registry key, and nothing else can be read through it.
+ *
+ *   1. environment   DXR_PREFERRED_PLUGIN_PER_SCREEN="<key>=<id>;<key>=<id>"
+ *   2. per-user file "preferred_plugin_per_screen": { "<key>": "<id>" }
+ *                    (what the dashboard / `displayxr-cli dp use --screen` write)
+ *   3. machine       HKLM\Software\DisplayXR\DisplayProcessors\PreferredPlugin,
+ *                    value "<key>" (REG_SZ, admin; Windows only)
+ *
+ * `<key>` is the stable screen key (`target_screen_keys_build_ex`). Every failure
+ * is "not set". The stores are read once per process; a long-lived process
+ * that must see a newer write (the service, on a display re-probe) calls
+ * @ref u_setting_per_screen_reload.
+ *
+ */
+
+//! Environment variable of the per-screen preference (tier 1).
+#define U_SETTING_PER_SCREEN_ENV "DXR_PREFERRED_PLUGIN_PER_SCREEN"
+//! Object name in the per-user settings file (tier 2).
+#define U_SETTING_PER_SCREEN_JSON_KEY "preferred_plugin_per_screen"
+//! Size of a screen key, incl. the NUL (= TARGET_SCREEN_KEY_MAX).
+#define U_SETTING_SCREEN_KEY_MAX 64
+
+/*!
+ * The plug-in id preferred for the screen @p key, through the chain above.
+ *
+ * @return @p buf when a tier names a plug-in for @p key, else NULL with
+ *         @p out_source (may be NULL) = @ref U_SETTING_SOURCE_DEFAULT.
+ */
+const char *
+u_setting_get_preferred_plugin_for_screen(const char *key, char *buf, size_t cap, enum u_setting_source *out_source);
+
+//! Drop the cached per-screen stores so the next lookup re-reads them.
+void
+u_setting_per_screen_reload(void);
+
+/*!
+ * Set (or, with @p plugin_id NULL/"", remove) the per-user preference for the
+ * screen @p key. Refuses an empty key, one too long, or one containing `=` or
+ * `;`. Returns false on refusal or I/O failure.
+ */
+bool
+u_setting_user_set_preferred_plugin_for_screen(const char *key, const char *plugin_id);
+
+//! Remove every per-user per-screen preference (the whole JSON object). Absent is success.
+bool
+u_setting_user_clear_preferred_plugin_per_screen(void);
+
+//! Outcome of a machine-tier write.
+enum u_setting_write_result
+{
+	U_SETTING_WRITE_OK = 0,
+	U_SETTING_WRITE_DENIED = 1,      //!< Needs an elevated (admin) process.
+	U_SETTING_WRITE_FAILED = 2,      //!< Any other failure (bad key, I/O).
+	U_SETTING_WRITE_UNSUPPORTED = 3, //!< No machine tier on this platform.
+};
+
+/*!
+ * Set (or, with @p plugin_id NULL/"", remove) the machine-wide preference for
+ * the screen @p key (Windows HKLM; admin). @p key NULL removes every one.
+ */
+enum u_setting_write_result
+u_setting_machine_set_preferred_plugin_for_screen(const char *key, const char *plugin_id);
+
+/*!
+ * @name Pure helpers behind the chain (unit-tested)
+ * @{
+ */
+//! Look @p key up in a `"<key>=<id>;..."` spec (whitespace trimmed, key case-insensitive).
+bool
+u_setting_per_screen_env_lookup(const char *spec, const char *key, char *buf, size_t cap);
+
+//! Look @p key up in the `preferred_plugin_per_screen` object of a settings-file text.
+bool
+u_setting_per_screen_json_lookup(const char *json_text, const char *key, char *buf, size_t cap);
+
+/*!
+ * The chain over already-read tiers: @p env_spec (tier 1), @p user_json (the
+ * settings-file text, tier 2), @p machine_value (tier 3's value for @p key);
+ * each may be NULL. Same contract as
+ * @ref u_setting_get_preferred_plugin_for_screen.
+ */
+const char *
+u_setting_per_screen_resolve(const char *key,
+                             const char *env_spec,
+                             const char *user_json,
+                             const char *machine_value,
+                             char *buf,
+                             size_t cap,
+                             enum u_setting_source *out_source);
+/*! @} */
 
 #ifdef __cplusplus
 }

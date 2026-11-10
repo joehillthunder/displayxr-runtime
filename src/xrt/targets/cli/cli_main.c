@@ -35,19 +35,68 @@ cli_print_help(int argc, const char **argv)
 	P("  selftest [--json] - Headless self-test: discover a display processor and validate\n");
 	P("                      its display info. Exits 0 on success, non-zero on failure.\n");
 	P("  perf <...>        - Performance settings the runtime reads inside each app.\n");
-	P("                      'perf list [--json]', 'perf set <name> <value>', 'perf reset'.\n");
-	P("  dp <...>          - List display processors / set the PreferredPlugin override.\n");
-	P("                      'dp list [--json]', 'dp use <id>', 'dp reset'.\n");
-	P("  input <...>       - Input providers (motion controllers, ADR-034).\n");
-	P("                      'input list [--json]', 'input haptic-test [seconds]'.\n");
+	P("                      'perf list [--all] [--json]', 'perf set <name> <value>', 'perf reset'.\n");
+	P("  dp <...>          - Display processors (ADR-019; verbs per ADR-054).\n");
+	P("                      'dp list [--json]', 'dp enable|disable <id> [--machine]',\n");
+	P("                      'dp use <id> [--machine]', 'dp reset [--machine]'; per screen:\n");
+	P("                      'dp use <id> --screen <key>', 'dp reset --screen <key>|all';\n");
+	P("                      'dp options <id> [--json]', 'dp set <id> <KEY> <value> [--machine]',\n");
+	P("                      'dp unset <id> <KEY> [--machine]' (the plug-in's own settings).\n");
+	P("  input <...>       - Input providers (motion controllers, ADR-034; verbs per ADR-054).\n");
+	P("                      'input list [--json]', 'input enable|disable <id> [--machine]',\n");
+	P("                      'input use <id> [--machine]', 'input reset', 'input options <id> [--json]',\n");
+	P("                      'input set <id> <KEY> <value> [--machine]', 'input unset <id> <KEY>',\n");
+	P("                      'input haptic-test [seconds]'.\n");
+	P("  tracking <...>    - Viewer-tracking providers (ADR-054 N6; verbs mirror 'input').\n");
+	P("                      'tracking list [--json]', 'tracking enable|disable <id> [--machine]',\n");
+	P("                      'tracking use|prefer <id> [--machine]', 'tracking reset', 'tracking options <id>',\n");
+	P("                      'tracking set <id> <KEY> <value> [--machine]', 'tracking unset <id> <KEY>',\n");
+	P("                      'tracking calibrate --screen <key> --watch --json' / 'calibrate solve|apply'.\n");
 	P("  runtime <...>     - Inspect / switch the active OpenXR runtime.\n");
 	P("                      'runtime status'   full loader precedence + conflicts,\n");
 	P("                      'runtime list'     every runtime on the box (incl. unregistered),\n");
 	P("                      'runtime activate [<manifest>]', 'runtime restore'.\n");
 	P("  displays [--json] - Enumerate connected displays via EDID (vendor-neutral).\n");
 	P("           [--claims] - Also show which plug-in claims each display (loads plug-ins).\n");
+	P("  status [--json]   - Display status snapshot (ADR-051): one row per screen with its claim,\n");
+	P("                      metres, roles, tracking and warnings, plus the live windows. From the\n");
+	P("                      service when reachable (DIAG IPC; non-elevated on Windows), else\n");
+	P("                      headless (labelled 'source: headless').\n");
+	P("         --watch [--interval ms]  stay connected; poll the service's generation counters\n");
+	P("                      every <ms> (default 500, min 100) and print only on a change: one\n");
+	P("                      NDJSON line per change with --json, else the table redrawn in place.\n");
+	P("                      Ends on Ctrl-C or stdin EOF.\n");
+	P("  workspace <...>   - Workspace controllers (role, registration) and their launch settings.\n");
+	P("                      'workspace list [--json]', 'workspace set <id> --hotkey <combo> |\n");
+	P("                      --no-hotkey | --mode auto|disabled', 'workspace reset <id>',\n");
+	P("                      'workspace launch <id>', 'workspace hotkey-suspend on|off'\n");
+	P("                      (the last two through the running service).\n");
 	P("  clients [--json]  - List the running service's IPC clients with their verified class\n");
-	P("                      (#960). Connects over IPC as a DIAG client; non-elevated on Windows.\n");
+	P("                      (#960), presenter, panel lease, window rect and owner screen.\n");
+	P("                      Connects over IPC as a DIAG client; non-elevated on Windows.\n");
+	P("  lift <...>        - 2D->3D conversion module (XR_DXR_lift, ADR-042), over IPC (DIAG).\n");
+	P("                      'lift caps [--json]', 'lift probe <image|frames_dir> [--mode depth|sbs|\n");
+	P("                      nview|gaussians] [--n N]' (Windows) — writes lift_out_<i>.png/.ply.\n");
+	P("  conv <...>        - Conversion providers (ADR-053): 'conv list|status [--json]',\n");
+	P("                      'conv status --watch', 'conv warm <task>|<id>[/<cap>]', 'conv enable|disable\n");
+	P("                      <id> [--machine]', 'conv use <task> <id>' / 'conv reset <task>|all',\n");
+	P("                      'conv options <id> [--json]', 'conv set <id> <KEY> <value> [--machine]',\n");
+	P("                      'conv unset <id> <KEY>', 'conv models list|prune'. Reads the service over\n");
+	P("                      DIAG, else headless.\n");
+	P("  camera <...>      - Stereo camera sources (XR_DXR_stereo_camera, ADR-043), over IPC (DIAG).\n");
+	P("                      'camera list [--json]', 'camera calib <id> [--raw|--rectified]',\n");
+	P("                      'camera probe [<id>] [--raw] [--format gray8|nv12|bgra8] [--fps F]\n");
+	P("                      [--frames N] [--seconds S] [--out DIR]' — rate, layout, disparity, PNG.\n");
+	P("                      'camera calibration list|show|set-placement|reset' — where each camera sits\n");
+	P("                      relative to each screen (local store, shared by every provider).\n");
+	P("  share <...>       - 3D screen share (XR_DXR_app_share, ADR-061): 'share list [--json]' and\n");
+	P("                      'share probe [<id>]' = camera list/probe of running-app entries;\n");
+	P("                      'share settings [prompt always|per-app-run] [resolution 720p|1080p]'.\n");
+#ifdef CLI_HAVE_DESKTOP
+	P("  desktop <...>     - Desktop control (XR_DXR_desktop_control, ADR-056), the user's store + audit\n");
+	P("                      log: 'desktop status [--json]', 'desktop stop|resume' (kill switch),\n");
+	P("                      'desktop allow|deny|forget <exe>', 'desktop audit [--tail N] [--json]'.\n");
+#endif
 	P("  test              - List found devices and role assignments, for prober testing.\n");
 	P("  probe             - Just probe and then exit.\n");
 
@@ -85,14 +134,23 @@ main(int argc, const char **argv)
 	if (strcmp(argv[1], "input") == 0) {
 		return cli_cmd_input(argc, argv);
 	}
+	if (strcmp(argv[1], "tracking") == 0) {
+		return cli_cmd_tracking(argc, argv);
+	}
 	if (strcmp(argv[1], "runtime") == 0) {
 		return cli_cmd_runtime(argc, argv);
 	}
 	if (strcmp(argv[1], "displays") == 0) {
 		return cli_cmd_displays(argc, argv);
 	}
+	if (strcmp(argv[1], "status") == 0) {
+		return cli_cmd_status(argc, argv);
+	}
 	if (strcmp(argv[1], "clients") == 0) {
 		return cli_cmd_clients(argc, argv);
+	}
+	if (strcmp(argv[1], "workspace") == 0) {
+		return cli_cmd_workspace(argc, argv);
 	}
 	if (strcmp(argv[1], "test") == 0) {
 		return cli_cmd_test(argc, argv);
@@ -100,5 +158,26 @@ main(int argc, const char **argv)
 	if (strcmp(argv[1], "probe") == 0) {
 		return cli_cmd_probe(argc, argv);
 	}
+	if (strcmp(argv[1], "lift") == 0) {
+		return cli_cmd_lift(argc, argv);
+	}
+	if (strcmp(argv[1], "conv") == 0) {
+		return cli_cmd_conv(argc, argv);
+	}
+	if (strcmp(argv[1], "camera") == 0) {
+		// The calibration store is local (no IPC): routed before the IPC-only camera verbs.
+		if (argc >= 3 && strcmp(argv[2], "calibration") == 0) {
+			return cli_cmd_camera_calibration(argc, argv);
+		}
+		return cli_cmd_camera(argc, argv);
+	}
+	if (strcmp(argv[1], "share") == 0) {
+		return cli_cmd_share(argc, argv);
+	}
+#ifdef CLI_HAVE_DESKTOP
+	if (strcmp(argv[1], "desktop") == 0) {
+		return cli_cmd_desktop(argc, argv);
+	}
+#endif
 	return cli_print_help(argc, argv);
 }

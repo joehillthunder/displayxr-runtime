@@ -21,6 +21,8 @@
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_handles.h"
 #include "xrt/xrt_system.h"
+#include "xrt/xrt_dp_lift.h"
+#include "xrt/xrt_lift.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,6 +56,13 @@ struct ipc_file_picker_result_path;
  * @param xdev The head device to render for.
  * @param xsysd System devices for qwerty input support (may be NULL).
  * @param usys System used to fan out session events (may be NULL).
+ * @param panel_screen_left The head panel's origin as the active plug-in
+ *        reported it (`xrt_plugin_display_info::display_screen_left`), 0 when
+ *        unknown. `xrt_system_compositor_info::display_screen_left/top` is only
+ *        filled after this returns, so the adapter selection and the
+ *        output-device split, which run here, read the panel's monitor from
+ *        this instead of from a desktop-origin zero.
+ * @param panel_screen_top Same, top edge.
  * @param[out] out_xsysc Pointer to receive the system compositor.
  * @return XRT_SUCCESS on success.
  *
@@ -63,6 +72,8 @@ xrt_result_t
 comp_d3d11_service_create_system(struct xrt_device *xdev,
                                  struct xrt_system_devices *xsysd,
                                  struct u_system *usys,
+                                 int32_t panel_screen_left,
+                                 int32_t panel_screen_top,
                                  struct xrt_system_compositor **out_xsysc);
 
 /*!
@@ -143,6 +154,39 @@ comp_d3d11_service_get_predicted_eye_positions_for_client(struct xrt_system_comp
                                                            struct xrt_vec3 *out_right);
 
 /*!
+ * Eye positions for a SPECIFIC client at a TARGET time (ADR-054 §4.1 /
+ * N6 Part 1, #2144): the client's DP (resolved exactly as
+ * @ref comp_d3d11_service_get_predicted_eye_positions_full_for_client) answers
+ * through its own get_eye_positions_at slot when it has one (if that slot
+ * fails, the ring of that DP's published answers — every query plus the
+ * render thread's per-frame viewer publish — is read at @p target_ns,
+ * clamped, never extrapolated). A DP WITHOUT the slot gets its "latest"
+ * answer unchanged — today's behaviour.
+ *
+ * @param target_ns When the pixels will be seen (os_monotonic_get_ns clock);
+ *                  0 = "latest" (the pre-N6 behaviour).
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_full_for_client_at(struct xrt_system_compositor *xsysc,
+                                                                  struct xrt_compositor *xc,
+                                                                  int64_t target_ns,
+                                                                  struct xrt_eye_positions *out_eyes);
+
+/*!
+ * @copydoc comp_d3d11_service_get_predicted_eye_positions_full_for_client_at
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_predicted_eye_positions_for_client_at(struct xrt_system_compositor *xsysc,
+                                                             struct xrt_compositor *xc,
+                                                             int64_t target_ns,
+                                                             struct xrt_vec3 *out_left,
+                                                             struct xrt_vec3 *out_right);
+
+/*!
  * Get display dimensions from the D3D11 service compositor's SR weaver.
  *
  * @param xsysc The system compositor (must be D3D11 service compositor).
@@ -193,6 +237,77 @@ comp_d3d11_service_owns_window(struct xrt_system_compositor *xsysc, struct xrt_c
  */
 void
 comp_d3d11_service_compositor_set_client_pid(struct xrt_compositor *xc, long pid);
+
+struct xrt_app_share_source_info;
+struct xrt_app_share_frame_info;
+struct xrt_plugin_stereo_camera_frame;
+
+/*!
+ * ADR-061: what the share tap knows about this client's session, for the enumeration.
+ * @p out_last_commit_ns: os_monotonic, 0 = nothing committed yet.
+ */
+bool
+comp_d3d11_service_share_query(struct xrt_compositor *xc,
+                               struct xrt_app_share_source_info *io_info,
+                               int64_t *out_last_commit_ns);
+
+/*!
+ * ADR-061: start tapping this client: side-by-side NV12, @p eye_w x @p eye_h per eye, at most
+ * @p fps. The handle stays valid after the compositor is gone (waits then return WAIT_ERROR);
+ * always pass it to @ref comp_d3d11_service_share_detach.
+ */
+xrt_result_t
+comp_d3d11_service_share_attach(struct xrt_compositor *xc, uint32_t eye_w, uint32_t eye_h, float fps, void **out_tap);
+
+/*!
+ * ADR-061 arm 2: the adapter an in-process app's ring must be on to be opened here.
+ * false = unknown.
+ */
+bool
+comp_d3d11_service_share_link_adapter_luid(struct xrt_system_compositor *xsysc, uint8_t out_luid[XRT_LUID_SIZE]);
+
+/*!
+ * ADR-061 arm 2: open an in-process app's published ring. Takes ownership of every handle
+ * (closed on failure too). @p eye_w x @p eye_h: the stream's per-eye extent.
+ */
+xrt_result_t
+comp_d3d11_service_share_link_import(struct xrt_system_compositor *xsysc,
+                                     const struct xrt_share_link_ring_desc *desc,
+                                     const xrt_graphics_buffer_handle_t *textures,
+                                     uint32_t texture_count,
+                                     xrt_graphics_sync_handle_t fence,
+                                     uint32_t eye_w,
+                                     uint32_t eye_h,
+                                     void **out_import);
+
+/*!
+ * ADR-061 arm 2: queue the conversion of one ring slot (a GPU-side wait on its fence) and hand
+ * back the newest FINISHED one: XRT_PLUGIN_STEREO_CAMERA_WAIT_OK, or WAIT_TIMEOUT when none is
+ * yet. Never blocks on the app. The planes stay valid until the next call.
+ */
+uint32_t
+comp_d3d11_service_share_link_convert(void *import,
+                                      const struct xrt_share_link_frame *frame,
+                                      struct xrt_plugin_stereo_camera_frame *out_frame,
+                                      struct xrt_app_share_frame_info *out_info);
+
+//! ADR-061 arm 2: close an imported ring; @p import is freed.
+void
+comp_d3d11_service_share_link_unimport(void *import);
+
+/*!
+ * ADR-061: the next tapped frame (XRT_PLUGIN_STEREO_CAMERA_WAIT_*). The planes stay valid until
+ * the next wait.
+ */
+uint32_t
+comp_d3d11_service_share_wait_frame(void *tap,
+                                    int64_t timeout_ns,
+                                    struct xrt_plugin_stereo_camera_frame *out_frame,
+                                    struct xrt_app_share_frame_info *out_info);
+
+//! ADR-061: stop tapping; @p tap is freed.
+void
+comp_d3d11_service_share_detach(void *tap);
 
 /*!
  * Get window metrics from the active D3D11 service compositor.
@@ -270,6 +385,241 @@ bool
 comp_d3d11_service_get_client_app_window_metrics(struct xrt_system_compositor *xsysc,
                                                   struct xrt_compositor *xc,
                                                   struct xrt_window_metrics *out_metrics);
+
+struct xrt_screen_list;
+struct xrt_segment_metrics;
+struct xrt_segment_view_routing;
+struct ipc_workspace_screen_list;
+struct ipc_workspace_window_placement;
+struct xrt_status_workspace;
+
+/*!
+ * The workspace on N screens (ADR-052): rebuild the workspace's screen set from
+ * the service's screen registry. Called by the IPC server on workspace
+ * activation (@p activation true: the new controller starts un-opted-in to
+ * SCREENS_CHANGED), on every display re-probe and before every enumeration.
+ * The set's generation moves only when it really changed; a change wakes an
+ * opted-in controller.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_update_screens(struct xrt_system_compositor *xsysc,
+                                            const struct xrt_screen_list *list,
+                                            bool activation);
+
+/*!
+ * The workspace's screens in `workspace_enumerate_screens` form (presenter
+ * modes filled live). @p opt_in marks the controller as having seen this
+ * generation and subscribes it to SCREENS_CHANGED.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_workspace_get_screens(struct xrt_system_compositor *xsysc,
+                                         bool opt_in,
+                                         struct ipc_workspace_screen_list *out);
+
+/*!
+ * xrSetWorkspaceClientWindowPlacementDXR: place a window in any workspace
+ * screen's display space. Addressed by compositor (@p xc) or, when @p xc is
+ * NULL, by slot (the 1000+slot form). Returns XRT_ERROR_INPUT_UNSUPPORTED for
+ * a screen id that is not a workspace screen.
+ *
+ * @ingroup comp_d3d11_service
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  const struct ipc_workspace_window_placement *placement);
+
+/*!
+ * xrGetWorkspaceClientWindowPlacementDXR: the placement in its anchor
+ * screen's space (screen_id = the anchor, never 0 while the set is known).
+ *
+ * @ingroup comp_d3d11_service
+ */
+xrt_result_t
+comp_d3d11_service_workspace_get_window_placement(struct xrt_system_compositor *xsysc,
+                                                  struct xrt_compositor *xc,
+                                                  int slot_index,
+                                                  struct ipc_workspace_window_placement *out);
+
+/*!
+ * Display status (ADR-051): fill the presenter screens of the workspace block.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_get_status(struct xrt_system_compositor *xsysc, struct xrt_status_workspace *ws);
+
+/*!
+ * Multi-screen M6 over IPC (ADR-047 Amendment 3): enable per-screen weaving of
+ * this client's window. The IPC server passes the SERVICE's screen list (its
+ * own instance's `enumerate_displays`) and the session's
+ * `XrSessionDisplayBindingDXR` pin (0 = none; a pinned session is never
+ * segmented). The render thread builds the client's segment manager from it
+ * on its next direct weave; a client that never calls this is never
+ * segmented.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_client_segment_screens(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              const struct xrt_screen_list *list,
+                                              uint64_t pinned_display_id);
+
+/*!
+ * ADR-060 R2: the IPC server OFFERS a present-owner the screen list at
+ * `weave_bind_window` (from its own instance's `enumerate_displays`). Inert
+ * unless the client's weave DP is windowless
+ * (XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN): only then does it become the
+ * client's segment list (pin 0), so the runtime cuts the window per screen
+ * where the vendor's own 2D-region logic no longer runs. A client that enabled
+ * segments itself keeps its own list and pin.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_weave_offer_screens(struct xrt_system_compositor *xsysc,
+                                       struct xrt_compositor *xc,
+                                       const struct xrt_screen_list *list);
+
+/*!
+ * Display dashboard phase 7: the screen registry was re-resolved (a display
+ * re-probe — after a per-screen DP preference changed, or a monitor was
+ * plugged, unplugged or moved: WM_DISPLAYCHANGE feeds the same worker). For
+ * every client that enabled segments, the client's manager is rebuilt from
+ * @p list on its next weave — the old segment DPs are released and the
+ * lifecycle's hysteresis makes each again from its screen's (new) registry
+ * entry — when a screen's plug-in changed, or (#2218 #9) a screen joined or
+ * left the registry, or moved / resized / changed role. The client's primary
+ * (system-default) screen keeps the registry entry its session started with —
+ * the session's own DP never swaps live — so a claimant change there only
+ * applies to the next session. A list identical in membership, geometry and
+ * claimants is a no-op.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_refresh_segment_screens(struct xrt_system_compositor *xsysc, const struct xrt_screen_list *list);
+
+/*!
+ * Multi-screen M3 over IPC: the segment table the last direct weave of this
+ * client took (count 0 = one view set), with every segment's eyes predicted
+ * now — the primary screen's from the panel DP, the others from their segment
+ * DPs. What the client's `xrLocateViews` frames per-segment views from.
+ *
+ * For a WORKSPACE tile of a workspace presenting on several screens (ADR-052
+ * D2) the table is instead cut from the tile's placement when its window
+ * straddles presenters (each part with its presenter's eyes), and is empty
+ * otherwise — the direct pipeline's table never applies to a tile.
+ *
+ * @return true when the window is woven per segment.
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_segment_metrics(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              struct xrt_segment_metrics *out);
+
+/*!
+ * ADR-047 Amendment 7: do the display processors presenting for @p xc on
+ * screens OTHER than its own (primary) one see a viewer?
+ *
+ * Counted: the direct pipeline's live segment DPs (table fresh within the
+ * publish window), the present-owner weave's segment DPs (eyes as its last
+ * submit predicted them), and, for a placed tile of a multi-presenter
+ * workspace, EVERY secondary workspace presenter (not only those its
+ * footprint touches: a viewer seen by any panel keeps every tile tracked).
+ * Each screen counts once. With @p xc NULL (a
+ * compositor-less session, the system status) every one of those across the
+ * service, plus every secondary workspace presenter.
+ *
+ * Eyes are never changed by this; the caller ORs the boolean into its own
+ * (util/u_tracking_any.h). Takes clients_mutex, per-client seg_mutex and
+ * ws_presenters_lock, never render_mutex.
+ *
+ * @param[out] out_count          Other screens whose DP answered (0 = none presents).
+ * @param[out] out_tracked_screen First such screen that sees a viewer (0 = none); may be NULL.
+ * @return true when any of them sees a viewer.
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_other_screens_tracking(struct xrt_system_compositor *xsysc,
+                                              struct xrt_compositor *xc,
+                                              uint32_t *out_count,
+                                              uint64_t *out_tracked_screen);
+
+/*!
+ * ADR-052 D2 — the screen a workspace tile's ONE view set is framed from, when
+ * that is not the primary: the window wholly on a secondary presenter, or
+ * (straddling, for a locate that keeps one view set) mostly on one. Fills the
+ * window metrics in THAT screen's display space (the placement mapped through
+ * desktop pixels; z and orientation unchanged), that screen's predicted eyes
+ * in its own display space (its presenter DP's; its nominal viewer when the
+ * DP gives none) and its nominal viewer — the inputs
+ * `ipc_try_get_sr_view_poses` frames the window-relative Kooima from.
+ *
+ * @return false — the outputs are not to be read — when the client is not a placed
+ *         tile of a multi-presenter workspace, or its window is framed from
+ *         the primary (today's path, unchanged).
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_workspace_view_frame(struct xrt_system_compositor *xsysc,
+                                                   struct xrt_compositor *xc,
+                                                   struct xrt_window_metrics *out_wm,
+                                                   struct xrt_eye_positions *out_eyes,
+                                                   struct xrt_vec3 *out_nominal);
+
+/*!
+ * Multi-screen M3 over IPC: where each segment's views are in the client's
+ * next projection layer (what its last splitting `xrLocateViews` handed out;
+ * count 0 = unrouted). Sent change-only, ahead of the commit it applies to.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_set_client_view_routing(struct xrt_system_compositor *xsysc,
+                                           struct xrt_compositor *xc,
+                                           const struct xrt_segment_view_routing *routing);
+
+/*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): client @p xc's runtime-
+ * drawn cursor request for the commit that follows. A direct client's cursor is
+ * drawn into its atlas at that commit; under the shell the workspace cursor is
+ * lifted onto the window instead. @p out answers the PREVIOUS request (#1952).
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct ipc_cursor_draw_request;
+struct ipc_cursor_draw_outcome;
+
+void
+comp_d3d11_service_set_cursor_draw_request(struct xrt_compositor *xc,
+                                           const struct ipc_cursor_draw_request *req,
+                                           struct ipc_cursor_draw_outcome *out);
+
+/*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): client @p xc's
+ * measured-disparity request for the commit that follows. That commit copies a
+ * cursor-sized patch of the two outermost views of its first projection layer;
+ * the copy is read back without waiting and block-matched by the shared
+ * u_cursor_measure_run(). @p out is the newest finished measurement (valid = 0
+ * until one has come back).
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct ipc_cursor_measure_request;
+struct ipc_cursor_measure_result;
+
+void
+comp_d3d11_service_set_cursor_measure_request(struct xrt_compositor *xc,
+                                              const struct ipc_cursor_measure_request *req,
+                                              struct ipc_cursor_measure_result *out);
 
 /*!
  * Check if the compositor's window is still valid (not closed by user).
@@ -458,6 +808,21 @@ void
 comp_d3d11_service_deactivate_workspace(struct xrt_system_compositor *xsysc);
 
 /*!
+ * #2416: the workspace controller's connection was lost without an orderly
+ * workspace_deactivate (crash, forced kill). Call AFTER
+ * comp_d3d11_service_deactivate_workspace(): re-runs the #814 teardown
+ * failsafe — which skipped itself while the dying controller's compositor was
+ * torn down, because the workspace was still active then — and requests
+ * hardware 2D through the ADR-028 hardware-only channel when the panel is in 3D
+ * and no survivor wants it (same survivor rules as the orderly exit). No-op
+ * while a live bridge relay owns the mode, or if the workspace is active again.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_workspace_controller_lost(struct xrt_system_compositor *xsysc);
+
+/*!
  * Grab or release all user input for the workspace controller (modal input
  * grab — XR_DXR_spatial_workspace spec_version 18). While grabbed, the
  * compositor window stops forwarding keyboard / mouse-button / scroll input to
@@ -499,6 +864,28 @@ comp_d3d11_service_capture_frame(struct xrt_system_compositor *xsysc,
                                  const char *path_prefix,
                                  uint32_t flags,
                                  struct ipc_capture_result *out_result);
+
+/*!
+ * #1810: @ref comp_d3d11_service_capture_frame for ONE client's compositor.
+ *
+ * With @p xc non-NULL, @c IPC_CAPTURE_FLAG_PROJECTION_ONLY reads THAT client's
+ * per-client atlas (its content-sized DP-input crop, else its full atlas) instead
+ * of whichever compositor last rendered (`sys->active_compositor`), so a
+ * standalone IPC app capturing itself gets its own pixels even with other clients
+ * running. NULL @p xc is exactly @ref comp_d3d11_service_capture_frame.
+ *
+ * @p xc must stay alive for the call: pass the CALLING client's own compositor
+ * from its own IPC thread (compositor teardown runs on that same thread), or a
+ * compositor the caller otherwise holds under render_mutex.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_capture_frame_for_client(struct xrt_system_compositor *xsysc,
+                                            struct xrt_compositor *xc,
+                                            const char *path_prefix,
+                                            uint32_t flags,
+                                            struct ipc_capture_result *out_result);
 
 /*!
  * Service a pending MCP capture_frame request. Delegates to
@@ -741,6 +1128,27 @@ comp_d3d11_service_workspace_set_overlay(struct xrt_system_compositor *xsysc,
                                           bool visible, bool stereo_sbs);
 
 /*!
+ * spec_version 26 (ADR-052 Amendment 2): as
+ * comp_d3d11_service_workspace_set_overlay, with the overlay on screen
+ * @p screen_id. Only that screen's presenter composes it, with @p anchor
+ * normalized to that screen and @p size_w_m x @p size_h_m in its metres. 0, or
+ * a screen that is not a live secondary presenter (unknown, 2D, removed,
+ * single-screen workspace), means the primary -- re-evaluated every frame, so
+ * the overlay follows its screen back when it presents again. The tag belongs
+ * to the overlay_id slot: an untagged set for the same id moves it back to the
+ * primary.
+ */
+xrt_result_t
+comp_d3d11_service_workspace_set_overlay_on_screen(struct xrt_system_compositor *xsysc,
+                                                    uint32_t overlay_id,
+                                                    struct xrt_swapchain *xsc,
+                                                    float anchor_x, float anchor_y,
+                                                    float pivot_x, float pivot_y,
+                                                    float size_w_m, float size_h_m,
+                                                    bool visible, bool stereo_sbs,
+                                                    uint64_t screen_id);
+
+/*!
  * Phase 2.C spec_version 8: lazy-create + return the workspace wakeup
  * event handle (Win32 HANDLE on Windows). The IPC handler then DuplicateHandle's
  * it into the controller process so the controller can wait on it instead
@@ -818,6 +1226,108 @@ comp_d3d11_service_device_is_removed(struct xrt_system_compositor *xsysc);
  */
 uint32_t
 comp_d3d11_service_dp_backend_state(struct xrt_system_compositor *xsysc);
+
+/*!
+ * One 10 s `[RENDER]` window as data (Phase 3 / #964 / #918), so the log lines
+ * and the status snapshot (ADR-051, phase 2) read the same struct and cannot
+ * drift. Filled by the emitter as it drains the window counters; the getter
+ * returns the last COMPLETED window.
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct comp_d3d11_render_diag
+{
+	bool valid;               //!< At least one window has completed.
+	uint32_t window_s;        //!< Window length, seconds.
+	uint32_t capture_renders; //!< Capture-thread renders in the window.
+	uint32_t capture_avg_us;  //!< Their average, µs.
+	uint32_t client_renders;  //!< Client-driven renders.
+	uint32_t client_skips;    //!< Client-driven skips.
+	uint32_t client_avg_us;   //!< Client render average, µs.
+	uint32_t wait_avg_us;     //!< Render-mutex wait average, µs.
+
+	bool pipe_valid;              //!< The always-on pipeline ran (the `pipe_*` fields are meaningful).
+	uint32_t pipe_active_present; //!< Active presenter presents.
+	uint32_t pipe_active_skip;    //!< Active presenter probe-then-skips.
+	uint32_t pipe_active_backoff; //!< Watchdog / occlusion parking.
+	uint32_t pipe_flat_present;   //!< Flat presenter presents.
+	uint32_t pipe_flat_skip;      //!< Flat presenter skips.
+	uint32_t pipe_rebind;         //!< Presenter rebinds.
+	uint32_t dp_stale_recreate;   //!< DP recreations after a STALE backend.
+	uint32_t atlas_contention;    //!< Atlas reads skipped mid-write (#1018).
+	uint32_t ctx_waits;           //!< Immediate-context waits (#1589).
+	int presenter;                //!< `enum d3d11_presenter_kind` at emit.
+	uint32_t recipe_hold;         //!< Recipe holds.
+	uint32_t zones_skip;          //!< Zones-composite skips.
+	uint32_t ui_acq_skip;         //!< UI acquire skips.
+
+	bool split_available;      //!< Stage A of the weave-on-scanout split succeeded (#918).
+	int split_active;          //!< The split is engaged.
+	uint64_t xb_kb;            //!< Bridge atlas transport, KiB per window.
+	int xb_degraded;           //!< The cross-adapter fence watchdog gave up.
+	uint32_t pipe_dev_rebind;  //!< Output-device rebinds.
+	uint32_t flat_skip;        //!< Flat skips on the split.
+	uint32_t maskpub_skip;     //!< Mask-publish skips.
+	uint32_t no_slot;          //!< Frames with no bridge slot.
+	uint32_t out_crop;         //!< Frames rescued by the output-device crop.
+	char ingress[12];          //!< "adaptive" / "direct" / "staged" / "none".
+	uint64_t ing_direct;       //!< Direct ingress submits (window).
+	uint64_t ing_staged;       //!< Staged ingress submits (window).
+	uint64_t ing_rebind;       //!< Settled source changes (lifetime).
+	uint64_t ing_churn;        //!< Unsettled key changes (lifetime).
+	uint64_t ing_leak;         //!< Dropped opens (lifetime; any non-zero is a bug).
+	char split_off_reason[80]; //!< Why the split is off (iff !split_available).
+};
+
+/*!
+ * ADR-051: copy the last completed `[RENDER]` window into @p out (zeroed, with
+ * `valid = false`, before the first one completes). Safe from any thread.
+ *
+ * @ingroup comp_d3d11_service
+ */
+void
+comp_d3d11_service_get_render_diag(struct xrt_system_compositor *xsysc, struct comp_d3d11_render_diag *out);
+
+/*!
+ * One client compositor's live facts for the display status snapshot
+ * (ADR-051 D3, phase 2) — what the `[HEALTH]` / `[RENDER]` structs do not
+ * carry per client.
+ *
+ * @ingroup comp_d3d11_service
+ */
+struct comp_d3d11_client_status
+{
+	//! The compositor is a live client of this service (false: everything below is zero).
+	bool live;
+	//! Who presents it, as an `enum xrt_status_presenter` value.
+	uint32_t presenter;
+	//! The DP that answers this client's eye query answered.
+	bool eyes_answered;
+	//! ...and reports a tracked viewer.
+	bool is_tracking;
+	//! The client's window (its canvas), as `system_get_client_window_metrics` reports it.
+	struct xrt_window_metrics window;
+	//! Screen whose DP holds the window handle (multi-screen owner), 0 = no segment manager.
+	uint64_t owner_screen;
+	//! The segment table the last direct weave took + per-segment eyes (count 0 = one view set).
+	struct xrt_segment_metrics segments;
+};
+
+/*!
+ * ADR-051: fill @p out for client compositor @p xc. Read-only and safe against
+ * the client's concurrent teardown: @p xc is dereferenced only after it is
+ * found in the service's live-client registry, which is held (under the
+ * render mutex) for the whole read, so a compositor being destroyed is either
+ * still whole or already skipped. Any IPC thread.
+ *
+ * @return false when @p xc is not (or no longer) a live client of this service.
+ *
+ * @ingroup comp_d3d11_service
+ */
+bool
+comp_d3d11_service_get_client_status(struct xrt_system_compositor *xsysc,
+                                     struct xrt_compositor *xc,
+                                     struct comp_d3d11_client_status *out);
 
 /*!
  * #964 (D-5): is the COMPOSITOR the one focus authority right now?
@@ -1158,6 +1668,67 @@ comp_d3d11_service_weave_set_screen_flat_regions(struct xrt_compositor *xc,
                                                  const struct xrt_rect *screen_rects);
 
 /*!
+ * XR_DXR_weave v14 (XrWeaveSubmitOverlayUnchangedDXR): what the NEXT
+ * @ref comp_d3d11_service_weave_submit declares about its overlay atlas — true =
+ * same pixels as the previous accepted submit's, so the display processor may
+ * reuse its lens prefilter of the 2D layer (ADR-027 Amendment). Per submit: the
+ * submit consumes and clears it. Same per-submit setter pattern as the desktop-
+ * Linux engine's v13 comp_multi_weave_linux_set_mono_in_2d.
+ */
+void
+comp_d3d11_service_weave_set_overlay_unchanged(struct xrt_compositor *xc, bool overlay_unchanged);
+
+/*!
+ * #2289: tag the client's per-client capture trigger with its executable
+ * basename (`%TEMP%\displayxr_atlas_trigger.<tag>`), the Windows twin of the
+ * POSIX weave engines' #2207 tag. Set per submit from the IPC handler; "" or
+ * NULL = the global trigger only.
+ */
+void
+comp_d3d11_service_weave_set_capture_tag(struct xrt_compositor *xc, const char *tag);
+
+/*!
+ * XR_DXR_weave v15 (XrWeaveSubmitOverlayFilterDXR): the lens-filter strength
+ * the NEXT @ref comp_d3d11_service_weave_submit asks for its overlay, [0,1];
+ * negative = the display processor's own default. Per submit: consumed and
+ * reset by the submit, same pattern as the v14 setter above.
+ */
+void
+comp_d3d11_service_weave_set_overlay_filter_strength(struct xrt_compositor *xc, float strength);
+
+/*!
+ * XR_DXR_cursor_depth v6 (ADR-046 Amendment 1): which lift rects of the last
+ * @ref comp_d3d11_service_weave_submit got the depth cursor — bit i = the
+ * submit's i-th lift binding (XrWeaveSubmitLiftRectsDXR::lifts[i]).
+ */
+uint32_t
+comp_d3d11_service_weave_lift_cursor_mask(struct xrt_compositor *xc);
+
+/*!
+ * XR_DXR_cursor_depth v8 (ADR-046 Amendment 4): stage the weave-rect cursor
+ * request for the NEXT @ref comp_d3d11_service_weave_submit of @p xc. Per
+ * submit, like the lift rects: the submit consumes it; a submit without one
+ * does no cursor work.
+ */
+void
+comp_d3d11_service_weave_set_cursor_request(struct xrt_compositor *xc, const struct xrt_weave_cursor_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v8: the texture carrier of sprite generation
+ * @p info->generation. Takes ownership of @p handle (an NT handle is closed
+ * once imported or replaced; a DXGI global handle is never closed).
+ */
+void
+comp_d3d11_service_weave_set_cursor_sprite_texture(struct xrt_compositor *xc,
+                                                   xrt_graphics_buffer_handle_t handle,
+                                                   bool is_dxgi,
+                                                   const struct xrt_weave_cursor_sprite_texture *info);
+
+//! XR_DXR_cursor_depth v8: what the last submit's cursor request drew (zero if none).
+void
+comp_d3d11_service_weave_get_cursor_state(struct xrt_compositor *xc, struct xrt_weave_cursor_state *out_state);
+
+/*!
  * Export the persistent server-allocated weaved-output texture handle (+ dims)
  * for the caller to import once and present each frame. Returns false until the
  * first successful @ref comp_d3d11_service_weave_submit has allocated it.
@@ -1192,6 +1763,95 @@ comp_d3d11_service_weave_snap_window_rect(struct xrt_compositor *xc,
                                           int32_t target_y,
                                           int32_t *out_x,
                                           int32_t *out_y);
+
+/*!
+ * XR_DXR_weave v19 (#1884, ADR-047 Amendment 4): what the last accepted
+ * @ref comp_d3d11_service_weave_submit of this present-owner did per screen —
+ * the bound window's segment table (count 0 = woven by one display processor)
+ * with every segment's eyes, the primary's being the submit's own base eyes.
+ * The client cuts its submitted rects at the table's seams (u_weave_rect_parts).
+ *
+ * Only a client that sent `compositor_segments_enable` is ever segmented, and
+ * only batch / v6 submits; otherwise the table is empty.
+ *
+ * @return true when the last submit was woven per segment.
+ */
+bool
+comp_d3d11_service_weave_get_segments(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * XR_DXR_weave v19 cheap split signal (ADR-047 Amendment 4, addendum): the
+ * segment count of the table this present-owner's last accepted submit
+ * published — what `weave_submit`'s reply carries so the client fetches the
+ * table (`weave_get_segments`) only when it is non-zero. 0 = one display
+ * processor (every window on one screen, every client that never enabled
+ * segments).
+ */
+uint32_t
+comp_d3d11_service_weave_segment_count(struct xrt_compositor *xc);
+
+/*!
+ * XR_DXR_weave v12 §5e on Windows (ADR-060 R3): the window origin the last
+ * ACCEPTED submit of @p xc was phased for, desktop-absolute device px, with its
+ * serial (monotonic, >= 1). Known only when the client's weave DP is windowless
+ * (the service fed that origin to `set_present_origin`); a window-bound vendor
+ * weaver reads its window itself, so nothing exact can be reported — false,
+ * all outputs 0, the pre-R3 reply.
+ */
+bool
+comp_d3d11_service_weave_get_woven_origin(struct xrt_compositor *xc,
+                                          int32_t *out_x,
+                                          int32_t *out_y,
+                                          uint64_t *out_serial);
+
+/*!
+ * The screen a zone-scoped locate of client @p xc must be framed against
+ * (ADR-047 Amendment 4, addendum): when the window @p xc frames its locates
+ * against is woven per screen and the element @p zone (window px) lies wholly
+ * on a NON-primary screen of it (u_weave_zone_screen_segment, with the live
+ * client size @p live_w x @p live_h), @p out is that window's per-screen table
+ * and @p out_index the element's segment, whose eyes are predicted now from its
+ * segment DP (the table's own, as of that weave, when the DP cannot answer).
+ *
+ * The table is this client's own last weave's, else that of any present-owner
+ * weaving the same window (the DisplayXR Browser locates from its browser
+ * process and weaves from its GPU process: two sessions, one window); only a
+ * table published within the last SVC_SEG_PUB_FRESH_NS counts.
+ *
+ * Cost: clients_mutex only, unless the element is on a non-primary screen
+ * (then render_mutex too, for the fresh eyes). A window on one screen never
+ * reaches the render thread's lock.
+ *
+ * @return true when the element is to be framed against out->seg[*out_index].
+ */
+bool
+comp_d3d11_service_get_zone_weave_screen(struct xrt_system_compositor *xsysc,
+                                         struct xrt_compositor *xc,
+                                         const struct xrt_rect *zone,
+                                         uint32_t live_w,
+                                         uint32_t live_h,
+                                         struct xrt_segment_metrics *out,
+                                         uint32_t *out_index);
+
+/*
+ * XR_DXR_lift (ADR-042) — the v3 lift wire is served by the conversion core
+ * (ipc_server_conv.h, ADR-053); the service compositor contributes its D3D11
+ * glue (comp_d3d11_service_conv.h) and the lift-rect weave below.
+ */
+
+//! Value types: xrt_lift_weave_rect (xrt_lift.h).
+
+/*!
+ * Latch the lift-flagged rects of this client's NEXT weave submit
+ * (XrWeaveSubmitLiftRectsDXR). Consumed — and cleared — by that submit. Each
+ * rect's content is snapshotted into its stream and the stream's LATEST result
+ * is woven at the rect's CURRENT position (flat until the first result).
+ */
+bool
+comp_d3d11_service_lift_set_weave_rects(struct xrt_compositor *xc,
+                                        uint64_t owner,
+                                        uint32_t count,
+                                        const struct xrt_lift_weave_rect *rects);
 
 /*! @} */
 

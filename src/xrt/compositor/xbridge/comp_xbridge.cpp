@@ -340,6 +340,14 @@ struct comp_xbridge
 	struct comp_xbridge_recipe eg_recipe[XB_EGRESS_RING];
 	struct comp_xbridge_recipe staged_recipe;
 
+	//! #1575 — the per-tile clip the next submit carries (one-shot), and the
+	//! one each slot was carried with (`eg_clipped` false = carried whole).
+	struct comp_xbridge_tile_clip staged_clip;
+	bool clip_staged;
+	struct comp_xbridge_tile_clip eg_clip[XB_EGRESS_RING];
+	bool eg_clipped[XB_EGRESS_RING];
+	uint64_t clipped_submits; //!< frames carried clipped to the panel
+
 	// --- planes (#918 Phase 2a) -------------------------------------------
 	//! Panel extent — every plane is allocated here ONCE and never resized.
 	uint32_t panel_w, panel_h;
@@ -396,6 +404,13 @@ struct comp_xbridge
 		ID3D12Resource *eg_12[XB_EGRESS_RING];
 		//! Content generation each slot's pixels carry (0 = never written).
 		uint64_t slot_seq[XB_EGRESS_RING];
+		//! Monotonic transport order of each slot's pixels (`copy_n` at the copy
+		//! that wrote them) — the half-rate catch-up's notion of "newest", since
+		//! `slot_seq` is a content hash and has no order.
+		uint64_t slot_copy_n[XB_EGRESS_RING];
+		uint64_t copy_n;
+		//! One WARN the first time a half-rate skip catches up locally.
+		bool catchup_warned;
 		//! Dirty box each slot still owes, accumulated across the frames it was
 		//! not the write slot. Empty (w==0) means "already current".
 		int32_t pend_x[XB_EGRESS_RING], pend_y[XB_EGRESS_RING];
@@ -436,6 +451,19 @@ struct comp_xbridge
 	uint64_t gate_under_since_ns;
 	//! One WARN for the over-budget-but-not-the-planes case, ever.
 	bool gate_atlas_only_warned;
+	/*!
+	 * Producer and consumer are the SAME adapter (the LUIDs match). The gate
+	 * protects a cross-adapter link; on one adapter the "transport" is a copy
+	 * within that GPU's own memory, a fraction of a percent of its bandwidth, so
+	 * halving a plane there buys nothing and costs the 2D update rate. The gate
+	 * is off for such a bridge (DXR_XBRIDGE_GATE_SAME_ADAPTER=1 forces it on).
+	 */
+	bool same_adapter;
+	//! The LUIDs match, whatever the gate override says. A bridge on one adapter
+	//! copies every app frame (atlas + planes) within that GPU for nothing: the
+	//! consumer could read the producer's texture in place (the hub's DIRECT
+	//! ingress). Reported once at create and on the [RENDER] row.
+	bool luid_same;
 
 	// --- ingress ---------------------------------------------------------
 	int ingress_mode;
@@ -690,6 +718,7 @@ xb_release_egress(struct comp_xbridge *xb)
 		xb->eg_gen[i] = 0;
 		xb->eg_cw[i] = 0;
 		xb->eg_ch[i] = 0;
+		xb->eg_clipped[i] = false;
 	}
 	xb->eg_w = 0;
 	xb->eg_h = 0;
@@ -937,7 +966,9 @@ xb_format_bpp(uint32_t fmt)
 	switch ((DXGI_FORMAT)fmt) {
 	case DXGI_FORMAT_R8_UNORM: return 1;
 	case DXGI_FORMAT_R8G8B8A8_UNORM:
-	case DXGI_FORMAT_B8G8R8A8_UNORM: return 4;
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+	case DXGI_FORMAT_R10G10B10A2_UNORM: return 4;
+	case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
 	default: return 4;
 	}
 }
@@ -1205,6 +1236,7 @@ xb_release_plane(struct comp_xbridge *xb, uint32_t p, bool drained)
 			pl.eg_tex[i] = nullptr;
 		}
 		pl.slot_seq[i] = 0;
+		pl.slot_copy_n[i] = 0;
 		pl.pend_w[i] = 0;
 		pl.pend_h[i] = 0;
 	}
@@ -1664,6 +1696,42 @@ comp_xbridge_slot_recipe(struct comp_xbridge *xb, int32_t slot, struct comp_xbri
 	return true;
 }
 
+extern "C" void
+comp_xbridge_stage_tile_clip(struct comp_xbridge *xb, const struct comp_xbridge_tile_clip *clip)
+{
+	if (xb == nullptr) {
+		return;
+	}
+	xb->clip_staged = clip != nullptr;
+	if (clip != nullptr) {
+		xb->staged_clip = *clip;
+	}
+}
+
+extern "C" bool
+comp_xbridge_slot_tile_clip(struct comp_xbridge *xb, int32_t slot, struct comp_xbridge_tile_clip *out)
+{
+	if (xb == nullptr || out == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0 ||
+	    !xb->eg_clipped[slot]) {
+		return false;
+	}
+	*out = xb->eg_clip[slot];
+	return true;
+}
+
+extern "C" void
+comp_xbridge_get_max_dims(struct comp_xbridge *xb, uint32_t *out_w, uint32_t *out_h)
+{
+	*out_w = xb != nullptr ? xb->max_w : 0;
+	*out_h = xb != nullptr ? xb->max_h : 0;
+}
+
+extern "C" uint64_t
+comp_xbridge_get_egress_rebuilds(struct comp_xbridge *xb)
+{
+	return xb != nullptr ? xb->eg_reallocs : 0;
+}
+
 extern "C" void *
 comp_xbridge_get_plane_srv(struct comp_xbridge *xb, int32_t slot, uint32_t plane, uint64_t want_seq)
 {
@@ -1790,8 +1858,57 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	 */
 	const struct xb_plane_box owed = xb_plane_pend_box(pl, eg);
 	const struct xb_plane_box staged = {pl.stage_x, pl.stage_y, pl.stage_w, pl.stage_h};
-	if (xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity) !=
-	    XB_PLANE_COPY) {
+	const enum xb_plane_action act =
+	    xb_plane_decide(pl.slot_seq[eg], pl.stage_seq, &owed, &staged, pl.half_rate, seq, pl.half_rate_parity);
+	if (act == XB_PLANE_SKIP_HALF_RATE) {
+		/*
+		 * Catch the slot up from the newest transported slot, on the consumer
+		 * queue alone — never across the adapter link the gate is protecting.
+		 * Without this the slot shows content three frames old while the frame
+		 * before it showed one frame old: the 2D band steps back in time on
+		 * every skipped frame (see xb_plane_catchup_source).
+		 *
+		 * Only the box this slot owes can differ from the source slot: outside
+		 * it nothing changed since this slot's generation, and the source's
+		 * generation is newer still. After the copy the two slots hold
+		 * identical pixels, so this slot inherits the source's generation,
+		 * debt and transport order verbatim. Both egress textures are
+		 * simultaneous-access COMMON, and the source slot's own copy was an
+		 * earlier ExecuteCommandLists on this same queue, so no barrier.
+		 */
+		const int src = xb_plane_catchup_source(pl.slot_seq, pl.slot_copy_n, XB_EGRESS_RING, eg);
+		uint32_t lim_w = 0, lim_h = 0;
+		xb_plane_limits(pl.src_w, pl.src_h, pl.alloc_w, pl.alloc_h, &lim_w, &lim_h);
+		const struct xb_plane_box b = xb_plane_box_snap_clamp(&owed, lim_w, lim_h);
+		if (src >= 0 && pl.eg_12[src] != nullptr && pl.eg_12[eg] != nullptr && !xb_plane_box_empty(&b)) {
+			D3D12_BOX box{};
+			box.left = (UINT)b.x;
+			box.top = (UINT)b.y;
+			box.front = 0;
+			box.right = (UINT)b.x + b.w;
+			box.bottom = (UINT)b.y + b.h;
+			box.back = 1;
+			D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(pl.eg_12[eg]);
+			D3D12_TEXTURE_COPY_LOCATION from = sub_loc(pl.eg_12[src]);
+			xb->cons_list->CopyTextureRegion(&dst, (UINT)b.x, (UINT)b.y, 0, &from, &box);
+			pl.slot_seq[eg] = pl.slot_seq[src];
+			pl.slot_copy_n[eg] = pl.slot_copy_n[src];
+			pl.pend_x[eg] = pl.pend_x[src];
+			pl.pend_y[eg] = pl.pend_y[src];
+			pl.pend_w[eg] = pl.pend_w[src];
+			pl.pend_h[eg] = pl.pend_h[src];
+			if (!pl.catchup_warned) {
+				pl.catchup_warned = true;
+				U_LOG_W("%s: %s plane at half rate — skipped frames now repeat the newest transported "
+				        "content via an output-device slot copy instead of showing an older slot (no "
+				        "cross-adapter traffic)",
+				        XB_TAG(xb), xb_plane_name(p));
+			}
+		}
+		pl.skips++;
+		return 0;
+	}
+	if (act != XB_PLANE_COPY) {
 		/*
 		 * Skipped. Leave `slot_seq` ALONE in every skip case: advancing it would
 		 * mark the slot as carrying this generation's pixels when no copy ever
@@ -1834,6 +1951,7 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
 	}
 
 	pl.slot_seq[eg] = pl.stage_seq;
+	pl.slot_copy_n[eg] = ++pl.copy_n;
 	pl.pend_w[eg] = 0;
 	pl.pend_h[eg] = 0;
 	pl.copies++;
@@ -1860,12 +1978,24 @@ xb_record_plane(struct comp_xbridge *xb, uint32_t p, uint64_t seq, int xa, int e
  *  - throttling only happens when the PLANES contribute meaningfully to it
  *    (@ref XB_GATE_PLANE_FLOOR_BYTES_PER_S), so an over-budget atlas alone never
  *    throttles a plane;
- *  - the latch is NOT permanent — it clears when the transport has stayed inside
- *    budget for @ref XB_GATE_UNLATCH_NS, and a plane re-bind clears its own.
+ *  - the latch is NOT permanent — it clears when the transport WOULD fit at full
+ *    plane rate, or the planes have gone idle, for @ref XB_GATE_UNLATCH_NS (the
+ *    rule is xb_gate_decide; "total back under budget" could never hold once the
+ *    atlas alone exceeded it, which pinned an 8K session at half rate), and a
+ *    plane re-bind clears its own.
+ *
+ * A same-adapter bridge has no cross-adapter link and never latches.
  */
 static void
 xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_bytes, uint64_t seq)
 {
+	if (xb->same_adapter) {
+		// No cross-adapter link to protect (see `same_adapter`): never latch.
+		for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
+			xb->plane[p].gate_bytes = 0;
+		}
+		return;
+	}
 	const uint64_t now = os_monotonic_get_ns();
 	xb->gate_atlas_bytes += atlas_bytes;
 	xb->gate_plane_bytes += plane_bytes;
@@ -1897,21 +2027,21 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		xb->plane[p].gate_bytes = 0;
 	}
 
-	if (total_rate <= XB_BANDWIDTH_GATE_BYTES_PER_S) {
-		// UN-LATCH. A latched plane runs at half rate for as long as the
-		// pressure lasts, not for the rest of the session — a resize or a
-		// fullscreen burst must not permanently halve the 2D update rate of a
-		// session that spends the next hour idle.
+	const enum xb_gate_action act = xb_gate_decide(total_rate, plane_rate, any_latched,
+	                                               XB_BANDWIDTH_GATE_BYTES_PER_S, XB_GATE_PLANE_FLOOR_BYTES_PER_S);
+	if (act == XB_GATE_SETTLED) {
+		// UN-LATCH once settled for the dwell. A latched plane runs at half rate
+		// for as long as the pressure lasts, not for the rest of the session.
 		if (xb->gate_under_since_ns == 0) {
 			xb->gate_under_since_ns = now;
-		} else if (any_latched && now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
+		} else if (now - xb->gate_under_since_ns >= XB_GATE_UNLATCH_NS) {
 			for (uint32_t p = 0; p < COMP_XBRIDGE_PLANE_COUNT; p++) {
 				xb->plane[p].half_rate = false;
 			}
 			xb->gate_under_since_ns = 0;
 			U_LOG_W(
-			    "%s: transport has been inside the %.1f GB/s gate for %llu s — "
-			    "releasing the half-rate latch on every plane (#918 Phase 2a)",
+			    "%s: transport would fit the %.1f GB/s gate at full plane rate, or the planes went idle, for "
+			    "%llu s — releasing the half-rate latch on every plane (#918 Phase 2a)",
 			    XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9,
 			    (unsigned long long)(XB_GATE_UNLATCH_NS / 1000000000ull));
 		}
@@ -1919,7 +2049,7 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 	}
 	xb->gate_under_since_ns = 0;
 
-	if (plane_rate < XB_GATE_PLANE_FLOOR_BYTES_PER_S) {
+	if (act == XB_GATE_ATLAS_ONLY) {
 		// Over budget, but not because of the planes. Halving one would cost
 		// the 2D update rate and buy nothing measurable.
 		if (!xb->gate_atlas_only_warned) {
@@ -1933,8 +2063,8 @@ xb_bandwidth_gate(struct comp_xbridge *xb, uint64_t atlas_bytes, uint64_t plane_
 		}
 		return;
 	}
-	if (worst >= COMP_XBRIDGE_PLANE_COUNT) {
-		return; // every live plane is already latched
+	if (act != XB_GATE_LATCH || worst >= COMP_XBRIDGE_PLANE_COUNT) {
+		return; // nothing to do, or every live plane is already latched
 	}
 	xb->plane[worst].half_rate = true;
 	xb->plane[worst].half_rate_parity = seq & 1ull;
@@ -1992,8 +2122,18 @@ xb_watchdog_thread(struct comp_xbridge *xb)
 
 		if (advanced || !(prod_stall || cons_stall || attempt_stall)) {
 			if (stage > 0) {
-				U_LOG_W("%s: bridge recovered at prod=%llu cons=%llu (#1017)", XB_TAG(xb),
-				        (unsigned long long)prod_done, (unsigned long long)cons_done);
+				// Once `degraded` is latched, submit returns at its first line, so
+				// the counters freeze and this branch is reached by silence, not by
+				// progress. Do not call that a recovery (#1575).
+				if (xb->degraded.load(std::memory_order_acquire)) {
+					U_LOG_W(
+					    "%s: no stall since DEGRADED stopped submissions at prod=%llu cons=%llu — "
+					    "the bridge is NOT recovered; it stays degraded for this session (#1017, #1575)",
+					    XB_TAG(xb), (unsigned long long)prod_done, (unsigned long long)cons_done);
+				} else {
+					U_LOG_W("%s: bridge recovered at prod=%llu cons=%llu (#1017)", XB_TAG(xb),
+					        (unsigned long long)prod_done, (unsigned long long)cons_done);
+				}
 			}
 			last_prod_done = prod_done;
 			last_cons_done = cons_done;
@@ -2115,11 +2255,20 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 	 * state one has no business sizing a heap.
 	 */
 	xb->fmt = (info->atlas_format != 0) ? (DXGI_FORMAT)info->atlas_format : XB_FORMAT_DEFAULT;
-	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+	/*
+	 * #2273 — the deep atlas formats (DXR_ATLAS_FORMAT) are carried too: every
+	 * ring is built in the caller's format and every copy is same-format, so
+	 * depth costs only bandwidth (`R16G16B16A16_FLOAT` is 8 bytes a pixel, which
+	 * the bandwidth gate sees through @ref xb_format_bpp). A GPU whose
+	 * cross-adapter ROW_MAJOR heap refuses the format fails the slot allocation
+	 * below, so Stage A fails and the session weaves on the render device.
+	 */
+	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM &&
+	    xb->fmt != DXGI_FORMAT_R10G10B10A2_UNORM && xb->fmt != DXGI_FORMAT_R16G16B16A16_FLOAT) {
 		U_LOG_E(
 		    "%s: unsupported atlas format %s (0x%x) — the bridge builds its ingress, cross-adapter and "
-		    "egress rings in the CALLER's format and only the 8-bit BGRA/RGBA UNORM pair is supported "
-		    "(#1178)",
+		    "egress rings in the CALLER's format and supports the 8-bit BGRA/RGBA UNORM pair plus "
+		    "R10G10B10A2_UNORM and R16G16B16A16_FLOAT (#1178, #2273)",
 		    XB_TAG(xb), xb_fmt_name(xb->fmt), (unsigned)xb->fmt);
 		*out_reason = "unsupported atlas format";
 		goto fail;
@@ -2210,6 +2359,37 @@ comp_xbridge_create(const struct comp_xbridge_info *info, struct comp_xbridge **
 			        xb_hr(hr, b, sizeof(b)));
 			*out_reason = "D3D12CreateDevice failed";
 			goto fail;
+		}
+	}
+
+	{
+		const LUID pl = xb->prod_dev->GetAdapterLuid();
+		const LUID cl = xb->cons_dev->GetAdapterLuid();
+		xb->same_adapter = pl.LowPart == cl.LowPart && pl.HighPart == cl.HighPart;
+		xb->luid_same = xb->same_adapter;
+		const char *force = getenv("DXR_XBRIDGE_GATE_SAME_ADAPTER");
+		if (xb->same_adapter && force != nullptr && force[0] == '1') {
+			xb->same_adapter = false;
+		}
+		if (xb->same_adapter) {
+			U_LOG_W("%s: producer and consumer share one adapter — the %.1f GB/s cross-adapter bandwidth gate "
+			        "is off for this bridge (planes always run at full rate; DXR_XBRIDGE_GATE_SAME_ADAPTER=1 "
+			        "forces it on)",
+			        XB_TAG(xb), (double)XB_BANDWIDTH_GATE_BYTES_PER_S / 1.0e9);
+		}
+		if (xb->luid_same) {
+			/*
+			 * The slow path, made loud. Both field incidents of this class
+			 * (#2518 D3D12, #2563 VK: a weaker single GPU at 8K lost 20 fps to
+			 * these copies, and the staged pick also weaves a frame stale,
+			 * ADR-059 Amendment 1) were invisible in the log and found by
+			 * measuring the GPU copy engine by hand.
+			 */
+			U_LOG_W("%s: SAME-ADAPTER BRIDGE — every app frame is copied through the bridge on one GPU "
+			        "(staged ingress: copy-engine load scales with the atlas and planes, and the weave reads "
+			        "one frame stale). The hub reads it in place on one adapter (DIRECT ingress); if this "
+			        "session should be on the hub, check its `hub placement:` / `ingress_reason` line",
+			        XB_TAG(xb));
 		}
 	}
 
@@ -2659,6 +2839,16 @@ comp_xbridge_slot_layout(struct comp_xbridge *xb, int32_t slot, uint64_t *out_ge
 	*out_gen = xb->eg_gen[slot];
 	*out_w = xb->eg_cw[slot];
 	*out_h = xb->eg_ch[slot];
+	return true;
+}
+
+extern "C" bool
+comp_xbridge_slot_seq(struct comp_xbridge *xb, int32_t slot, uint64_t *out_seq)
+{
+	if (xb == nullptr || out_seq == nullptr || slot < 0 || slot >= XB_EGRESS_RING || xb->eg_seq[slot] == 0) {
+		return false;
+	}
+	*out_seq = xb->eg_seq[slot];
 	return true;
 }
 
@@ -3224,6 +3414,39 @@ comp_xbridge_pre_plane_write(struct comp_xbridge *xb, uint32_t plane)
 	xb_app_back_wait(xb, xb->prod_submit_seq.load(std::memory_order_acquire));
 }
 
+/*!
+ * #1575 — take (and disarm) the clip staged for this submit. True when one was
+ * staged AND it describes the packed @p content_w x @p content_h box: every
+ * kept rect inside its tile, cols x w by rows x h equal to the box. A clip that
+ * does not is dropped, loudly and throttled, and the frame is carried whole —
+ * the extent checks then refuse it exactly as they would without a clip.
+ */
+static bool
+xb_take_tile_clip(struct comp_xbridge *xb, uint32_t content_w, uint32_t content_h, struct comp_xbridge_tile_clip *out)
+{
+	if (!xb->clip_staged) {
+		return false;
+	}
+	xb->clip_staged = false;
+	const struct comp_xbridge_tile_clip &c = xb->staged_clip;
+	const bool ok = c.cols > 0 && c.rows > 0 && c.w > 0 && c.h > 0 && c.canvas_w > 0 && c.canvas_h > 0 &&
+	                (uint64_t)c.x + c.w <= c.src_view_w && (uint64_t)c.y + c.h <= c.src_view_h &&
+	                (uint64_t)c.cols * c.w == content_w && (uint64_t)c.rows * c.h == content_h;
+	if (!ok) {
+		static uint64_t dropped = 0;
+		if ((dropped++ % 300u) == 0u) {
+			U_LOG_W(
+			    "%s: a staged tile clip (%ux%u tiles, %ux%u at %u,%u of %ux%u) does not describe the %ux%u "
+			    "box — dropped, the frame is carried whole (#1575; %llu so far)",
+			    XB_TAG(xb), c.cols, c.rows, c.w, c.h, c.x, c.y, c.src_view_w, c.src_view_h, content_w,
+			    content_h, (unsigned long long)dropped);
+		}
+		return false;
+	}
+	*out = c;
+	return true;
+}
+
 extern "C" void
 comp_xbridge_submit(struct comp_xbridge *xb,
                     uint64_t seq,
@@ -3232,15 +3455,24 @@ comp_xbridge_submit(struct comp_xbridge *xb,
                     uint32_t content_w,
                     uint32_t content_h)
 {
-	if (xb == nullptr || seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
+	if (xb == nullptr) {
+		return;
+	}
+	/*
+	 * #1575 — the clip staged for THIS submit, taken before any early-out so a
+	 * refused or skipped frame can never leave it armed for the next one.
+	 */
+	struct comp_xbridge_tile_clip clip = {};
+	const bool clipped = xb_take_tile_clip(xb, content_w, content_h, &clip);
+	if (seq == 0 || xb->degraded.load(std::memory_order_relaxed)) {
 		return;
 	}
 	if (content_w == 0 || content_h == 0 || xb->eg_w == 0) {
 		return;
 	}
-	// Counted BEFORE the allocator-busy early-outs below: the watchdog's whole
-	// point is that a skipped frame is still an attempted frame (#918 F3).
-	xb->attempted.fetch_add(1, std::memory_order_release);
+	// #1575: the farthest texel a clipped copy reads in the caller's atlas.
+	const uint32_t clip_src_w = clipped ? (clip.cols - 1) * clip.src_view_w + clip.x + clip.w : 0;
+	const uint32_t clip_src_h = clipped ? (clip.rows - 1) * clip.src_view_h + clip.y + clip.h : 0;
 
 	/*
 	 * #1178 — the content box must FIT the egress ring, and saying so is not the
@@ -3250,10 +3482,15 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	 * anywhere records that anything went wrong.
 	 *
 	 * `comp_xbridge_set_content_size` runs immediately before every submit and
-	 * either sizes the ring to the content box or holds the worst-case ring
-	 * (which is >= any content box, since the box is clamped to `max_*` there),
-	 * so this is unreachable by construction. That is precisely why it must say
-	 * so out loud rather than paper over it if the construction ever changes.
+	 * either sizes the ring to the content box or holds the worst-case ring. It
+	 * clamps the RING to `max_*`, but not the caller's box, so this IS reachable:
+	 * a content box larger than the worst-case system atlas — a window larger
+	 * than the panel, e.g. after a 150 % -> 300 % DPI move doubled it to
+	 * 3848x2169 on a 3840x2160 panel (#1603 is the same shape for a 2-view
+	 * layout) — lands here on every frame for as long as it stays that size.
+	 * #1575: a caller that clips such a window to the panel
+	 * (@ref comp_xbridge_stage_tile_clip) hands in the packed, clipped box,
+	 * which fits; only a caller that does not still lands here.
 	 */
 	if (!xb_check_copy_extent(xb, "atlas submit (content box vs egress ring)", content_w, content_h,
 	                          /*src=*/0, 0, xb->eg_w, xb->eg_h)) {
@@ -3293,14 +3530,39 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		}
 		// #1178 — and the same question about EXTENT. The atlas is the caller's
 		// own texture, sized by the renderer; the staging ring is `max_*`.
-		if (!xb_check_copy_extent(xb, "ingress stage (Option II)", content_w, content_h, (uint32_t)ad.Width,
-		                          ad.Height, xb->max_w, xb->max_h)) {
-			return;
+		if (clipped) {
+			// #1575: the clipped tiles are read from the full-size atlas and
+			// packed into the staging ring, so the two ends are checked apart.
+			if (!xb_check_copy_extent(xb, "ingress stage (Option II, clipped source)", clip_src_w,
+			                          clip_src_h, (uint32_t)ad.Width, ad.Height, 0, 0) ||
+			    !xb_check_copy_extent(xb, "ingress stage (Option II, clipped box)", content_w, content_h, 0,
+			                          0, xb->max_w, xb->max_h)) {
+				return;
+			}
+			// One copy per tile: its kept rect, at its real offset in the
+			// tile, packed tile by tile. Nothing is scaled.
+			for (uint32_t r = 0; r < clip.rows; r++) {
+				for (uint32_t c = 0; c < clip.cols; c++) {
+					const UINT sx = c * clip.src_view_w + clip.x;
+					const UINT sy = r * clip.src_view_h + clip.y;
+					D3D11_BOX tb = {sx, sy, 0, sx + clip.w, sy + clip.h, 1};
+					xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, c * clip.w, r * clip.h, 0,
+					                                   atlas, 0, &tb);
+				}
+			}
+		} else {
+			if (!xb_check_copy_extent(xb, "ingress stage (Option II)", content_w, content_h,
+			                          (uint32_t)ad.Width, ad.Height, xb->max_w, xb->max_h)) {
+				return;
+			}
+			D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
+			xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		}
-		D3D11_BOX box = {0, 0, 0, content_w, content_h, 1};
-		xb->app_ctx->CopySubresourceRegion(xb->in_tex[in], 0, 0, 0, 0, atlas, 0, &box);
 		src12 = xb->in_12[in];
 	}
+	// #1575: leg 1 itself clips only when it reads the caller's atlas in place
+	// (Option I); a staged frame arrives above already packed.
+	const bool leg1_clip = clipped && use_direct;
 	if (src12 == nullptr) {
 		return;
 	}
@@ -3322,11 +3584,32 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		 * the renderer's schedule, not the window's; the cross-adapter ring is
 		 * `max_*`, fixed at create. Nothing before this ever compared them.
 		 */
-		if (!xb_check_copy_extent(xb, where, content_w, content_h, (uint32_t)sd.Width, sd.Height, xb->max_w,
-		                          xb->max_h)) {
+		if (leg1_clip) {
+			if (!xb_check_copy_extent(xb, where, clip_src_w, clip_src_h, (uint32_t)sd.Width, sd.Height, 0,
+			                          0) ||
+			    !xb_check_copy_extent(xb, where, content_w, content_h, 0, 0, xb->max_w, xb->max_h)) {
+				return;
+			}
+		} else if (!xb_check_copy_extent(xb, where, content_w, content_h, (uint32_t)sd.Width, sd.Height,
+		                                 xb->max_w, xb->max_h)) {
 			return;
 		}
 	}
+
+	/*
+	 * Counted HERE: after every refusal above, BEFORE the allocator-busy and
+	 * no-egress-slot early-outs below. The watchdog's whole point is that a
+	 * skipped frame is still an attempted frame (#918 F3) — a frame the GPU
+	 * side could not take is evidence of a wedge. A frame refused above is
+	 * not: the format / extent checks are CPU-side verdicts on what the caller
+	 * handed in, and they repeat for as long as the caller's sizes disagree.
+	 * Counting them made the watchdog read "attempted, no egress progress" as a
+	 * wedged CONSUMER and latch `degraded` after 5 s, so a window that was
+	 * larger than the panel for 5 s stayed black for the rest of the session
+	 * even after it was resized to fit. The refusals still have their own
+	 * counters and their own throttled ERROR lines.
+	 */
+	xb->attempted.fetch_add(1, std::memory_order_release);
 
 	// The app's writes to the atlas complete before the producer reads it. This
 	// is a fence SIGNAL on the immediate context — no CPU wait. The Flush is
@@ -3393,7 +3676,24 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	{
 		D3D12_TEXTURE_COPY_LOCATION dst = sub_loc(xb->xa_prod[xa]);
 		D3D12_TEXTURE_COPY_LOCATION src = sub_loc(src12);
-		xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+		if (leg1_clip) {
+			// #1575: one copy per tile, each tile's kept rect at its real
+			// offset, packed into the content box leg 2 carries whole.
+			for (uint32_t r = 0; r < clip.rows; r++) {
+				for (uint32_t c = 0; c < clip.cols; c++) {
+					D3D12_BOX tb{};
+					tb.left = c * clip.src_view_w + clip.x;
+					tb.top = r * clip.src_view_h + clip.y;
+					tb.front = 0;
+					tb.right = tb.left + clip.w;
+					tb.bottom = tb.top + clip.h;
+					tb.back = 1;
+					xb->prod_list->CopyTextureRegion(&dst, c * clip.w, r * clip.h, 0, &src, &tb);
+				}
+			}
+		} else {
+			xb->prod_list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+		}
 	}
 	{
 		// #1178 — leg 2's extent was checked at the top of this function (`content
@@ -3459,6 +3759,13 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 	xb->eg_gen[eg] = layout_gen;
 	xb->eg_cw[eg] = content_w;
 	xb->eg_ch[eg] = content_h;
+	// #1575: and with the clip it was carried with, so the weave hands its DP
+	// the canvas these pixels belong to (never the live one: #1140's rule).
+	xb->eg_clipped[eg] = clipped;
+	if (clipped) {
+		xb->eg_clip[eg] = clip;
+		xb->clipped_submits++;
+	}
 
 	/*
 	 * #918 Phase 2a — stamp the COMPOSITE RECIPE. plane_valid/plane_seq are
@@ -3482,7 +3789,8 @@ comp_xbridge_submit(struct comp_xbridge *xb,
 		 * is what let a stale 2D band composite under a current frame with
 		 * nothing anywhere able to tell.
 		 */
-		if (xb_plane_slot_is_valid(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq)) {
+		if (xb_plane_slot_is_presentable(pl.live, pl.staged, pl.slot_seq[eg], pl.stage_seq, pl.half_rate,
+		                                 pl.slot_copy_n[eg], pl.copy_n)) {
 			xb->eg_recipe[eg].plane_valid |= (1u << p);
 		}
 	}
@@ -3783,6 +4091,14 @@ xb_content_probe(struct comp_xbridge *xb, int32_t slot)
 	if (slot < 0 || slot >= XB_EGRESS_RING || xb->eg_tex[slot] == nullptr || xb->eg_seq[slot] == 0) {
 		return;
 	}
+	// #2273: the verdict below reads 8-bit RGBA bytes. A deep chain (10-bit,
+	// 16F) would be scored as garbage, so the probe latches off instead.
+	if (xb->fmt != DXGI_FORMAT_R8G8B8A8_UNORM && xb->fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+		xb->probe_on = false;
+		U_LOG_W("%s: content probe reads 8-bit RGBA only; the chain is %s - probe off (#2273)", XB_TAG(xb),
+		        xb_fmt_name(xb->fmt));
+		return;
+	}
 	// Only a slot whose consumer copy is CPU-verified complete: reading one the
 	// consumer is still writing would report a tear as a defect.
 	if (xb->f_out_cons == nullptr || xb->f_out_cons->GetCompletedValue() < xb->eg_seq[slot]) {
@@ -3857,6 +4173,12 @@ comp_xbridge_is_degraded(struct comp_xbridge *xb)
 	return xb != nullptr && xb->degraded.load(std::memory_order_relaxed);
 }
 
+extern "C" bool
+comp_xbridge_is_same_adapter(struct comp_xbridge *xb)
+{
+	return xb != nullptr && xb->luid_same;
+}
+
 
 /*
  *
@@ -3915,6 +4237,10 @@ comp_xbridge_quiesce(struct comp_xbridge *xb)
 		    "%s: %llu submits REFUSED on a copy-extent mismatch — the chain is %ux%u worst-case / %ux%u "
 		    "egress (#1178)",
 		    XB_TAG(xb), (unsigned long long)xb->ext_refused, xb->max_w, xb->max_h, xb->eg_w, xb->eg_h);
+	}
+	if (xb->clipped_submits > 0) {
+		U_LOG_W("%s: %llu frames carried clipped to the panel (the window overhung it) (#1575)", XB_TAG(xb),
+		        (unsigned long long)xb->clipped_submits);
 	}
 	if (xb->ingress_mode == XB_INGRESS_ADAPTIVE) {
 		U_LOG_W(

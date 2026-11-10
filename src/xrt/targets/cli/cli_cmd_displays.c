@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  `displays` subcommand — enumerate connected displays via EDID.
+ * @brief  `displays` subcommand — enumerate connected displays via EDID
+ * (Windows: SetupAPI; desktop Linux: RandR joined to DRM sysfs).
  *
  * Vendor-neutral list of every connected monitor (manufacturer/product,
  * resolution, position, primary), independent of which display processor is
@@ -14,11 +15,15 @@
  */
 
 #include "cli_common.h"
+#include "cli_query.h"
 
 #include "os/os_display_edid.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_config_os.h"
+#include "xrt/xrt_instance.h"
 #include "xrt/xrt_plugin.h"
 #include "target_plugin_loader.h"
+#include "util/u_setting.h"
 
 #include <cjson/cJSON.h>
 
@@ -86,14 +91,53 @@ apis_to_str(const struct xrt_dp_registry_entry *e, char *out, size_t cap)
 }
 
 /*!
+ * Off-Windows, bring the system up headlessly (no compositor) and tear it down
+ * again, so the active plug-in's `get_display_info` has been read — the
+ * builder notes it with `target_plugin_note_active_panel`, which places a
+ * plug-in-without-`probe_displays` back-compat claim on its panel's monitor
+ * exactly as the runtime does at instance create. Windows keeps the plain
+ * loader path (its back-compat claim is the primary monitor either way).
+ */
+static void
+note_active_panel_headless(void)
+{
+#ifndef XRT_OS_WINDOWS
+	struct cli_query_handles h = {0};
+	if (xrt_instance_create(NULL, &h.xi) == XRT_SUCCESS) {
+		(void)xrt_instance_create_system(h.xi, &h.xsys, &h.xsysd, &h.xso, NULL);
+	}
+	cli_query_teardown(&h);
+#endif
+}
+
+//! The enumerated record behind a registry entry, by monitor id.
+static const struct os_display_edid_monitor *
+monitor_for_id(const struct os_display_edid_list *list,
+               const struct xrt_display_descriptor *descs,
+               uint32_t dn,
+               uint64_t monitor_id)
+{
+	for (uint32_t i = 0; i < dn && i < list->count; i++) {
+		if (descs[i].monitor_id == monitor_id) {
+			return &list->monitors[i];
+		}
+	}
+	return NULL;
+}
+
+/*!
  * `displays --claims`: enumerate EDID, ask the registered plug-ins which
  * monitors they claim, and print the resolved monitor→plug-in registry
- * (#69 / ADR-015). Loads the active plug-in(s) — same exposure as
+ * (#69 / ADR-015). Loads the registered plug-ins — same exposure as
  * `selftest`/`info`. Plain `displays` stays vendor-blind (no plug-in load).
  */
 static int
 cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 {
+	note_active_panel_headless();
+	// #2250: the CLI may re-key a legacy per-user screen preference while it resolves.
+	target_plugin_set_screen_key_rekey(true);
+
 	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
 	uint32_t dn = target_plugin_build_descriptors(list, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
 
@@ -102,6 +146,7 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 
 	if (json) {
 		cJSON *root = cJSON_CreateObject();
+		cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 		cJSON_AddNumberToObject(root, "monitor_count", (double)dn);
 		cJSON_AddNumberToObject(root, "claimed_count", (double)reg.entry_count);
 		cJSON *arr = cJSON_AddArrayToObject(root, "claims");
@@ -122,6 +167,49 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 			cJSON_AddNumberToObject(c, "pixel_height", (double)e->pixel_height);
 			cJSON_AddNumberToObject(c, "screen_left", (double)e->screen_left);
 			cJSON_AddNumberToObject(c, "screen_top", (double)e->screen_top);
+			// Display dashboard phase 7: the stable screen key and the
+			// per-screen preference (additive; schema stays 1).
+			char key[64] = {0};
+			if (target_plugin_get_monitor_key(e->monitor_id, key, sizeof(key), NULL, 0)) {
+				cJSON_AddStringToObject(c, "key", key);
+			} else {
+				cJSON_AddNullToObject(c, "key");
+			}
+			// #2250: the EDID-form key a stored preference may still use (additive).
+			char legacy_key[64] = {0};
+			if (target_plugin_get_monitor_legacy_key(e->monitor_id, legacy_key, sizeof(legacy_key))) {
+				cJSON_AddStringToObject(c, "legacy_key", legacy_key);
+			} else {
+				cJSON_AddNullToObject(c, "legacy_key");
+			}
+			cJSON_AddBoolToObject(c, "forced", e->forced);
+			if (e->forced) {
+				cJSON_AddStringToObject(c, "forced_source",
+				                        u_setting_source_str((enum u_setting_source)e->forced_source));
+			} else {
+				cJSON_AddNullToObject(c, "forced_source");
+			}
+			if (e->preferred_plugin[0] != '\0') {
+				cJSON_AddStringToObject(c, "preferred_plugin", e->preferred_plugin);
+			} else {
+				cJSON_AddNullToObject(c, "preferred_plugin");
+			}
+			const struct os_display_edid_monitor *m = monitor_for_id(list, descs, dn, e->monitor_id);
+			if (m != NULL) {
+				char pnp[4];
+				pnp_code(m->manufacturer_id, pnp);
+				char prod[8];
+				snprintf(prod, sizeof(prod), "%04X", m->product_id);
+				cJSON_AddStringToObject(c, "manufacturer", pnp);
+				cJSON_AddStringToObject(c, "product", prod);
+				cJSON_AddNumberToObject(c, "edid_serial", (double)m->serial_number);
+				cJSON_AddNumberToObject(c, "physical_width_mm", (double)m->physical_width_mm);
+				cJSON_AddNumberToObject(c, "physical_height_mm", (double)m->physical_height_mm);
+				cJSON_AddStringToObject(c, "connector", m->connector);
+				cJSON_AddStringToObject(c, "output_name", m->output_name);
+				cJSON_AddStringToObject(c, "display_name", m->display_name);
+				cJSON_AddBoolToObject(c, "primary", m->is_primary);
+			}
 			cJSON_AddItemToArray(arr, c);
 		}
 		char *out = cJSON_Print(root);
@@ -142,10 +230,38 @@ cli_cmd_displays_claims(const struct os_display_edid_list *list, bool json)
 		const struct xrt_dp_registry_entry *e = &reg.entries[i];
 		char apis[64];
 		apis_to_str(e, apis, sizeof(apis));
-		PT("monitor 0x%016llx  %ux%u @ (%d,%d)\n", (unsigned long long)e->monitor_id, e->pixel_width,
-		   e->pixel_height, e->screen_left, e->screen_top);
+		const struct os_display_edid_monitor *m = monitor_for_id(list, descs, dn, e->monitor_id);
+		PT("monitor 0x%016llx  %ux%u @ (%d,%d)%s\n", (unsigned long long)e->monitor_id, e->pixel_width,
+		   e->pixel_height, e->screen_left, e->screen_top,
+		   (m != NULL && m->origin_unknown) ? " (origin unknown)" : "");
+		if (m != NULL) {
+			char pnp[4];
+			pnp_code(m->manufacturer_id, pnp);
+			PT("    %s %04X serial=0x%08X  %ux%u mm%s%s%s%s%s\n", pnp, m->product_id, m->serial_number,
+			   m->physical_width_mm, m->physical_height_mm, m->output_name[0] != '\0' ? "  output=" : "",
+			   m->output_name, m->connector[0] != '\0' ? "  connector=" : "", m->connector,
+			   m->is_primary ? "  [primary]" : "");
+			if (m->display_name[0] != '\0' || m->native_width > 0) {
+				PT("    '%s'  native %ux%u\n", m->display_name, m->native_width, m->native_height);
+			}
+		}
 		PT("    plug-in='%s'  confidence=%s  apis=%s%s%s\n", e->plugin_id, confidence_label(e->confidence),
 		   apis, e->serial[0] != '\0' ? "  serial=" : "", e->serial);
+		char key[64] = {0};
+		if (target_plugin_get_monitor_key(e->monitor_id, key, sizeof(key), NULL, 0)) {
+			// #2250: the EDID-form key, when the vendor serial keys the screen.
+			char legacy_key[64] = {0};
+			const bool has_legacy =
+			    target_plugin_get_monitor_legacy_key(e->monitor_id, legacy_key, sizeof(legacy_key));
+			PT("    key='%s'%s%s%s%s%s%s%s\n", key, has_legacy ? "  legacy='" : "", legacy_key,
+			   has_legacy ? "'" : "", e->forced ? "  forced by a per-screen preference (" : "",
+			   e->forced ? u_setting_source_str((enum u_setting_source)e->forced_source) : "",
+			   e->forced ? ")" : "",
+			   (!e->forced && e->preferred_plugin[0] != '\0') ? "  (per-screen preference ignored)" : "");
+		}
+	}
+	if (reg.entry_count < dn) {
+		PT("(%u of %u monitor(s) claimed by no plug-in)\n", dn - reg.entry_count, dn);
 	}
 	return 0;
 }
@@ -162,6 +278,7 @@ cli_cmd_displays(int argc, const char **argv)
 
 	if (cli_has_flag(argc, argv, "--json")) {
 		cJSON *root = cJSON_CreateObject();
+		cJSON_AddNumberToObject(root, "schema", (double)CLI_JSON_SCHEMA);
 		cJSON_AddNumberToObject(root, "count", (double)list.count);
 		cJSON *arr = cJSON_AddArrayToObject(root, "displays");
 		for (uint32_t i = 0; i < list.count; i++) {
@@ -182,6 +299,16 @@ cli_cmd_displays(int argc, const char **argv)
 			cJSON_AddNumberToObject(d, "screen_left", (double)m->screen_left);
 			cJSON_AddNumberToObject(d, "screen_top", (double)m->screen_top);
 			cJSON_AddBoolToObject(d, "primary", m->is_primary);
+			cJSON_AddNumberToObject(d, "edid_serial", (double)m->serial_number);
+			cJSON_AddNumberToObject(d, "physical_width_mm", (double)m->physical_width_mm);
+			cJSON_AddNumberToObject(d, "physical_height_mm", (double)m->physical_height_mm);
+			cJSON_AddNumberToObject(d, "native_width", (double)m->native_width);
+			cJSON_AddNumberToObject(d, "native_height", (double)m->native_height);
+			cJSON_AddStringToObject(d, "connector", m->connector);
+			cJSON_AddStringToObject(d, "output_name", m->output_name);
+			cJSON_AddStringToObject(d, "display_name", m->display_name);
+			cJSON_AddStringToObject(d, "join", os_display_edid_join_str(m->join));
+			cJSON_AddBoolToObject(d, "origin_unknown", m->origin_unknown);
 			cJSON_AddItemToArray(arr, d);
 		}
 		cJSON *diag = cJSON_AddObjectToObject(root, "diag");
@@ -206,15 +333,25 @@ cli_cmd_displays(int argc, const char **argv)
 		PT("(none enumerated; diag_error=%d gdi=%u setupdi=%u edid_reads=%u win32err=%u)\n",
 		   (int)list.diag_error, list.diag_gdi_count, list.diag_setupdi_count, list.diag_edid_read_count,
 		   list.diag_win32_error);
-		PT("Note: EDID enumeration is Windows-only; other platforms report none.\n");
+		PT("Note: EDID enumeration is implemented on Windows, desktop Linux and macOS; other platforms "
+		   "report none.\n");
 		return 0;
 	}
 	for (uint32_t i = 0; i < list.count; i++) {
 		const struct os_display_edid_monitor *m = &list.monitors[i];
 		char pnp[4];
 		pnp_code(m->manufacturer_id, pnp);
-		PT("[%u] %s %04X  %ux%u @ %uHz  pos (%d,%d)%s\n", i, pnp, m->product_id, m->pixel_width,
-		   m->pixel_height, m->refresh_hz, m->screen_left, m->screen_top, m->is_primary ? "  [primary]" : "");
+		PT("[%u] %s %04X  %ux%u @ %uHz  pos (%d,%d)%s%s\n", i, pnp, m->product_id, m->pixel_width,
+		   m->pixel_height, m->refresh_hz, m->screen_left, m->screen_top, m->is_primary ? "  [primary]" : "",
+		   m->origin_unknown ? "  (origin unknown)" : "");
+		if (m->connector[0] != '\0' || m->output_name[0] != '\0') {
+			PT("    serial=0x%08X  %ux%u mm  native %ux%u  output='%s' connector='%s' join=%s\n",
+			   m->serial_number, m->physical_width_mm, m->physical_height_mm, m->native_width,
+			   m->native_height, m->output_name, m->connector, os_display_edid_join_str(m->join));
+		}
+		if (m->display_name[0] != '\0') {
+			PT("    name='%s'\n", m->display_name);
+		}
 	}
 	return 0;
 }

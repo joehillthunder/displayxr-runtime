@@ -8,7 +8,7 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 
 DisplayXR is a lightweight standalone OpenXR runtime purpose-built for 3D displays (originally forked from **Monado**). It implements the Khronos OpenXR API on Windows, macOS, Linux, and Android. The runtime is vendor-agnostic — any 3D display vendor integrates via a plug-in DLL; **Leia SR** is the first integration.
 
-**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows (macOS port deferred). Linux (X11/XCB, Vulkan-only compositor) **ships** on Ubuntu 22.04/24.04/26.04 — code-complete on `main`, hardware-validated on real Vulkan+X11 hardware (24.04/26.04), and published as a `.deb` attached to every `v*` release (#781) plus a tarball via `scripts/package_linux.sh`. Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
+**Current state:** native compositors ship for all major graphics APIs (D3D11, D3D12, Metal, OpenGL, Vulkan). The display extensions and the vendor plug-in extraction are complete. The spatial shell ships on Windows, macOS and Linux (from `displayxr-shell-releases`: `DisplayXRShellSetup-*.exe`, `DisplayXRShell-*.pkg`, `displayxr-shell_*_amd64.deb`). Linux (X11/XCB, Vulkan-only compositor) **ships** on Ubuntu 22.04/24.04/26.04 — code-complete on `main`, hardware-validated on real Vulkan+X11 hardware (24.04/26.04), and published as a `.deb` attached to every `v*` release (#781) plus a tarball via `scripts/package_linux.sh`. Full status: [milestone tracker](https://github.com/DisplayXR/displayxr-runtime/milestones) · [Linux Support](docs/roadmap/linux-support.md).
 
 ## Architecture
 
@@ -28,7 +28,7 @@ App (any graphics API)
    Display
 ```
 
-Each graphics API gets a native compositor — no interop, no Vulkan intermediary.
+Each graphics API gets a native compositor — no Vulkan intermediary; on Windows the in-process tiers can weave + present through one D3D11 hub, importing their atlas at one shared-texture boundary (ADR-059).
 
 - Layer boundaries, the vendor-isolation rule, and "must NOT contain" constraints: `docs/architecture/separation-of-concerns.md`
 - Why per-API compositors: `docs/adr/ADR-001-native-compositors-per-graphics-api.md`. Compositor never weaves (that's the DP's job): `docs/adr/ADR-007-compositor-never-weaves.md`
@@ -41,10 +41,10 @@ Each graphics API gets a native compositor — no interop, no Vulkan intermediar
 - **include/xrt/** — Core interface headers (`xrt_device.h`, `xrt_compositor.h`, `xrt_instance.h`, …)
 - **auxiliary/** — Shared utilities: math (`m_*`), util (`u_*`), OS abstraction (`os_*`), Vulkan helpers (`vk_*`)
 - **compositor/** — Native compositors: `d3d11`, `d3d12`, `metal`, `gl`, `vk_native`, plus `multi`, `client`, `null` (headless, for testing). See `docs/architecture/project-structure.md`.
-- **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019.
+- **drivers/** — `sim_display/` (vendor-neutral simulation + plug-in), `qwerty/` (keyboard/mouse), and the in-tree input providers (ADR-034 / ADR-054 class, plug-in DLLs): `sim_input/` (scripted reference), `net_input/` (loopback-TCP feeder), `ultraleap/` (SDK-gated hands), `gamepad/` (XInput / GameController pad → `/user/gamepad` role + rig navigation + optional emulated controllers; Linux stub), and the viewer-tracking reference provider `sim_tracking/` (ADR-054 N6 Part 2, the fourth class: a scripted viewer that drives `xrLocateViews` on a display that does not track and declares `EXTERNAL_OK`; contract `xrt/xrt_tracking_plugin.h`, spec `docs/specs/runtime/tracking-provider-discovery.md`). Vendor plug-ins (Leia SR etc.) ship from their own repos per ADR-019.
 - **state_trackers/oxr/** — OpenXR API implementation
-- **ipc/** — IPC for service mode (preserve for `_ipc` apps, WebXR, multi-app shell)
-- **targets/** — Build targets (runtime library, `displayxr-cli`, `displayxr-service`)
+- **ipc/** — IPC for service mode (preserve for `_ipc` apps, WebXR, multi-app workspace controllers)
+- **targets/** — Build targets (runtime library, `displayxr-cli`, `displayxr-service`, and the service's two supervised satellites: `displayxr-conversion-host` (ADR-053) and `displayxr-tracking-host` (the viewer-tracking provider's process, writing the shared-memory viewer pose page — `docs/specs/runtime/tracking-provider-discovery.md` §4a))
 
 ### Key interfaces (C, vtable-style polymorphism)
 `xrt_device`, `xrt_compositor`, `xrt_instance`, `xrt_prober`. Full catalog incl. display-processor vtables: `docs/archive/vendor-integration-historical.md`.
@@ -54,7 +54,7 @@ Four classes (handle, texture, hosted, IPC) — full reference: `docs/getting-st
 - `_handle` / `_texture` / `_hosted` → in-process `compositor/{d3d11,d3d12,metal,gl,vk_native}/`
 - `_ipc` → `compositor/client/` → `ipc/` → `compositor/multi/` → native compositor (out-of-process)
 - **Window handle:** `_handle` and `_texture` pass the app's **real** HWND (texture also passes a shared texture; its HWND is used for DP position tracking); `_hosted` passes **NULL** → the runtime self-creates a window at native res. The display processor always gets a real HWND — the app's, or the runtime's for hosted. (Branch: window-handling block in `*_compositor_create`.)
-- **Engine apps (Unity) — first-class Display Provider, NOT a hook.** The DisplayXR Unity plugin (`displayxr-unity`, ships `displayxr_unity.dll`) is a custom **`IUnityXRDisplay` display provider** (epic #166; the old `xrCreateSession`-hook + injected-overlay path was **hard-removed** in plugin v2.0.0 — notes mentioning `displayxr_hooks.cpp` / injected `WS_CHILD` overlays describe deleted code). The provider **itself** loads the runtime (`xrNegotiateLoaderRuntimeInterface`), creates the session on **Unity's own D3D12 device/queue** (zero-copy: runtime swapchain `ID3D12Resource*` handed straight to Unity via `CreateTexture`), enables `XR_DXR_display_info` + `view_rig` + `win32_window_binding`, and passes a provider-created top-level `WS_POPUP` overlay HWND as a first-class window binding — so Unity is an **extension app** (no legacy tile-scaling compromise), running on the in-process native `comp_d3d12_compositor` as a `_handle` app. It renders through one **SPI `arraySize=2` sliced swapchain** (eyes = array layers 0/1 via `subImage.imageArrayIndex`, ADR-032) and supports **multi-zone `XR_DXR_display_zones`** (up to 4 zones = Unity render passes, per-zone swapchains, live tile realloc) + Local2D — the `desktop-avatar` sample in `displayxr-unity-samples` is a shipping zones app (3D zone + Local2D). What survives from the old model: Unity's **stereo topology is fixed at 2** — no view synthesis exists anywhere, so Unity can only drive modes whose `view_count ≤ 2` (a `sim_display` 2×2 Quad, `view_count = 4`, cannot be filled; the runtime synthesises per-tile *viewer poses*, not pixels). The plugin computes no Kooima — it consumes `XR_DXR_view_rig` render-ready views. (Under the shell, Unity takes the client→IPC→D3D11-service route instead.) Full trace: `docs/architecture/unity-d3d12-app-path.md`; provider internals: `displayxr-unity` repo, `docs~/architecture/xr-display-provider.md`.
+- **Engine apps (Unity) — first-class Display Provider, NOT a hook.** The DisplayXR Unity plugin (`displayxr-unity`, ships `displayxr_unity.dll`) is a custom **`IUnityXRDisplay` display provider** (epic #166; the old `xrCreateSession`-hook + injected-overlay path was **hard-removed** in plugin v2.0.0 — notes mentioning `displayxr_hooks.cpp` / injected `WS_CHILD` overlays describe deleted code). The provider **itself** loads the runtime (`xrNegotiateLoaderRuntimeInterface`), creates the session on a **provider-owned D3D12 device/queue on the runtime's adapter LUID** (standalone D3D12: Unity renders into an NT-shared 2-slice bridge texture that the provider copies into the runtime swapchain, one `CopyTextureRegion` per slice per frame, synced by a shared fence — handing the runtime's raw `ID3D12Resource*` to Unity's device removes the device; **Unity's own device is used only under the shell**, IPC route; a D3D11 *built player* is the one true zero-copy case, a D3D11 *editor* uses an own device + bridge), enables `XR_DXR_display_info` + `view_rig` + `win32_window_binding`, and passes a provider-created top-level `WS_POPUP` overlay HWND as a first-class window binding — so Unity is an **extension app** (no legacy tile-scaling compromise), running on the in-process native `comp_d3d12_compositor` as a `_handle` app. It renders through one **SPI `arraySize=2` sliced swapchain** (eyes = array layers 0/1 via `subImage.imageArrayIndex`, ADR-032) and supports **multi-zone `XR_DXR_display_zones`** (up to 4 zones = Unity render passes, per-zone swapchains, live tile realloc) + Local2D — the `desktop-avatar` sample in `displayxr-unity-samples` is a shipping zones app (3D zone + Local2D). What survives from the old model: Unity's **stereo topology is fixed at 2** — no view synthesis exists anywhere, so Unity can only drive modes whose `view_count ≤ 2` (a `sim_display` 2×2 Quad, `view_count = 4`, cannot be filled; the runtime synthesises per-tile *viewer poses*, not pixels). The plugin computes no Kooima — it consumes `XR_DXR_view_rig` render-ready views. (Under a workspace controller, Unity takes the client→IPC→D3D11-service route instead.) Full trace: `docs/architecture/unity-d3d12-app-path.md`; provider internals: `displayxr-unity` repo, `docs~/architecture/xr-display-provider.md`.
 - **Texture class = content-handoff, NOT a region mechanism (#696).** Handoff class (`handle`/`texture`/`hosted`/`ipc`) and region paradigm (display-zones) are **orthogonal axes** — every class mixes 2D/3D the same way (zones + mask). `_texture` is present-ownership handoff for a producer with no window the runtime can weave into (CEF, WebXR bridge, decode/capture target). **Verified:** in shared-texture mode the compositor creates **no swapchain and never presents** (`comp_d3d11_compositor.cpp:2103` `c->hwnd=nullptr`; `:2251-2257` DXGI target skipped, "offscreen shared texture mode") — the DP weaves **into the app's shared texture** and the **app presents it** (`:2326-2333`, #68). The app's HWND is a **position/phase anchor** the DP uses (`dp_hwnd = c->hwnd?c->hwnd:c->app_hwnd`, `:2313`), never a render target, and is **already optional in code** (NULL-HWND path at `:2107`) — dropping it costs drag phase-snap + canvas-scoped Kooima (`get_window_metrics` false at `:3920-3922` → display-scoped fallback, #396 W7). Decoupling that channel from the HWND = #697. The legacy output-rect/surround entry points and bespoke surround mechanism were **removed** (ADR-031); display-zones is the sole region paradigm (ADR-027). Current mechanism smoke-test apps (don't rename/prune yet, #696): `cube_zones_texture_{d3d11_win,d3d12_win,metal_macos}`.
 - Test app naming: `cube_{class}_{api}_{platform}` (e.g. `cube_handle_metal_macos`, `cube_zones_texture_d3d11_win`).
 
@@ -62,23 +62,24 @@ Four classes (handle, texture, hosted, IPC) — full reference: `docs/getting-st
 Full reference: `docs/architecture/extension-vs-legacy.md`. `_handle` and `_texture` are always extension apps; `_hosted` can be either. Legacy-app compromise scaling is computed in `oxr_system_fill_in()`. The `legacy_app_tile_scaling` flag on `xrt_system_compositor_info` disables 1/2/3-key mode selection for legacy apps (V toggle only).
 
 ### Key notes
-- Compositor vtable has 56 methods — use the `comp_base` helper for boilerplate.
+- `struct xrt_compositor` has ~37 function-pointer slots (`xrt_compositor.h`). `comp_base` (`compositor/util/comp_base.{c,h}`) is a boilerplate helper used only by `compositor/main/` and `compositor/null/`; the five native compositors (`d3d11`, `d3d12`, `vk_native`, `gl`, `metal`) and the D3D11 service fill the vtable by hand (e.g. `c->base.base.create_swapchain = …` in each `*_compositor_create`) — copy the nearest native compositor, not `comp_base`.
 - **Two distinct swapchains** and the **canvas concept** (view dims + Kooima projection use canvas size, not display size): `docs/specs/runtime/swapchain-model.md`.
 - **Crop before the DP is the law; zero-copy is the rare exception.** The app swapchain is worst-case-sized across all modes (ADR-010), so the compositor must crop to the active mode's content dims before `process_atlas()` — *unless* the submission exactly fills the swapchain (`u_tiling_can_zero_copy()` is the *sole* gate; no per-call-site proxies like `view_count>1` or hardware-flag coupling). That coincidence only happens full-screen in the worst-case-filling mode (Windows Leia: 2D only; Android: never). ADR-030 + `docs/specs/runtime/multiview-tiling.md#zero-copy-eligibility--the-single-rule`.
 
 ### Vendor plug-in integration
-Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). `DisplayXR-LeiaSR.dll` (from `displayxr-leia-plugin`'s `src/drv_leia/`, entry point `xrtPluginNegotiate`) loads at `xrCreateInstance` via registry-driven discovery on Windows / JSON-manifest discovery on POSIX (`target_plugin_loader.c`). The runtime DLL has zero SR or `sim_display_*` identifiers in its link line (ADR-019 §2.1; CI-asserted in `build-windows.yml`). Eye tracking and display dimensions come through `iface->get_display_info` → `xrt_plugin_display_info` — no direct runtime → vendor call.
+Vendor display drivers ship as **plug-in DLLs** from their own repos (ADR-019). `DisplayXR-LeiaSR.dll` (from `displayxr-leia-plugin`'s `src/drv_leia/`, entry point `xrtPluginNegotiate`) loads at `xrCreateInstance` via registry-driven discovery on Windows / JSON-manifest discovery on POSIX (`target_plugin_loader.c`). The runtime DLL, `displayxr-service.exe` and `displayxr-cli.exe` have zero SR, `drv_sim_*`, Ultraleap/LeapC identifiers in their link lines or import tables (ADR-019 §2.1, ADR-054 §1; CI-asserted in `build-windows.yml` against both `dumpbin /dependents` and the Release link edges in `build/CMakeFiles/impl-Release.ninja`). The same job runs the ADR-054 N4 per-class conformance step: each `sim_*` reference is selected and an ABI-major-mismatched fixture (the `tests_conversion_loader_stub_*_abi.dll` test modules) is rejected and fallen through for every class; `Enabled=0` falls back (input, conversion; DP after N3 #2049) and Preferred wins (DP `PreferredPlugin`, conversion `PreferredProvider\<task>`; the input prefer case lands with N3 #2048). **Provenance gate (ADR-054 N4b, ENFORCING on Windows since PR B):** the shared loader classifies every component binary before loading it — `signed` (Authenticode, any trusted root) / `allowlisted` (SHA-256 under `HKLM\Software\DisplayXR\Trust\Allowlist`) / `platform-trusted` (APK, root-owned `.deb` path) / `dev-override` (`DXR_ALLOW_DEV_PLUGIN_PATHS`, **never on an elevated host**) / `unverified` — logs it, and on Windows **refuses** `unverified` (`UNTRUSTED`, falls through to the next candidate) unless `HKLM\Software\DisplayXR\Trust\Enforce` = 0 (DWORD, the one-release opt-out); POSIX audits unless `/etc/displayxr/trust/enforce` exists, because it has no signer check and the tarball's user-level install is unsigned. The runtime installer allowlists the sim-display DLL it ships (`installer/gen_allowlist_nsh.cmake`), so unsigned builds install cleanly. `register_dev_plugin.bat` and `push-runtime-pf.sh` allowlist what they register/copy, so a rebuilt dev DLL needs them re-run; `plugins[].provenance` in `selftest --json` says what the loader decided (spec: `docs/specs/runtime/plugin-discovery.md` §4.3). Eye tracking and display dimensions come through `iface->get_display_info` → `xrt_plugin_display_info` — no direct runtime → vendor call.
 - Discovery / registration contract: `docs/specs/runtime/plugin-discovery.md`
 - Vendor onboarding: `docs/guides/vendor-plugin-onboarding.md`
 
 ### Custom OpenXR extensions
 - `XR_DXR_win32_window_binding` — app passes HWND to runtime
-- `XR_DXR_cocoa_window_binding` — app passes NSWindow to runtime
+- `XR_DXR_cocoa_window_binding` — app passes an NSView (CAMetalLayer-backed) to runtime
 - `XR_DXR_xlib_window_binding` — app passes X11 Display*/Window to runtime (desktop Linux)
 - `XR_DXR_display_info` — display dimensions, eye-tracking modes
-- `XR_DXR_android_surface_binding` — app passes its own Android Surface/`ANativeWindow`; `xrSetAndroidSurfaceDXR` republishes it across background/resume and `xrSetAndroidWindowGeometryDXR` feeds the per-frame window rect (ADR-036 D6). **Required for multi-window on Android** — the runtime-spawned SurfaceView is `_hosted`-fullscreen-only
+- `XR_DXR_android_surface_binding` — app passes its own Android Surface/`ANativeWindow`; `xrSetAndroidSurfaceDXR` republishes it across background/resume, `xrSetAndroidWindowGeometryDXR` feeds the per-frame window rect (ADR-036 D6), and `xrSubmitAndroidInputEventDXR` (spec v3) feeds the surface's touch to the runtime's touch input provider (#132: orbit / pinch / pan rig + emulated controller; the hosted SurfaceView feeds it by itself). **Required for multi-window on Android** — the runtime-spawned SurfaceView is `_hosted`-fullscreen-only
 - `XR_DXR_mcp_tools` — app registers its own MCP tools (agent control surface); event-queue dispatch via `XrEventDataMCPToolCallDXR`
 - `XR_DXR_depth_budget` — advisory **rear depth budget**: how far behind the display plane a transparent app may render (`farOffsetVH`, 0 = clip at the ZDP, 1000 = unrestricted), chained on `XrViewState` at `xrLocateViews`. The runtime owns the policy (it measures the background's horizontal-disparity cue), the DP owns pixels, the app owns geometry — ADR-040
+- `XR_DXR_lift` — 2D→3D **conversion service**: a vendor plug-in's module (depth / SBS / N-view / photo→splats) exposed generically as async latest-wins streams (conversion always in the D3D11 service's lift thread — IPC sessions use their own connection, in-process D3D11/D3D12 sessions such as the Unity provider a lift-only connection, ADR-049); SBS/N-view results are woven on the ordinary weave path (a weave rect can be flagged "lift me"), and a READY module supersedes the browser/SDK open default — ADR-042
 
 The list above is highlights, not the catalog — **`docs/specs/extensions/index.json` is the catalog**: one hand-written note (group, title, one-line summary) per published extension, joined to the `XR_DXR_*.h` headers by `scripts/gen_extensions_index.py`. It generates the `displayxr-extensions` mirror's `README.md` + machine-readable `extensions.json`, and `displayxr-website` merges its longer editorial prose onto that by name — so adding a header is all it takes for an extension to appear on every public surface. `lint.yml` runs `--check` on every PR, so a header with no note (or a note with no header) fails the build. That guard exists because the mirror's README was a frozen heredoc that documented 5 of 16 extensions for months (displayxr-extensions#2).
 
@@ -113,7 +114,8 @@ Builds runtime, OpenXR loader, test apps. The macOS Vulkan native compositor run
 ```bash
 # apt deps listed in the script header (Vulkan, XCB, glslang, …)
 ./scripts/build_linux.sh              # headless build + selftest
-./scripts/build_linux.sh --service    # + displayxr-service / IPC
+./scripts/build_linux.sh --service    # + displayxr-service / IPC (runtime is then IPC-only)
+./scripts/build_linux.sh --hybrid     # + displayxr-service, hybrid runtime — what the .deb/tarball ship (#1744)
 ./scripts/build_linux.sh --apps       # + test apps (cube_hosted/handle vk_linux; --backend=x11|wayland|auto picks the window system)
 ./scripts/build_linux.sh --clean      # after installing a dependency into an already-configured tree (#1556)
 ./scripts/package_linux.sh            # dist/*.tar.gz + user-level install.sh (#705)
@@ -131,6 +133,8 @@ mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Debug -G Ninja && cmake --build .
 ```
 Key options: `XRT_FEATURE_SERVICE` (out-of-process service mode), `BUILD_TESTING`. Vendor DP code is **not** a CMake option — all `drv_*` implementations ship as plug-in DLLs discovered at `xrCreateInstance`.
+
+**DisplayXR Dashboard** (`src/dashboard/`, Avalonia / .NET 10 — replaced the ImGui Control Panel, now removed): `scripts\build_windows.bat dashboard` (or `all`, which publishes it into `_package\bin` before the installer; no `dotnet` = WARN + skip), `dotnet test src\dashboard\DisplayXR.Dashboard.sln`; run it non-elevated. Details: `src/dashboard/README.md`.
 
 ### Tests & formatting
 ```bash
@@ -160,7 +164,7 @@ Public-repo CI is free, so `build-windows.yml` + `build-macos.yml` + `build-linu
 - **`shell-path-guard`** — fails any push reintroducing `src/xrt/targets/shell/*` or `installer/DisplayXRShellInstaller.nsi` (those live in `displayxr-shell-pvt`).
 - **`Linux Packaging` aggregator** (`build-linux.yml`) — one stable required context standing in for the whole packaging lane: `needs:` `Deb` + `Package` + the `DebInstall (Ubuntu 22.04|24.04|26.04)` matrix, runs `if: always()`, and fails if any leg is anything but `success`. It exists because **a matrix leg makes a bad required context** (its name moves when the supported-release list changes, and a ruleset demanding a context no job emits blocks every PR), and because `if: always()` is load-bearing — a *skipped* aggregator would count as green for the ruleset and silently stop gating exactly when a leg went red. Closes the #1656 class of bug: `DebRelease` already depended on `DebInstall`, so a broken `.deb` was caught at release time, but nothing stopped it merging.
 - **Headless self-test gate** — the `Runtime` job registers the freshly-built sim-display plug-in in `HKLM\Software\DisplayXR\DisplayProcessors` and runs `displayxr-cli selftest` (see below). This is the only CI step that *executes* the runtime (every other job just builds); it gates on plug-in discovery + ABI + display-info validity, hardware-free.
-- **No per-CI OneDrive upload** — `build-windows.yml` no longer rclone-copies build artifacts (runtime installer / test-apps zip) to OneDrive. The OneDrive copy now happens **on bundle release only**, in `displayxr-installer`'s `publish-bundle.yml` (uploads `DisplayXRBundle-*.exe` to `SANDBOX/RUNTIMES + SDK + PLUGINS/OpenXR`, gated on its own `RCLONE_CONFIG` secret). CI artifacts stay on GitHub via `upload-artifact`.
+- **No OneDrive mirror** — build artifacts stay on GitHub (`upload-artifact` for CI, release assets for tags). The bundle's OneDrive mirror was retired 2026-10-01: the GitHub release page is the single distribution point.
 
 For tagged releases use `/release` — don't tag manually.
 
@@ -236,7 +240,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 /release v1.2.1   # explicit            /release patch
 /release minor                          /release major
 ```
-`/release` pushes an **empty "Release vX.Y.Z" marker commit** to `main` and tags it (so the graph shows an obvious release boundary; CI still patches `CMakeLists.txt VERSION` from `git describe` at build time — the marker carries no version content, so PR #353's drift vector stays dead; the marker's main-push CI short-circuits via the empty-diff → docs_only rule in `DetectChanges`), watches both CI workflows, writes curated notes, then waits for `BumpVersionsJsonOnTag` (ABI gate + `versions.json` bump + mirror to `displayxr-installer`). `/dxr-release` and `/installer-release` push the same marker commit to their target repos. macOS `.pkg` is a soft requirement (warns, doesn't block). Auto-bump regex is strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`) so non-canonical tags are skipped. See `.claude/skills/release/SKILL.md`.
+`/release` pushes an **empty "Release vX.Y.Z" marker commit** to `main` and tags it (so the graph shows an obvious release boundary; every build derives its version from `git describe` via `cmake/DisplayXRVersion.cmake` (#1790: exactly the tag on a tag build, last release + `-<n>-g<sha>` after it, on every platform) — the marker carries no version content, so PR #353's drift vector stays dead; the marker's main-push CI short-circuits via the empty-diff → docs_only rule in `DetectChanges`), watches both CI workflows, writes curated notes, then waits for `BumpVersionsJsonOnTag` (ABI gate + `versions.json` bump + mirror to `displayxr-installer`). `/dxr-release` and `/installer-release` push the same marker commit to their target repos. macOS `.pkg` is a soft requirement (warns, doesn't block). Auto-bump regex is strict (`^v[0-9]+\.[0-9]+\.[0-9]+$`) so non-canonical tags are skipped. See `.claude/skills/release/SKILL.md`.
 
 **Sibling release flows (NOT `/release` in this repo):**
 
@@ -247,7 +251,7 @@ This repo IS the public runtime (no private→public mirror). A release is a `vX
 | MCP framework | `displayxr-mcp` | `/dxr-release` → matrix build + dual-platform installers (`DisplayXRMCPSetup-*.exe` NSIS + `DisplayXRMCP-*.pkg` productbuild) + dispatches `versions-bump`. |
 | Extension headers | `displayxr-extensions` | Auto-syncs from `src/external/openxr_includes/` on every push to main. No tag. Its `README.md` + `extensions.json` are **generated** from the headers joined to `docs/specs/extensions/index.json` (see below). |
 | Standalone demos | `displayxr-demo-*` | `/dxr-release` → builds installer + dispatches `versions-bump`. |
-| Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. On release, uploads `DisplayXRBundle-*.exe` to OneDrive (the sole OneDrive upload point; runtime CI no longer does). |
+| Meta-installer bundle | `displayxr-installer` | `/installer-release` or `workflow_dispatch` (NOT auto-fired). Chains every component installer. |
 
 `/dxr-release` handles every sibling repo; `/installer-release` handles the bundle. Neither applies to this repo (use `/release` here).
 
@@ -339,6 +343,8 @@ _package\run_cube_handle_d3d11_win.bat
 ```
 **Elevated-terminal caveat:** the bundled Khronos `openxr_loader.dll` (1.1.38 and 1.1.43) silently ignores `XR_RUNTIME_JSON` in elevated/admin processes and falls back to `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime`. Use a non-elevated terminal, or push the rebuilt DLL to Program Files.
 
+**In-process D3D11 weaves through the hub by default on a cross-adapter (hybrid) box (#2317 step 2, ADR-059).** A plain window-bound `_handle` D3D11 session presents from `comp_hub_d3d11` (on one adapter too since ADR-059 Amendment 4, with DIRECT ingress — on one GPU no in-process route copies a frame by default; a session that still does logs `SAME-ADAPTER BRIDGE`); `DXR_HUB=0` is the kill switch back to the tier's own legs (for A/B and oracle native arms — an old recipe that leaves `DXR_HUB` unset for its "native" arm now measures the hub). Each session logs one `hub placement: hub=1 … | hub=0 reason=<token>` line. **In-process D3D12 on a hybrid box follows since #2375** (the #1264 reroute onto the same hub, `reason=hybrid_reroute_default_on`); `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is its per-route kill switch back to the own-legs #918 split, and `DXR_HUB=0` kills it too unless the route knob is set.
+
 **Which DLL loaded?** Every `xrCreateInstance` logs a WARN line near the top of `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<ts>.log` — search `loaded from:` for the authoritative path. Full dev-iteration reference: `docs/getting-started/building.md`.
 
 After a rebuild, push binaries to `C:\Program Files\DisplayXR\Runtime` with **`scripts/push-runtime-pf.sh`** — never hand-copy. A *partial* copy (e.g. service exe updated, client DLLs not) arms a time bomb: the client↔service git-tag gate rejects every `xrCreateInstance` from the moment the service next restarts, and every app goes black with no obvious cause. The script copies the full set (excluding the shell + preserving the installed MCP adapter), verifies both tags match, and restarts the service immediately so a mismatch can never lie dormant. Only run the installer when the installer itself changed.
@@ -354,6 +360,8 @@ A from-source runtime that's **ahead of the released ABI** will ABI-reject an *i
 ### Headless diagnostics (`displayxr-cli`)
 `displayxr-cli` runs the runtime **without a compositor/GPU/window** — it exercises the real plug-in discovery + display-processor path in-process (`target_instance_no_comp`), so it's the fastest way to check "did the runtime start, find a DP, and get sane display info?" without launching an app.
 - `displayxr-cli selftest` — asserts a DP-backed head device exists, a vendor plug-in is active (the loader rejects ABI-mismatched plug-ins, so this *is* an ABI check), and display dims are **proven** — equal to `EnumDisplaySettingsW`'s current mode, not just non-zero — plus that the process is per-monitor DPI aware (#1201; every DisplayXR executable embeds `src/xrt/targets/common/dpi_aware.manifest`, and an unaware process reads DPI-virtualised geometry). Strict exit code; this is what the CI gate runs.
+- `displayxr-cli status [--json]` — the ADR-051 display status snapshot: one row per screen (claim, native vs desktop mode, metres, roles, live tracking, bound DPs, warnings as data) plus the live windows; from the service over DIAG IPC when reachable (non-elevated on Windows), else headless and labelled `source: headless`. `status --watch [--interval ms] [--json]` holds one DIAG connection and prints only when the service's `topology`/`status` generation moves (one NDJSON line per change with `--json` — what the DisplayXR Dashboard and MCP `get_status_snapshot` consume).
+- `displayxr-cli dp use <id> --screen <key>` — per-screen display-processor preference (per-user, no admin; `--machine` = HKLM): e.g. sim-display on one Leia panel, leia-sr on the other. Keys from `dp list` / `displays --claims` (`<PNP>-<PROD>-<SERIAL>[@DISPLAYn]`); `dp reset --screen <key>|all`. A running service re-probes at once: a secondary screen's segment DP follows live, the primary screen at the next session (display-dashboard §12).
 - `displayxr-cli info` — bug-report dump: runtime version/git-tag, plug-in ABI, active plug-in identity + display info (dims, viewer, eye-tracking modes), and the Windows `ActiveRuntime` value.
 - `displayxr-cli runtime <status|list|activate|restore>` — the OpenXR runtime switcher (supersedes the retired `DisplayXRSwitcher.exe`, #378; an orphaned copy may still sit in Program Files on upgraded boxes — ignore it, the installer now sweeps it). `status` resolves the **full loader precedence chain** (`XR_RUNTIME_JSON` → HKCU → HKLM, × 64-bit/WOW6432Node) and flags each conflict; `list` enumerates every runtime on the box **including ones that never registered in `AvailableRuntimes`** (it sweeps the filesystem too — a registry-only switcher is blind to a competing runtime that grabbed `ActiveRuntime` without registering, which is exactly how a hijack goes undiagnosed); `activate [<manifest>]` writes **both registry views**, clears the HKCU shadow, and self-registers in `AvailableRuntimes`; `restore` hands the key back. **`selftest` fails with `active_runtime — HIJACKED` when another runtime holds the key** (absence never fails, so CI and from-source boxes stay green).
 
@@ -362,7 +370,9 @@ A from-source runtime that's **ahead of the released ABI** will ABI-reject an *i
 Both use registry discovery on Windows (so they pick up whatever plug-in is installed — Leia SR or sim-display), `XRT_PLUGIN_SEARCH_PATH` on POSIX.
 
 ### Simulating eye tracking without hardware
-sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `SIM_DISPLAY_FAKE_TRACKING=1` re-enables MANUAL_BIT + tracked 3D modes, and `SIM_DISPLAY_FAKE_TRACKING_PERIOD_MS=N` square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedDXR` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=false`, `supportedModes=0`) — `displayxr-cli dp set sim-display TRACKING 1` (per user, next session; or `DXR_DP_SIM_DISPLAY_TRACKING=1` in the hosting process's env, which always wins) re-enables MANUAL_BIT + tracked 3D modes, and `TRACKING_PERIOD_MS` = N square-waves `is_tracking` to exercise tracking-loss edges + `XrEventDataEyeTrackingStateChangedDXR` (look for `OXR EVENT: Eye tracking state changed` WARN lines). Works in-process and via `XRT_FORCE_MODE=ipc`. The old `SIM_DISPLAY_FAKE_TRACKING=1` / `_PERIOD_MS` env names stay aliases for one release (N3c, ADR-054 decision 7 — every sim-display knob is now a setting: `dp options sim-display`). Contract: `docs/specs/vendor/eye-tracking-modes.md`; design: ADR-022.
+
+**A moving viewer without hardware goes through the viewer-tracking provider class** (ADR-054 N6, spec `docs/specs/runtime/tracking-provider-discovery.md` §8): `displayxr-cli tracking set sim-tracking ENABLE 1` (or `DXR_TRACKING_SIM_TRACKING_ENABLE=1`) drives `xrLocateViews` from a scripted head (`SOURCE=script`, `SCRIPT=sweep|offset`), or with `SOURCE=webcam` from a real webcam face tracker (#1855, moved here from sim_display) that also publishes the camera-space block for calibration. The webcam needs a face estimator built in (`-DXRT_SIM_WEBCAM_ESTIMATOR=onnx`; the default build ships the stub and the provider declines). sim_display's own `WEBCAM_TRACKING` (legacy `SIM_DISPLAY_WEBCAM_TRACKING`) still works for **one release** as a deprecation alias over the same core — sim_display then tracks itself (OWN-like, MANAGED) and logs one WARN pointing to `sim-tracking SOURCE=webcam`.
 
 ### Windows test apps
 `scripts\build_windows.bat test-apps` builds apps and generates run scripts in `_package/` that set `XR_RUNTIME_JSON` to the dev build.
@@ -375,7 +385,7 @@ sim_display honestly advertises **no** eye tracking (per-mode `has_tracking=fals
 | cube_handle_gl_win | `_package\run_cube_handle_gl_win.bat` |
 | cube_handle_vk_win | `_package\run_cube_handle_vk_win.bat` |
 
-**Forcing the IPC/service path (easiest way to exercise IPC without the shell).**
+**Forcing the IPC/service path (easiest way to exercise IPC without a workspace controller).**
 By default `handle`/`hosted` apps run **in-process** (local compositor, app- or
 runtime-owned window) — a running `displayxr-service.exe` does *not* by itself
 make an app an IPC client. To put **any** existing app on the IPC path, start the
@@ -414,27 +424,17 @@ Copy binaries to `_package/DisplayXR-macOS/bin/`. Generated `run_*.sh` set `XRT_
 | cube_hosted_metal_macos | `run_cube_hosted_metal.sh` |
 | cube_hosted_legacy_metal_macos | `run_cube_hosted_legacy_metal.sh` |
 
-### Shell mode (Windows)
-The DisplayXR Shell ships from `displayxr-shell-pvt` via `DisplayXRShellSetup-*.exe`, installs into the runtime tree (`C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe`), requires the runtime as a hard prereq (`HKLM\Software\DisplayXR\Runtime\InstallPath`), and registers at `HKLM\Software\DisplayXR\WorkspaceControllers\shell`. **This repo does NOT build a shell binary** — any `_package\bin\displayxr-shell.exe` is stale; ignore/delete. The runtime owns no specific workspace app; third-party verticals follow the same registration contract (`docs/specs/runtime/workspace-controller-registration.md`).
+### Workspace controllers
+A **workspace controller** is a separate process that owns the multi-app spatial workspace (window placement, focus, layouts, app launching) on top of the service's compose path. It is a *process contract over IPC*, not a component class (ADR-054 §2): it registers under `WorkspaceControllers\<id>` on Windows (HKLM) or as a per-user `WorkspaceControllers/<id>.json` manifest on macOS / Linux, and the service spawns it on demand. **This repo builds no controller binary and owns no specific workspace app** — the DisplayXR Shell is one registered controller, released as installers from `displayxr-shell-releases` (Windows, macOS, Linux); third-party verticals register the same way. Contract, discovery roots and lifecycle: `docs/specs/runtime/workspace-controller-registration.md`; an Android reference controller lives at `test_apps/workspace/workspace_controller_android`.
 
-**Orchestration topology (who starts whom).** `displayxr-service.exe` is the **always-on orchestrator** — it auto-starts at logon (`HKLM\…\Run\DisplayXR Service`), runs as a tray daemon, and *it* spawns children **on demand**: the workspace controller (shell) via the Ctrl+Space hotkey (`src/xrt/targets/service/service_orchestrator.c`). So the service is the long-lived root; the shell is an on-demand child. (**The WebXR bridge and its :9014 trampoline are gone** — retired with the bridge itself, #1180 / ADR-035 Amendment 1. `grep -rn 9014 src/` returns nothing; older notes describing that child are stale.) **Do not kill the service as part of test cleanup** — tearing down the shell + client apps is fine, but leaving the service down breaks on-demand orchestration until next logon (restart it non-elevated via `explorer.exe "…\displayxr-service.exe"`). The reverse direction below (shell starting the service) is a *fallback* for the direct CLI-launch path when the service isn't already up. Full as-built map incl. supervision gaps (no job objects on spawned children, #969): `docs/architecture/service-architecture.md`.
+**Orchestration topology (who starts whom).** `displayxr-service` is the **always-on orchestrator** — on Windows it auto-starts at logon (`HKLM\…\Run\DisplayXR Service`) and runs as a tray daemon; on macOS a LaunchAgent starts it; on Linux it is socket-activated (`displayxr.socket`). *It* spawns the registered controller **on demand** via the configured hotkey, **Ctrl+Shift+Space** by default — Ctrl+Space until 2026-10-26, changed because the service's low-level hook beat every app that binds it; macOS: fixed Control+Shift+Space, Control not Command (`displayxr-cli workspace set <id> --hotkey …`, `workspace launch <id>`, `workspace list --json`; `src/xrt/targets/service/service_orchestrator.c`; POSIX: `posix_spawn("<binary> --service-managed")` with `DISPLAYXR_WORKSPACE_SESSION=1` in the environment). So the service is the long-lived root; the controller is an on-demand child. (**The WebXR bridge and its :9014 trampoline are gone** — retired with the bridge itself, #1180 / ADR-035 Amendment 1. `grep -rn 9014 src/` returns nothing; older notes describing that child are stale.) **Do not kill the service as part of test cleanup** — tearing down the controller + client apps is fine, but leaving the service down breaks on-demand orchestration until next logon (Windows: restart it non-elevated via `explorer.exe "…\displayxr-service.exe"`). A controller launched directly from a terminal may start the service itself as a *fallback*; that is the controller's behaviour, not the runtime's. Full as-built map incl. supervision gaps (no job objects on spawned children, #969): `docs/architecture/service-architecture.md`.
 
-`displayxr-shell.exe` (launched directly from the CLI) auto-starts the service if it isn't running, activates shell mode via IPC, sets `XR_RUNTIME_JSON` + `DISPLAYXR_WORKSPACE_SESSION=1`, launches apps, and monitors clients:
-```
-"C:\Program Files\DisplayXR\Runtime\displayxr-shell.exe" app1.exe app2.exe
-```
-Optional per-app pose (`--pose x,y,z,width_m,height_m` before each app path):
-```
-"...\displayxr-shell.exe" --pose -0.1,0.05,0,0.14,0.08 app1.exe --pose 0.1,0.05,0,0.14,0.08 app2.exe
-```
-**Launching from Claude Code:** use `displayxr-shell.exe` with `run_in_background: true` and `timeout: 600000` (see the shell-mode launch section above + `_package\run_shell_*.bat`).
-
-**Shell controls:** left-click=focus, title-bar drag=move, edge drag=resize, right-click=focus+forward to app, double-click title bar=maximize/restore, scroll=resize, Ctrl+1=grid layout, Ctrl+2=immersive layout, Ctrl+3=billboard toggle (all windows face the viewer; a layout preset exits it), TAB=cycle focus, DELETE=close app, ESC=forwarded to the focused app (the app decides — e.g. demos that quit on ESC; the shell's own close key is DELETE, and ESC never dismisses the workspace — Ctrl+Space is the sole toggle), V=toggle 2D/3D, WASD/left-drag=app input. Title-bar buttons: close (X), minimize (—).
+A controller's own launch flags, key bindings and launcher UI are that controller's documentation, not this repo's.
 
 ## Autonomous capture & debugging
 
 ### Windows compositor screenshot (preferred)
-The D3D11 service compositor file-triggers a capture of what it is about to present (reads the D3D11 textures directly — no DPI/PrintWindow issues). One trigger, **two files**, on both the direct single-client path (`pipeline_default_policy_render()`) and the compose/shell path (`multi_compositor_render()`), each just before its `Present()`:
+The D3D11 service compositor file-triggers a capture of what it is about to present (reads the D3D11 textures directly — no DPI/PrintWindow issues). One trigger, **two files**, on both the direct single-client path (`pipeline_default_policy_render()`) and the compose path under a workspace controller (`multi_compositor_render()`), each just before its `Present()`:
 
 | file | what it is | device |
 |---|---|---|
@@ -446,20 +446,11 @@ rm -f /c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot*.png
 touch "/c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot_trigger"
 sleep 3; ls /c/Users/SPARKS~1/AppData/Local/Temp/workspace_screenshot*.png   # then Read them
 ```
-The post-weave file is presenter-sized: full panel under the shell, but the app's **window** size for a windowed single client (a 1280×720 PNG from a 1312×808 window is correct, not a failure). Every outcome logs a WARN in the service log — `[dxr_diag_dump_tex] #73 diag: wrote …workspace_screenshot.png (WxH …)` and `[comp_d3d11_service_capture_frame] capture_frame: prefix=… written=0x… used=WxH (atlas=WxH)` on success, `workspace_screenshot: post-weave dump SKIPPED — …` when the compose path had no weave that tick. Those lines are the discriminator when "no screenshot appeared": present → you are looking for the wrong filename; absent → the pipeline never reached the capture site (the trigger is consumed before `Present()`, so a non-presenting pipeline writes nothing and logs nothing — treat that as a datum). Verified working with the weave-on-scanout split engaged on the hybrid box (2026-09-18). %TEMP% screenshot artifacts are pre-authorized for read/write. Screenshots taken during eye-tracking warmup may miss UI — when correctness depends on visuals, ask the user to eyeball the live display.
+**The present-owner weave route (`XR_DXR_weave`, the DisplayXR Browser) never presents, so the trigger above never fires for it.** It has its own trigger (#2289, the Windows twin of the POSIX weave engines' #2207), same names as the macOS/Linux table below, read in the **service's** `%TEMP%`: `displayxr_atlas_trigger` or `displayxr_atlas_trigger.<client-exe>` (e.g. `.chrome`, checked first) → `displayxr_atlas[.<exe>].input.png` (the caller's submitted buffer, best effort), `displayxr_atlas[.<exe>].png` (the DP input with the lifted rects written in — the ADR-058 late-synthesis oracle) and `displayxr_atlas[.<exe>].woven.png` (the output the caller presents); a `.projection` trigger writes the DP input alone. One WARN `#2289 weave capture:` names the files; alpha is written as submitted.
 
-**Toggle the shell launcher (Ctrl+L) programmatically** via PostMessage to the message-only window:
-```powershell
-Add-Type @'
-using System;using System.Runtime.InteropServices;
-public class ShellMsg{
-[DllImport("user32.dll",CharSet=CharSet.Ansi)] public static extern IntPtr FindWindowExA(IntPtr p,IntPtr a,string c,string t);
-[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);
-}
-'@
-$h=[ShellMsg]::FindWindowExA([IntPtr]::new(-3),[IntPtr]::Zero,'Static','DisplayXR Shell Msg')
-[ShellMsg]::PostMessage($h,0x0312,[IntPtr]::new(2),[IntPtr]::Zero)
-```
+**An in-process texture-class session (client-presents: `_texture`, the ADR-060 texture target) presents nothing either**, so the service trigger above never fires for it; it answers the in-process trigger instead (`%TEMP%` of the app, `displayxr_atlas_trigger[.<exe>]`): `displayxr_atlas[.<exe>].png` is the DP input (the atlas) and `displayxr_atlas[.<exe>].woven.png` the app's shared texture as the app is about to present it, on the D3D11, D3D12 and Vulkan tiers' own legs (#2421, one WARN `#2421 texture capture:`) and on the hub route (`DXR_HUB=1`, #2380, WARN `#2342 hub capture`). Before #2421 the native legs consumed the trigger and wrote nothing.
+
+The post-weave file is presenter-sized: full panel under a workspace controller, but the app's **window** size for a windowed single client (a 1280×720 PNG from a 1312×808 window is correct, not a failure). Every outcome logs a WARN in the service log — `[dxr_diag_dump_tex] #73 diag: wrote …workspace_screenshot.png (WxH …)` and `[comp_d3d11_service_capture_frame] capture_frame: prefix=… written=0x… used=WxH (atlas=WxH)` on success, `workspace_screenshot: post-weave dump SKIPPED — …` when the compose path had no weave that tick. Those lines are the discriminator when "no screenshot appeared": present → you are looking for the wrong filename; absent → the pipeline never reached the capture site (the trigger is consumed before `Present()`, so a non-presenting pipeline writes nothing and logs nothing — treat that as a datum). Verified working with the weave-on-scanout split engaged on the hybrid box (2026-09-18). %TEMP% screenshot artifacts are pre-authorized for read/write. Screenshots taken during eye-tracking warmup may miss UI — when correctness depends on visuals, ask the user to eyeball the live display.
 
 ### macOS test-app pixels
 `screencapture`/`CGWindowListCreateImage`/`osascript keystroke` all need TCC permissions the harness lacks. Instead dump from inside the app via `stbi_write_png` (forward-declare `extern "C" int stbi_write_png(...)` at file scope of the `.mm`, dump on a frame-counter gate ~120 — HUD strings are throttled to ~2 Hz so frame-0 dumps are blank). Preferred: the metal + GL compositors poll `/tmp/dxr_atlas_trigger` and write the composited content region (post per-tile, pre DP) to `/tmp/dxr_atlas.png`:
@@ -483,6 +474,9 @@ directory from **`$TMPDIR`** — and on macOS `$TMPDIR` is a *per-user*
 |---|---|---|
 | Metal, GL | `/tmp/dxr_atlas_trigger` | `/tmp/dxr_atlas.png` |
 | vk_native | `$TMPDIR/displayxr_atlas_trigger` | `$TMPDIR/displayxr_atlas.png` |
+| Linux service weave engine (`XR_DXR_weave`: the DisplayXR Browser, weave probes) | the **service's** `$TMPDIR/displayxr_atlas_trigger` (or `…_trigger.<client-exe>`) | `displayxr_atlas.input.png` (caller's buffer) + `displayxr_atlas.png` (DP input, lifted views in) + `displayxr_atlas.woven.png` (post-weave) |
+| macOS service weave engine (`XR_DXR_weave`, vk and Metal backends) | same as Linux: the **service's** `$TMPDIR` (a `/var/folders/...` path unless you set it) | same three files |
+| Android weave engine (`XR_DXR_weave`, #2501) | `/sdcard/Android/data/<runtime-pkg>/files/displayxr_atlas_trigger.<client-pkg>` (`adb shell touch`; `debug.dxr.capture_dir` overrides the dir, logged once as `weave capture (#2501): capture dir`) | the same three + `displayxr_atlas.<client-pkg>.overlay.png` (the v4 2D layer as received); `adb pull` them. Raw alpha: `setprop debug.xrt.DXR_ATLAS_CAPTURE_RAW_ALPHA 1` before the runtime starts |
 
 ```bash
 rm -f "$TMPDIR/displayxr_atlas.png" "$TMPDIR/displayxr_atlas_trigger"
@@ -495,6 +489,19 @@ suffixes, and MCP / `xrCaptureAtlasDXR` — see `u_capture_intent.h`. Touching t
 Metal/GL path while running a Vulkan app looks exactly like a broken capture: the
 trigger file simply stays on disk, unconsumed. **Do not unify the two paths
 casually** — the Metal/GL names are baked into existing recipes and notes.
+
+The **service weave engines** on desktop Linux (`comp_multi_weave_linux.c`, #2207)
+and macOS (`comp_multi_weave_macos.c` over its vk / Metal backends, #2470)
+use the same `u_capture_intent` names, but they run in `displayxr-service`, so
+the trigger goes in the **service's** `$TMPDIR` (set it explicitly on a dev
+service). A per-client trigger names the **client's** executable, not the
+service's: `displayxr_atlas_trigger.chrome` / `.weave_probe_vk_linux` /
+`.weave_present_vk_macos` → `displayxr_atlas.<exe>{.input,,.woven}.png`. A POST
+trigger writes all three stages; `.projection` writes only the DP input
+(`displayxr_atlas[.<exe>].projection.png`). One WARN per capture
+(`weave capture (#2207)`; on macOS it also names `backend=vk|metal`). MCP /
+`xrCaptureAtlasDXR` do **not** reach this route. Details:
+`src/xrt/compositor/multi/comp_multi_weave_capture.h`.
 
 **Alpha is forced opaque by default in every capture** (`u_image_force_opaque_rgba8`,
 issue #425: undefined swapchain alpha otherwise renders the PNG black). That is right
@@ -536,7 +543,7 @@ See `docs/README.md` for the full index. By task:
 | When you need to… | Read |
 |---|---|
 | Layer boundaries (what goes where) | `docs/architecture/separation-of-concerns.md` |
-| Build a workspace app (shell-style controller) | `docs/specs/runtime/workspace-controller-registration.md` |
+| Build a workspace controller (a spatial shell or a vertical) | `docs/specs/runtime/workspace-controller-registration.md` |
 | Add a new display vendor | `docs/guides/vendor-plugin-onboarding.md` → `docs/reference/xrt_plugin_iface.md` + `docs/specs/runtime/plugin-discovery.md` |
 | `xrt_plugin_iface` callbacks | `docs/reference/xrt_plugin_iface.md` |
 | Multiview tiling / atlas layout | `docs/specs/runtime/multiview-tiling.md` |
@@ -544,7 +551,7 @@ See `docs/README.md` for the full index. By task:
 | Extension API (display_info, window bindings) | `docs/specs/extensions/XR_DXR_display_info.md` |
 | Why an architectural decision was made | `docs/adr/` |
 | Write / scaffold / lint a DisplayXR app | `docs/guides/displayxr-app-rules.md` (+ `/new-displayxr-app`, `scripts/check_displayxr_app.py`) |
-| Diagnose a runtime/hardware/environment failure (app hangs at startup, VPN Winsock LSP deadlock, "Failed to initialize OpenXR", Vulkan crash, eye-tracking/camera, wrong runtime loads) | `docs/getting-started/troubleshooting.md` (triage with `displayxr-cli selftest`) |
+| Diagnose a runtime/hardware/environment failure (app hangs at startup, VPN Winsock LSP deadlock, "Failed to initialize OpenXR", Vulkan crash, eye-tracking/camera, Samsung Odyssey stays 2D or wrong colours at 60 Hz (OSD "3D PC selection" + HDMI 2.0), wrong runtime loads) | `docs/getting-started/troubleshooting.md` (triage with `displayxr-cli selftest`) |
 | Diagnose a workspace freeze/wedge (close hangs, one app freezing everything, [RENDER] diag reading, unbounded-wait rules) | `docs/reference/workspace-stability.md` (epic #925; site-by-site audit in the issue) |
 | Understand the service process (who spawns whom, threads/locks, the two compositor modes, client classes, `IPC_MAX_CLIENTS`, failure domains) | `docs/architecture/service-architecture.md` → target: `docs/adr/ADR-035-service-owned-arbitration-single-pipeline-isolated-satellites.md` |
 | Conceptual "what is DisplayXR" questions (supported displays/OSes/APIs, multiview vs stereo, hardware-free dev, license, Monado lineage) | `docs/getting-started/faq.md` |
@@ -555,7 +562,7 @@ See `docs/README.md` for the full index. By task:
 | Bring up a 3D-display Android device as an OEM/ODM (what the platform must provide or not break: capture exclude-uid, input passthrough, 1:1 freeform pixels, vendor-service contract, ADPF) | `docs/specs/vendor/oem-android-platform-requirements.md` |
 | Why tracked hands follow WASD/mouse-look but NOT head parallax (rig rule — diverges from HMD VR) | `docs/adr/ADR-034-input-provider-plugins.md` § *Amendment 2* → `docs/specs/runtime/input-provider-discovery.md` §4a |
 | Tune or reason about motion-to-photon latency (late weave, repaint, VK queue tiers, deferred present, late latching) — and what the defaults are per GPU topology | `docs/reference/motion-to-photon-levers.md` |
-| Look up **any** `DXR_*` env var — what it does, where it's read, its default, and whether it could ever be a user-facing setting | `docs/roadmap/control-panel-performance-settings.md` (census of all 71 + Control Panel design) |
+| Look up **any** `DXR_*` env var — what it does, where it's read, its default, and whether it could ever be a user-facing setting | `docs/roadmap/control-panel-performance-settings.md` (census of all 71 + the persisted-settings design the Dashboard drives) |
 | GPU adapter selection on hybrid iGPU/dGPU machines (`DXR_D3D_FORCE_GPU`/`DXR_VK_FORCE_GPU`, in-process `getenv` caveat) | `docs/reference/adapter-selection.md` |
 | Read or publish any Win32 screen/window geometry from runtime or plug-in code (`GetMonitorInfo`, `MonitorFromPoint`, `GetWindowRect`) — why a DLL inherits the HOST app's DPI space, and the `__COMPAT_LAYER` A/B that exposes it | `docs/reference/dpi-awareness.md` |
 | Install / release DisplayXR on Android (released APKs, the two variants, the launch-once broker trap) | `docs/getting-started/android-build-guide.md` § *Installing from released artifacts* → `scripts/install-android.sh` |

@@ -21,6 +21,12 @@ never register a plug-in DLL living in a worktree or build directory under
 a live service (#943): the service holds the DLL and its stale code for its
 whole lifetime.
 
+The ADR-054 component verbs are **implemented** for this class (N3b,
+#2049): the optional `Enabled` value (§2), the per-user HKCU overlay for
+`Enabled` and `PreferredPlugin` (§2.1), the manifest's `enabled` (§3.1),
+and `displayxr-cli dp list | enable | disable | use | reset`; a change to
+either value under a running service is picked up live (§4.2a, #2051).
+
 This document is the **runtime ↔ plug-in discovery contract**. The
 C-ABI side — the negotiation entry point, the `xrt_plugin_iface` vtable,
 the `xrt_plugin_display_info` struct — lives in `xrt/xrt_plugin.h`. The
@@ -51,6 +57,14 @@ DisplayXR shell, …):
      Because the loader is **one-shot per process**, changing the
      preference takes effect on the **next** process: a running service must
      be **restarted** for the switch to apply to live sessions.
+   - **`Enabled` (§2 / §2.1 / §3.1, N3b):** an entry whose `Enabled` is 0
+     (per user or machine-wide) or whose manifest says `"enabled": false`
+     is **never tried, by any scan** — not here, not by the display-claim
+     collection (§3.4 / ADR-015, so the per-monitor registry stops
+     offering it), not by the mid-install re-scan or the hotplug rescan.
+     It is still listed by `dp list` (so it can be re-enabled). A disabled
+     `PreferredPlugin` falls through to the ProbeOrder sort with one WARN:
+     `Enabled=0` is the stronger verb.
 4. For each entry, in order:
    - `LoadLibraryExW` / `dlopen` the DLL/`.dylib`.
    - Resolve the single exported symbol `xrtPluginNegotiate`.
@@ -58,6 +72,10 @@ DisplayXR shell, …):
      plug-in returns its own `xrt_plugin_iface *` and the API version
      it speaks. Version mismatch → `XRT_ERROR_PROBER_NOT_SUPPORTED`,
      skip.
+   - If the iface carries `get_platform_state` (§4.1), call it and record
+     the plug-in's platform state + hint against the entry — **before**
+     `probe()`, so a plug-in about to decline can still say why. The state
+     is advisory: it never stops the loader from calling `probe()`.
    - Call `iface->probe(&inst)`. `XRT_ERROR_PROBER_NOT_SUPPORTED` is a
      clean "no matching device" decline (logged at INFO); any other
      `XRT_ERROR_*` is a hard failure (logged at WARN). Either way, the
@@ -95,6 +113,29 @@ plug-in does **not** claim, so the sim-display `FALLBACK` backstop and
 future multi-vendor routing are unaffected. `PreferredPlugin` (§2.1) is
 resolved first and outranks both.
 
+**Per-screen preference (display dashboard phase 7).** A per-screen
+preference (`displayxr-cli dp use <id> --screen <key>`; env
+`DXR_PREFERRED_PLUGIN_PER_SCREEN` > per-user `settings.json` > HKLM
+`DisplayProcessors\PreferredPlugin\<key>`) outranks, for that one monitor,
+the global `PreferredPlugin`, the active-plug-in rule and confidence — only a
+`DXR_SCREEN_PLUGIN` pin outranks it. It wins when its plug-in is loaded and
+claimed the monitor at **any** confidence (sim-display's `FALLBACK` claim
+included); otherwise it is ignored with one WARN and the monitor resolves as
+above. The entry is marked `forced` with its source. On the system-default
+screen it also moves the primary DP (`primary_override`, scalars follow); the
+head device stays the active plug-in's. The service re-reads the preference on
+every re-probe (§4.2) and recreates a changed **secondary** screen's segment
+DPs; the primary DP never swaps live, so the primary screen's choice applies at
+the next session / service start. The screen key is the EDID form
+`<PNP>-<PROD>-<SERIAL>[@<device>]`, except that a screen
+is keyed `<PNP>-<vendor serial>` as soon as any plug-in's claim on it (above
+`FALLBACK`) carries a serial — the product code and device name can change
+with the cable or port, the vendor serial cannot (#2250). A preference stored
+under a screen's EDID-form ("legacy") key still matches it: the service and the CLI re-key
+a per-user one in place (one WARN; an app only WARNs, as for an env / machine one),
+and `dp reset --screen` accepts either spelling. Key format, store and the
+hot/next-session matrix: `docs/roadmap/display-dashboard.md` §12.
+
 ---
 
 ## 2. Windows: registry-driven discovery
@@ -112,20 +153,21 @@ kebab-case ASCII. Example layout:
 ```
 HKLM\Software\DisplayXR\DisplayProcessors
 ├── sim-display           (ProbeOrder=200, ships in runtime installer)
-├── leia-sr               (ProbeOrder=50,  ships in DisplayXR-LeiaSR-Setup)
-└── future-vendor-name    (ProbeOrder=50,  ships in its own installer)
+└── <vendor-id>           (ProbeOrder=50,  ships in the vendor's own plug-in installer)
 ```
 
 **Subkey values:**
 
 | Value             | Type        | Required | Purpose                                                                                                                                  |
 | ----------------- | ----------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `Binary`          | `REG_SZ`    | yes      | Absolute path to the plug-in DLL. Spaces in the path are allowed; the runtime does no shell-style splitting.                             |
+| `Binary`          | `REG_SZ`    | yes      | Absolute path to the plug-in DLL (`C:\…` or `\\server\…`; anything else makes the row malformed). Spaces allowed; no shell-style splitting. |
 | `DisplayName`     | `REG_SZ`    | yes      | Human-readable name; logged at probe attempt and at successful negotiate.                                                                |
 | `Vendor`          | `REG_SZ`    | no       | Publisher name (e.g. `"Leia Inc."`). Logged at probe attempt.                                                                            |
 | `Version`         | `REG_SZ`    | no       | Free-form vendor version string. Logged at successful negotiate.                                                                         |
-| `UninstallString` | `REG_SZ`    | see §5   | Required for vendor plug-ins shipped by their own installer (powers the runtime's cascade-uninstall). Sim-display omits this — see §5.  |
+| `UninstallString` | `REG_SZ`    | no       | Optional, informational (mirrors the plug-in's Add/Remove Programs entry). The runtime never executes it — see §5.                       |
 | `ProbeOrder`      | `REG_DWORD` | no       | Lower runs first. Missing defaults to 100. Vendors should use 50; sim-display uses 200 so it's always the fallback.                      |
+| `Enabled`         | `REG_DWORD` | no       | 0 = the loader never tries this plug-in, in any scan (§1 step 3). Absent (or any non-zero) = enabled. Installers **do not write it** — it is the user's / administrator's switch (`displayxr-cli dp enable\|disable`, §2.1), and a per-user HKCU value overrides it. |
+| `Settings\<KEY>`  | `REG_SZ` / `REG_DWORD` | no | The plug-in's own settings, read by the plug-in ONLY through `host->get_setting` (§2.3, the one options contract — ADR-054 decision 7). Written by `displayxr-cli dp set <id> <KEY> <value> --machine`; a per-user HKCU `Settings\<KEY>` overrides it, and `DXR_DP_<ID>_<KEY>` in the hosting process's environment overrides both. |
 
 **ProbeOrder convention:**
 
@@ -136,37 +178,44 @@ HKLM\Software\DisplayXR\DisplayProcessors
 | `100` | Default when `ProbeOrder` is missing. Use only if you genuinely don't care.          |
 | `200` | The sim-display fallback. No real-hardware plug-in should use this or higher.        |
 
-**Sample install (PowerShell):**
+**Sample install (PowerShell)** — `acme-panel` is a placeholder vendor id.
+Vendor plug-ins install into a **sibling** of the runtime directory,
+`C:\Program Files\DisplayXR\Plugins\<Vendor>\`, never inside
+`C:\Program Files\DisplayXR\Runtime\`:
 
 ```powershell
-$key = "HKLM:\Software\DisplayXR\DisplayProcessors\leia-sr"
-New-Item -Path $key -Force | Out-Null
-New-ItemProperty -Path $key -Name "Binary"          -Value "C:\Program Files\LeiaSR\Plugin\DisplayXR-LeiaSR.dll" -PropertyType String -Force
-New-ItemProperty -Path $key -Name "DisplayName"     -Value "DisplayXR Leia SR"     -PropertyType String -Force
-New-ItemProperty -Path $key -Name "Vendor"          -Value "Leia Inc."             -PropertyType String -Force
-New-ItemProperty -Path $key -Name "Version"         -Value "1.35.0.2011"           -PropertyType String -Force
-New-ItemProperty -Path $key -Name "UninstallString" -Value "`"C:\Program Files\LeiaSR\Plugin\Uninstall.exe`"" -PropertyType String -Force
-New-ItemProperty -Path $key -Name "ProbeOrder"      -Value 50                      -PropertyType DWord  -Force
+$dir = "C:\Program Files\DisplayXR\Plugins\Acme"
+$key = "HKLM:\Software\DisplayXR\DisplayProcessors\acme-panel"
+New-Item -Path $key -Force | Out-Null   # also creates DisplayProcessors if no runtime is installed yet
+New-ItemProperty -Path $key -Name "Binary"          -Value "$dir\DisplayXR-Acme.dll"  -PropertyType String -Force
+New-ItemProperty -Path $key -Name "DisplayName"     -Value "DisplayXR Acme Panel"     -PropertyType String -Force
+New-ItemProperty -Path $key -Name "Vendor"          -Value "Acme Displays"            -PropertyType String -Force
+New-ItemProperty -Path $key -Name "Version"         -Value "1.0.0"                    -PropertyType String -Force
+New-ItemProperty -Path $key -Name "UninstallString" -Value "`"$dir\Uninstall.exe`""   -PropertyType String -Force
+New-ItemProperty -Path $key -Name "ProbeOrder"      -Value 50                         -PropertyType DWord  -Force
 ```
 
-**Sample install (NSIS):**
+**Sample install (NSIS)** (`InstallDir "$PROGRAMFILES64\DisplayXR\Plugins\Acme"`):
 
 ```nsi
 SetRegView 64
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Binary"          "$INSTDIR\DisplayXR-LeiaSR.dll"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "DisplayName"     "DisplayXR Leia SR"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Vendor"          "Leia Inc."
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "Version"         "${VERSION}"
-WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
-WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\leia-sr" "ProbeOrder"      50
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Binary"          "$INSTDIR\DisplayXR-Acme.dll"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "DisplayName"     "DisplayXR Acme Panel"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Vendor"          "Acme Displays"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "Version"         "${VERSION}"
+WriteRegStr   HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "UninstallString" "$\"$INSTDIR\Uninstall.exe$\""
+WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\acme-panel" "ProbeOrder"      50
 ```
+
+The registration may be written before the runtime is installed; the
+runtime adopts it when present (§5).
 
 The runtime installer's reference implementation (sim-display, no
 `UninstallString`) lives in
 `installer/DisplayXRInstaller.nsi` — the section labeled "Vendor
 plug-in: sim-display".
 
-### 2.1 `PreferredPlugin` override
+### 2.1 `PreferredPlugin` override and the per-user overlay
 
 A single **root-level** value selects a plug-in to try before the
 `ProbeOrder` sort. It is **not** a per-subkey value — it lives directly
@@ -174,26 +223,74 @@ under the discovery root:
 
 | Location                                              | Value            | Type     | Purpose                                                                                   |
 | ----------------------------------------------------- | ---------------- | -------- | ----------------------------------------------------------------------------------------- |
-| `HKLM\Software\DisplayXR\DisplayProcessors` (root)    | `PreferredPlugin`| `REG_SZ` | The `<id>` of the plug-in to attempt first. Empty / absent = normal `ProbeOrder` discovery. |
+| `HKCU\Software\DisplayXR\DisplayProcessors` (root), then `HKLM\…\DisplayProcessors` (root) | `PreferredPlugin`| `REG_SZ` | The `<id>` of the plug-in to attempt first. Empty / absent = normal `ProbeOrder` discovery. |
 
-Semantics: if the named id is registered and its `probe()` succeeds, it
-wins regardless of `ProbeOrder`. If the id is unregistered or fails to
-load, discovery silently falls back to the normal `ProbeOrder` order. The
-override is **sticky** — the mid-install re-scan never swaps it out — and,
-because the loader is one-shot per process, a change takes effect only for
-processes started afterward (restart the service to switch a live session).
+Semantics: if the named id is registered, **enabled**, and its `probe()`
+succeeds, it wins regardless of `ProbeOrder`. If the id is unregistered or
+fails to load, discovery silently falls back to the normal `ProbeOrder`
+order; if it is **disabled** (`Enabled` = 0, below) it falls back with one
+WARN — `Enabled=0` is the stronger verb. The override is **sticky** — the
+mid-install re-scan never swaps it out. A change reaches a running service
+through the live re-select path (§4.2a): a secondary screen's segment DP
+follows at once, the primary screen's DP at the next session; in-process
+apps read it at their next launch.
+
+**Per-user policy (N3b, ADR-054 verbs `enable|disable` and `prefer`).** Two
+values are also read from **HKCU**, where they win over HKLM; they are what
+`displayxr-cli dp …` writes without admin (`--machine` writes the HKLM
+64-bit view instead). **Nothing else is ever read from HKCU** — the plug-in
+rows themselves (`Binary`, `ProbeOrder`, …) are HKLM-only, so a per-user key
+can never inject a DLL. (The per-screen preference of `dp use --screen` is a
+separate store — the per-user `settings.json`, or machine-wide
+`DisplayProcessors\PreferredPlugin\<key>` under HKLM, §1.1 — and is
+unchanged; the `PreferredPlugin` and `Policy` *subkeys* are reserved and
+never read as plug-in rows.)
+
+| Location | Value | Type | Purpose | Written by |
+|---|---|---|---|---|
+| `HKCU\…\DisplayProcessors\<id>` (overrides `HKLM\…\DisplayProcessors\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` in every scan (logged once per process: `disabled (Enabled=0, user\|machine)`); absent = the HKLM value; HKLM absent = enabled | `displayxr-cli dp enable\|disable <id> [--machine]` |
+| `HKCU\…\DisplayProcessors` root, then `HKLM\…\DisplayProcessors` root | `PreferredPlugin` | REG_SZ | as above | `displayxr-cli dp use <id> [--machine]` / `dp reset [--machine]` |
+
+The `Enabled` overlay is the shared component loader's
+(`target_component_apply_user_overlay`, ADR-054 N2), so the conversion
+root's kiosk rule applies here too: HKLM `DisplayProcessors\Policy\Lock` =
+1 makes the machine value win for every row
+(conversion-provider-discovery.md §3.1); the `Policy` subkey is reserved
+and never read as a plug-in row. `dp enable|disable` refuses an id that is
+not registered (HKLM row / manifest) — non-zero exit, nothing written — since
+a per-user `Enabled` for it would be an orphan row `dp list` can never show.
 
 This is the non-destructive replacement for the old "delete the vendor
 registry key to force sim-display" workaround. Manage it with
-`displayxr-cli dp use <id>` / `dp reset` (or the Control Panel); both write
-the 64-bit view (HKLM → administrator rights required). `FORCE_SIM_DISPLAY`
-is unrelated — it only nudges *builder* priority, not which *plug-in* loads.
+`displayxr-cli dp use <id>` / `dp reset` (or the DisplayXR Dashboard); the
+default writes HKCU (no admin), `--machine` writes the 64-bit HKLM view
+(administrator rights required). `FORCE_SIM_DISPLAY` is unrelated — it only
+nudges *builder* priority, not which *plug-in* loads.
 
 ```powershell
-# Force sim-display, then restore normal discovery:
-New-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin" -Value "sim-display" -PropertyType String -Force
-Remove-ItemProperty -Path "HKLM:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
+# Force sim-display for this user, then restore normal discovery:
+New-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin" -Value "sim-display" -PropertyType String -Force
+Remove-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors" -Name "PreferredPlugin"
+# Turn a registered plug-in off for this user (what `dp disable acme-panel` writes):
+New-ItemProperty -Path "HKCU:\Software\DisplayXR\DisplayProcessors\acme-panel" -Name "Enabled" -Value 0 -PropertyType DWord -Force
 ```
+
+`displayxr-cli dp list [--json]` shows every registered plug-in with its
+`Enabled` and where it came from (the JSON `enabled_source`: `user` = a
+per-user HKCU `Enabled` is in force, whatever its value; `machine` =
+disabled by HKLM `Enabled` = 0; `manifest` = disabled by the POSIX
+manifest; `default` = enabled with no per-user value), the `PreferredPlugin`
+override, the N4b provenance verdict, and `*` on the plug-in the loader
+would select — a disabled one is never `*`. The JSON also carries
+`policy.policy_lock` (bool; the same key `conv list --json` emits): HKLM
+`DisplayProcessors\Policy\Lock` = 1, so no row is `user` and a per-user
+`dp enable|disable` is ignored — the CLI says so in a `note:` line, and the
+dashboard disables its per-user Enabled control (a `PreferredPlugin` is not
+under the lock). Always false on POSIX. `displayxr-cli selftest` reports
+the better-ranked plug-ins discovery skipped because they are disabled
+(`display_processor.skipped_disabled` in `--json`; the `active_plugin`
+check's detail in text), so "sim-display is active" on a box with a vendor
+panel is never a mystery; a disabled plug-in is never a failure.
 
 ### 2.2 `DXR_PLUGIN_EXCLUSIVE` — load one plug-in and nothing else
 
@@ -237,6 +334,74 @@ calling `SetEnvironmentVariableW` after startup is silently ignored; see
 caveat*.
 
 ---
+
+### 2.3 Component settings — the one options contract (ADR-054 decision 7, N3c)
+
+Every component class — display processors, input providers
+(input-provider-discovery.md § *Component settings*), conversion providers
+(conversion-provider-discovery.md §3.9) — carries its per-component settings
+the same way, and a component reads them **only through its host iface**,
+never from its own environment or an ad-hoc vendor key
+(`xrt/xrt_component_settings.h`; the display-processor slot is
+`xrt_plugin_host_iface::get_setting(id, key, buf, cap)`, announced by
+`XRT_PLUGIN_HOST_HAS_GET_SETTING`, carved from `reserved[]` at an unchanged
+ABI). In a satellite or the service the environment is the host's, not the
+user's shell, which is why a `getenv` in a plug-in can never be reached by a
+CLI verb.
+
+| Tier | Where | Wins over |
+|---|---|---|
+| 1 — environment | `DXR_DP_<ID>_<KEY>` in the **hosting** process's environment; `<ID>` = the id upper-cased, `-` → `_` (`DXR_DP_SIM_DISPLAY_TRACKING`). Android: the `debug.xrt.` system property of the same name. A set-but-empty variable is unset. | everything — the `u_setting` rule: a launcher, a `.bat` or a harness can always take control back from a setting somebody left behind |
+| 2 — user | Windows: `HKCU\Software\DisplayXR\DisplayProcessors\<id>\Settings\<KEY>` (`REG_SZ` or `REG_DWORD`). POSIX: `<id>.settings.json` in the per-user manifest dir (a flat object `{"KEY": "value"}`), next to `preferred`. | tier 3 — unless HKLM `DisplayProcessors\Policy\Lock` = 1, the kiosk rule `Enabled` already follows (§2.1), which hides the user tier (never the environment) |
+| 3 — machine / manifest | Windows: `HKLM\Software\DisplayXR\DisplayProcessors\<id>\Settings\<KEY>` (64-bit view). POSIX: the manifest's `plugin.settings` object (§3.1). | the plug-in's compiled default |
+
+Values are strings; the plug-in parses. Keys are `[A-Za-z0-9_]`, not
+digit-first, matched case-insensitively (they are registry value names) and
+conventionally upper-case. **Only `Settings\*` is ever read from HKCU / the
+per-user file**: a per-user store can change what a registered plug-in is
+*told*, never which binary loads — the §2.1 rule. `u_setting_is_managed`'s
+allow-list (the runtime-policy `DXR_*` levers of
+`docs/roadmap/control-panel-performance-settings.md`) is a different store
+this contract never touches: a component-owned key is `DXR_<CLASS>_<ID>_<KEY>`,
+a runtime-policy lever is a bare `DXR_*`, and neither resolves through the
+other.
+
+**Verbs** — one spelling across `dp` / `input` / `conv`
+(`cli_component_options.c`):
+
+| Verb | What |
+|---|---|
+| `displayxr-cli dp options <id> [--json]` | Every key the plug-in declares (`xrt_plugin_iface::describe_settings`, `XRT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type (`bool` / `int` / `float` / `string` / `enum`), default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`), plus the environment prefix and both store paths. Loads + negotiates the registered binary (no probe) to ask it — the same exposure as `dp list`'s status snapshot. |
+| `dp set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written (the `enable\|disable` rule). After the write the CLI reads the key back and prints *Effective now:* the value the plug-in will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `dp unset <id> <KEY> [--machine]` | Removes it from that store; absent is success (POSIX: the per-user file is deleted once empty). |
+
+**When it applies.** A display processor reads its settings at init through
+the host iface (sim-display resolves each key once per process and caches
+it), so a write reaches the **next session / service start**; the verbs
+never poke the running service — restart it, or launch a fresh app. (Input
+providers: the same. Conversion providers differ: the running service
+re-describes on its registry watch, conversion-provider-discovery.md §4.1, so
+a `conv set` reaches the next re-describe.)
+
+**Reference implementation and the guard.** `drivers/sim_display/sim_display_settings.c`
+is the one place sim-display reads a knob: `dp options sim-display` lists all
+of them (`TRACKING`, `TRACKING_PERIOD_MS`, `OUTPUT`, `FORCE_MODE`, `WIDTH_M`,
+`HEIGHT_M`, `NOMINAL_Z_M`, `PIXEL_W`/`PIXEL_H`, `STRICT_PANEL`,
+`INTERLACE_PERIOD`, `METAL_SNAP_PERIOD`, `LENS`, `WEAVE_SCOPE`, `ZONE_*`,
+`WISH_QUANTIZE`, `LIFT*`, `STEREO_CAMERA*`, `WEBCAM_*`). The former
+`SIM_DISPLAY_<X>` / `SIM_DISPLAY_FAKE_<X>` environment names stay aliases for
+**one release** (a deprecation WARN once per key), read in that shim and
+nowhere else: `lint.yml`'s `sim-plugin-getenv-guard` fails any `getenv` under
+the three reference plug-ins outside their shims. A vendor plug-in follows
+the same shape (vendor-plugin-onboarding.md § *Settings*).
+
+```powershell
+# What the plug-in would read, and from where:
+displayxr-cli dp options sim-display
+# Fake eye tracking for this user (next session), then undo it:
+displayxr-cli dp set sim-display TRACKING 1
+displayxr-cli dp unset sim-display TRACKING
+```
 
 ## 3. Per-platform filesystem discovery
 
@@ -294,9 +459,12 @@ Fields mirror the Windows registry schema:
 | `plugin.display_name` | `DisplayName`      | yes      | Logged at probe / negotiate.                                                          |
 | `plugin.vendor`       | `Vendor`           | no       | Publisher name.                                                                       |
 | `plugin.version`      | `Version`          | no       | Free-form version string.                                                             |
-| `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib`. Spaces allowed.                                |
+| `plugin.binary_path`  | `Binary`           | yes      | Absolute path to the `.so` / `.dylib` (a relative one makes the manifest malformed — nothing resolves it against the manifest's directory). Spaces allowed. |
 | `plugin.probe_order`  | `ProbeOrder`       | no       | Default 100. Sim-display=200, vendors=50.                                             |
-| `plugin.uninstall_command` | `UninstallString` | see §5 | Command-line invocation for cascade-uninstall. Required for vendor plug-ins.          |
+| `plugin.enabled`      | `Enabled`          | no       | Boolean; `false` = the loader never tries this plug-in, in any scan (§1 step 3), and `dp list` shows it `no (manifest)`. A non-boolean rejects the manifest as malformed (the shared component loader's parser, ADR-054 N2). This is the POSIX switch — there is no per-user `Enabled` store, so `displayxr-cli dp enable\|disable` is refused here and points at this field. |
+| `plugin.uninstall_command` | `UninstallString` | no     | Informational only; the runtime never runs it (§5).                                   |
+| `plugin.settings`     | `Settings\*`       | no       | Object of `"KEY": "value"` (strings; numbers and booleans are accepted and read as strings, `true` = `"1"`) — the machine tier of the plug-in's own settings (§2.3). Overridden per user by `<id>.settings.json` in the per-user manifest dir (what `dp set` writes), and by `DXR_DP_<ID>_<KEY>` in the hosting process's environment. |
+| `plugin.settings_schema` | n/a (the binary's `describe_settings`) | no | Array of `{"key", "type", "default", "help"}` declaring the keys for `dp options`; merged with what the binary itself declares. |
 
 Discovery roots are searched in priority order — the per-user root
 above first, then the packaged system roots below. Per-user entries with
@@ -390,9 +558,9 @@ app does not bundle. The runtime package is derived from the same
   metadata convention on `<service>`/`<receiver>` tags in
   `AndroidManifest.xml`. Open question for when a second Android
   vendor materializes.
-- Cascade-uninstall (§5): each plug-in `.so` shipped in the runtime
+- Separate uninstall (§5): each plug-in `.so` shipped in the runtime
   APK is uninstalled by the OS as part of the APK uninstall. Vendor
-  APK plug-ins (v2) will need a separate uninstall hook design.
+  APK plug-ins (v2) are uninstalled by the OS with their own APK.
 
 ### 3.3 `PreferredPlugin` override (POSIX)
 
@@ -405,10 +573,182 @@ fall through on miss/failure, sticky for the process" semantics:
    (`~/Library/Application Support/DisplayXR/DisplayProcessors/preferred`
    on macOS; `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/preferred`
    on Linux) — a single line containing the plug-in id. This is what
-   `displayxr-cli dp use <id>` / `dp reset` write.
+   `displayxr-cli dp use <id>` / `dp reset` write (`--machine` is refused:
+   there is no machine-wide store on POSIX).
+
+A disabled preferred id (`"enabled": false`, §3.1) falls through to the
+ProbeOrder sort with one WARN, exactly as on Windows (§2.1).
 
 Android exposes only the env-var read (the writable override and `dp list`
 are not shipped there in v1; see Non-goals above).
+
+### 3.4 Desktop Linux: monitor enumeration and display claims (multi-screen M0)
+
+The per-monitor registry (§1.1, #69 / ADR-015) is populated on desktop Linux
+as on Windows. Two pieces make that possible.
+
+**Monitor enumeration** (`os_display_edid_enumerate`,
+`src/xrt/auxiliary/os/os_display_edid_linux.c`). No single source is a monitor
+record: RandR knows where each monitor sits on the desktop and which one is
+primary, but XWayland publishes no EDID property; DRM sysfs
+(`/sys/class/drm/card*-*/{status,enabled,edid,modes}`) has the EDID and the
+connector name but no desktop position. The enumerator takes the RandR
+monitors from `os_display_desktop_enumerate` and ties each one to a connected
+DRM connector, first rule that fires:
+
+0. **randr-edid** — the X server publishes the output's own `EDID` property
+   (native X does; XWayland does not). That is the monitor's identity. The
+   connector is the one enabled connector carrying the same EDID (vendor,
+   product, serial), or, among several identical ones, the one whose name
+   agrees.
+1. **name** — RandR output name equals the connector name with the card prefix
+   and the kernel's subtype letter dropped (`card1-HDMI-A-1` → `HDMI-1`), and
+   the connector agrees physically: its modes hold the monitor's device mode,
+   or its EDID size is within 10 mm of RandR's. A bare name is not enough: the
+   NVIDIA X driver numbers outputs from 0 (`DP-0`) while nvidia-drm numbers
+   connectors from 1, and two GPUs can each have an `HDMI-A-1`. This is the
+   normal case on Mutter's XWayland.
+2. **mm** — exactly one unused, enabled connector whose EDID physical size is
+   within 10 mm of RandR's (EDID stores cm in the base block and mm in the
+   detailed timing; 340 vs 344 mm is the same panel).
+3. **mode** — exactly one unused, enabled connector with the monitor's device
+   mode among its modes.
+
+"Device mode" is the compositor's current mode when Mutter reports it, else
+the RandR rect. It is never the DRM-derived mode, which was itself found by
+connector name.
+
+Ambiguity is never guessed: a monitor no rule ties uniquely is listed with
+its placement and no EDID identity. A connector is used at most once, and a
+connected-but-disabled connector never joins by mm or mode. The record keeps
+the card prefix (`card1-HDMI-A-1`). Connectors are read in name order, so
+DRM-only records come out in the same order on every boot. From
+the EDID the enumerator reads the manufacturer and product id (bytes 8–11),
+the serial (12–15), the size in cm (21/22) and the first detailed timing's
+pixels, mm and refresh. With **no reachable X server** (pure Wayland,
+headless) every connected, enabled connector becomes a DRM-only record flagged
+`origin_unknown` at (0, 0). The join method per monitor is logged once at INFO
+(`plugin loader: monitor N … join=randr-edid|name|mm|mode|drm-only|none`), and
+`displayxr-cli displays` prints it.
+
+The plug-in-facing `xrt_display_descriptor` is unchanged (no ABI change). The
+connector name, mm and device mode stay runtime-side (`os_display_edid_monitor`
+plus a loader side table keyed by `monitor_id`). Where the platform names the
+connector, the `monitor_id` hash is EDID manufacturer + product + serial + the
+connector name **with its card prefix** (`card1-HDMI-A-1`), with no desktop
+position (multi-screen M1): the connector is unique per machine, so the id
+survives a monitor rearrangement — it is the `displayId` apps hold via
+`xrEnumerateDisplaysDXR` — DRM-only records at (0, 0) stay distinct, and two GPUs
+that both expose an `HDMI-A-1` do not collide. The id changes when a different
+panel is plugged into the port, the panel moves port, or the kernel renumbers
+the card (GPU added/removed, probe order across boots). Windows ids (no
+connector name) are unchanged: manufacturer + product + position.
+
+**Claims from every plug-in.** `target_plugin_resolve_displays` now loads every
+manifest plug-in on POSIX as a claim source (`collect_display_sources_platform`,
+the twin of the Windows one): same roots and order as discovery,
+`DXR_PLUGIN_EXCLUSIVE` honoured, the active plug-in reused rather than loaded
+twice. The other plug-ins are claim sources only. No device is created from
+them, and active-plug-in selection is unchanged.
+
+Unlike Windows, POSIX loads the others **only when they could matter**. The
+active plug-in wins every monitor it claims (#1521), at any confidence, and
+only a different PreferredPlugin or a `DXR_SCREEN_PLUGIN` pin naming a
+different plug-in for that monitor outranks it. So when the active plug-in
+claims every monitor, no other plug-in is preferred, and no pin for a
+connected monitor names another plug-in, the source set is the active plug-in
+alone, and nothing else is `dlopen`ed or probed
+(`target_screen_active_decides_every_monitor`, unit-tested). The pin clause is
+what keeps `XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN=HDMI-1=leia-sr`
+(below) working: leia-sr must be loaded for the pin to find its claim. Without a pin, the shortcut covers
+`XRT_PREFERRED_PLUGIN_ID=sim-display` (sim-display claims every monitor), so
+pinning sim-display does not load the Leia plug-in or touch the SR service.
+The check is repeated on every resolve.
+
+Plug-in instances loaded only as claim sources are released with the
+`xrt_instance` (`target_plugin_release_claim_sources`, from
+`t_instance_destroy`): `destroy()` is called on each, the source cache is
+dropped, and the next resolve re-collects. The `dlopen` handles stay loaded,
+as for every plug-in. Windows is unchanged and keeps its claim sources for
+the process lifetime. `DXR_PLUGIN_EXCLUSIVE` (§2.2) still keeps every other
+plug-in out of the process entirely.
+
+**Back-compat claim for a plug-in without `probe_displays`.** Such a plug-in
+gets one synthesized `EDID`-confidence claim. On Windows that claim stays on
+the primary monitor. Off-Windows, the **active** plug-in's claim goes to the
+monitor its panel matches once the runtime has read `get_display_info`
+(`target_plugin_note_active_panel`, called by the builder at system create and
+on every display-info apply). The matching uses the ADR-033 resolver's rules:
+the plug-in's origin when non-zero, then the connector's device mode, then the
+pixel size, with ties broken on physical size. Without this, a laptop with the
+3D panel on an external connector would route the laptop screen (the primary)
+to the vendor DP and the panel to the fallback, because the active plug-in
+wins every monitor it claims (#1521). A plug-in that implements
+`probe_displays` never reaches the synthesized path, so its own claims always
+decide. `displayxr-cli displays --claims` brings the system up headlessly
+first, so it reports the same placement the runtime uses.
+
+Example from a laptop (eDP-1, primary) with an Acer DS1 on HDMI, with
+`leia-sr` active and no `probe_displays` in the plug-in yet:
+
+```
+monitor …  3456x2160 @ (0,0)      SDC 423F  300x190 mm  output=eDP-1   → sim-display  FALLBACK
+monitor …  3840x2160 @ (3456,0)   ACR 0001  344x193 mm  output=HDMI-1  → leia-sr      EDID
+```
+
+On Linux nothing in the compositors reads the registry yet. The Vulkan
+compositor uses the scalar `dp_factory_*`, so this milestone changes no
+weaving. macOS and Android still enumerate no monitors. (Since multi-screen M2/M3
+the Vulkan compositor does read it for a window spanning screens: each segment's DP
+comes from that screen's registry entry, mixed vendors included —
+`docs/architecture/comp-segments.md`.)
+
+**The winner per monitor**, in order (`target_screen_pick`,
+`src/xrt/targets/common/target_screen_pin.{h,c}`, unit-tested by
+`tests/tests_target_screen_pin.cpp`):
+
+1. a **per-screen pin** (`DXR_SCREEN_PLUGIN`, below) whose plug-in claims the monitor;
+2. the **PreferredPlugin** override (#791, §2.1/§3.3), if that plug-in claims it;
+3. the **active** plug-in, if it claims it (#1521) — unless its claim is `FALLBACK` and a plug-in
+   ranked before it (lower ProbeOrder) claims the monitor above `FALLBACK`: then rule 4 decides.
+   That source can only appear after instance create (display hotplug, ADR-047 Amendment 8 — a
+   better-ranked plug-in that probed at discovery would be the active one), so ProbeOrder forcing
+   and every create-time resolve are unchanged;
+4. the highest **confidence**, ties to the lower ProbeOrder.
+
+A winning claim at **`XRT_DISPLAY_CLAIM_PRESENT_NOT_READY`** (20) marks the registry entry
+`not_ready` and clears its DP factories: the plug-in owns the panel, nobody weaves it, and the
+compositors show it flat 2D until the plug-in claims it for real (ADR-047 Amendment 8).
+
+**Display hotplug (ADR-047 Amendment 8).** The registry is re-resolved while the process runs
+(OS display reconfiguration, a monitor-list poll, or a plug-in's `request_display_rescan`). Each
+sweep first calls `target_plugin_rescan_claim_sources`: every manifest plug-in that is not a claim
+source yet is loaded and probed again — a vendor plug-in that declined at instance create because
+its panel was absent gets its chance — and inserted in ProbeOrder; existing sources are never
+re-probed or released. A PreferredPlugin naming the active plug-in keeps the shortcut above (nothing
+else loads). macOS/Linux; the Windows twin is a TODO.
+
+**`DXR_SCREEN_PLUGIN` — pin one monitor to a plug-in** (multi-screen M4, #793 phase 3).
+`DXR_SCREEN_PLUGIN=<match>=<plugin-id>[,<match>=<plugin-id>…]`, where `<match>` is
+the monitor's RandR output name (`HDMI-1`), its DRM connector (`HDMI-A-1`) — both
+case-insensitive — or its monitor id in hex (`0x886e4475353b22b9`, `0x` optional).
+For that monitor only, the pin outranks rules 2–4; every other monitor resolves
+exactly as before. The global PreferredPlugin pin makes sim-display win every
+monitor it claims — on `ds1-linux` that includes the DS1, which sim claims at
+FALLBACK while leia-sr claims it VERIFIED — so a sim-display session with the DS1
+still woven by leia-sr is:
+
+```
+XRT_PREFERRED_PLUGIN_ID=sim-display DXR_SCREEN_PLUGIN=HDMI-1=leia-sr <app>
+```
+
+Logging: one INFO line per applied pin (`… → 'leia-sr' by DXR_SCREEN_PLUGIN`); a
+WARN when a pin names a plug-in with no claim on that monitor (the pin is ignored
+there), when the pinned plug-in offers no display-processor factory for it, when an
+entry names no known monitor, and for malformed entries. Read at every registry
+resolve (session/system create), like the other loader env overrides. The pinned
+plug-in must be loaded as a claim source, so `DXR_PLUGIN_EXCLUSIVE` naming another
+plug-in defeats it.
 
 ---
 
@@ -445,47 +785,300 @@ vendor-neutral) and the Leia plug-in's entry point in
 delegates to per-API DP factories and device-creation functions in its own
 tree; the entry-point TU is short (~150 lines).
 
+### 4.1 Loadable without the platform; `probe()` is cheap; report platform state (ADR-045)
+
+A registered plug-in is a fact, not a decision: the runtime may enumerate
+it on a machine where the vendor platform it drives is missing, not yet
+running, or has no display attached — and the order in which the user
+installs the runtime, the plug-in and the vendor platform is arbitrary.
+Every plug-in therefore MUST:
+
+1. **Load without its platform.** `LoadLibraryExW` / `dlopen` of the plug-in
+   binary must succeed when the vendor platform runtime is not installed.
+   Resolve vendor libraries lazily (delay-load / `dlopen` by a path the
+   plug-in derives itself) rather than as static imports the OS loader
+   must satisfy — and never rely on the host process's `PATH`, which in the
+   long-lived service is frozen at logon.
+2. **Keep `probe()` and `get_platform_state()` within ~100 ms**, and never
+   block on the vendor platform becoming ready. Both run on the
+   `xrCreateInstance` hot path and on every re-probe (§4.2). Presence
+   checks only — a registry value, a named kernel object, an EDID table
+   lookup. A readiness wait belongs in `create_device` / the DP factory
+   (or a background thread the plug-in owns), not in `probe()`.
+3. **Report its platform state** through the optional
+   `xrt_plugin_iface::get_platform_state` slot (`XRT_PLUGIN_HAS_PLATFORM_STATE`,
+   appended per ADR-020 at unchanged ABI):
+
+   | `xrt_plugin_platform_state` | Meaning |
+   |---|---|
+   | `UNKNOWN` (0) | Not reported (slot absent, older plug-in, call returned false). Runtime behaves as before. |
+   | `READY` | Platform installed, running, display attached. |
+   | `PLATFORM_ABSENT` | The vendor platform runtime is not installed. |
+   | `PLATFORM_NOT_RUNNING` | Installed, its service/daemon is not running. |
+   | `NO_DISPLAY` | Platform up, none of its displays attached. |
+   | `INCOMPATIBLE` | Platform present but unusable (version, OS, GPU, …). |
+
+   plus `hint` — a short (≤ 127 bytes UTF-8) vendor-written sentence the
+   runtime shows verbatim and never parses ("install the … runtime",
+   "connect the display"), and `flags`. `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`
+   marks a plug-in that claims any system (the in-tree sim-display); vendor
+   plug-ins MUST NOT set it.
+
+   Call sequence: **load → negotiate → `get_platform_state` → `probe`**.
+   The slot takes no instance, is thread-safe, and may also be called at any
+   time after selection (diagnostics poll it while the plug-in is active).
+
+### 4.2 Re-probe and the no-live-swap rule
+
+The long-lived service re-evaluates selection on world events — display
+topology change, device-node change, a change under the
+`DisplayProcessors` registry key, and a slow timer while the active plug-in
+is the fallback — debounced to at most one refresh per second. A refresh
+adopts a better (lower `ProbeOrder`) plug-in **only while the active one
+carries `XRT_PLUGIN_PLATFORM_FLAG_FALLBACK`** (or, for a plug-in that does
+not report state, has id `sim-display`). An active vendor plug-in that
+reports `NO_DISPLAY` is kept: the runtime surfaces the state (tray,
+`displayxr-cli info` / `selftest`) and the DP passes pixels through
+unwoven. In-process apps do not re-probe on world events.
+
+**Adoption is complete via a restart when idle.** On adoption the weaving DP
+and display info follow the new plug-in at once, but the head device (mode
+table, eye tracking) was created by the fallback and is held by the system
+compositor and every client's shared-memory snapshot, so it cannot be swapped
+live. The system marks it stale (`xrt_system_compositor_info::head_device_stale`);
+once no IPC client has been connected for 2 s the Windows service ends its main
+loop and starts a successor (`--adoption-restart-after-pid <pid>`), which waits
+for the old process to exit and builds its system on the new plug-in. A
+successor never restarts itself for adoption again (no loop on a flapping
+probe).
+
+### 4.2a Live `Enabled` / `PreferredPlugin` change (ADR-054 N3d, #2051)
+
+A policy write — the root `PreferredPlugin` (§2.1 / §3.3), a row's `Enabled`
+(N3b) — is a world event of the same class as a registration change, and it
+is delivered the same way whether the CLI made it or a registry / file edit
+did:
+
+| Who | How the service learns | What happens |
+|---|---|---|
+| `displayxr-cli dp use|reset` (and `dp enable|disable`, N3b) | the DIAG call `system_request_display_reprobe` right after the write (`dp use --screen` has always done this) | the debounced re-probe worker runs at once |
+| a dashboard / `reg.exe` / editor write | the service's one component-policy watch thread (`service_component_watch.c`): `RegNotifyChangeKeyValue` on HKLM **and HKCU** `DisplayProcessors`, debounced 500 ms; on POSIX a 2 s mtime poll of the per-user dir (`preferred`, the manifests) | the same re-probe, within ~1 s |
+
+The re-probe is bound by the no-live-swap rule above: a **secondary screen's
+segment DP** is re-resolved against the new policy and follows within ~1 s
+(the segment manager recreates it); the **primary screen's DP** — held by the
+system compositor and every client's shared-memory snapshot — changes at the
+next session, and the log says so. `Enabled` = 0 for a plug-in that is
+already loaded as a display-claim source **withdraws its claims** at that
+re-resolve (`'<id>' withdrawn from the display claims (Enabled=0, user)` in
+the log, `re-admitted` on the way back), so the screen table — what
+`status` reports as each screen's claim — follows the policy at once even
+though the primary's live DP does not. Nothing is unloaded. **In-process apps**
+(`_handle` / `_hosted` / `_texture` without the service) run the loader once
+at `xrCreateInstance` and are unaffected until their next launch — the watch
+exists only in the service process, which is the only one that outlives a
+policy edit. The CLI's post-write message states exactly this (now / next
+session / next launch); "restart the service" is no longer the answer.
+
+### 4.3 Provenance: signed, allowlisted or admitted (ADR-054 N4b)
+
+A registration row needs administrator rights once; the binary it points at
+does not, and until ADR-054 nothing looked at the file. Every class loader now
+runs one **provenance check** on the binary, in the shared load path, after the
+#952 path guard and before `LoadLibrary` / `dlopen`. The verdict is one of
+these, first match wins (`target_component_provenance_classify`):
+
+| Verdict | Means | Where it comes from |
+|---|---|---|
+| `signed` | valid Authenticode chain to a trusted root | Windows, `WinVerifyTrust` (no UI, no network revocation) — any trusted root in v1, no publisher pinning; a valid chain whose leaf has no subject CN is `signed` by `(unknown subject)` |
+| `allowlisted` | the file's SHA-256 is in the **admin-only** allowlist | Windows: a value named `<sha256-hex>` under `HKLM\Software\DisplayXR\Trust\Allowlist` (data = a note); POSIX: a `<sha256-hex>` line in `/etc/displayxr/trust/allowlist` (honoured only if the file and every parent directory are root-owned and not group/world-writable) |
+| `platform-trusted` | the platform already vouches for it | Android: anything inside the runtime APK; `.deb`/`.pkg` installs: the `realpath()`-resolved path under `/usr/`, `/opt/` or `/Library/Application Support/DisplayXR/`, and the file **and every directory up to `/`** root-owned and not group/world-writable |
+| `dev-override` | unsigned and unlisted, admitted by `DXR_ALLOW_DEV_PLUGIN_PATHS` | **non-elevated hosts only** — an elevated process (the installer-restarted service, CI runners, an admin prompt) gets no override |
+| `unverified` | none of the above | what the gate refuses once enforcing |
+
+The digest, signer and one-line reason (for `unverified`: the exact allowlist row
+to write) are kept on the registration and shown by `displayxr-cli info`,
+`selftest --json` (`plugins[].provenance` / `signer` / `provenance_reason`) and,
+through the N3 CLI passes, the `dp|input|conv list` tables.
+
+**Signature policy, stated plainly.** Revocation is not checked
+(`WTD_REVOKE_NONE`, cache-only URL retrieval, so a load never waits on the
+network), and any code-signing certificate that chains to a trusted root
+passes — the gate does not yet pin a publisher (future work). `signed` means
+"some trusted publisher signed these bytes", not "DisplayXR or a known vendor
+signed them".
+
+**The same file, start to finish.** The load path opens the binary once and
+judges and loads *that* file. Windows: `CreateFileW(GENERIC_READ,
+FILE_SHARE_READ)`; the SHA-256 is read through the handle, `WinVerifyTrust`
+receives it as `WINTRUST_FILE_INFO.hFile`, and the handle stays open until
+`LoadLibraryExW` returns — the share mode refuses every writer, renamer and
+deleter meanwhile — and the mapped module is then compared to the handle by
+volume serial + file index (mismatch → `FreeLibrary`, `UNTRUSTED`). POSIX:
+`open(O_RDONLY|O_CLOEXEC)` + `fstat`, hashed through the descriptor, and the
+path must still name that descriptor's `st_dev`/`st_ino`/size/mtime just
+before and just after `dlopen` (else `dlclose`, `UNTRUSTED`). POSIX does not
+`dlopen("/proc/self/fd/N")`: that names the module `/proc/self/fd/N`, which
+breaks `$ORIGIN` and the `dladdr()` own-directory lookups plug-ins use for
+their resources. The residual POSIX window is a swap-and-swap-back during the
+`dlopen` call itself by someone who can write the file or its directory —
+which the `platform-trusted` rule's root-owned chain excludes. The listers
+(`dp|input|conv list`, `selftest`, `info`) run the same evaluation on a
+handle they open and close without loading.
+
+**What is cached.** The digest is recomputed through the open handle on every
+check (cheap next to `LoadLibrary`). Only the Authenticode result is cached
+for the process, keyed on the file's identity (volume serial + file index /
+`st_dev` + `st_ino`), size, mtime **and** that digest, so a file rewritten in
+place with its size and mtime restored is judged afresh; the allowlist and
+platform facts are re-evaluated every time (an admin may remove a row at any
+moment). One lock guards the cache: the DP refresh, the service's IPC status
+snapshots and the input / conversion loaders all reach it from their own
+threads.
+
+**A relative `Binary` is malformed.** A registry `Binary` that is not a
+drive-letter or UNC path, or a manifest `plugin.binary_path` that is not
+absolute, marks the row MALFORMED; it is never handed to `LoadLibrary` /
+`dlopen`, which would resolve it against the host's search order or cwd.
+
+**Dependencies are not provenance-gated.** Only the component binary itself
+is checked. The DLLs / shared objects it imports load by the platform's normal
+rules from wherever its installer put them — a vendor that wants its
+dependencies covered ships them signed, or in the root-owned / admin-only
+locations the platform already protects. One runtime mechanism used to stage
+copies of dependencies: the #434 sanitized pre-load copies a dependency with
+tracer-unsafe unwind data into the per-user, user-writable
+`%LOCALAPPDATA%\DisplayXR\ThirdParty\…` and loads it from there. Under UAC an
+elevated process shares that directory, so **on an elevated host the
+sanitized pre-load is skipped** (dependencies load normally); on a
+non-elevated host a staged copy is reused only if its SHA-256 equals the
+source's (re-copied otherwise) and is held open share-read-only until its
+load returns.
+
+**Enforcing on Windows (ADR-054 N4b PR B).** The gate shipped in audit mode in
+v2.44.2 and has **enforced by default on Windows** since the release after it:
+an `unverified` binary is refused (`TARGET_COMPONENT_LOAD_UNTRUSTED`, plug-in
+status `UNTRUSTED`, one ERROR line naming the allowlist row to write) and
+discovery falls through to the next candidate. The escape hatch for one
+release is `HKLM\Software\DisplayXR\Trust` value `Enforce` (DWORD) = **0**,
+which puts the gate back in audit mode (`provenance UNVERIFIED — … (audit
+mode: loading anyway)`); `Enforce` = 1 says enforcing explicitly and is the
+same as absent. **POSIX stays in audit mode by default**: it has no signer check
+(no Authenticode equivalent is wired, so nothing can read `signed`), and the
+tarball's user-level install (`install.sh` without `--system`) puts an unsigned
+plug-in in a user-owned directory the platform rule cannot vouch for.
+`/etc/displayxr/trust/enforce` enforces unless its first non-blank byte is
+`0` (like the allowlist, it counts only if it and every parent directory are
+root-owned and not group/world-writable — otherwise it is ignored with one
+WARN and the platform default applies); the `.deb` (`/usr/lib/displayxr/plugins`) and the macOS `.pkg`
+(`/Library/Application Support/DisplayXR/…`) are root-owned and read
+`platform-trusted` either way. Android never enforces (everything is inside
+the APK). The pure decision is `target_component_trust_policy(knob_present,
+knob_zero, platform_default)`: an explicit knob wins, else the platform
+default.
+
+**What an installer must do.** A signed binary passes on its signature. An
+unsigned one — a CI build, a dev `build_windows.bat installer`, a release the
+signing provider missed — must have its SHA-256 written by the installer that
+ships it: the runtime installer does this for `DisplayXR-SimDisplay.dll`
+(`installer/gen_allowlist_nsh.cmake` hashes the exact bytes being packed into
+`!macro DXR_ALLOWLIST_WRITE` / `DXR_ALLOWLIST_REMOVE`; the uninstaller removes
+only the rows it wrote). Its row data is `<dll> (DisplayXR runtime installer
+<version>)`, and before writing a build's rows — and again at uninstall —
+it deletes every value whose data carries `(DisplayXR runtime installer `, so
+an in-place upgrade does not leave the previous build's digests admitting
+DLLs the box no longer ships; rows with any other note are never touched. A vendor installer that ships unsigned builds does the
+same under its own row data (see the vendor onboarding guide §5). Rows are
+value names under `HKLM\Software\DisplayXR\Trust\Allowlist`, data = a
+human note saying which installer wrote it and for what.
+
+**Dev lane.** `scripts\register_dev_plugin.bat` allowlists the SHA-256 of every
+DLL it registers in the same elevated run (a rebuilt DLL has a new digest: re-run
+it), `push-runtime-pf.sh` does the same for what it copies, and CI allowlists the
+just-built `sim_*` references before the per-class conformance step asserts
+`allowlisted` on them. Nothing else changes for a from-source box: the override
+still works in a normal prompt; it only stops working in an elevated one, where
+the allowlist is the right tool.
+
+What this is **not**: licensing or DRM (that is ADR-045 / ADR-053 vocabulary,
+N5), and not a path rule — on Windows a path is never a provenance, which is why
+`Program Files` alone does not make a binary `signed`.
+
 ---
 
-## 5. Cascade-uninstall
+## 5. Registration lifetime (no cascade-uninstall)
 
-The runtime installer enumerates `HKLM\Software\DisplayXR\DisplayProcessors\*`
-on uninstall and runs each subkey's `UninstallString /S` before
-touching the runtime's own files. This lets vendor plug-in installers
-clean up their files + registry entries while their dependency on
-`DisplayXRClient.dll` is still on disk.
+A registration under `HKLM\Software\DisplayXR\DisplayProcessors\<id>` is
+owned by the installer that wrote it, for its whole lifetime. Nothing may
+depend on the order in which the runtime and a plug-in are installed or
+uninstalled (epic #1803).
 
-**Two-pass design** (see
-`installer/DisplayXRInstaller.nsi` for the implementation):
+**The runtime never removes a vendor registration.** Its uninstaller
+(`installer/DisplayXRInstaller.nsi`, Section "Uninstall"):
 
-1. **Collect pass:** enumerate subkeys, read `UninstallString`, append
-   non-empty values to a pipe-delimited buffer. Done up-front because
-   each chained uninstaller deletes its own subkey, which would shift
-   `EnumRegKey` indices if iterated in-place.
-2. **Run pass:** walk the pipe-delimited list, `nsExec::ExecToLog
-   '"$R7" /S'` for each entry.
+1. deletes only its own `sim-display` subkey;
+2. deletes the root `PreferredPlugin` value only when it names
+   `sim-display` or a plug-in that is no longer registered (a pin to a
+   still-registered vendor plug-in is the user's choice and survives);
+3. deletes the `DisplayProcessors` key itself only if it is then empty
+   (`DeleteRegKey /ifempty`);
+4. never runs a plug-in's `UninstallString`, never deletes files outside
+   its own install directory, and removes the shared
+   `C:\Program Files\DisplayXR` parent only non-recursively, so vendor
+   plug-in directories (`C:\Program Files\DisplayXR\Plugins\<Vendor>`)
+   survive.
 
-After the cascade, the runtime uninstaller `DeleteRegKey
-HKLM\Software\DisplayXR\DisplayProcessors` to drop sim-display's subkey
-(no `UninstallString`, runtime owns its lifecycle) plus any orphans
-whose vendor uninstallers failed.
+Vendor plug-ins are separate products with their own Add/Remove Programs
+entries; the runtime uninstaller says so in its log. (Earlier runtimes
+ran every registered `UninstallString /S` and then deleted the whole key.
+A plug-in whose uninstaller failed was left installed, with its files and
+Add/Remove Programs entry, but **unregistered** — invisible to the
+runtime, and version-skipped by a later bundle. That cascade is gone.)
 
-**Vendor uninstaller contract:**
+**A plug-in may be installed before the runtime.** Its subkey can
+pre-exist the runtime, and the runtime installer adopts it: install,
+repair and upgrade write only the `sim-display` subkey and never rewrite
+or delete another one. A runtime uninstall followed by a reinstall
+therefore picks a vendor plug-in up again without reinstalling it.
 
-- Honor `/S` (silent mode). The runtime invokes you silently; a
-  GUI-only uninstaller blocks the runtime's uninstall flow.
-- Delete your own `<id>` subkey under
-  `HKLM\Software\DisplayXR\DisplayProcessors`. The runtime drops the
-  parent key after the cascade, but the runtime might be uninstalled
-  AFTER your vendor uninstaller in some flows; clean up after yourself.
-- Delete your plug-in DLL + supporting files.
-- Don't touch the runtime's files — your dependency on
-  `DisplayXRClient.dll` is still load-bearing for other vendor plug-ins
-  registered alongside yours.
+**Vendor installer / uninstaller contract:**
 
-POSIX equivalent: `uninstall_command` is invoked as `sh -c
-"<command>"`. Same contract: silent, idempotent, cleans up your own
-manifest + binary, leaves the runtime alone.
+- Honor `/S` (silent mode) and never show a modal under it (NSIS:
+  `MessageBox ... /SD <default>`).
+- Do not require the runtime. Install your files and write your own
+  `<id>` subkey (64-bit view) whether or not a runtime is present; if you
+  enforce a minimum runtime version, do it only when a runtime is
+  installed.
+- Release your DLL from a running `displayxr-service.exe` with Windows
+  Restart Manager (`RmGetList` / `RmShutdown(RmForceShutdown)` /
+  `RmRestart`), not by killing it; if you start the service yourself,
+  start it through `explorer.exe`, never elevated (an elevated service
+  cannot be reached by normal-integrity apps).
+- On uninstall, delete your own `<id>` subkey and your own files, with or
+  without the runtime present. Don't touch the runtime's files or any
+  other subkey.
+- **Never touch HKCU** (N3b). The per-user `Enabled` / `PreferredPlugin`
+  overlay (§2.1) belongs to the user, not to your installer: an installer
+  runs elevated under one account and cannot enumerate every user's hive
+  anyway, and a per-user `Enabled` = 0 that outlives your registration is
+  harmless — the loader only overlays rows that exist in HKLM, and `dp
+  list` shows nothing for an id with no row. Likewise, do not write
+  `Enabled` on your own HKLM row at install time: a user who disabled your
+  plug-in before upgrading expects it to stay disabled.
+- `UninstallString` is optional and informational; the runtime does not
+  execute it.
+
+Workspace controllers are different: they require the runtime, so the
+runtime uninstaller still cascades into each registered controller's
+`UninstallString` (see
+[workspace-controller-registration.md](workspace-controller-registration.md)),
+but it too deletes the `WorkspaceControllers` key only if it is empty
+afterwards, so a controller whose uninstaller failed keeps its
+registration.
+
+POSIX: `uninstall_command` in a JSON manifest is likewise informational —
+no runtime packaging step runs it. A plug-in package removes its own
+manifest + binary and leaves the runtime alone.
 
 ---
 
@@ -576,13 +1169,23 @@ The runtime emits these one-shot lines at instance creation, all at
 | `plugin loader: <N> registered plug-in(s); attempting in ProbeOrder ascending.`                                      | INFO — entry count after enumeration. Suppressed at default WARN level.                                   |
 | `plugin loader:   [i/N] <id> (ProbeOrder=<order>, <path>)`                                                            | INFO — per-entry attempt trace. Suppressed at default WARN level.                                         |
 | `plugin loader:   <id>: probe declined (no matching device).`                                                         | INFO — clean decline from probe (`XRT_ERROR_PROBER_NOT_SUPPORTED`). Suppressed at default WARN level.     |
-| `plugin loader:   <id>: LoadLibrary(<path>) failed (err=<n>).`                                                       | WARN — DLL load failure. Surfaces in default log.                                                         |
+| `plugin loader:   <id>: LoadLibrary(<path>) failed (err=<n>).`                                                       | WARN — DLL load failure. `err=126` with the binary present adds "a library the plug-in imports is missing" (`DEPENDENCY_MISSING`). |
+| `plugin loader:   <id>: registered Binary '<path>' does not exist — skipping (orphan registration).`                  | WARN — `BINARY_MISSING` (ADR-045).                                                                        |
+| `plugin loader:   <id> disabled (Enabled=0, user\|machine\|manifest; ProbeOrder=<n>) — never tried.`                  | WARN once per process per id (INFO on later scans) — `DISABLED` (N3b, §2.1 / §3.1).                      |
+| `plugin loader: PreferredPlugin '<id>' is disabled (Enabled=0, …) — falling through to ProbeOrder.`                  | WARN once — the preferred plug-in is disabled; `Enabled=0` is the stronger verb (N3b).                    |
+| `plugin loader:   <id>: platform state <STATE>[ — <hint>]`                                                           | WARN on change — what `get_platform_state` reported, before `probe()` (ADR-045).                          |
+| `plug-in adoption: '<old>' -> '<new>' — weaving DP and display info follow now; …`                                   | WARN — a refresh adopted a better plug-in under the fallback's head device (service).                     |
+| `plug-in adoption: no client connected — restarting the service so the head device follows '<id>'.`                 | WARN — the adoption restart (Windows service).                                                            |
+
 | `plugin loader:   <id>: missing entry point 'xrtPluginNegotiate' — skipping.`                                        | WARN — DLL has no negotiate symbol. Plug-in DLL is structurally invalid.                                  |
 | `plugin loader:   <id>: negotiate returned <code> (iface=<ptr>) — skipping.`                                         | WARN — negotiate failure. Usually version mismatch.                                                       |
 | `plugin loader:   <id>: probe returned <code> — skipping.`                                                            | WARN — probe failure other than the clean `XRT_ERROR_PROBER_NOT_SUPPORTED` decline.                       |
 | `plugin loader: active plug-in: id=<id> name='<name>' vendor='<vendor>' version='<version>' plugin_api=<v> probe_order=<n> path=<path>` | WARN — the winning plug-in. Authoritative line for "which DP shipped this session."                       |
 | `plugin loader: no registered plug-in claimed the system — falling back to static drivers.`                          | WARN — every entry failed / declined. **The message is stale**: the static-link fallback was removed in #287 (see §7), so nothing loads and instance creation fails.  |
 | `plugin loader: registry root HKLM\Software\DisplayXR\DisplayProcessors absent (rc=<n>) — no plug-ins to try.`       | INFO — no plug-ins registered. Same stale "static" wording as above; there is no fallback. Suppressed at default WARN.  |
+
+Load failures, the `loading plug-in binary` breadcrumb, and the #461 skew check WARN on the **first**
+attempt per plug-in per process (or when the outcome changes); repeats from re-probes log at INFO.
 
 Vendor support flows checking "is the plug-in actually loading"
 should look for the `active plug-in:` line in
@@ -606,4 +1209,5 @@ the corresponding POSIX log directory.
   fallback plug-in.
 - [`displayxr-leia-plugin`](https://github.com/DisplayXR/displayxr-leia-plugin) (`src/drv_leia/`) — reference vendor plug-in (ships from its own repo, ADR-019).
 - `installer/DisplayXRInstaller.nsi` — reference installer flow
-  (sim-display registration + cascade uninstall).
+  (sim-display registration; uninstall removes only its own
+  registration — §5).

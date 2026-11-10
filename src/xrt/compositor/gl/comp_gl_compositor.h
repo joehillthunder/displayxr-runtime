@@ -34,6 +34,9 @@ struct xrt_rect;
  * @param gl_context             Platform GL context (HGLRC on Windows, EGLContext on Android, CGLContextObj on macOS).
  * @param gl_display             Platform display (HDC on Windows, EGLDisplay on Android, NULL on macOS).
  * @param dp_factory_gl          Display processor factory (may be NULL).
+ * @param dp_factory_d3d11       #2317 P3: the D3D11 display-processor factory the D3D11 hub
+ *                               weaves with under `DXR_HUB=1` (Windows; may be NULL, which
+ *                               the hub refuses as `dp_refused_scanout`). Ignored elsewhere.
  * @param shared_texture_handle  D3D11 shared texture HANDLE for offscreen mode (Windows only, may be NULL).
  * @param transparent_background Request transparent desktop composition. On Windows the
  *                               compositor switches to a DComp + WGL_NV_DX_interop2 present
@@ -54,6 +57,7 @@ comp_gl_compositor_create(struct xrt_device *xdev,
                           void *gl_context,
                           void *gl_display,
                           void *dp_factory_gl,
+                          void *dp_factory_d3d11,
                           void *shared_texture_handle,
                           bool transparent_background,
                           int32_t display_screen_left,
@@ -115,6 +119,37 @@ comp_gl_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                struct xrt_eye_positions *out_eye_pos);
 
 /*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
+ *
+ * @param xc          GL compositor base.
+ * @param target_ns   When the pixels will be seen (monotonic ns).
+ * @param out_eye_pos Output eye positions (N-view).
+ * @return true if valid positions were produced.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                        int64_t target_ns,
+                                        struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * ADR-047 Amendment 8 (#2305): whether the session's primary slot holds another
+ * screen's DP (the window was handed to a ready screen at the home-gone bound,
+ * or a stand-in serves the home), so that the eye set from
+ * @ref comp_gl_compositor_get_eye_positions_at must cover the views. Stays true until the
+ * update that gives the home its own DP back, a few ms after the screen list
+ * names the home again. Any thread.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_slot_holds_other_screen(struct xrt_compositor *xc);
+
+/*!
  * Get window metrics for adaptive FOV calculation.
  *
  * @param xc          GL compositor base.
@@ -172,6 +207,87 @@ comp_gl_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *mask);
  */
 bool
 comp_gl_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
+
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+struct u_cursor_draw_request;
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers
+ * (projection, quad, window-space) and before the display processor. Called by
+ * the state tracker only on a frame whose locate chained
+ * XrCursorDepthDrawInfoDXR and reported willDraw; a compositor never handed a
+ * request does no cursor work at all.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): at the NEXT layer_commit only,
+ * copy a cursor-sized patch out of the two outermost views of the frame's
+ * first projection layer into a staging buffer; a later commit that finds the
+ * copy finished (polled, never waited on) block-matches it on the CPU
+ * (u_cursor_measure_run) and publishes the result. Called by the state
+ * tracker only on a frame whose locate chained the measured-disparity source;
+ * a compositor never handed a request allocates and copies nothing.
+ */
+void
+comp_gl_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7: the newest finished measurement (thread-safe).
+ * @return out->valid.
+ */
+bool
+comp_gl_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
+struct xrt_screen_list;
+struct xrt_segment_metrics;
+struct xrt_segment_view_routing;
+
+/*!
+ * Multi-screen M6 (ADR-047 D2 on Windows, OpenGL): hand the compositor the
+ * system's screen list, so a window that spans several monitors is woven per
+ * segment, each by its own screen's display processor, into the one window
+ * framebuffer. Call once at session creation. @p pinned_display_id is the
+ * session's `XrSessionDisplayBindingDXR` (0 = none); a pinned session is never
+ * segmented. A window on the primary screen only keeps the single-DP path
+ * byte for byte. The GL twin of comp_d3d11_compositor_set_screens. No-op off
+ * Windows.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_screens(struct xrt_compositor *xc,
+                               const struct xrt_screen_list *list,
+                               const struct xrt_system_compositor_info *info,
+                               uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 (Windows OpenGL): the segment table the last weave took,
+ * with each segment's eyes predicted NOW (the primary from the session's DP,
+ * the others from their segment DP), for xrLocateViews to frame per-segment
+ * views. Thread-safe against the weave. `out->count == 0` = one view set.
+ *
+ * @ingroup comp_gl
+ */
+bool
+comp_gl_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 (Windows OpenGL): which views of the next frame belong to
+ * which window segment — what the app's last xrLocateViews handed out. The
+ * projection pass paints each segment's views into that segment's rect of
+ * every tile (a mosaic) and the segment path crops them out per screen.
+ * Thread-safe.
+ *
+ * @ingroup comp_gl
+ */
+void
+comp_gl_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
 
 #ifdef __cplusplus
 }

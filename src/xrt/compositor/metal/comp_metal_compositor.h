@@ -18,6 +18,9 @@
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_screen.h"
+#include "util/u_cursor_depth.h"
+#include "util/u_rear_budget.h" // XR_DXR_depth_budget: struct u_rear_budget_out
 
 // Forward declarations
 struct xrt_system_devices;
@@ -70,6 +73,18 @@ comp_metal_compositor_create(struct xrt_device *xdev,
 bool
 comp_metal_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                   struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
+ * Returns false if no valid positions could be produced.
+ */
+bool
+comp_metal_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                           int64_t target_ns,
+                                           struct xrt_eye_positions *out_eye_pos);
 
 /*!
  * Get physical display dimensions in meters.
@@ -219,6 +234,78 @@ void
 comp_metal_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
 /*!
+ * Runtime-owned window placement on macOS (ADR-050): take over the bound
+ * window's title-bar drag, edge / corner resize and zoom, phase-snap every
+ * step through the DP's `snap_window_rect` and apply it in the same Core
+ * Animation transaction as the frame woven for it. A no-op (AppKit keeps the
+ * window, logged once) when @p app_owned (the app chained
+ * `XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR`), `DXR_MACOS_NATIVE_DRAG=1`,
+ * an offscreen / shared-IOSurface / workspace session, or a bound view that
+ * is not its window's contentView. Call once, after creation.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_setup_window_placement(struct xrt_compositor *xc, bool app_owned);
+
+/*!
+ * Phase-snap a proposed window origin with the session's display processor
+ * (xrt_display_processor_metal::snap_window_rect): the in-process route of
+ * xrWeaveSnapWindowRectDXR, for an app that owns its own placement. Backing
+ * px, same frame for both points. Outputs are always written (the target on
+ * false = no snap support / declined).
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_snap_window_rect(struct xrt_compositor *xc,
+                                       int32_t origin_x,
+                                       int32_t origin_y,
+                                       int32_t target_x,
+                                       int32_t target_y,
+                                       int32_t *out_x,
+                                       int32_t *out_y);
+
+/*!
+ * Multi-screen on macOS (ADR-047 D2): hand the compositor the system's screen
+ * list and DP registry, so a window whose content view spans displays is
+ * woven per segment, each by its own display's DP
+ * (`create_dp_metal_for_screen`, windowless, phase from set_present_origin).
+ * A session pinned to one display (@p pinned_display_id != 0, from
+ * `XrSessionDisplayBindingDXR`) or `DXR_SEGMENTS=0` is never segmented. A
+ * window on the primary display only keeps the single-DP path exactly.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_set_screens(struct xrt_compositor *xc,
+                                  const struct xrt_screen_list *list,
+                                  const struct xrt_system_compositor_info *info,
+                                  uint64_t pinned_display_id);
+
+/*!
+ * Multi-screen M3 (macOS): the segment table the last weave took, with each
+ * segment's eyes predicted NOW (the primary from the session's DP, the others
+ * from their segment DP), for xrLocateViews to frame per-segment views.
+ * Returns false (count 0) when the window is not segmented.
+ *
+ * @ingroup comp_metal
+ */
+bool
+comp_metal_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3 (macOS): which views of the next frame belong to which
+ * window segment — what the app's last xrLocateViews handed out. The
+ * projection pass paints each segment's views into that segment's rect of
+ * every tile (a mosaic) and the segment path crops them out per display.
+ *
+ * @ingroup comp_metal
+ */
+void
+comp_metal_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
  * Set system devices for qwerty driver support.
  */
 void
@@ -238,6 +325,82 @@ comp_metal_compositor_set_sys_info(struct xrt_compositor *xc,
  */
 void
 comp_metal_compositor_set_source_gl(struct xrt_compositor *xc);
+
+/*!
+ * XR_DXR_cursor_depth v2 (ADR-046 Phase 3a): read a cursor-sized patch of the
+ * submitted depth at the NEXT layer_commit only. Called by the state tracker
+ * only on a frame whose locate chained XrCursorDepthSourceDXR; a compositor
+ * never handed a request does no cursor work at all.
+ */
+void
+comp_metal_compositor_set_cursor_depth_request(struct xrt_compositor *xc,
+                                               const struct u_cursor_depth_patch_request *req);
+
+/*!
+ * The newest finished depth-patch read (asynchronous: one or more frames old).
+ *
+ * @return out->valid.
+ */
+bool
+comp_metal_compositor_get_cursor_depth_result(struct xrt_compositor *xc, struct u_cursor_depth_patch_result *out);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the app's layers and
+ * before the display processor. Called by the state tracker only on a frame
+ * whose locate chained XrCursorDepthDrawInfoDXR and reported willDraw; a
+ * compositor never handed a request does no cursor work at all.
+ */
+void
+comp_metal_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): at the NEXT layer_commit only,
+ * copy a cursor-sized patch out of the two outermost views of the frame's
+ * first projection layer into a staging buffer; a later commit that finds the
+ * copy finished (polled, never waited on) block-matches it on the CPU
+ * (u_cursor_measure_run) and publishes the result. Called by the state
+ * tracker only on a frame whose locate chained the measured-disparity source;
+ * a compositor never handed a request allocates and copies nothing.
+ */
+void
+comp_metal_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7: the newest finished measurement (thread-safe).
+ * @return out->valid.
+ */
+bool
+comp_metal_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
+
+/*!
+ * XR_DXR_depth_budget: latch the app's extension opt-in and arm the policy
+ * when the session is also transparent. Call right after
+ * comp_metal_compositor_create. The source is the runtime's own desktop
+ * capture (#2264), so the policy only has something to measure on a session
+ * that captures the desktop (a weaving DP that cannot present alpha).
+ */
+void
+comp_metal_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+//! XR_DXR_depth_budget v2: the app's XrContentBoundsDXR, window-normalised.
+void
+comp_metal_compositor_set_content_bounds(
+    struct xrt_compositor *xc, float u0, float v0, float u1, float v1, uint64_t now_ns);
+
+//! XR_DXR_depth_budget v3: the app's XrContentMaskDXR (copied by the runner).
+void
+comp_metal_compositor_set_content_mask(struct xrt_compositor *xc,
+                                       const uint8_t *cells,
+                                       uint32_t w,
+                                       uint32_t h,
+                                       uint32_t stride,
+                                       float margin_normalized,
+                                       uint64_t now_ns);
+
+//! The latest published budget; false when this session never opted in.
+bool
+comp_metal_compositor_get_rear_budget(struct xrt_compositor *xc, struct u_rear_budget_out *out);
 
 /*!
  * Get the MTLTexture (as void*) for a given swapchain image index.

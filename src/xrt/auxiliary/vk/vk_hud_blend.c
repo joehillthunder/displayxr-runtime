@@ -110,6 +110,15 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
                    struct vk_bundle *vk,
                    VkFormat target_fmt)
 {
+	return vk_hud_blend_init_ex(blend, vk, target_fmt, false);
+}
+
+bool
+vk_hud_blend_init_ex(struct vk_hud_blend *blend,
+                     struct vk_bundle *vk,
+                     VkFormat target_fmt,
+                     bool write_alpha)
+{
 	VkResult ret;
 
 	// Shader modules from embedded SPIR-V
@@ -186,6 +195,8 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	};
 	VkDescriptorPoolCreateInfo dp_ci = {
 	    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+	    // Individual frees: vk_hud_blend_forget_image() returns a set (#1782).
+	    .flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
 	    .maxSets = VK_HUD_BLEND_MAX_IMAGES,
 	    .poolSizeCount = 1,
 	    .pPoolSizes = &pool_size,
@@ -260,9 +271,9 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	    .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
 	VkPipelineColorBlendAttachmentState blend_att = {
 	    .blendEnable = VK_TRUE,
-	    // Don't touch the framebuffer's alpha channel — leaves whatever the
-	    // present path expects intact (some compositors treat alpha as window
-	    // transparency even with COMPOSITE_ALPHA_OPAQUE_BIT).
+	    // Default: don't touch the framebuffer's alpha channel — leaves
+	    // whatever the present path expects intact (some compositors treat
+	    // alpha as window transparency even with COMPOSITE_ALPHA_OPAQUE_BIT).
 	    .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
 	                      VK_COLOR_COMPONENT_B_BIT,
 	    .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
@@ -271,6 +282,14 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 	    .srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
 	    .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
 	    .alphaBlendOp = VK_BLEND_OP_ADD};
+	if (write_alpha) {
+		// #1780: alpha "over" as well, so a HUD over a transparent atlas
+		// region (alpha 0) is not see-through. Alpha only ever grows, so an
+		// opaque target (alpha 1) is unchanged.
+		blend_att.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+		blend_att.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+		blend_att.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	}
 	VkPipelineColorBlendStateCreateInfo cb = {
 	    .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
 	    .attachmentCount = 1,
@@ -305,6 +324,16 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 		return false;
 	}
 
+	// #1786: premultiplied variant, same state but colour src ONE. Picked per
+	// draw by vk_hud_blend_draw_no_layout_ex(); everything else uses the
+	// straight pipeline above.
+	blend_att.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	ret = vk->vkCreateGraphicsPipelines(vk->device, VK_NULL_HANDLE, 1, &pipe_ci, NULL, &blend->pipeline_premul);
+	if (ret != VK_SUCCESS) {
+		U_LOG_E("[HUD blend] Failed to create premultiplied pipeline: %d", ret);
+		return false;
+	}
+
 	blend->initialized = true;
 	return true;
 }
@@ -317,10 +346,16 @@ vk_hud_blend_init(struct vk_hud_blend *blend,
 static VkDescriptorSet
 get_or_create_image_desc(struct vk_hud_blend *blend,
                           struct vk_bundle *vk,
-                          VkImage hud_image)
+                          VkImage hud_image,
+                          VkFormat view_fmt)
 {
+	// #1795: the legacy view. Encoded-space callers keep it; honest callers
+	// pass the swapchain's declared format.
+	if (view_fmt == VK_FORMAT_UNDEFINED) {
+		view_fmt = VK_FORMAT_R8G8B8A8_UNORM;
+	}
 	for (uint32_t i = 0; i < blend->image_count; i++) {
-		if (blend->cached_images[i].image == hud_image) {
+		if (blend->cached_images[i].image == hud_image && blend->cached_images[i].format == view_fmt) {
 			return blend->cached_images[i].desc_set;
 		}
 	}
@@ -334,7 +369,7 @@ get_or_create_image_desc(struct vk_hud_blend *blend,
 	    .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 	    .image = hud_image,
 	    .viewType = VK_IMAGE_VIEW_TYPE_2D,
-	    .format = VK_FORMAT_R8G8B8A8_UNORM,
+	    .format = view_fmt,
 	    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
 	VkImageView view = VK_NULL_HANDLE;
@@ -372,6 +407,7 @@ get_or_create_image_desc(struct vk_hud_blend *blend,
 	vk->vkUpdateDescriptorSets(vk->device, 1, &write, 0, NULL);
 
 	blend->cached_images[blend->image_count].image = hud_image;
+	blend->cached_images[blend->image_count].format = view_fmt;
 	blend->cached_images[blend->image_count].view = view;
 	blend->cached_images[blend->image_count].desc_set = desc_set;
 	blend->image_count++;
@@ -400,7 +436,7 @@ vk_hud_blend_draw(struct vk_hud_blend *blend,
 	(void)hud_w;
 	(void)hud_h;
 
-	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image, VK_FORMAT_UNDEFINED);
 	if (desc_set == VK_NULL_HANDLE) {
 		return;
 	}
@@ -509,12 +545,67 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
                               uint32_t dst_w,
                               uint32_t dst_h)
 {
+	vk_hud_blend_draw_no_layout_ex(blend, vk, cmd, fb, fb_w, fb_h, hud_image, dst_x, dst_y, dst_w, dst_h, false);
+}
+
+void
+vk_hud_blend_draw_no_layout_ex(struct vk_hud_blend *blend,
+                               struct vk_bundle *vk,
+                               VkCommandBuffer cmd,
+                               VkFramebuffer fb,
+                               uint32_t fb_w,
+                               uint32_t fb_h,
+                               VkImage hud_image,
+                               int32_t dst_x,
+                               int32_t dst_y,
+                               uint32_t dst_w,
+                               uint32_t dst_h,
+                               bool premultiplied)
+{
+	vk_hud_blend_draw_no_layout_fmt(blend, vk, cmd, fb, fb_w, fb_h, hud_image, VK_FORMAT_UNDEFINED, dst_x, dst_y,
+	                                dst_w, dst_h, premultiplied);
+}
+
+void
+vk_hud_blend_draw_no_layout_fmt(struct vk_hud_blend *blend,
+                                struct vk_bundle *vk,
+                                VkCommandBuffer cmd,
+                                VkFramebuffer fb,
+                                uint32_t fb_w,
+                                uint32_t fb_h,
+                                VkImage hud_image,
+                                VkFormat src_view_fmt,
+                                int32_t dst_x,
+                                int32_t dst_y,
+                                uint32_t dst_w,
+                                uint32_t dst_h,
+                                bool premultiplied)
+{
 	if (!blend->initialized || hud_image == VK_NULL_HANDLE || fb == VK_NULL_HANDLE ||
 	    dst_w == 0 || dst_h == 0) {
 		return;
 	}
 
-	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image);
+	/*
+	 * #2356: the render area is the destination rect (clamped to the
+	 * framebuffer), not the whole framebuffer. The draw is scissored to that
+	 * rect anyway, and the pass LOADs and STOREs, so the pixels are the same —
+	 * but a tiling GPU (Adreno) loads, bins and stores only the render area:
+	 * a full-atlas render area made every stamp of a small window-space layer
+	 * pay for the whole ~3K atlas, in GPU time and in the driver's per-bin
+	 * command building on the recording thread. The clamp also keeps the
+	 * scissor offset non-negative, which Vulkan requires.
+	 */
+	const int64_t x0 = dst_x < 0 ? 0 : dst_x;
+	const int64_t y0 = dst_y < 0 ? 0 : dst_y;
+	const int64_t x1 = (int64_t)dst_x + dst_w > (int64_t)fb_w ? (int64_t)fb_w : (int64_t)dst_x + dst_w;
+	const int64_t y1 = (int64_t)dst_y + dst_h > (int64_t)fb_h ? (int64_t)fb_h : (int64_t)dst_y + dst_h;
+	if (x1 <= x0 || y1 <= y0) {
+		return; // entirely outside the framebuffer
+	}
+	const VkRect2D area = {{(int32_t)x0, (int32_t)y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+
+	VkDescriptorSet desc_set = get_or_create_image_desc(blend, vk, hud_image, src_view_fmt);
 	if (desc_set == VK_NULL_HANDLE) {
 		return;
 	}
@@ -523,21 +614,44 @@ vk_hud_blend_draw_no_layout(struct vk_hud_blend *blend,
 	    .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 	    .renderPass = blend->render_pass,
 	    .framebuffer = fb,
-	    .renderArea = {{0, 0}, {fb_w, fb_h}},
+	    .renderArea = area,
 	};
 	vk->vkCmdBeginRenderPass(cmd, &rp_bi, VK_SUBPASS_CONTENTS_INLINE);
 
 	VkViewport vp = {(float)dst_x, (float)dst_y, (float)dst_w, (float)dst_h, 0.0f, 1.0f};
 	vk->vkCmdSetViewport(cmd, 0, 1, &vp);
-	VkRect2D scissor = {{dst_x, dst_y}, {dst_w, dst_h}};
+	VkRect2D scissor = area;
 	vk->vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipeline);
+	vk->vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+	                      premultiplied ? blend->pipeline_premul : blend->pipeline);
 	vk->vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, blend->pipe_layout, 0, 1,
 	                             &desc_set, 0, NULL);
 	vk->vkCmdDraw(cmd, 3, 1, 0, 0);
 
 	vk->vkCmdEndRenderPass(cmd);
+}
+
+void
+vk_hud_blend_forget_image(struct vk_hud_blend *blend, struct vk_bundle *vk, VkImage hud_image)
+{
+	if (!blend->initialized || hud_image == VK_NULL_HANDLE) {
+		return;
+	}
+
+	// #1795: an image may be cached under more than one view format.
+	for (uint32_t i = 0; i < blend->image_count;) {
+		if (blend->cached_images[i].image != hud_image) {
+			i++;
+			continue;
+		}
+		vk->vkDestroyImageView(vk->device, blend->cached_images[i].view, NULL);
+		vk->vkFreeDescriptorSets(vk->device, blend->desc_pool, 1, &blend->cached_images[i].desc_set);
+
+		// Order does not matter: move the last entry into the hole.
+		blend->image_count--;
+		blend->cached_images[i] = blend->cached_images[blend->image_count];
+	}
 }
 
 void
@@ -557,6 +671,9 @@ vk_hud_blend_fini(struct vk_hud_blend *blend, struct vk_bundle *vk)
 
 	if (blend->pipeline != VK_NULL_HANDLE) {
 		vk->vkDestroyPipeline(vk->device, blend->pipeline, NULL);
+	}
+	if (blend->pipeline_premul != VK_NULL_HANDLE) {
+		vk->vkDestroyPipeline(vk->device, blend->pipeline_premul, NULL);
 	}
 	if (blend->render_pass != VK_NULL_HANDLE) {
 		vk->vkDestroyRenderPass(vk->device, blend->render_pass, NULL);

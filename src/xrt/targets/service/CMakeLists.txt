@@ -13,18 +13,36 @@ target_link_libraries(
 		ipc_server
 		target_lists
 		target_instance
+		target_workspace_config
 	)
 
 # Workspace-controller discovery is cross-platform: registry-backed on Windows,
 # JSON-manifest-backed on POSIX (mirrors the plug-in loader). The minimal macOS
 # service orchestration in main.c uses the POSIX path to find + spawn a
 # registered controller (e.g. the macOS shell).
+#
+# service_config.c (service.json, cross-platform), service_hotkey.c (the launch
+# hotkey grammar) and service_workspace_registry.c come from the
+# target_workspace_config library (targets/common), which displayxr-cli links too.
 target_sources(displayxr-service PRIVATE
-	service_workspace_registry.c
-	service_workspace_registry.h
 	service_client_class.c
 	service_client_class.h
+	# ADR-053 (#2005): the service's conversion core (loader -> conv_core -> IPC).
+	service_conversion.c
+	service_conversion.h
+	# ADR-054 N3d (#2051): the one watch over every class's Enabled / Preferred store.
+	service_component_watch.c
+	service_component_watch.h	# Child-process mechanics shared by the orchestrator and the conversion-host
+	# supervisor (ADR-053 P2): sibling paths, spawn, terminate.
+	service_spawn.c
+	service_spawn.h
 )
+target_link_libraries(displayxr-service PRIVATE displayxr::conversion_runtime displayxr::conversion_store ipc_server_conv)
+if(TARGET comp_d3d11_conv_host_lane)
+	# ADR-053 P2: the GPU lane of conversion-host satellites (Windows).
+	target_link_libraries(displayxr-service PRIVATE comp_d3d11_conv_host_lane)
+	target_compile_definitions(displayxr-service PRIVATE SERVICE_HAVE_CONV_HOST_LANE_D3D11)
+endif()
 
 # Delay-load Vulkan so the service can start on systems where it is absent.
 # The D3D11 service compositor path never calls into Vulkan functions, so the
@@ -40,15 +58,14 @@ if(WIN32)
 	# Run as GUI app (no console window) with system tray icon and orchestrator
 	set_target_properties(displayxr-service PROPERTIES WIN32_EXECUTABLE TRUE)
 	target_sources(displayxr-service PRIVATE
-		service_config.c
-		service_config.h
 		service_orchestrator.c
 		service_orchestrator.h
 		service_tray_win.c
 		service_tray_win.h
 		service_resources.rc
 	)
-	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32)
+	# wtsapi32: WTSRegisterSessionNotification — the stereo camera's lock-screen suspension (ADR-043 R3)
+	target_link_libraries(displayxr-service PRIVATE shell32 ws2_32 wtsapi32 advapi32)
 
 	# #1201 — embed the shared per-monitor-v2 DPI manifest. The service already
 	# called SetProcessDpiAwarenessContext at the top of WinMain (now
@@ -71,11 +88,37 @@ endif()
 # unconditionally near the top of this file.
 if(APPLE)
 	target_sources(displayxr-service PRIVATE
-		service_config.c
-		service_config.h
 		service_orchestrator.c
 		service_orchestrator.h
 	)
+endif()
+
+# Desktop-Linux orchestrator: the macOS posix_spawn orchestrator (same #elif
+# block) plus the launch hotkey — a GNOME Shell extension keybinding over the
+# session bus (libdbus) and an X11 root-window grab fallback (xcb). Both are
+# optional: without either the controller is launched from the dashboard / CLI.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+	target_sources(displayxr-service PRIVATE
+		service_orchestrator.c
+		service_orchestrator.h
+		service_hotkey_linux.c
+		service_hotkey_linux.h
+		service_drm_hotplug_linux.c
+		service_drm_hotplug_linux.h
+		service_display_layout_linux.c
+		service_display_layout_linux.h
+	)
+	target_link_libraries(displayxr-service PRIVATE aux_os xrt-pthreads)
+	if(XRT_HAVE_DBUS)
+		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_DBUS SERVICE_HAVE_DBUS)
+		target_include_directories(displayxr-service SYSTEM PRIVATE ${DBUS_INCLUDE_DIRS})
+		target_link_libraries(displayxr-service PRIVATE ${DBUS_LIBRARIES})
+	endif()
+	if(XRT_HAVE_XCB)
+		target_compile_definitions(displayxr-service PRIVATE SERVICE_HOTKEY_HAVE_XCB)
+		target_include_directories(displayxr-service SYSTEM PRIVATE ${XCB_INCLUDE_DIRS})
+		target_link_libraries(displayxr-service PRIVATE ${XCB_LIBRARIES})
+	endif()
 endif()
 
 install(TARGETS displayxr-service RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -172,9 +215,29 @@ if(XRT_INSTALL_SYSTEMD_UNIT_FILES OR XRT_INSTALL_ABSOLUTE_SYSTEMD_UNIT_FILES)
 endif()
 
 if(XRT_HAVE_SDL2)
-	target_link_libraries(displayxr-service PRIVATE st_gui xrt-external-imgui-sdl2 aux_ogl)
+	target_link_libraries(displayxr-service PRIVATE xrt-external-imgui-sdl2 aux_ogl)
 
 	if(XRT_BUILD_DRIVER_QWERTY)
 		target_link_libraries(displayxr-service PRIVATE drv_qwerty_includes)
 	endif()
+endif()
+
+# Dev-tree parity with the installed layout: the service admits a DIAG client
+# (displayxr-cli status / workspace launch / clients ...) only when its binary
+# sits in the service's own directory (service_client_class.c verify_diag), and
+# the .deb / tarball / macOS bundle already co-locate the two. In the build
+# tree the CLI lands in targets/cli/, so a dev displayxr-cli was demoted to APP
+# and refused. Keep a COPY next to the service (a symlink would not do: the
+# check resolves /proc/<pid>/exe to the real path). The original stays where
+# the scripts look for it. Windows builds already stage both into _package/bin.
+if(TARGET cli AND NOT WIN32)
+	set(_cli_beside_service "${CMAKE_CURRENT_BINARY_DIR}/displayxr-cli${CMAKE_EXECUTABLE_SUFFIX}")
+	add_custom_command(
+		OUTPUT "${_cli_beside_service}"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:cli> "${_cli_beside_service}"
+		DEPENDS cli $<TARGET_FILE:cli>
+		COMMENT "Copying displayxr-cli next to displayxr-service (DIAG same-directory rule)"
+		VERBATIM
+		)
+	add_custom_target(displayxr-cli-beside-service ALL DEPENDS "${_cli_beside_service}")
 endif()

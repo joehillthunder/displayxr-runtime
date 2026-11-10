@@ -73,16 +73,127 @@ D3D11      32 -> 17 ms
 workspace  29 -> 17 ms
 ```
 
-`DXR_LATE_WEAVE=0` opts out, for A/B or triage only.
+`DXR_LATE_WEAVE=0` opts out, for A/B or triage only. It is also a **settable** lever: the
+Dashboard's Developer settings ("Turn off") or `displayxr-cli perf set DXR_LATE_WEAVE 0` stores
+it per user, so it reaches apps the Dashboard never launched; `perf reset DXR_LATE_WEAVE` undoes it.
+Each read site caches it once per process, so it applies to apps started afterwards — restart the
+service for workspace apps. An environment variable still outranks the stored value.
 
 | Companion | Default | Effect |
 |---|---|---|
-| `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH` |
-| `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min |
+| `DXR_LATE_WEAVE_MAX_LATENCY` | `1` | Frame-latency depth, clamped to `1..LATE_WEAVE_MAX_DEPTH`. On the desktop-Linux present_wait tier an explicit value **pins** the depth and turns the #2119 governor off for the session |
+| `DXR_LATE_WEAVE_AUTOBACKOFF` | on (`0` disables) | Backs the depth off when probes fail; dwell 30 s, doubling per failure, capped at 5 min. On the desktop-Linux present_wait tier `0` holds the depth at 1 (no lag floor, no slip escalation) |
 | `DXR_LATE_WEAVE_SLIP_CAP` | on (`0` restores the pre-2026-09 policy) | Caps slip-rate escalation at `needed_depth() + 1`, requires three clean slip windows before a return probe, and doubles the probe dwell when a slip escalation follows a probe within two dwells (30 → 60 → 120 → 300 s; measured: the 2↔3 cycle converges instead of running forever) |
+| `DXR_LATE_WEAVE_SCANOUT_WAIT` | auto (`0` forces off, `1` forces on) | The D3D11 in-process / hub chain and the D3D12 tier's own chain (`late_weave_stage2_gate`; the D3D12 chain exposes no `IDXGISwapChainMedia`, so there it stays off unless forced). The stage-2 scanout wait (weave only once the previous present is on the glass) runs only when DXGI reports the chain scanning out directly (`OVERLAY` / independent flip, confirmed over 30 frames); it is off while DWM composes the window (`COMPOSED`) and while the mode is unknown. On a composed chain DWM picks presents up at the vblank, so a present made just after scanout always misses it: depth 1 ran at 30 fps, the governor churned between depths, and every change moved weave→scanout by a refresh, which showed as 3D stutter (#2564). Off on such a chain: depth 1 holds 60 fps at a constant ~33 ms on the 8K box |
 
 Late weave depends on present-timing feedback from the swapchain. Where the platform does not
 provide it, it is **dormant** rather than wrong — see the topology table.
+
+**Desktop Linux (Vulkan, #2059).** Two sources, chosen per session, both behind `DXR_LATE_WEAVE`:
+
+| Tier | Source | Covers | Log line when it engages |
+|---|---|---|---|
+| present_wait (#2060) | `VK_KHR_present_wait` — acquire blocks until present id N−(depth−1) hit glass; depth governed since #2119 (below) | **enable2 apps** (Unity and anything using `xrCreateVulkanDeviceKHR`: the runtime chains `presentId`/`presentWait` itself) | `#902: late weave on VK_KHR_present_wait — pacing on present id N-0 hitting glass (depth governed (#2119) …)` |
+| measured grid (#2062) — **opt-in, `DXR_LATE_WEAVE_LINUX_GRID=1`** (#2068) | the window system's presentation feedback anchors `comp_vblank_grid.h`: native Wayland `wp_presentation` (`presented`: timestamp, refresh, seq, `vsync`/`hw_clock`), X11 Present `CompleteNotify` (`ust`/`msc`) | **enable1 apps** that did not chain the features, and any session where present_wait never resolves | `#902: late weave on the measured grid — period …, … (grid source: wp_presentation \| x11-present)` |
+
+**present_wait depth governor (#2119).** Depth 1 is only free when a present reaches glass within
+one refresh of its commit. A windowed surface on a composited desktop (GNOME/Wayland) reaches it
+about two refreshes later, so at depth 1 the next weave waits a whole extra refresh and the app
+runs at half rate — measured on ds1-linux (Intel PTL, GNOME 50, in-process Unity player, 60 Hz):
+**30.0 present/s at depth 1, 58.0 at depth 2, 55.5 with `DXR_LATE_WEAVE=0`**; the GPU clock is
+not involved (33.6 with it pinned at 2.5 GHz). So the depth is derived from measurements, base 1
+everywhere, ceiling 4:
+
+- **effective depth = max(lag floor, slip level).**
+- **Floor** (`util/comp_late_weave_depth.h`) — every signal is one the pacer already measures:
+  - **Raised by lag.** EMA of commit-to-glass (`wp_presentation` presented − `vkQueuePresentKHR`
+    return; on X11 the return of a present wait that blocked), taken **only from presents committed
+    with 0 of ours outstanding**, each sample clamped to EMA ± 0.5 period. The floor rises to
+    round(EMA) once the EMA reaches floor + 0.5 periods: 2 on a composited window, 1 on direct
+    scanout. Never lowered by lag — how much of a sample taken behind our own queue is queueing is
+    not observable (a FIFO that withholds the frame adds a period per present ahead; GNOME's
+    pipelined compositor adds nothing).
+  - **Raised by starvation.** In a 30-frame window, ≥ 24 frames that both waited ≥ 0.8 period in
+    the pacer and took ≥ 1.5 periods → one level up. This is the depth-1 serialisation signature,
+    and it catches a wrong lowering within about a second.
+  - **Lowered by slack.** At depth d the pacer waits on present N−(d−1). If over a dwell ≥ 95 % of
+    those waits return in < 0.1 period (the present was already on glass), the pipeline has a period
+    to spare → one level down, no probe. On a 2-period compositor the wait on N−1 stays ~0.7 period,
+    so depth 2 holds; on a 1-period target it is ~0, so depth 1 follows after the dwell. The dwell
+    starts at 5 s and doubles (to 300 s) when a raise follows a lowering within two dwells; the lag
+    EMA is re-learned after a lowering.
+  - **Drain.** After any raise, a frame is not admitted while more than depth − 1 of ours are
+    outstanding (Wayland: committed − answered feedback tags; bounded wait of 1.5 periods), so a
+    slot filled at the lower depth cannot stay queued — round 4 left the residual at 2.97 periods for
+    ~50 s after a revert.
+  - History: subtracting nothing from the lag ran away to depth 4 (residual 1.99 → 3.99 periods);
+    subtracting depth − 1 or the outstanding count misread the pipelined compositor and dropped to
+    depth 1 (30 present/s for two minutes); a 1 s throughput probe worked but cost a second at half
+    rate per probe plus the leftover queue. Depth 2 is cheap: the #206 weave→scanout horizon measured
+    the same at depth 1 and 2, while mutter flips its own buffering between 1 and 2 periods within a
+    run (5 s windows at depth 1: 59, 34, 97, 60, 61, 60, 58, 24, 98, 61 presents/s).
+- **Slip level** — the shared slip machine `util/comp_feedback_pace.h` (the Windows governor's
+  rules, also used by feedback pacing) fed with "paced frame interval > 1.55 periods". On this tier
+  it banks **no** level above the floor (`banked = 0`; feedback pacing keeps 1): measured on the
+  second CI build, a 58 fps app slipping from GPU jitter escalated 2 → 3, ran at 58 fps either way,
+  and paid a full period of residual. A slipping window at the cap logs
+  `#2119: slip window at the depth cap …` (at most every 30 s) instead.
+- The app's predicted display time follows the depth: at depth > 1 `xrWaitFrame` returns the
+  measured `wait_frame → weave + weave → scanout` lookahead (#867's formula) instead of `2 × period`.
+- `DXR_LATE_WEAVE_MAX_LATENCY` set = pinned depth, governor off; `DXR_LATE_WEAVE_AUTOBACKOFF=0` =
+  depth 1. Inert when the tier latches off. Every change logs one WARN (unthrottled) naming the
+  signal: `#2119: late-weave depth 1 -> 2 (commit-to-glass lag; … floor 2, slip level 1, …)`.
+  With `DXR_WEAVE_CADENCE_TRACE=1` the 5 s `#206` residual line carries the governor state:
+  `| depth 2 (floor 2, slip level 1, governed), lag at 0 outstanding 1.98 periods, outstanding at last commit 1, drains 0`.
+
+`VK_GOOGLE_display_timing` stays the grid source wherever a driver has it. The feeder ignores
+samples without `vsync`, counts `discarded` / `SKIP`, refuses a feed whose timestamps are not in
+`CLOCK_MONOTONIC`, derives the period from the vblank counter when no refresh value is given, and
+logs one `#902: <source> feed — …` line per state change. `DXR_VK_PRESENT_FEEDBACK=0` turns the
+feeder off.
+
+**Measured (Intel, GNOME, 60 Hz, window 1:1 on the panel, #2068):** the present_wait tier costs
+nothing (59.2–60.0 presents/s on vs 59.4–60.0 with `DXR_LATE_WEAVE=0`, Unity). The grid tier at
+the fixed 1.5 ms margin cost a quarter of the frames (40.5–43.4 vs 52.9–56.7, native enable1
+app): a composited desktop latches client buffers *before* the vblank, so a weave aimed just
+before it is shown a refresh late. **Feedback pacing (#2068, opt-in `DXR_LATE_WEAVE_LINUX_PACE=1`).** The present_wait latency-1
+behaviour for enable1 apps: before weaving frame N the compositor waits, bounded at 1.5 periods,
+until the `wp_presentation` feedback for commit N−latency has arrived (it is on glass, or was
+discarded). Rationale: same compositor, same runtime FIFO swapchain, an enable2 app paced by
+present_wait measured a 0.90-period weave→scanout residual and an unpaced enable1 app 2.5–3.1 —
+the difference reads as frames queued in FIFO, which pacing removes. `DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY`
+(1..4, default 1) mirrors `DXR_LATE_WEAVE_MAX_LATENCY`; slip rules mirror the Windows governor
+(`util/comp_feedback_pace.h`: a wait that times out is a slip, ≥ 10 slips per 120 waits escalates one
+level capped at base + 1, three clean windows plus a 30 s dwell probe back, a failed probe doubles
+the dwell up to 300 s, `DXR_LATE_WEAVE_AUTOBACKOFF=0` holds it; three slips before any success turn
+it off). Wayland only — X11 Present carries no tag of ours yet. Logs: `#902: pacing enable1 weaves
+on wp_presentation feedback (latency 1)`, and under `DXR_WEAVE_CADENCE_TRACE=1` every 5 s
+`#2068: feedback pacing — waits N, slips M, mean wait X ms (latency D)` next to the `#206` residual.
+The swapchain's real depth is logged once per target: `#2068: VK native swapchain — N images
+(surface minImageCount M, …), FIFO`.
+
+**Measured on a composited Wayland desktop (GNOME, Intel, 60 Hz, `DXR_WEAVE_CADENCE_TRACE=1`): the
+weave→scanout residual is 46.0 ms — 2.76 refresh periods** (`#206: last measured weave->scanout
+residual 46.01 ms (2.76 refresh periods, n=102)`). That is the real latency budget behind a
+desktop compositor, which composes on one refresh and scans out on a later one, and it is the
+number any late-weave benefit on Linux must be judged against. Late weave can only move the weave
+*within* a period; the whole-vblank pipeline delay is the compositor's.
+
+So on desktop Linux the grid tier **learns the compositor's latch** (`util/comp_late_weave_adapt.h`),
+in units of *vblanks from commit to glass*. The desktop's pipeline sets a floor (the fewest any
+commit has needed); an aimed frame that takes one vblank more committed after the latch and is a
+miss. Before aiming anything the gate watches 30 frames it did not delay, and starts the lead at
+the smallest commit-to-vblank gap that still made the floor (less the wake margin) — a lead known
+to hit — then probes it down 0.5 ms per 120 hits and adds 2 ms per miss. When lead + weave +
+margin no longer fit in a period it turns itself off for the session (`#902: grid late weave OFF
+for this session — …`). (The first cut called every frame landing after its aimed vblank a miss,
+which behind a compositor is every frame: the panel log was `lead 12.17 ms, aimed hits 0, misses
+4 [OFF]`.) The tier is **opt-in** behind `DXR_LATE_WEAVE_LINUX_GRID=1` until a panel A/B shows it
+holds the present rate. Without the opt-in an enable1 session logs `#902: grid late weave NOT
+engaged — opt-in on desktop Linux …` and the grid is still fed. `DXR_WEAVE_CADENCE_TRACE=1` logs
+the `#206` residual — as per-5 s window statistics (n, mean, p50, p95, max, % above 1.5 periods), not
+a single sample, because early samples are transients — and `#2068: grid late weave — desktop floor N vblank(s) commit-to-glass; …
+lead …, aimed hits …, misses …` every 5 s.
 
 **The governor's depth is a lever on the eye predictor, not just on fps (measured 2026-09-10).**
 Every queue level the governor adds moves the flip one whole period later, and #1437's learned
@@ -151,6 +262,29 @@ behavior.
 | `DXR_WEAVE_REPAINT_FORCE=1` | Repaint every refresh regardless of app rate. Correctness probe; it **will** cost frame rate. |
 | `_DIAG`, `_HASH`, `_NO2D`, `_DRAIN`, `_REFLATTEN`, `_APPTHREAD` | Bisect probes from the #868 investigation. Not for production. |
 
+**A fill that loses its fence-park race must hand its image back (#1748).** Since #1264 S1 a
+vk_native fill releases the compositor lock while it waits on its GPU fence, and drops its present
+if an app frame presented meanwhile. The drop used to return without presenting the swapchain image
+the fill had acquired, and Vulkan only returns an acquired image through a present, so every lost
+race leaked one image for the life of the swapchain. A few leaks and the next `vkAcquireNextImageKHR`
+blocked forever, with the app thread holding the compositor lock: this is why
+`DXR_WEAVE_REPAINT_FORCE=1` (which makes the race constant) hung a native-Wayland app within seconds.
+The dropped image is now held by the target and handed to the next acquire
+(`comp_vk_native_target_hold_unpresented`); a recreate drops the hold. Rare races under the default
+gate leaked the same way, so long sessions were exposed too.
+
+**Move fill on native Wayland (#1748, `DXR_WL_MOVE_SYNC_FILL`).** While a move-synced window is
+being dragged, the window advances on screen only when a frame woven for its new position is
+presented, so the vk repaint loop re-weaves the last atlas at the new position whenever no weave has
+chosen an origin for 7/8 of a refresh period. It bypasses the quiet gate and the phase hold (they
+keep fills out of a paced app's slots; during a drag the empty slot is the point) but never
+`app_frame_in_progress` or the submit window, and adds at most one weave per period, so the FIFO
+queue does not deepen. An app that already fills every refresh (FIFO-bound) gets nothing from it,
+and in the headless harness even a 30 Hz app was re-woven by the ordinary repaint gate often enough
+that the fill's effect stayed within run-to-run noise; the large cadence gain came from the GNOME
+extension publishing a move-synced window's geometry every frame instead of every other frame. See
+`docs/specs/runtime/wayland-window-geometry.md` §9.
+
 **Repaint weaves outside the app's frame loop, and a DP may not expect that.** A display processor
 is entitled to assume a weave cadence tied to app frames, and one that does may degrade — possibly
 silently — when repaint drives extra weaves. That is a per-vendor contract question, not a runtime
@@ -170,7 +304,7 @@ themselves on top of the throttle — double pacing; on vsync-blocking tiers the
 off its slots to cycle + stride, measured 14/s on a 20/s schedule), and animation steps
 by `predictedDisplayTime` deltas, which stride honestly. Releases sit on a fixed grid —
 never re-anchored — so a late app converges back onto its slots. Measured precursors
-**Supported tier: the #918 split's d3d11 fill arm — hybrid AND, since ADR-039 Phase A,
+**Supported tier: the #918 split's d3d11 fill arm (now `comp_hub_d3d11`, ADR-059) — hybrid AND, since ADR-039 Phase A,
 same-adapter** — the hybrid acceptance record is steady 60.0 presents across long runs,
 exact weave/repaint pair, GPU 25.5→19.0%, and the eyeball verdicts "tracking is great no
 stutter very good experience" / "looks great this run"; the same-adapter record (#1264,
@@ -212,9 +346,76 @@ Repaint needs somewhere to submit from. Three tiers, resolved automatically:
 Tier 2 is not assumed to work — the runtime resolves `vkGetQueueLockMarkerDXR` to confirm the
 layer is actually in *this* device's chain. The layer had never been packaged until #917, which
 meant tier 2 was unreachable on every single-queue GPU and those machines silently fell to tier 3.
+On Linux the same gap lasted until #2036: the `.deb` and the tarball built the layer but did not
+install it. They now install it (manifest in `/usr/share/vulkan/explicit_layer.d/`, or
+`$XDG_DATA_HOME/vulkan/explicit_layer.d/` for a user-level tarball install). Run `displayxr-cli info`
+to check that the loader can reach it.
 
 Overrides: `queue` = tier 1 only · `layer` = force tier 2 even where a queue exists, so the layer
 path is testable on multi-queue GPUs · `off` = no layer injection, no repaint.
+
+#### `vulkan_enable1` apps — getting the layer into a chain the runtime does not create (#886)
+
+Tier 1 needs a queue the runtime asked for, and tier 2's layer is *injected* at
+`xrCreateVulkanInstanceKHR` — both exist only under `XR_KHR_vulkan_enable2`, where the runtime creates
+the `VkInstance` and `VkDevice`. Under `XR_KHR_vulkan_enable1` (every shipped native demo: avatar,
+modelviewer, gaussiansplat, earthview, mediaplayer) the **app** creates both, so there is never a
+runtime-owned queue — on any GPU — and the layer tier is the *only* repaint tier. The layer must
+reach the app's chain by a route the app or its environment controls:
+
+| Route | How | Verdict |
+|---|---|---|
+| **(a) implicit manifest** | The same layer, same name and library, also installed as an **implicit** layer: `/usr/share/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json` (`.deb`) or `$XDG_DATA_HOME/vulkan/implicit_layer.d/` (tarball). Gated by `enable_environment` **`DXR_VK_QUEUE_LOCK=1`**; `disable_environment` **`DXR_VK_QUEUE_LOCK_DISABLE=1`** vetoes it. | **Shipped, desktop Linux.** No app change; a launcher or a user sets one env var. Inert without it — an ungated implicit layer would load into every Vulkan process on the box, which `displayxr-cli info` and the DebInstall gate both refuse. |
+| (b) runtime requirement list | Advertise the layer through `xrGetVulkanInstanceExtensionsKHR` / `xrGetVulkanGraphicsRequirementsKHR`. | **Not possible.** enable1 returns instance/device *extension* names and an API-version range only; the spec has no channel for layers, and a layer name in the extension string makes `vkCreateInstance` fail with `VK_ERROR_EXTENSION_NOT_PRESENT`. |
+| (c) app enables it | The app checks `vkEnumerateInstanceLayerProperties` and appends `VK_LAYER_DXR_queue_lock` to its own `ppEnabledLayerNames` (a native port did this behind `DXR_VK_QUEUE_LOCK=1` and the marker handshake worked: `repaint loop start ret=0`). | Works everywhere the explicit manifest is installed, including Windows; needs a change per app (tracked on `displayxr-common` for the demo template). |
+| (d) runtime arms (a) in-process | The runtime `setenv("DXR_VK_QUEUE_LOCK","1")` from `xrGetVulkanInstanceExtensionsKHR` (enable1 only) when the user has not set it. | **Viable, not enabled yet.** Verified: the Vulkan loader re-reads the environment on every `vkCreateInstance`, even after an earlier instance in the same process. Ordering requirement: the app's `VkInstance` must be created *after* that call — which the enable1 flow already implies, because the app needs that call's extension list to create the instance. An engine that creates its `VkInstance` before touching OpenXR misses it. `setenv` is process-wide and not thread-safe against concurrent `getenv`, so it belongs in that early, single-threaded call. Held back until runtime#2039 is re-measured on the fixed native app. |
+
+**Recommended default:** (a) is the mechanism and ships now, **opt-in** (`DXR_VK_QUEUE_LOCK=1`) — the
+same knob a native port already uses for its own app-side opt-in, so one variable means "give this
+app the layer" whichever route honours it. (c) is the belt-and-braces for apps that must work without
+the env var (and on Windows, where no implicit manifest is installed). (d) is the follow-up that makes
+it default-on with no app change, once runtime#2039's re-measurement shows no per-call serialisation
+cost for an enable1 app.
+
+*Experiment, not a product path:* Intel ANV honours `ANV_QUEUE_OVERRIDE=gc=2`, which exposes **two**
+graphics queues (measured on an Intel PTL laptop). That hands an **enable2** app tier 1 — the runtime
+asks for its own queue — and no layer is needed. It does nothing for enable1 (the app creates the
+device and asks for one queue), it is a driver debug knob, and it changes what every Vulkan process on
+the box sees; use it only to A/B tier 1 against tier 2 on the same iGPU.
+
+**The field log names the route.** The layer reports how it entered the chain through a second
+handshake entry point, `vkGetQueueLockActivationDXR(VkDevice)` — named in `ppEnabledLayerNames`,
+implicit (not named, `DXR_VK_QUEUE_LOCK=1`), or loader env (`VK_INSTANCE_LAYERS` /
+`VK_LOADER_LAYERS_ENABLE`) — and the runtime adds whether *it* named it. One line per session:
+
+```
+#886: VK_LAYER_DXR_queue_lock route=<injected|app-enabled|implicit|loader-env|absent|unknown> (...) —
+      <app-created (vulkan_enable1) | runtime-created (vulkan_enable2)> device,
+      graphics family has N queue(s), repaint tier: <runtime-owned queue | shared app queue | none>
+```
+
+`unknown` = a layer older than the query (the installed `.so` predates #886). The loader dedupes the
+explicit and implicit manifests by name, so a runtime-injected (enable2) session and an enable1 app
+run with `DXR_VK_QUEUE_LOCK=1` both get exactly one copy in the chain
+(`tests/tests_vk_queue_lock_activation.sh` pins this against the real loader).
+
+**Cost guard — log only (runtime#2039).** When an enable1 app on a single-graphics-queue GPU runs
+with the layer live, the repaint on its queue and app swapchains deeper than two images (more than
+one app frame can be queued on the shared queue), the compositor logs one `#868: per-call queue
+serialisation in effect …` line naming `DXR_WEAVE_REPAINT=0` as the A/B switch for the loop. Nothing
+is disabled automatically: the collapse first reported in #2039 reproduced *without* the layer and was
+later attributed to a tracked viewer plus a low GPU clock.
+
+**Single weave-thread ownership is the default there (#2393).** With the repaint sharing an
+enable1 app's queue, legacy ownership (`DXR_WEAVE_SINGLE_THREAD` off — the desktop default) has two
+threads weaving into the one `VkSwapchainKHR`: the app thread inside `xrEndFrame`, and the repaint
+thread. A field report (an enable1 app, hosted, Windows) saw every app-frame
+`vkAcquireNextImageKHR` time out and the session return `XR_ERROR_RUNTIME_FAILURE` from then on,
+cleared by `DXR_WEAVE_SINGLE_THREAD=1`. So when the device is app-created (enable1) **and** the
+shared-queue tier engaged, the compositor turns single ownership on and logs one
+`#2393: vulkan_enable1 app with the repaint sharing its queue …` WARN ahead of the usual `#1196:
+weave thread ownership` line. An explicit `DXR_WEAVE_SINGLE_THREAD=0` restores the legacy
+ownership; enable2 sessions and Android are unchanged.
 
 ### `DXR_DEFER_PRESENT` — **REMOVED from the code; kept here as the measurement record** (#837)
 
@@ -471,6 +672,19 @@ change in real present latency is largely self-correcting without any runtime kn
 the DP thinks it means when `DXR_DEFER_PRESENT` moves the present into the following call. Nothing
 moves the present any more. Re-open it only if a deferred-present mechanism is ever reintroduced.
 
+**Look-around eyes are asked for at the display time (ADR-054 N6 Part 1, #2144).** The eyes an
+app renders for used to be "the vendor's latest prediction" — now + a horizon the caller could not
+see — so the rendered pair and the woven pair could disagree by however far the app's
+`displayTime` was from that horizon. `xrLocateViews` now passes the frame's `displayTime`
+(monotonic) down to the DP's optional `get_eye_positions_at` slot — in-process, and over IPC to the
+service, which answers from that client's DP. **A DP without the slot keeps today's latest-answer
+behaviour; implementing the slot opts in to display-time sampling** — the runtime never
+re-extrapolates an answer the vendor already predicted (that would double the horizon). The
+trunk's eye ring (`u_eye_history`) is read only when an implemented slot fails, and then clamped
+to its newest sample. No env var: the target is the app's own `displayTime`, so anything that
+moves `xrWaitFrame`'s predicted display time moves a slot-implementing DP's eyes with it. Server-side
+weave-time queries (the weave engines' own per-frame eye reads) still use "latest" — Part 1b.
+
 ### Adjacent levers that change the picture
 
 | Lever | Default | Note |
@@ -480,14 +694,16 @@ moves the present any more. Re-open it only if a deferred-present mechanism is e
 | `DXR_D3D_FORCE_GPU` / `DXR_VK_FORCE_GPU` | unset | Which adapter renders and weaves (#821). See [adapter-selection.md](adapter-selection.md) |
 | `DXR_WEAVE_ON_SCANOUT` | **on (kill switch)** | **DEFAULT ON since #918 Phase 3 (ADR-037 §1).** The output-device split engages automatically wherever the scanout adapter differs from the render adapter **and the path implements it**: in-process D3D11, the D3D11 service (eligible presenter kinds only — `SERVICE_WINDOW` / `APP_HWND`; `CLIENT_TEXTURE` and self-presenting clients are structurally ineligible), in-process D3D12 (**all layer kinds** as of D12-4/D12-5), and **in-process Vulkan** (**all layer kinds** as of #1178 VK-0/VK-1a/VK-1b, shipped v2.12.1/v2.13.0). Vulkan reaches it without any cross-adapter Vulkan work: the compositor renders its atlas directly into a same-adapter D3D11 deposit texture (zero copies — the atlas IS the deposit slot, `COLOR_ATTACHMENT`), ordered by a shared `ID3D11Fence` imported as a VK timeline semaphore, and the existing D3D11-ends `comp_xbridge` carries it from there — so the bridge needed **no** Vulkan support. A VK session refuses the split only when the deposit can stand up no GPU-side sync at all: fence mode needs `VK_KHR_timeline_semaphore` on the app's `VkDevice` (`reason=no_timeline_semaphore`), and on a driver with no D3D12_FENCE import the deposit falls back to KEYED-MUTEX mode (ADR-039 Phase A; requires `VK_KHR_win32_keyed_mutex`; plane deposits run timing-only per #1274). **OpenGL** has no split and cannot have one — it exposes no adapter-selection API, so the runtime cannot place a GL context — and takes ADR-037 §3 rung 2, logged as `split=0 reason=api_unsupported`; its D3D interop devices do now follow the GL context's own adapter (#1159). Set `DXR_WEAVE_ON_SCANOUT=0` (or `f…`/`n…`/`off`) to KILL it and force the old single-adapter behaviour; `=1` still works and is now a no-op restatement of the default. What it does: the app keeps rendering on its own adapter while the swapchain, the display processor, the HUD and the repaint loop move to the adapter that scans out the panel, with the composited atlas crossing once per app frame through a D3D12 cross-adapter heap. Removes the cross-adapter present, so the weave→scanout residual drops from ~2.5 frame periods to one. Covers **zones, Local2D, authored masks and the 2D-under backdrop** as of Phase 2a on the D3D11 legs (the four mask rasterizers take pure CPU rects and are built on the output device, while the Local2D flatten, the backdrop and a Tier-3 app-drawn mask ride the same egress slot as the atlas as extra planes — dirty-box + change-skip; measured 3 copies per session at rest, zero bridge traffic per repaint tick). The D3D12 leg covered projection only until D12-4/D12-5; it now transports zones, Local2D, the backdrop and app-authored masks too, so `layers_unsupported` is a **retired token** that nothing emits (kept so pre-D12-4 field logs still resolve). The VK leg likewise covers all layer kinds; its only remaining retire triggers are machine failures (`authored_mask` on an R8 plane allocation failure, `dp_refused_scanout`). On the SERVICE it covers **both** paths — direct (the focused client's cropped atlas) and compose (the crop of the combined atlas) — with the panel DP staying on the scanout adapter across a shell attach/detach, the zones wish mask following the DP's device rather than the output half, and unfocused app-HWND flat repaints skipped while it is on. When the scanout adapter already is the app's, ALL THREE accepted tiers now ENGAGE by default (`DXR_SPLIT_SAME_ADAPTER=0` is the shared kill switch back to the old `reason=same_adapter` decline — the fill-engine headroom, not the removed copy, is the property): VK (ADR-039 Phase A), the in-process D3D11 tier (Phase C — all layer kinds, planes eyeball-verified), and the D3D12 tier **via the heavy-d3d12 reroute** — its engage routes through the d3d11 fill arm (its own-legs arm serializes under real app load; `DXR_SPLIT_D3D12_ROUTE=own` keeps it as the A/B control), with Local2D/backdrop/zone planes transported and live window-resize followed. Refused outright under `DXR_LEGACY_STANDALONE`. Every fallback names itself on the one `weave placement:` line. `DXR_WEAVE_ON_SCANOUT_DEPTH=1` forces the deterministic seq−1 slot instead of the opportunistic newest-ready pick; `DXR_TEST_SPLIT_FAIL_STAGEA=1` forces Stage A to fail and `DXR_TEST_FAKE_DP_REFUSE=1` forces a DP refusal on the scanout adapter (both in-process legs: D3D12 retires the engaged split, D3D11 fails Stage A before it engages — ADR-037 §3a), for exercising the two halves of the fallback matrix. **#1172:** an ineligible SERVICE client (`CLIENT_TEXTURE` / present-owner) does not merely stay off the scanout adapter — it gets a display processor of its **own** on the render device, bound to its **own** window, because the shared panel DP follows whichever presenter owns the panel and weaving a render-adapter texture through a scanout-adapter weaver faults inside the vendor SDK. Logged as `split=0 reason=presenter_ineligible,weave_on_ingest`. `DXR_TEST_FORCE_WEAVE_INGEST_DP=1` forces that path on with no split at all (so it is exercisable on a single-adapter box, with `test_apps/probes/weave_rpc_probe_d3d11_win`), `=2` forces the DP creation to fail so the refusal guard runs instead of the weave |
 | `DXR_SPLIT_INGRESS` | `adaptive` | **#918 Phase 2b PR 6, service only.** What the bridge does with the app-device source texture. `adaptive` reads a source that has held still IN PLACE and stages only the frame a source CHANGE lands on (a focus change, a controller attaching, a crop texture reallocating), with a 250 ms settle before it re-binds so a resize drag cannot drive one shared-handle re-open per frame. `staged` pins the PR 3-5 behaviour — one extra full-content app-device copy every frame — and exists as the A/B control, not as tuning. A source the render thread does not exclusively own is never read in place regardless: a client's own atlas is written by that client's IPC thread and always stages |
+| `DXR_HUB` | **on (kill switch)** | **#2317 step 2 (ADR-059):** the in-process D3D11 leg weaves and presents through the D3D11 hub (`comp_hub_d3d11`) by default **on a cross-adapter box** (`comp_xbridge` ingress); on one adapter (DIRECT ingress, 0 transport copies) only with `=1` until the single-dGPU desktop run. `=0` restores the tier's own #918 split / single-device legs; one `hub placement:` line per session names the rung. Hosted, transparent, texture-class and PQ-atlas sessions stay on the tier's own legs by name |
+| `DXR_SPLIT_D3D12_HYBRID_REROUTE` | **on (kill switch)** on a cross-adapter box | **#2375 (ADR-059):** an in-process D3D12 session on a hybrid box weaves and presents through the D3D11 hub (the #1264 reroute, `comp_xbridge` ingress) instead of the tier's own-legs #918 split. Hybrid-laptop record: #2374, #2375 (open legs listed there: single-dGPU #2371, Unreal, part of the mode switch, eye-tracking state change). A false spelling restores the own-legs split (`hub=0 reason=hybrid_reroute_disabled_by_env`); unset, `DXR_HUB=0` does too (`hub_disabled_by_env`); any non-false value engages it even under `DXR_HUB=0`. A failed hub Stage A falls back to the own-legs split on its own (#2376) |
 | `DXR_FRAME_STAGE_TIMING` | off | Per-stage CPU timing of the windowed commit. `composite=` is the GPU wait |
 
 ## Defaults by GPU topology
 
 | | dGPU (discrete, multi-queue) | iGPU (integrated) | Hybrid laptop |
 |---|---|---|---|
-| Late weave | **on**, fully effective | **on**, but *dormant on VK* where the driver exposes no VK present-timing extensions | on; effective on whichever adapter owns the present |
-| Repaint | **on**, tier 1 dedicated queue | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) | on; follows the adapter the session was created on |
+| Late weave | **on**, fully effective | **on**; on Windows *dormant on VK* where the driver exposes no VK present-timing extensions — on desktop Linux fed by `VK_KHR_present_wait` or the window system (above) | on; effective on whichever adapter owns the present |
+| Repaint | **on**, tier 1 dedicated queue (enable2); enable1 apps: tier 2 only, opt-in `DXR_VK_QUEUE_LOCK=1` (#886) | **on**, tier 2 via `VK_LAYER_DXR_queue_lock` (single queue family) — injected for enable2; enable1 apps opt in with `DXR_VK_QUEUE_LOCK=1` (#886) | on; follows the adapter the session was created on |
 | `DXR_DEFER_PRESENT` | *removed from the code* | *removed* | *removed* |
 | `DXR_PRESENT_OPAQUE` | off | off — **pure cost on VK** without timing extensions to exploit; the opposite has been observed for engine apps | off |
 
@@ -500,8 +716,11 @@ woven frame, and every repaint tick, crosses inside `Present`. Measured on the r
 purely on re-transfer.
 
 The **output-device split** (above) is that scanout-local pipeline, and since #918 Phase 3 it is
-the DEFAULT rather than a flag. It runs on the D3D11 windowed path, on the in-process D3D12 path
-(projection-only), and on **both** of the
+the DEFAULT rather than a flag. In-process, a window-bound D3D11 or D3D12 session on a hybrid box
+weaves and presents through the D3D11 hub, `comp_hub_d3d11` (ADR-059: D3D11 since #2363, D3D12
+since #2375), and the Vulkan tier's split is the same hub. Sessions the hub refuses (on D3D11,
+a `_hosted` window or a transparent session) and sessions under a kill switch run the tier's own-legs split. The
+service runs its own split on **both** of the
 D3D11 service's paths — the DIRECT path (PR 3) and the COMPOSE path with a workspace controller
 attached (PR 4). So a forced-IPC `_handle` app, a hosted client presenting through the service
 window, and the shell composing several of them all weave and present on the scanout adapter, and
@@ -535,13 +754,14 @@ stack (all six share flavours fail at the open call, both directions), so the tr
 `SHARED | SHARED_CROSS_ADAPTER` heap with D3D11 on both ends; KMT handles share no pixels on some
 integrated drivers, so use NT handles.
 
-There is still **no hybrid-specific default** — unflagged, you get the dGPU column with a
-cross-adapter copy. #918 stays **open** on Phase 3, which owns default-on, and default-on has a
-hard external gate: **SR Platform ≥ 1.37.0+1498**. Below that the scanout weave emits
-transparent-black bursts while nobody is tracked (#1134, closed — a non-monotonic pulse-animation
-clock in the vendor weavers, fixed as LeiaSR#190 and verified 0/40 against 8/40 pre-fix). Until
-Phase 3 lands, read the split as the lever to try first when a hybrid box shows a ~2.5-frame
-residual, not as tuning advice.
+So the hybrid column has its own default: the scanout-local pipeline, with no flag. #918 is
+closed: its Phase 3 made the split the default, and #2363 / #2375 then moved the in-process half
+onto the D3D11 hub. The split still needs **SR Platform ≥ 1.37.0+1498** on Leia hardware. Below
+that the scanout weave emits transparent-black bursts while nobody is tracked (#1134, closed — a
+non-monotonic pulse-animation clock in the vendor weavers, fixed as LeiaSR#190 and verified 0/40
+against 8/40 pre-fix). To tell which pipeline a session got, read its `hub placement:` line
+(in-process) or its `weave placement:` / `[RENDER] split=` lines; `DXR_HUB=0` and
+`DXR_WEAVE_ON_SCANOUT=0` are the A/B controls.
 
 ## Measuring any of this
 

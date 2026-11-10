@@ -31,6 +31,13 @@ if(XRT_BUILD_DRIVER_QWERTY)
 		list(APPEND QWERTY_SOURCES qwerty/qwerty_macos.m)
 	endif()
 
+	# On desktop Linux, add the X11 input handler for the vk_native compositor's
+	# self-created XCB window (#1727). Needs only <X11/keysym.h> (a header), which
+	# comes with the x11-xcb dependency that XRT_HAVE_XCB already requires.
+	if(XRT_HAVE_XCB AND NOT ANDROID)
+		list(APPEND QWERTY_SOURCES qwerty/qwerty_xcb.c)
+	endif()
+
 	add_library(drv_qwerty STATIC ${QWERTY_SOURCES})
 	# aux_math (PUBLIC displayxr::math_xrt) provides the canonical rig converters
 	# (dxr_view_rig_*) + dxr_view_math.h, used by the qwerty V-toggle to switch
@@ -63,11 +70,60 @@ endif()
 add_library(drv_sim_display_includes INTERFACE)
 target_include_directories(drv_sim_display_includes INTERFACE sim_display)
 
+# #1855: the face estimator behind the webcam eye tracker (sim_tracking
+# SOURCE=webcam, and sim_display's deprecated WEBCAM_TRACKING alias). "stub" (the
+# default, and what every release ships) builds none: the tracker then logs a WARN
+# and never opens a camera. "onnx" is a developer opt-in that fetches ONNX
+# Runtime + the YuNet face model (both pinned by SHA256) and drops the runtime
+# library and the model next to the plug-ins; see sim_tracking/sim_webcam_onnx.cmake.
+set(XRT_SIM_WEBCAM_ESTIMATOR "stub" CACHE STRING
+	"webcam eye tracker face estimator (#1855): stub | onnx")
+set_property(CACHE XRT_SIM_WEBCAM_ESTIMATOR PROPERTY STRINGS stub onnx)
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	include(${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking/sim_webcam_onnx.cmake)
+elseif(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "stub")
+	set(SIM_WEBCAM_ESTIMATOR_SOURCE sim_tracking/sim_face_estimator_none.c)
+else()
+	message(FATAL_ERROR "XRT_SIM_WEBCAM_ESTIMATOR must be stub or onnx, not '${XRT_SIM_WEBCAM_ESTIMATOR}'")
+endif()
+
+# The webcam tracker core (#1855), owned by sim_tracking and compiled into both
+# hosts: sim_tracking (SOURCE=webcam) and sim_display (the one-release
+# WEBCAM_TRACKING alias). Its only host dependency is the sim_webcam_settings
+# callback, so there is one copy of the code.
+set(SIM_WEBCAM_CORE_SOURCES
+	sim_tracking/sim_face_estimator.h
+	${SIM_WEBCAM_ESTIMATOR_SOURCE}
+	sim_tracking/sim_face_yunet.c
+	sim_tracking/sim_face_yunet.h
+	sim_tracking/sim_webcam_settings.h
+	sim_tracking/sim_webcam_source.c
+	sim_tracking/sim_webcam_source.h
+	sim_tracking/sim_webcam_tracker.c
+	sim_tracking/sim_webcam_tracker.h
+	sim_tracking/sim_webcam_tracking.c
+	sim_tracking/sim_webcam_tracking.h
+	)
+
 # Simulation 3D display driver (always available as fallback, FORCE_SIM_DISPLAY=1 overrides vendor drivers)
 set(SIM_DISPLAY_SOURCES
 	sim_display/sim_display_device.c
+	sim_display/sim_display_eyes.c
+	sim_display/sim_display_eyes.h
 	sim_display/sim_display_interface.h
+	sim_display/sim_display_settings.c
+	sim_display/sim_display_settings.h
+	sim_display/sim_display_monitor_geometry.c
+	sim_display/sim_display_monitor_geometry.h
 	sim_display/sim_display_zone_common.h
+	sim_display/sim_display_stereo_camera.c
+	sim_display/sim_display_stereo_camera.h
+	sim_display/sim_display_stereo_camera_pattern.c
+	sim_display/sim_display_stereo_camera_pattern.h
+	# #1855: the deprecated WEBCAM_TRACKING alias — sim_display's glue over the
+	# core sim_tracking owns.
+	sim_display/sim_display_webcam.c
+	${SIM_WEBCAM_CORE_SOURCES}
 	)
 
 # Vulkan display processor (anaglyph/blend shaders)
@@ -94,7 +150,14 @@ endif()
 # D3D11 display processor (HLSL shaders compiled at runtime)
 if(WIN32)
 	list(APPEND SIM_DISPLAY_SOURCES
-		sim_display/sim_display_processor_d3d11.cpp)
+		sim_display/sim_display_processor_d3d11.cpp
+		# ADR-042: env-gated FAKE lift module (SIM_DISPLAY_FAKE_LIFT=1),
+		# DEPRECATED by DisplayXR-SimConversion (ADR-053): a thin wrapper over
+		# the synthesis shared with that provider (sim_conversion/ below).
+		sim_display/sim_display_lift_d3d11.cpp
+		sim_conversion/sim_conv_fake_ply.c
+		sim_conversion/sim_conv_synth.c
+		sim_conversion/sim_conv_synth.cpp)
 endif()
 
 # D3D12 display processor (HLSL shaders compiled at runtime into PSOs)
@@ -127,13 +190,17 @@ add_library(drv_sim_display STATIC ${SIM_DISPLAY_SOURCES})
 # aux_ogl is only needed by the desktop-GL display processor (gated on
 # NOT ANDROID AND XRT_HAVE_OPENGL above) — keep this link in lockstep so a
 # headless Linux build without GL doesn't drag in GL/GLES aux.
-target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os PUBLIC drv_includes)
+target_link_libraries(drv_sim_display PRIVATE xrt-interfaces aux_util aux_os aux_os_uvc PUBLIC drv_includes)
 if(NOT ANDROID AND XRT_HAVE_OPENGL)
 	target_link_libraries(drv_sim_display PRIVATE aux_ogl)
 endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	sim_webcam_onnx_configure(drv_sim_display)
+endif()
 
 # aux_ogl headers (ogl_api.h) are in auxiliary/ogl/
-target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary)
+target_include_directories(drv_sim_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion ${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking)
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display PRIVATE aux_vk)
@@ -207,7 +274,7 @@ if(ANDROID OR XRT_HAVE_LINUX)
 	# (APK lib dir on Android; the plug-in search dir on Linux) and the loader
 	# preloads siblings by path (#333). See docs/roadmap/linux-support.md.
 	target_link_libraries(drv_sim_display_plugin PRIVATE
-		xrt-interfaces aux_util aux_os drv_includes)
+		xrt-interfaces aux_util aux_os aux_os_uvc drv_includes)
 	if(NOT ANDROID AND XRT_HAVE_OPENGL)
 		# Non-Android desktop GL build: the GL DP is compiled in, so it needs
 		# aux_ogl. (Headless Linux without GL skips this, matching the static lib.)
@@ -229,15 +296,44 @@ else()
 			xrt-interfaces
 			aux_util
 			aux_os
+			aux_os_uvc
 			aux_ogl
 			drv_includes
 		)
 	add_dependencies(drv_sim_display_plugin ${RUNTIME_TARGET})
+	if(MSVC)
+		# #1855: the webcam tracker's capture backend (aux_os_uvc, Media
+		# Foundation) is reached only under WEBCAM_TRACKING=1 (deprecated alias).
+		# Delay-load it so every process that loads this plug-in does not map
+		# MF at load — and so the plug-in still loads on Windows "N" editions,
+		# which ship without Media Foundation.
+		target_link_options(drv_sim_display_plugin PRIVATE
+			"/DELAYLOAD:mf.dll" "/DELAYLOAD:mfplat.dll" "/DELAYLOAD:mfreadwrite.dll")
+		target_link_libraries(drv_sim_display_plugin PRIVATE delayimp)
+	endif()
 endif()
 target_include_directories(drv_sim_display_plugin PRIVATE
 	${CMAKE_CURRENT_SOURCE_DIR}/sim_display
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking
 	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
 	)
+
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	# #1855 opt-in estimator: the plug-in loads ONNX Runtime and the model from
+	# its OWN directory at run time (never linked), so both travel with it --
+	# into the build output here, and into the plug-in dir by the install rules
+	# below. Default builds take none of this.
+	sim_webcam_onnx_configure(drv_sim_display_plugin)
+	add_custom_command(
+		TARGET drv_sim_display_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+			"$<TARGET_FILE_DIR:drv_sim_display_plugin>/"
+		COMMENT "sim webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the sim_display plug-in"
+		VERBATIM
+		)
+endif()
 
 if(XRT_HAVE_VULKAN)
 	target_link_libraries(drv_sim_display_plugin PRIVATE aux_vk)
@@ -320,7 +416,106 @@ elseif(NOT ANDROID)
 		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
 		)
 endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx" AND NOT ANDROID)
+	if(WIN32)
+		set(_sim_webcam_plugin_dir ${CMAKE_INSTALL_BINDIR}/plugins)
+	else()
+		set(_sim_webcam_plugin_dir ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins)
+	endif()
+	install(FILES "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+		DESTINATION ${_sim_webcam_plugin_dir} COMPONENT Runtime)
+endif()
 endif() # XRT_FEATURE_OPENXR — DisplayXR-SimDisplay plug-in block
+
+####
+# DisplayXR-TouchInput input-provider plug-in (ADR-034 / #132).
+#
+# The first ANDROID input provider: touch gestures -> a NAVIGATION device
+# (orbit / pinch / pan / double-tap recenter) + an emulated
+# khr/simple_controller (aim ray under the finger, select = tap or hold). The
+# events come from the host's pointer queue (xrt_input_plugin_host_iface::
+# poll_pointer_events), which the runtime's own surfaces push into, so the
+# plug-in has no platform code of its own and builds EVERYWHERE: Android is
+# the shipping target (libdxri100_touch_input.so, discovered by the
+# `libdxri<NNN>_` prefix exactly like libdxrp for DPs), desktop builds get
+# DisplayXR-TouchInput for development — its probe() declines there unless
+# ENABLE=1, because nothing feeds the queue on a desktop yet. Build model as
+# sim-input below: self-contained static aux + version script on ELF (Android
+# included), XRT_USING_RUNTIME_DLL + runtime import lib on Windows/macOS.
+if(XRT_FEATURE_OPENXR)
+add_library(drv_touch_input_plugin SHARED
+	touch_input/touch_gesture.c
+	touch_input/touch_gesture.h
+	touch_input/touch_input_controller.c
+	touch_input/touch_input_interface.h
+	touch_input/touch_input_nav.c
+	touch_input/touch_input_plugin.c
+	touch_input/touch_input_provider.h
+	touch_input/touch_input_settings.c
+	touch_input/touch_input_settings.h
+	)
+if(ANDROID OR XRT_HAVE_LINUX)
+	target_link_libraries(drv_touch_input_plugin PRIVATE xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_touch_input_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_touch_input_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_touch_input_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_touch_input_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/touch_input
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+if(ANDROID)
+	# Convention-driven discovery: the input loader scans the runtime APK's
+	# lib dir for libdxri<NNN>_<id>.so, NNN = ProbeOrder. 100: a vendor's
+	# tracking provider (50) outranks touch; sim-input (200) would not.
+	set_target_properties(drv_touch_input_plugin PROPERTIES
+		OUTPUT_NAME "dxri100_touch_input"
+		LINKER_LANGUAGE CXX
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+else()
+	set_target_properties(drv_touch_input_plugin PROPERTIES
+		OUTPUT_NAME "DisplayXR-TouchInput"
+		PREFIX ""
+		LINKER_LANGUAGE CXX
+		C_VISIBILITY_PRESET hidden
+		CXX_VISIBILITY_PRESET hidden
+		VISIBILITY_INLINES_HIDDEN ON
+		)
+endif()
+# Single-symbol export filter: xrtInputPluginNegotiate only (Android included —
+# the statically-linked aux copies must not interpose the runtime's, #496).
+if(APPLE)
+	target_link_options(drv_touch_input_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_touch_input_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_touch_input_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+elseif(NOT ANDROID)
+	install(
+		TARGETS drv_touch_input_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR — DisplayXR-TouchInput block
 
 ####
 # DisplayXR-SimInput input-provider plug-in DLL (ADR-034 / #823).
@@ -329,14 +524,21 @@ endif() # XRT_FEATURE_OPENXR — DisplayXR-SimDisplay plug-in block
 # controllers for the hardware-free CI gate. Same build model as the
 # sim-display plug-in above (XRT_USING_RUNTIME_DLL + runtime import lib on
 # Windows/macOS; self-contained static-aux + version script on ELF), but a
-# much smaller dependency set: no DP factories, no graphics APIs. Android
-# ships no input providers in v1 (loader stubs), so the target is desktop-only.
+# much smaller dependency set: no DP factories, no graphics APIs. The only
+# Android input provider is the touch provider above; the simulated
+# controllers stay desktop-only.
 if(XRT_FEATURE_OPENXR AND NOT ANDROID)
 add_library(drv_sim_input_plugin SHARED
 	sim_input/sim_input_device.c
+	sim_input/sim_input_hand_script.c
+	sim_input/sim_input_hand_script.h
 	sim_input/sim_input_nav.c
 	sim_input/sim_input_interface.h
 	sim_input/sim_input_plugin.c
+	sim_input/sim_input_settings.c
+	sim_input/sim_input_settings.h
+	sim_input/sim_input_shared_camera.c
+	sim_input/sim_input_shared_camera.h
 	)
 if(XRT_HAVE_LINUX)
 	# ELF self-contained model: static aux, single-symbol version script —
@@ -397,6 +599,97 @@ else()
 		)
 endif()
 
+####
+# DisplayXR-SimTracking viewer-tracking provider plug-in (ADR-054 §4.1, N6
+# Part 2). The in-tree reference for the fourth class: a scripted viewer with
+# no camera (SCRIPT=sweep|offset), opt-in through its ENABLE setting. Same
+# build model as sim-input: XRT_USING_RUNTIME_DLL + the runtime import lib on
+# Windows/macOS, static aux + a single-symbol version script on ELF.
+# sim_tracking_script.c is pure and also compiled straight into the unit tests.
+if(XRT_FEATURE_OPENXR AND NOT ANDROID)
+add_library(drv_sim_tracking_plugin SHARED
+	sim_tracking/sim_tracking_plugin.c
+	sim_tracking/sim_tracking_script.c
+	sim_tracking/sim_tracking_script.h
+	# SOURCE=webcam (#1855 moved here): the provider wrapper + the shared core.
+	sim_tracking/sim_tracking_webcam.c
+	sim_tracking/sim_tracking_webcam.h
+	${SIM_WEBCAM_CORE_SOURCES}
+	)
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_sim_tracking_plugin PRIVATE xrt-interfaces aux_util aux_os aux_os_uvc drv_includes m)
+else()
+	target_compile_definitions(drv_sim_tracking_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_tracking_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			aux_os_uvc
+			drv_includes
+		)
+	add_dependencies(drv_sim_tracking_plugin ${RUNTIME_TARGET})
+	if(APPLE)
+		# A process that has not loaded the runtime (displayxr-cli, the tracking
+		# tests) must still resolve @rpath/openxr_displayxr.dylib in the build tree.
+		set_property(TARGET drv_sim_tracking_plugin APPEND PROPERTY BUILD_RPATH "$<TARGET_FILE_DIR:${RUNTIME_TARGET}>")
+	endif()
+	if(MSVC)
+		# SOURCE=webcam's capture backend (aux_os_uvc, Media Foundation): delay-
+		# loaded, as in sim_display, so loading the provider never maps MF and
+		# it still loads on Windows "N" editions.
+		target_link_options(drv_sim_tracking_plugin PRIVATE
+			"/DELAYLOAD:mf.dll" "/DELAYLOAD:mfplat.dll" "/DELAYLOAD:mfreadwrite.dll")
+		target_link_libraries(drv_sim_tracking_plugin PRIVATE delayimp)
+	endif()
+endif()
+if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+	# The opt-in estimator loads ONNX Runtime + the model from the plug-in's OWN
+	# directory; the install rules above already put them in the shared plug-in dir.
+	sim_webcam_onnx_configure(drv_sim_tracking_plugin)
+	add_custom_command(
+		TARGET drv_sim_tracking_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+			"$<TARGET_FILE_DIR:drv_sim_tracking_plugin>/"
+		COMMENT "sim webcam (#1855): copying ${SIM_ORT_LIB_NAME} + ${SIM_WEBCAM_MODEL_NAME} next to the sim_tracking plug-in"
+		VERBATIM
+		)
+endif()
+target_include_directories(drv_sim_tracking_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/sim_tracking
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+set_target_properties(drv_sim_tracking_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimTracking"
+	PREFIX ""
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+if(APPLE)
+	target_link_options(drv_sim_tracking_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtTrackingPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_tracking_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tracking_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_sim_tracking_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_tracking_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — DisplayXR-SimTracking block
+
 # Keep the dev plug-in staging dir fresh on every build (desktop Linux).
 #
 # Linux plug-in discovery is JSON-manifest driven, and scripts/build_linux.sh
@@ -412,7 +705,7 @@ endif()
 # copy_if_different keeps it a no-op when nothing changed. The manifests stay
 # the script's job — they carry absolute paths and never go stale.
 if(XRT_HAVE_LINUX AND NOT ANDROID)
-	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin)
+	foreach(_dxr_staged_plugin drv_sim_display_plugin drv_sim_input_plugin drv_touch_input_plugin drv_sim_tracking_plugin)
 		add_custom_command(
 			TARGET ${_dxr_staged_plugin}
 			POST_BUILD
@@ -423,7 +716,251 @@ if(XRT_HAVE_LINUX AND NOT ANDROID)
 			VERBATIM
 			)
 	endforeach()
+	if(XRT_SIM_WEBCAM_ESTIMATOR STREQUAL "onnx")
+		# #1855: the opt-in estimator's library + model sit beside the staged plug-in.
+		add_custom_command(
+			TARGET drv_sim_display_plugin
+			POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${SIM_ORT_LIB_FILE}" "${SIM_WEBCAM_MODEL_FILE}"
+				"${CMAKE_BINARY_DIR}/_plugins/"
+			VERBATIM
+			)
+	endif()
 endif()
+
+####
+# DisplayXR-SimConversion conversion-provider plug-in (ADR-053; discovery
+# spec §6.1). The hardware-free reference provider: every task of the v1
+# vocabulary, CPU compute (D3D11 NT-handle import on Windows only to exercise
+# that transport), scriptable readiness through host->get_setting. FALLBACK at
+# ProbeOrder 250; probe() declines unless setting ENABLE=1, so staging its
+# manifest is harmless. Same build model as sim-input: XRT_USING_RUNTIME_DLL +
+# runtime import lib on Windows/macOS, self-contained static aux + a
+# single-symbol version script on ELF. Android (libdxrc250_sim_conversion.so)
+# lands with the Android conversion loader.
+#
+# sim_conversion_static: the same sources as an OBJECT library WITHOUT
+# XRT_USING_RUNTIME_DLL, so tests link the provider's own entry point
+# statically (no dlopen, no registry) — tests/tests_sim_conversion.cpp.
+if(NOT ANDROID)
+set(SIM_CONVERSION_SOURCES
+	sim_conversion/sim_conv_plugin.c
+	sim_conversion/sim_conv_synth.c
+	sim_conversion/sim_conv_synth.h
+	sim_conversion/sim_conv_fake_ply.c
+	sim_conversion/sim_conv_fake_ply.h
+	)
+if(WIN32)
+	list(APPEND SIM_CONVERSION_SOURCES
+		sim_conversion/sim_conv_d3d11_io.cpp
+		sim_conversion/sim_conv_d3d11_io.h)
+endif()
+
+add_library(sim_conversion_static OBJECT ${SIM_CONVERSION_SOURCES})
+target_link_libraries(sim_conversion_static PUBLIC xrt-interfaces aux_util aux_os)
+target_include_directories(sim_conversion_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
+if(WIN32)
+	target_link_libraries(sim_conversion_static PUBLIC d3d11 dxgi)
+endif()
+
+if(XRT_FEATURE_OPENXR)
+add_library(drv_sim_conversion_plugin SHARED ${SIM_CONVERSION_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_sim_conversion_plugin PRIVATE xrt-interfaces aux_util aux_os)
+else()
+	target_compile_definitions(drv_sim_conversion_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_sim_conversion_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+		)
+	add_dependencies(drv_sim_conversion_plugin ${RUNTIME_TARGET})
+endif()
+target_include_directories(drv_sim_conversion_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sim_conversion)
+if(WIN32)
+	target_link_libraries(drv_sim_conversion_plugin PRIVATE d3d11 dxgi)
+endif()
+# LINKER_LANGUAGE CXX: the D3D11 import path and parts of aux are C++.
+set_target_properties(drv_sim_conversion_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-SimConversion"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+# Single-symbol export filter: xrtConversionPluginNegotiate only.
+if(APPLE)
+	target_link_options(drv_sim_conversion_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtConversionPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_sim_conversion_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/conversion_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_sim_conversion_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_sim_conversion_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+
+# ADR-053 P4 (#2108): the fake model pack the sim's DOWNLOAD_MS knob fetches
+# through the host's model store ("sim/fake": one 1 KiB blob served from a
+# relative file:// base next to the DLL). Generated, so its sha256 is computed
+# here rather than typed (tests_conv_store writes the same bytes). Register it
+# with the provider's `Packs` = sim-conversion.models.json.
+set(_simconv_pack_dir "${CMAKE_CURRENT_BINARY_DIR}/sim_conversion_pack")
+string(REPEAT "0123456789abcdef" 64 _simconv_blob)
+file(WRITE "${_simconv_pack_dir}/fake.bin" "${_simconv_blob}")
+file(SHA256 "${_simconv_pack_dir}/fake.bin" _simconv_sha)
+file(MAKE_DIRECTORY "${_simconv_pack_dir}/sim-conversion-blobs")
+file(WRITE "${_simconv_pack_dir}/sim-conversion-blobs/${_simconv_sha}.bin" "${_simconv_blob}")
+file(WRITE "${_simconv_pack_dir}/sim-conversion.models.json"
+"{
+  \"schema\": 2,
+  \"pack\": \"sim\",
+  \"provider\": \"sim-conversion\",
+  \"generated\": \"build\",
+  \"blobBaseUrl\": \"sim-conversion-blobs\",
+  \"models\": [{
+    \"name\": \"fake\", \"version\": \"1.0.0\", \"task\": \"views-mono\", \"prefetch\": true,
+    \"license\": { \"spdx\": \"BSL-1.0\", \"commercial\": true },
+    \"variants\": [{ \"id\": \"cpu\", \"backend\": \"cpu\",
+      \"files\": [{ \"role\": \"model\", \"format\": \"bin\", \"sha256\": \"${_simconv_sha}\", \"size\": 1024 }] }]
+  }],
+  \"defaults\": { \"views-mono\": { \"low\": \"fake\", \"medium\": \"fake\", \"high\": \"fake\" } }
+}
+")
+add_custom_command(
+	TARGET drv_sim_conversion_plugin
+	POST_BUILD
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_simconv_pack_dir}/sim-conversion.models.json"
+		"$<TARGET_FILE_DIR:drv_sim_conversion_plugin>/"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${_simconv_pack_dir}/sim-conversion-blobs"
+		"$<TARGET_FILE_DIR:drv_sim_conversion_plugin>/sim-conversion-blobs"
+	VERBATIM
+	)
+if(WIN32)
+	set(_simconv_pack_dest "${CMAKE_INSTALL_BINDIR}/plugins")
+else()
+	set(_simconv_pack_dest "${CMAKE_INSTALL_LIBDIR}/displayxr/plugins")
+endif()
+install(FILES "${_simconv_pack_dir}/sim-conversion.models.json" DESTINATION ${_simconv_pack_dest} COMPONENT Runtime)
+install(DIRECTORY "${_simconv_pack_dir}/sim-conversion-blobs" DESTINATION ${_simconv_pack_dest} COMPONENT Runtime)
+
+if(XRT_HAVE_LINUX)
+	# Dev staging, as for the other plug-ins (see the _plugins block below).
+	add_custom_command(
+		TARGET drv_sim_conversion_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_sim_conversion_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_sim_conversion_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR
+endif() # NOT ANDROID — DisplayXR-SimConversion block
+
+####
+# DisplayXR-RemoteConversion conversion-provider plug-in (ADR-057 S2): the
+# generic remote provider. SPLATS_MONO / SPLATS_STEREO on the job lane,
+# forwarded to HTTPS endpoints implementing endpoint contract v1. No new
+# build or package dependency: WinHTTP on Windows; libcurl loaded at run time
+# on macOS / desktop Linux (absent = the provider reports ABSENT). Off by
+# default (setting ENABLE) and consent-gated; opt-in registration, like
+# net-input: no installer registers it. remote_conversion_static: the same
+# sources without XRT_USING_RUNTIME_DLL, for tests/tests_remote_conversion.cpp.
+if(NOT ANDROID)
+set(REMOTE_CONVERSION_SOURCES
+	remote_conversion/remote_conv_plugin.c
+	remote_conversion/remote_conv_http.c
+	remote_conversion/remote_conv_http.h
+	)
+add_library(remote_conversion_static OBJECT ${REMOTE_CONVERSION_SOURCES})
+target_link_libraries(remote_conversion_static PUBLIC xrt-interfaces aux_util aux_os xrt-external-cjson xrt-external-stb)
+target_include_directories(remote_conversion_static PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/remote_conversion)
+if(WIN32)
+	target_link_libraries(remote_conversion_static PUBLIC winhttp)
+elseif(NOT APPLE)
+	target_link_libraries(remote_conversion_static PUBLIC ${CMAKE_DL_LIBS})
+endif()
+
+if(XRT_FEATURE_OPENXR)
+add_library(drv_remote_conversion_plugin SHARED ${REMOTE_CONVERSION_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_remote_conversion_plugin PRIVATE xrt-interfaces aux_util aux_os xrt-external-cjson
+		xrt-external-stb ${CMAKE_DL_LIBS})
+else()
+	target_compile_definitions(drv_remote_conversion_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_remote_conversion_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			xrt-external-cjson
+			xrt-external-stb
+		)
+	add_dependencies(drv_remote_conversion_plugin ${RUNTIME_TARGET})
+endif()
+if(WIN32)
+	target_link_libraries(drv_remote_conversion_plugin PRIVATE winhttp)
+endif()
+target_include_directories(drv_remote_conversion_plugin PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/remote_conversion)
+set_target_properties(drv_remote_conversion_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-RemoteConversion"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+if(APPLE)
+	target_link_options(drv_remote_conversion_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtConversionPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_remote_conversion_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/conversion_plugin_exports.version")
+endif()
+if(WIN32)
+	install(
+		TARGETS drv_remote_conversion_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_remote_conversion_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+if(XRT_HAVE_LINUX)
+	add_custom_command(
+		TARGET drv_remote_conversion_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_remote_conversion_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_remote_conversion_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+endif() # XRT_FEATURE_OPENXR
+endif() # NOT ANDROID — DisplayXR-RemoteConversion block
 
 ####
 # DisplayXR-NetInput input-provider plug-in DLL (ADR-034 / #823 Phase 2).
@@ -495,6 +1032,126 @@ else()
 		)
 endif()
 ####
+# DisplayXR-Gamepad input-provider plug-in DLL (ADR-034 / ADR-054, existing
+# input-provider class).
+#
+# The one controller every desk has, turned into the three things a flat 3D
+# display needs with no tracked head or hands: the `/user/gamepad` role
+# (`microsoft/xbox_controller`), the RIG role (left stick = move, right stick
+# = look, ADR-034 Amendment 4), and an optional emulated khr/simple_controller
+# pair so HANDLE apps — denied the qwerty pair because their own window owns
+# the keyboard — get xrSyncActions controllers at all. Platform readers:
+# XInput + HID for Sony pads (Windows), GameController.framework (macOS); desktop Linux is a stub
+# that declines at probe (evdev follow-up). Presence-gated: registered by
+# the installer, inert without a pad. Same build model as sim-input above.
+#
+# drv_gamepad_sources / drv_gamepad_static: the sources also compile as a
+# plain OBJECT library outside the OpenXR gate, which is what
+# scripts/build-mingw-check.sh builds to compile-check the XInput backend
+# from a Mac / Linux box (the plug-in proper needs the runtime import lib).
+set(DRV_GAMEPAD_SOURCES
+	gamepad/gamepad_backend.h
+	gamepad/gamepad_backend_stub.c
+	gamepad/gamepad_backend_xinput.c
+	gamepad/gamepad_device.c
+	gamepad/gamepad_emu.c
+	gamepad/gamepad_hub.c
+	gamepad/gamepad_interface.h
+	gamepad/gamepad_map.c
+	gamepad/gamepad_map.h
+	gamepad/gamepad_nav.c
+	gamepad/gamepad_plugin.c
+	gamepad/gamepad_settings.c
+	gamepad/gamepad_settings.h
+	)
+if(WIN32)
+	# Windows = XInput + HID (Sony pads): gamepad_backend_win.c dispatches per
+	# device between the two readers (#2472).
+	list(APPEND DRV_GAMEPAD_SOURCES
+		gamepad/gamepad_backend_win.c
+		gamepad/gamepad_backend_win.h
+		gamepad/gamepad_backend_hid_win.c
+		gamepad/gamepad_hid_report.c
+		gamepad/gamepad_hid_report.h
+		)
+endif()
+if(APPLE)
+	list(APPEND DRV_GAMEPAD_SOURCES gamepad/gamepad_backend_gc.m)
+endif()
+
+add_library(drv_gamepad_plugin SHARED ${DRV_GAMEPAD_SOURCES})
+if(XRT_HAVE_LINUX)
+	target_link_libraries(drv_gamepad_plugin PRIVATE
+		xrt-interfaces aux_util aux_os drv_includes)
+else()
+	target_compile_definitions(drv_gamepad_plugin PRIVATE XRT_USING_RUNTIME_DLL)
+	target_link_libraries(
+		drv_gamepad_plugin
+		PRIVATE
+			$<TARGET_LINKER_FILE:${RUNTIME_TARGET}>
+			xrt-interfaces
+			aux_util
+			aux_os
+			drv_includes
+		)
+	add_dependencies(drv_gamepad_plugin ${RUNTIME_TARGET})
+endif()
+if(WIN32)
+	# xinput9_1_0: the Windows-7-and-later XInput import every SDK carries;
+	# hid + setupapi: the HID reader (enumeration, attributes, caps). Only the
+	# plug-in DLL imports them — the runtime DLL, service and CLI do not.
+	target_link_libraries(drv_gamepad_plugin PRIVATE xinput9_1_0 hid setupapi)
+elseif(APPLE)
+	target_link_libraries(drv_gamepad_plugin PRIVATE "-framework GameController" "-framework Foundation")
+endif()
+target_include_directories(drv_gamepad_plugin PRIVATE
+	${CMAKE_CURRENT_SOURCE_DIR}/gamepad
+	${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+	)
+
+# LINKER_LANGUAGE CXX: same rule as net_input (static-link paths pull C++ aux).
+set_target_properties(drv_gamepad_plugin PROPERTIES
+	OUTPUT_NAME "DisplayXR-Gamepad"
+	PREFIX ""
+	LINKER_LANGUAGE CXX
+	C_VISIBILITY_PRESET hidden
+	CXX_VISIBILITY_PRESET hidden
+	VISIBILITY_INLINES_HIDDEN ON
+	)
+
+if(APPLE)
+	target_link_options(drv_gamepad_plugin PRIVATE
+		"LINKER:-exported_symbol,_xrtInputPluginNegotiate")
+elseif(NOT WIN32)
+	target_link_options(drv_gamepad_plugin PRIVATE
+		"LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/input_plugin_exports.version")
+endif()
+
+if(WIN32)
+	install(
+		TARGETS drv_gamepad_plugin
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		LIBRARY DESTINATION ${CMAKE_INSTALL_BINDIR}/plugins COMPONENT Runtime
+		)
+else()
+	install(
+		TARGETS drv_gamepad_plugin
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/displayxr/plugins COMPONENT Runtime
+		)
+endif()
+if(XRT_HAVE_LINUX)
+	add_custom_command(
+		TARGET drv_gamepad_plugin
+		POST_BUILD
+		COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/_plugins"
+		COMMAND ${CMAKE_COMMAND} -E copy_if_different
+			"$<TARGET_FILE:drv_gamepad_plugin>" "${CMAKE_BINARY_DIR}/_plugins/"
+		COMMENT "Staging $<TARGET_FILE_NAME:drv_gamepad_plugin> into _plugins/"
+		VERBATIM
+		)
+endif()
+
+####
 # DisplayXR-Ultraleap input-provider plug-in DLL (#825 Tier 1).
 #
 # Hand-as-motion-controller provider on the ADR-034 channel: LeapC palm
@@ -517,6 +1174,8 @@ find_library(LEAPC_LIBRARY NAMES LeapC
 if(LEAPC_INCLUDE_DIR AND LEAPC_LIBRARY)
 add_library(drv_ultraleap_plugin SHARED
 	ultraleap/ultraleap_interface.h
+	ultraleap/ultraleap_map.c
+	ultraleap/ultraleap_map.h
 	ultraleap/ultraleap_plugin.c
 	ultraleap/ultraleap_provider.cpp
 	)
@@ -610,6 +1269,33 @@ else()
 endif() # LeapC SDK found
 
 endif() # XRT_FEATURE_OPENXR AND NOT ANDROID — input-provider plug-in blocks
+
+# The gamepad provider's sources as a plain OBJECT library, outside the
+# OpenXR gate: the compile-only target scripts/build-mingw-check.sh builds
+# (`drv_gamepad_static`) to catch Win32 / XInput typos from a non-Windows box.
+# Nothing links it in a normal build.
+if(NOT ANDROID)
+	set(DRV_GAMEPAD_STATIC_SOURCES
+		gamepad/gamepad_backend_stub.c
+		gamepad/gamepad_backend_xinput.c
+		gamepad/gamepad_device.c
+		gamepad/gamepad_emu.c
+		gamepad/gamepad_hub.c
+		gamepad/gamepad_map.c
+		gamepad/gamepad_nav.c
+		gamepad/gamepad_plugin.c
+		gamepad/gamepad_settings.c
+		)
+	if(APPLE)
+		list(APPEND DRV_GAMEPAD_STATIC_SOURCES gamepad/gamepad_backend_gc.m)
+	endif()
+	add_library(drv_gamepad_static OBJECT EXCLUDE_FROM_ALL ${DRV_GAMEPAD_STATIC_SOURCES})
+	target_link_libraries(drv_gamepad_static PUBLIC xrt-interfaces aux_util aux_os drv_includes)
+	target_include_directories(drv_gamepad_static PUBLIC
+		${CMAKE_CURRENT_SOURCE_DIR}/gamepad
+		${CMAKE_CURRENT_SOURCE_DIR}/../../auxiliary
+		)
+endif()
 
 set(ENABLED_DRIVERS ${ENABLED_HEADSET_DRIVERS} ${ENABLED_DRIVERS})
 if(ENABLED_DRIVERS)

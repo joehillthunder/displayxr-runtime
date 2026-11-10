@@ -21,6 +21,7 @@
 #include "catch_amalgamated.hpp"
 
 #include "util/u_wayland_geom.h"
+#include "util/u_wayland_layout.h"
 
 // The measured layout, named once.
 static constexpr int32_t kLaptopLogicalW = 1728;
@@ -435,6 +436,58 @@ TEST_CASE("an unmapped device-pixel buffer spills past the frame")
 
 /*
  *
+ * buffer_device: the compositor's own answer wins (#1991).
+ *
+ */
+
+TEST_CASE("buffer_device wins over the conversion, even where they disagree")
+{
+	// The #1928 case on KWin at 166.67 %: the buffer is published at y 191,
+	// which converts to row 318, while KWin paints it on row 319.
+	const struct u_wl_monitor m = laptop_from_shell_extension();
+	const struct u_wl_rect_logical content = {100, 191, 768, 432};
+	const struct u_wl_rect_px painted = {167, 319, 1280, 720};
+	struct u_wl_rect_px out = {};
+	bool used = false;
+	REQUIRE(u_wl_window_device_rect(&m, &content, &painted, &out, &used));
+	REQUIRE(used);
+	REQUIRE(out.x == 167);
+	REQUIRE(out.y == 319);
+	REQUIRE(out.w == 1280);
+	REQUIRE(out.h == 720);
+
+	// The conversion alone is the one-row-off answer.
+	REQUIRE(u_wl_window_device_rect(&m, &content, nullptr, &out, &used));
+	REQUIRE_FALSE(used);
+	REQUIRE(out.y == 318);
+}
+
+TEST_CASE("no buffer_device, or an empty one: today's conversion")
+{
+	const struct u_wl_monitor m = panel_from_shell_extension();
+	const struct u_wl_rect_logical content = {kPanelLogicalX + 100, 50, 640, 360};
+	const struct u_wl_rect_px empty = {5, 5, 0, 0};
+	struct u_wl_rect_px out = {};
+	bool used = true;
+	REQUIRE(u_wl_window_device_rect(&m, &content, &empty, &out, &used));
+	REQUIRE_FALSE(used);
+	REQUIRE(out.x == 200);
+	REQUIRE(out.y == 100);
+	REQUIRE(out.w == 1280);
+	REQUIRE(out.h == 720);
+}
+
+TEST_CASE("buffer_device is the 1:1 test's destination")
+{
+	// A buffer the compositor paints at its own size is 1:1; one it scales is not.
+	const struct u_wl_rect_px painted = {0, 0, 1280, 720};
+	REQUIRE(u_wl_present_is_1to1(1280, 720, (uint32_t)painted.w, (uint32_t)painted.h));
+	const struct u_wl_rect_px scaled = {0, 0, 1281, 720};
+	REQUIRE_FALSE(u_wl_present_is_1to1(1280, 720, (uint32_t)scaled.w, (uint32_t)scaled.h));
+}
+
+/*
+ *
  * Wayland placement quantum (#1609).
  *
  */
@@ -490,6 +543,119 @@ TEST_CASE("any scale: a whole-logical-pixel move lands where Mutter draws it")
 	// table is only valid for the start it was built from.
 	REQUIRE(u_wl_logical_to_px(1, 1.5) - u_wl_logical_to_px(0, 1.5) == 2);
 	REQUIRE(u_wl_logical_to_px(2, 1.5) - u_wl_logical_to_px(1, 1.5) == 1);
+}
+
+
+/*
+ *
+ * Mutter's layout modes: the stage is LOGICAL px in one and DEVICE px in the
+ * other. Measured on a headless mutter 50.1 with a 3840x2160 virtual monitor,
+ * switching only the layout mode (gdctl set --layout-mode).
+ *
+ */
+
+//! The extension's monitor object for that 3840x2160 monitor, as published in
+//! each mode, with the stage->device factor resolved the way the runtime does.
+static struct u_wl_monitor
+monitor_as_published(int32_t stage_w, int32_t stage_h, double monitor_scale, enum u_wl_layout_mode mode)
+{
+	struct u_wl_monitor m = {};
+	m.logical_w = stage_w;
+	m.logical_h = stage_h;
+	m.scale = u_wl_stage_to_device_scale(monitor_scale, 0.0, mode);
+	return m;
+}
+
+TEST_CASE("PHYSICAL layout at 200 %: the stage already is device px")
+{
+	// layout-mode 2, scale 2: Meta.Display.get_monitor_geometry() is the full
+	// 3840x2160 and get_monitor_scale() is 2.
+	REQUIRE(u_wl_stage_to_device_scale(2.0, 0.0, U_WL_LAYOUT_MODE_PHYSICAL) == 1.0);
+
+	const struct u_wl_monitor m = monitor_as_published(3840, 2160, 2.0, U_WL_LAYOUT_MODE_PHYSICAL);
+	int32_t w = 0, h = 0;
+	REQUIRE(u_wl_monitor_size_px(&m, &w, &h));
+	REQUIRE(w == 3840);
+	REQUIRE(h == 2160);
+
+	// The measured windowed cube: content 1600x900 at stage (1120, 720), its
+	// committed buffer 1600x900 device px.
+	struct u_wl_rect_px r = {};
+	REQUIRE(u_wl_window_rect_px_on_monitor(&m, 1120, 720, 1600, 900, &r));
+	REQUIRE(r.x == 1120);
+	REQUIRE(r.y == 720);
+	REQUIRE(r.w == 1600);
+	REQUIRE(r.h == 900);
+	REQUIRE(u_wl_present_is_1to1(1600, 900, (uint32_t)r.w, (uint32_t)r.h));
+	REQUIRE(u_wl_monitor_is_panel(&m, 0, 0, 3840, 2160, NULL));
+}
+
+TEST_CASE("PHYSICAL layout with the monitor scale applied is the reported failure")
+{
+	// What every consumer did before the layout mode was known: x2 on top of
+	// device px. The panel reads as a 7680x4320 output and the window as twice
+	// its buffer, so the surface is "not on the panel" and never weaves.
+	struct u_wl_monitor m = {};
+	m.logical_w = 3840;
+	m.logical_h = 2160;
+	m.scale = u_wl_stage_to_device_scale(2.0, 0.0, U_WL_LAYOUT_MODE_UNKNOWN);
+	REQUIRE(m.scale == 2.0);
+	int32_t w = 0, h = 0;
+	REQUIRE(u_wl_monitor_size_px(&m, &w, &h));
+	REQUIRE(w == 7680);
+	REQUIRE(h == 4320);
+	REQUIRE_FALSE(u_wl_monitor_is_panel(&m, 0, 0, 3840, 2160, NULL));
+}
+
+TEST_CASE("LOGICAL layout: the monitor scale is the factor, at every scale")
+{
+	// {stage w, stage h, scale}: the same 3840x2160 monitor in layout-mode 1.
+	// 1.5 and 2.0 are measured; the rest are the scales GNOME Settings offers
+	// for a 3840x2160 output.
+	struct
+	{
+		int32_t w, h;
+		double scale;
+	} cases[] = {
+	    {3840, 2160, 1.0}, {3072, 1728, 1.25}, {2560, 1440, 1.5}, {2194, 1234, 1.75}, {1920, 1080, 2.0},
+	};
+	for (const auto &c : cases) {
+		CAPTURE(c.scale);
+		REQUIRE(u_wl_stage_to_device_scale(c.scale, 0.0, U_WL_LAYOUT_MODE_LOGICAL) == c.scale);
+		const struct u_wl_monitor m = monitor_as_published(c.w, c.h, c.scale, U_WL_LAYOUT_MODE_LOGICAL);
+		int32_t w = 0, h = 0;
+		REQUIRE(u_wl_monitor_size_px(&m, &w, &h));
+		REQUIRE(w == 3840);
+		REQUIRE(h == 2160);
+		REQUIRE(u_wl_monitor_is_panel(&m, 0, 0, 3840, 2160, NULL));
+	}
+}
+
+TEST_CASE("an unknown layout mode keeps the monitor scale (pre-#1596 behaviour)")
+{
+	REQUIRE(u_wl_stage_to_device_scale(5.0 / 3.0, 0.0, U_WL_LAYOUT_MODE_UNKNOWN) == 5.0 / 3.0);
+	REQUIRE(u_wl_stage_to_device_scale(0.0, 0.0, U_WL_LAYOUT_MODE_UNKNOWN) == 0.0);
+	REQUIRE(u_wl_stage_to_device_scale(-1.0, 0.0, U_WL_LAYOUT_MODE_LOGICAL) == 0.0);
+}
+
+TEST_CASE("a published device scale wins over the mode and the monitor scale")
+{
+	// Extension v11 publishes the stage view's scale: 1 in PHYSICAL, the
+	// monitor scale in LOGICAL. It is authoritative either way.
+	REQUIRE(u_wl_stage_to_device_scale(2.0, 1.0, U_WL_LAYOUT_MODE_UNKNOWN) == 1.0);
+	REQUIRE(u_wl_stage_to_device_scale(2.0, 1.0, U_WL_LAYOUT_MODE_LOGICAL) == 1.0);
+	REQUIRE(u_wl_stage_to_device_scale(1.5, 1.5, U_WL_LAYOUT_MODE_PHYSICAL) == 1.5);
+}
+
+TEST_CASE("the payload's layout_mode string")
+{
+	REQUIRE(u_wl_layout_mode_from_string("logical") == U_WL_LAYOUT_MODE_LOGICAL);
+	REQUIRE(u_wl_layout_mode_from_string("physical") == U_WL_LAYOUT_MODE_PHYSICAL);
+	REQUIRE(u_wl_layout_mode_from_string("") == U_WL_LAYOUT_MODE_UNKNOWN);
+	REQUIRE(u_wl_layout_mode_from_string("logic") == U_WL_LAYOUT_MODE_UNKNOWN);
+	REQUIRE(u_wl_layout_mode_from_string("physicalx") == U_WL_LAYOUT_MODE_UNKNOWN);
+	REQUIRE(u_wl_layout_mode_from_string("PHYSICAL") == U_WL_LAYOUT_MODE_UNKNOWN);
+	REQUIRE(u_wl_layout_mode_from_string(NULL) == U_WL_LAYOUT_MODE_UNKNOWN);
 }
 
 

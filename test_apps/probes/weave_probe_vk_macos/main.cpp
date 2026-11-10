@@ -24,11 +24,44 @@
  * Run (service already started with the sim display plug-in):
  *   SIM_DISPLAY_OUTPUT=anaglyph XRT_PLUGIN_SEARCH_PATH=.../plugins displayxr-service &
  *   XRT_FORCE_MODE=ipc XR_RUNTIME_JSON=build/openxr_displayxr-dev.json \
- *     ./weave_probe_gl_macos
+ *     ./weave_probe_vk_macos [--geometry ox,oy[,display]] [--snap [period]]
+ *
+ * --snap: xrWeaveSnapWindowRectDXR legs (ADR-050 on the weave path). Before the
+ * first submit (engine not up) the snap must be the identity; after the
+ * submits it must be the identity too unless [period] > 1 is given, which
+ * asserts the snap of a vertical lattice of that period — set the SERVICE's
+ * SIM_DISPLAY_METAL_SNAP_PERIOD to the same value and DXR_WEAVE_MAC_BACKEND=metal
+ * (the vk backend never snaps on macOS, so pass no period there).
+ *
+ * --views <service-log> (needs --geometry): per-window OOP views for a weave
+ * session. After the submits it locates views (PRIMARY_STEREO) with a chained
+ * XrDisplayRigDXR + a window-centred XrDisplayZoneDXR and asserts: views valid
+ * + tracked, raw eyes tracked when the probe runs with
+ * SIM_DISPLAY_FAKE_TRACKING=1 (set it on the SERVICE too), the two eyes
+ * differ (stereo), and the service log's "(macOS weave)" per-window offset
+ * equals the window centre's offset from the panel centre within 1 mm (panel
+ * = displayId, else the display containing the origin, else main; pitch from
+ * XR_DXR_display_info).
+ *
+ * --lift (XR_DXR_lift §6, ADR-053 P5 step C): after the checks above, rect A
+ * holds a 2D frame (left half red, right half blue) flagged "lift me" on a
+ * spec-3 SBS stream (xrCreateLiftStreamDXR), with the browser's options
+ * (convergence AUTO, strength 1, inpaint, TRACKED, viewCount 2). Woven as SBS
+ * the quarter point would read magenta (red left eye, blue right eye); lifted
+ * (flat until the first result, then the stream's views) it reads red. Run the
+ * SERVICE with DXR_CONV_SIM_CONVERSION_ENABLE=1 (a provider) and grep its log
+ * for "lift rect: stream" (the snapshot / woven lines). Both weave backends
+ * lift (DXR_WEAVE_MAC_BACKEND=metal exercises the Metal path). The red reads
+ * the same flat or woven; the service's "woven" line is what proves a result.
+ *
+ * The service picks its weave backend with DXR_WEAVE_MAC_BACKEND=auto|metal|vk
+ * (sim_display exports both DP families, so auto = vk); every check above holds
+ * on both backends.
  */
 
 #include <IOSurface/IOSurface.h>
 #include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 
 #include <vulkan/vulkan.h>
 
@@ -37,11 +70,20 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_DXR_weave.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_local_3d_zone.h>
+#include <openxr/XR_DXR_display_zones.h>
+#include <openxr/XR_DXR_lift.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <string>
+#include <thread>
+#include <chrono>
 #include <vector>
 
 #define LOG(...)                                                                                                       \
@@ -311,19 +353,253 @@ split_exts(const std::string &s, std::vector<std::string> &storage, std::vector<
 	}
 }
 
+/*!
+ * A display's rect in global CoreGraphics BACKING px (points x the mode's
+ * backing scale) — the convention XrWeaveWindowGeometryDXR uses on macOS.
+ */
+static bool
+display_backing_rect(CGDirectDisplayID d, double *x, double *y, double *w, double *h)
+{
+	const CGRect b = CGDisplayBounds(d);
+	if (b.size.width <= 0.0) {
+		return false;
+	}
+	double scale = 1.0;
+	CGDisplayModeRef mode = CGDisplayCopyDisplayMode(d);
+	if (mode != NULL) {
+		scale = (double)CGDisplayModeGetPixelWidth(mode) / b.size.width;
+		CGDisplayModeRelease(mode);
+	}
+	*x = b.origin.x * scale;
+	*y = b.origin.y * scale;
+	*w = b.size.width * scale;
+	*h = b.size.height * scale;
+	return true;
+}
+
+//! The panel a weave geometry origin lands on: displayId, else containment, else main.
+static CGDirectDisplayID
+probe_panel(int ox, int oy, int display_id, double *px, double *py, double *pw, double *ph)
+{
+	if (display_id > 0 && display_backing_rect((CGDirectDisplayID)display_id, px, py, pw, ph)) {
+		return (CGDirectDisplayID)display_id;
+	}
+	CGDirectDisplayID ids[16];
+	uint32_t n = 0;
+	if (CGGetActiveDisplayList(16, ids, &n) == kCGErrorSuccess) {
+		for (uint32_t i = 0; i < n; i++) {
+			double x, y, w, h;
+			if (display_backing_rect(ids[i], &x, &y, &w, &h) && ox >= x && ox < x + w && oy >= y &&
+			    oy < y + h) {
+				*px = x, *py = y, *pw = w, *ph = h;
+				return ids[i];
+			}
+		}
+	}
+	CGDirectDisplayID m = CGMainDisplayID();
+	display_backing_rect(m, px, py, pw, ph);
+	return m;
+}
+
+/*!
+ * --views: per-window OOP views of a weave session (the macOS browser path).
+ * Locates PRIMARY_STEREO with a display rig + a window-centred zone, then
+ * checks validity, tracking, stereo, and the service-logged window offset.
+ */
+static bool
+views_leg(XrInstance instance,
+          XrSystemId system_id,
+          XrSession session,
+          int ox,
+          int oy,
+          int display_id,
+          const char *service_log)
+{
+	// Panel physical size + pixel width -> square pitch (what the runtime uses).
+	XrDisplayInfoDXR info = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
+	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
+	sp.next = &info;
+	if (XR_FAILED(xrGetSystemProperties(instance, system_id, &sp)) || info.displayPixelWidth == 0 ||
+	    info.displaySizeMeters.width <= 0.0f) {
+		LOG("views FAIL: no XrDisplayInfoDXR (px=%u, m=%.4f)", info.displayPixelWidth,
+		    (double)info.displaySizeMeters.width);
+		return false;
+	}
+	const double pitch = (double)info.displaySizeMeters.width / (double)info.displayPixelWidth;
+	double px = 0, py = 0, pw = 0, ph = 0;
+	const CGDirectDisplayID panel = probe_panel(ox, oy, display_id, &px, &py, &pw, &ph);
+	const double want_x = ((ox - px) + kWinW * 0.5 - pw * 0.5) * pitch;
+	const double want_y = -(((oy - py) + kWinH * 0.5 - ph * 0.5) * pitch);
+	LOG("views: panel 0x%x backing (%.0f,%.0f %.0fx%.0f), pitch %.6f m/px -> expected window offset "
+	    "(%.4f,%.4f) m",
+	    (unsigned)panel, px, py, pw, ph, pitch, want_x, want_y);
+
+	XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+	rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+	rsci.poseInReferenceSpace.orientation.w = 1.0f;
+	XrSpace space = XR_NULL_HANDLE;
+	if (XR_FAILED(xrCreateReferenceSpace(session, &rsci, &space))) {
+		LOG("views FAIL: xrCreateReferenceSpace");
+		return false;
+	}
+
+	// A window-centred zone, so the zone adds no offset of its own and the
+	// logged window offset is the whole story.
+	XrDisplayZoneDXR zone = {(XrStructureType)XR_TYPE_DISPLAY_ZONE_DXR};
+	zone.zoneId = 1;
+	zone.rect = {{(int32_t)kWinW / 4, (int32_t)kWinH / 4}, {(int32_t)kWinW / 2, (int32_t)kWinH / 2}};
+	XrDisplayRigDXR rig = {(XrStructureType)XR_TYPE_DISPLAY_RIG_DXR};
+	rig.next = &zone;
+	rig.pose.orientation.w = 1.0f;
+	rig.virtualDisplayHeight = (float)(kWinH / 2 * pitch); // m2v = 1 for the zone
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
+	vli.next = &rig;
+	vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	vli.displayTime = 1000000000; // any valid time: the sim/fake tracker is time-free
+	vli.space = space;
+
+	XrViewEyeTrackingStateDXR ets = {(XrStructureType)XR_TYPE_VIEW_EYE_TRACKING_STATE_DXR};
+	XrViewDisplayRawDXR raw = {(XrStructureType)XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	raw.next = &ets;
+	XrViewState vs = {XR_TYPE_VIEW_STATE};
+	vs.next = &raw;
+	XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+	uint32_t n = 0;
+	XrResult r = XR_SUCCESS;
+	// A few locates: the per-window log line is written on the first one.
+	for (int i = 0; i < 3 && XR_SUCCEEDED(r); i++) {
+		vli.displayTime += 16666666;
+		r = xrLocateViews(session, &vli, &vs, 2, &n, views);
+	}
+	xrDestroySpace(space);
+	if (XR_FAILED(r) || n != 2) {
+		LOG("views FAIL: xrLocateViews -> %d (n=%u)", (int)r, n);
+		return false;
+	}
+
+	bool ok = true;
+	const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+	                              XR_VIEW_STATE_POSITION_TRACKED_BIT | XR_VIEW_STATE_ORIENTATION_TRACKED_BIT;
+	const bool flags_ok = (vs.viewStateFlags & need) == need;
+	LOG("views: viewStateFlags=0x%llx (want valid+tracked) -> %s", (unsigned long long)vs.viewStateFlags,
+	    flags_ok ? "OK" : "WRONG");
+	ok = ok && flags_ok;
+
+	const char *ft = getenv("SIM_DISPLAY_FAKE_TRACKING");
+	const bool want_tracking = ft != NULL && ft[0] == '1';
+	LOG("views: raw eyes=%u isTracking=%d [0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f) canvas %.4fx%.4fm",
+	    raw.eyeCountOutput, (int)raw.isTracking, (double)raw.rawEyes[0].x, (double)raw.rawEyes[0].y,
+	    (double)raw.rawEyes[0].z, (double)raw.rawEyes[1].x, (double)raw.rawEyes[1].y, (double)raw.rawEyes[1].z,
+	    (double)raw.canvasSizeMeters.width, (double)raw.canvasSizeMeters.height);
+	if (want_tracking) {
+		const bool t_ok = raw.isTracking == XR_TRUE;
+		LOG("views: DP eyes tracked (SIM_DISPLAY_FAKE_TRACKING=1) -> %s", t_ok ? "OK" : "WRONG");
+		ok = ok && t_ok;
+		// The derived per-view state rides a separate IPC (eye positions RPC).
+		const bool e_ok = ets.isTracking == XR_TRUE;
+		LOG("views: XrViewEyeTrackingStateDXR.isTracking=%d -> %s", (int)ets.isTracking, e_ok ? "OK" : "WRONG");
+		ok = ok && e_ok;
+	}
+
+	const XrVector3f &a = views[0].pose.position;
+	const XrVector3f &b = views[1].pose.position;
+	const double sep = sqrt((double)(a.x - b.x) * (a.x - b.x) + (double)(a.y - b.y) * (a.y - b.y) +
+	                        (double)(a.z - b.z) * (a.z - b.z));
+	const bool stereo_ok = sep > 0.01 && views[0].fov.angleLeft != views[1].fov.angleLeft;
+	LOG("views: eye0=(%.4f,%.4f,%.4f) eye1=(%.4f,%.4f,%.4f) sep=%.4f m, fovL %.4f vs %.4f -> %s", a.x, a.y,
+	    a.z, b.x, b.y, b.z, sep, (double)views[0].fov.angleLeft, (double)views[1].fov.angleLeft,
+	    stereo_ok ? "OK (stereo)" : "WRONG (mono / identical)");
+	ok = ok && stereo_ok;
+
+	// The service's lifecycle line for THIS window (last match wins).
+	FILE *f = fopen(service_log, "r");
+	if (f == NULL) {
+		LOG("views FAIL: cannot open service log %s", service_log);
+		return false;
+	}
+	char line[1024];
+	bool found = false;
+	double got_x = 0, got_y = 0;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		if (strstr(line, "(macOS weave)") == NULL) {
+			continue;
+		}
+		const char *o = strstr(line, "offset=(");
+		double x = 0, y = 0;
+		if (o != NULL && sscanf(o, "offset=(%lf,%lf)", &x, &y) == 2) {
+			got_x = x, got_y = y, found = true;
+		}
+	}
+	fclose(f);
+	if (!found) {
+		LOG("views FAIL: no \"(macOS weave)\" per-window line in %s", service_log);
+		return false;
+	}
+	const bool off_ok = fabs(got_x - want_x) <= 0.001 && fabs(got_y - want_y) <= 0.001 &&
+	                    (fabs(got_x) > 0.0005 || fabs(got_y) > 0.0005);
+	LOG("views: service winOffset=(%.4f,%.4f) m vs expected (%.4f,%.4f) m (tol 1 mm, non-zero) -> %s", got_x,
+	    got_y, want_x, want_y, off_ok ? "OK" : "WRONG");
+	return ok && off_ok;
+}
+
 int
 main(int argc, char **argv)
 {
-	(void)argc;
-	(void)argv;
+	// --geometry ox,oy[,display]: bind with xrWeaveBindWindow2DXR + a chained
+	// XrWeaveWindowGeometryDXR (spec v7) whose origin is global CoreGraphics
+	// BACKING px (y down) and whose client size is the probe's window. The
+	// service then resolves + forwards a panel-relative present origin to the
+	// DP (Metal backend) and logs it once; the CPU checks are unchanged.
+	bool have_geometry = false;
+	int geom_x = 0, geom_y = 0, geom_display = -1;
+	bool do_snap = false;
+	int snap_period = 0; // 0/1 = expect identity
+	const char *views_log = NULL; // --views <service log>
+	bool do_lift = false;         // --lift
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--lift") == 0) {
+			do_lift = true;
+		} else if (strcmp(argv[i], "--views") == 0 && i + 1 < argc) {
+			views_log = argv[++i];
+		} else if (strcmp(argv[i], "--snap") == 0) {
+			do_snap = true;
+			if (i + 1 < argc && argv[i + 1][0] != '-') {
+				snap_period = atoi(argv[++i]);
+			}
+		} else if (strcmp(argv[i], "--geometry") == 0 && i + 1 < argc) {
+			int n = sscanf(argv[++i], "%d,%d,%d", &geom_x, &geom_y, &geom_display);
+			if (n < 2) {
+				LOG("bad --geometry '%s' (want ox,oy[,display])", argv[i]);
+				return 1;
+			}
+			have_geometry = true;
+		} else {
+			LOG("usage: %s [--geometry ox,oy[,display]] [--snap [period]] [--views <service-log>] [--lift]",
+			    argv[0]);
+			return 1;
+		}
+	}
+	if (views_log != NULL && !have_geometry) {
+		LOG("--views needs --geometry (the per-window Kooima keys on the bound window)");
+		return 1;
+	}
 
 	// ---- Instance with the weave + vulkan-enable extensions.
 	uint32_t ext_count = 0;
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(NULL, 0, &ext_count, NULL));
 	std::vector<XrExtensionProperties> exts(ext_count, {XR_TYPE_EXTENSION_PROPERTIES});
 	XR_CHECK(xrEnumerateInstanceExtensionProperties(NULL, ext_count, &ext_count, exts.data()));
-	bool has_weave = false, has_vk = false;
+	bool has_weave = false, has_vk = false, has_rig = false, has_zones = false, has_info = false;
+	bool has_lift = false;
 	for (const auto &e : exts) {
+		has_lift = has_lift || strcmp(e.extensionName, XR_DXR_LIFT_EXTENSION_NAME) == 0;
+		has_rig = has_rig || strcmp(e.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0;
+		has_zones = has_zones || strcmp(e.extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0;
+		has_info = has_info || strcmp(e.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0;
 		if (strcmp(e.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) {
 			has_weave = true;
 		}
@@ -337,15 +613,30 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME};
+	if (views_log != NULL && (!has_rig || !has_zones || !has_info)) {
+		LOG("--views needs XR_DXR_view_rig (%d) + XR_DXR_display_zones (%d) + XR_DXR_display_info (%d)",
+		    (int)has_rig, (int)has_zones, (int)has_info);
+		return 1;
+	}
+	const char *enabled[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_DXR_WEAVE_EXTENSION_NAME,
+	                         XR_DXR_VIEW_RIG_EXTENSION_NAME, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME,
+	                         XR_DXR_DISPLAY_INFO_EXTENSION_NAME, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME};
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
 	snprintf(ici.applicationInfo.applicationName, sizeof(ici.applicationInfo.applicationName), "%s",
 	         "DXRWeaveProbeMacOS");
 	ici.applicationInfo.applicationVersion = 1;
 	snprintf(ici.applicationInfo.engineName, sizeof(ici.applicationInfo.engineName), "%s", "None");
 	ici.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-	ici.enabledExtensionCount = 2;
-	ici.enabledExtensionNames = enabled;
+	std::vector<const char *> enabled_list(enabled, enabled + (views_log != NULL ? 6 : 2)); // zones need local_3d_zone
+	if (do_lift) {
+		if (!has_lift) {
+			LOG("--lift needs XR_DXR_lift");
+			return 1;
+		}
+		enabled_list.push_back(XR_DXR_LIFT_EXTENSION_NAME);
+	}
+	ici.enabledExtensionCount = (uint32_t)enabled_list.size();
+	ici.enabledExtensionNames = enabled_list.data();
 	XrInstance instance = XR_NULL_HANDLE;
 	XR_CHECK(xrCreateInstance(&ici, &instance));
 
@@ -488,7 +779,26 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	XR_CHECK(pfn_bind(session, (void *)(uintptr_t)0x1)); // fake window id (phase-anchor only)
+	if (have_geometry) {
+		PFN_xrWeaveBindWindow2DXR pfn_bind2 = NULL;
+		xrGetInstanceProcAddr(instance, "xrWeaveBindWindow2DXR", (PFN_xrVoidFunction *)&pfn_bind2);
+		if (pfn_bind2 == NULL) {
+			LOG("failed to resolve xrWeaveBindWindow2DXR");
+			return 1;
+		}
+		XrWeaveWindowGeometryDXR geom = {(XrStructureType)XR_TYPE_WEAVE_WINDOW_GEOMETRY_DXR};
+		geom.windowOriginOnScreen = {geom_x, geom_y};
+		geom.clientSize = {(int32_t)kWinW, (int32_t)kWinH};
+		geom.displayId = geom_display;
+		XrWeaveBindWindowInfoDXR bind_info = {(XrStructureType)XR_TYPE_WEAVE_BIND_WINDOW_INFO_DXR};
+		bind_info.next = &geom;
+		bind_info.windowHandle = (void *)(uintptr_t)0x1; // fake window id
+		XR_CHECK(pfn_bind2(session, &bind_info));
+		LOG("bound with geometry origin=(%d,%d) client=%ux%u displayId=%d", geom_x, geom_y, kWinW, kWinH,
+		    geom_display);
+	} else {
+		XR_CHECK(pfn_bind(session, (void *)(uintptr_t)0x1)); // fake window id (phase-anchor only)
+	}
 
 	// ---- Build the window-sized squeezed-SBS input.
 	IOSurfaceRef input = create_input_surface();
@@ -532,6 +842,39 @@ main(int argc, char **argv)
 	submit.inputIsDxgi = XR_FALSE;
 	submit.firstChunk = XR_TRUE; // single submit per frame → first → clears woven output transparent (v5)
 
+	// ---- --snap: xrWeaveSnapWindowRectDXR. Points in the weave geometry
+	// convention (global CoreGraphics BACKING px, y down); dx = 13, dy = 11.
+	PFN_xrWeaveSnapWindowRectDXR pfn_snap = NULL;
+	const XrRect2Di snap_origin = {{200, 150}, {(int32_t)kWinW, (int32_t)kWinH}};
+	const XrRect2Di snap_target = {{213, 161}, {(int32_t)kWinW, (int32_t)kWinH}};
+	auto snap_leg = [&](const char *when, bool expect_snap) -> bool {
+		XrRect2Di got = {};
+		XrResult r = pfn_snap(session, &snap_origin, &snap_target, &got);
+		XrRect2Di want = snap_target;
+		if (expect_snap) {
+			const int dx = snap_target.offset.x - snap_origin.offset.x;
+			const int n = dx >= 0 ? (dx + snap_period / 2) / snap_period
+			                      : -((-dx + snap_period / 2) / snap_period);
+			want.offset.x = snap_origin.offset.x + n * snap_period;
+		}
+		const bool ok = r == XR_SUCCESS && got.offset.x == want.offset.x && got.offset.y == want.offset.y &&
+		                got.extent.width == want.extent.width && got.extent.height == want.extent.height;
+		LOG("snap %s: rc=%d origin=(%d,%d) target=(%d,%d) -> (%d,%d %dx%d) want (%d,%d %dx%d) [%s] -> %s", when,
+		    (int)r, snap_origin.offset.x, snap_origin.offset.y, snap_target.offset.x, snap_target.offset.y,
+		    got.offset.x, got.offset.y, got.extent.width, got.extent.height, want.offset.x, want.offset.y,
+		    want.extent.width, want.extent.height, expect_snap ? "lattice" : "identity", ok ? "OK" : "WRONG");
+		return ok;
+	};
+	bool snap_ok = true;
+	if (do_snap) {
+		xrGetInstanceProcAddr(instance, "xrWeaveSnapWindowRectDXR", (PFN_xrVoidFunction *)&pfn_snap);
+		if (pfn_snap == NULL) {
+			LOG("FAIL: failed to resolve xrWeaveSnapWindowRectDXR");
+			return 1;
+		}
+		snap_ok = snap_leg("before first submit (engine not up)", false) && snap_ok;
+	}
+
 	IOSurfaceRef output = NULL;
 	uint32_t out_w = 0, out_h = 0;
 	for (int frame = 0; frame < 5; frame++) {
@@ -561,6 +904,17 @@ main(int argc, char **argv)
 		return 1;
 	}
 
+	if (do_snap) {
+		snap_ok = snap_leg("after submits (engine up)", snap_period > 1) && snap_ok;
+		LOG("snap: %s", snap_ok ? "PASS" : "FAIL");
+	}
+
+	bool views_ok = true;
+	if (views_log != NULL) {
+		views_ok = views_leg(instance, system_id, session, geom_x, geom_y, geom_display, views_log);
+		LOG("views: %s", views_ok ? "PASS" : "FAIL");
+	}
+
 	// ---- Verify the anaglyph weave on the CPU.
 	dump_ppm(output, "/tmp/weave_probe_macos_output.ppm");
 
@@ -574,7 +928,7 @@ main(int argc, char **argv)
 	    {"rectB(cyan)", kRectB.offset.x + kRectB.extent.width / 2, kRectB.offset.y + kRectB.extent.height / 2,
 	     false},
 	};
-	bool pass = true;
+	bool pass = snap_ok && views_ok;
 	for (const auto &c : checks) {
 		uint8_t r = 0, g = 0, b = 0;
 		if (!sample_px(output, c.x, c.y, &r, &g, &b)) {
@@ -695,6 +1049,122 @@ main(int argc, char **argv)
 			}
 			CFRelease(nv_input);
 		}
+	}
+
+	// ---- --lift: rect A holds 2D and is lifted on a spec-3 SBS stream.
+	if (do_lift) {
+		bool lift_ok = true;
+		PFN_xrGetLiftPropertiesDXR pfn_props = NULL;
+		PFN_xrCreateLiftStreamDXR pfn_create = NULL;
+		PFN_xrDestroyLiftStreamDXR pfn_destroy = NULL;
+		xrGetInstanceProcAddr(instance, "xrGetLiftPropertiesDXR", (PFN_xrVoidFunction *)&pfn_props);
+		xrGetInstanceProcAddr(instance, "xrCreateLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_create);
+		xrGetInstanceProcAddr(instance, "xrDestroyLiftStreamDXR", (PFN_xrVoidFunction *)&pfn_destroy);
+		XrLiftPropertiesDXR props = {XR_TYPE_LIFT_PROPERTIES_DXR};
+		XrLiftStreamDXR stream = XR_NULL_HANDLE;
+		if (pfn_props == NULL || pfn_create == NULL || pfn_destroy == NULL) {
+			LOG("lift FAIL: XR_DXR_lift entry points missing");
+			lift_ok = false;
+		} else {
+			// Readiness: SBS appears once the service's provider is up (it may be ACTIVATING first).
+			for (int i = 0; i < 100; i++) {
+				if (XR_SUCCEEDED(pfn_props(session, &props)) && (props.supportedModes & XR_LIFT_MODE_SBS_BIT_DXR) != 0 &&
+				    props.state == XR_LIFT_STATE_READY_DXR) {
+					break;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			}
+			LOG("lift properties: modes=0x%llx state=%d maxViews=%u backend='%s'",
+			    (unsigned long long)props.supportedModes, (int)props.state, props.maxViews, props.backend);
+			XrLiftStreamCreateInfoDXR ci = {XR_TYPE_LIFT_STREAM_CREATE_INFO_DXR};
+			ci.mode = XR_LIFT_MODE_SBS_DXR;
+			ci.inputScale = 1.0f;
+			XrResult cr = pfn_create(session, &ci, &stream);
+			if (XR_FAILED(cr)) {
+				LOG("lift FAIL: xrCreateLiftStreamDXR(SBS) -> %d (service needs a provider: "
+				    "DXR_CONV_SIM_CONVERSION_ENABLE=1)",
+				    (int)cr);
+				lift_ok = false;
+			}
+		}
+		if (lift_ok) {
+			IOSurfaceLock(input, 0, NULL);
+			const int half = kRectA.extent.width / 2;
+			for (int y = kRectA.offset.y; y < kRectA.offset.y + kRectA.extent.height; y++) {
+				for (int x = kRectA.offset.x; x < kRectA.offset.x + kRectA.extent.width; x++) {
+					const bool left = (x - kRectA.offset.x) < half;
+					put_px(base, stride, x, y, left ? 0xFF : 0x00, 0x00, left ? 0x00 : 0xFF);
+				}
+			}
+			IOSurfaceUnlock(input, 0, NULL);
+			XrLiftOptionsDXR opt = {XR_TYPE_LIFT_OPTIONS_DXR};
+			opt.convergence = XR_LIFT_CONVERGENCE_AUTO_DXR;
+			opt.strength = 1.0f;
+			opt.inpaint = XR_TRUE;
+			opt.viewpointSource = XR_LIFT_VIEWPOINT_SOURCE_TRACKED_DXR;
+			opt.viewCount = 2;
+			XrWeaveRectLiftDXR lr = {XR_TYPE_WEAVE_RECT_LIFT_DXR};
+			lr.next = &opt;
+			lr.rectIndex = 0; // rect A
+			lr.stream = stream;
+			XrWeaveSubmitLiftRectsDXR lifts = {XR_TYPE_WEAVE_SUBMIT_LIFT_RECTS_DXR};
+			lifts.liftCount = 1;
+			lifts.lifts = &lr;
+			XrWeaveSubmitRectsDXR lbatch = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_RECTS_DXR};
+			lbatch.next = &lifts;
+			lbatch.rectCount = 2;
+			lbatch.rects = rects;
+			XrWeaveSubmitInfoDXR lsubmit = {(XrStructureType)XR_TYPE_WEAVE_SUBMIT_INFO_DXR};
+			lsubmit.next = &lbatch;
+			lsubmit.inputTexture = (void *)input;
+			lsubmit.inputIsDxgi = XR_FALSE;
+			lsubmit.firstChunk = XR_TRUE;
+			IOSurfaceRef lout = NULL;
+			for (int frame = 0; frame < 90 && lift_ok; frame++) { // ~1.5 s: results land well before
+				XrWeaveOutputDXR out = {(XrStructureType)XR_TYPE_WEAVE_OUTPUT_DXR};
+				XrResult r = pfn_submit(session, &lsubmit, &out);
+				if (XR_FAILED(r)) {
+					LOG("lift FAIL: xrWeaveSubmitDXR frame %d -> %d", frame, (int)r);
+					lift_ok = false;
+				}
+				if (out.weavedTexture != NULL && lout == NULL) {
+					lout = (IOSurfaceRef)out.weavedTexture;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(16));
+			}
+			IOSurfaceRef sample_from = lout != NULL ? lout : output;
+			if (lift_ok) {
+				dump_ppm(sample_from, "/tmp/weave_probe_macos_lift_output.ppm");
+				const int qx = kRectA.offset.x + kRectA.extent.width / 4;
+				const int qy = kRectA.offset.y + kRectA.extent.height / 2;
+				uint8_t r = 0, g = 0, b = 0;
+				if (sample_px(sample_from, qx, qy, &r, &g, &b)) {
+					const bool red = r > 150 && g < 80 && b < 80;
+					LOG("lift rect A quarter @(%d,%d) = (%u,%u,%u) want red (lifted 2D; magenta = woven as "
+					    "SBS) -> %s",
+					    qx, qy, r, g, b, red ? "OK" : "WRONG");
+					lift_ok = red;
+				} else {
+					lift_ok = false;
+				}
+				const int bx = kRectB.offset.x + kRectB.extent.width / 2;
+				const int by = kRectB.offset.y + kRectB.extent.height / 2;
+				if (sample_px(sample_from, bx, by, &r, &g, &b)) {
+					const bool cyan = r < 80 && g > 150 && b > 150;
+					LOG("lift rect B (not lifted) @(%d,%d) = (%u,%u,%u) want cyan -> %s", bx, by, r, g, b,
+					    cyan ? "OK" : "WRONG");
+					lift_ok = lift_ok && cyan;
+				}
+			}
+			if (lout != NULL) {
+				CFRelease(lout);
+			}
+		}
+		if (stream != XR_NULL_HANDLE) {
+			pfn_destroy(stream);
+		}
+		LOG("lift: %s", lift_ok ? "PASS" : "FAIL");
+		pass = pass && lift_ok;
 	}
 
 	xrDestroySession(session);

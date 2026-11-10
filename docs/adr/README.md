@@ -45,3 +45,23 @@
 - [ADR-039](ADR-039-one-fill-engine-for-every-tier.md) — One fill engine for every tier (same-adapter split)
 - [ADR-040](ADR-040-rear-depth-budget.md) — Rear depth budget — the runtime owns the policy, the plug-in owns pixels, the app owns geometry
 - [ADR-041](ADR-041-fixed-view-count-with-per-frame-activity.md) — Fixed view count with per-frame activity — inactive views alias, they do not disappear
+- [ADR-042](ADR-042-vendor-2d3d-conversion-supersedes-default.md) — A vendor 2D→3D conversion module supersedes the open default — the runtime exposes it, weaving stays the DP's
+- [ADR-043](ADR-043-stereo-camera-source.md) — A display's stereo camera is a plug-in-provided source, owned by the service and privacy-gated by the runtime
+- [ADR-044](ADR-044-colour-contract-per-backend.md) — The colour contract, per backend and swapchain format
+- [ADR-045](ADR-045-plugins-always-loadable-and-report-platform-state.md) — Plug-ins are always loadable and report their platform state
+- [ADR-046](ADR-046-depth-aware-cursor.md) — Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
+- [ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md) — Multi-screen — segments and per-screen views
+- [ADR-048](ADR-048-lift-viewpoint-policy.md) — Lift viewpoint policy — window-relative viewpoints, rig gains, axis mode and ease-back are runtime policy
+- [ADR-049](ADR-049-in-process-lift-rides-the-service.md) — In-process lift rides the service — one conversion module per machine, reached over a lift-only connection
+- [ADR-050](ADR-050-macos-runtime-owns-window-placement.md) — On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
+- [ADR-051](ADR-051-display-status-model-and-dashboard.md) — Display status — one vendor-generic model, the service owns the truth, the panel stays dumb
+- [ADR-052](ADR-052-workspace-on-n-screens.md) — Workspace on N screens — one presenter per 3D screen, one desktop-space layout
+- [ADR-053](ADR-053-conversion-providers.md) — Conversion providers — 2D→3D models are a third plug-in type, the service composes them, apps see tasks
+- [ADR-054](ADR-054-component-model.md) — Component model — a trunk with peer component classes over versioned C ABIs
+- [ADR-055](ADR-055-weave-sync-gpu-side-semaphores-no-host-drains.md) — Weave synchronisation is GPU-side — semaphores at every layer, no host drains
+- [ADR-056](ADR-056-desktop-control-runs-in-the-app.md) — Desktop control is a first-class capability that runs in the app — the OS's consent belongs to the app, never to DisplayXR
+- [ADR-057](ADR-057-image-to-splat-providers.md) — Image → splat conversion — one provider per class, models are packs, local or remote hosting; the provider reports facts, the author owns the camera block
+- [ADR-058](ADR-058-late-view-synthesis-and-depth-reprojection.md) — Late view synthesis and depth reprojection — converted content is placed at the eyes of the frame it is shown in, not the frame it was converted for
+- [ADR-059](ADR-059-d3d11-hub-compositor-windows.md) — One D3D11 hub compositor on Windows; the per-API in-process compositors become import shims
+- [ADR-060](ADR-060-texture-target-reference-window-binding.md) — A texture target is named by a reference window and a rect; its display processor is windowless
+- [ADR-061](ADR-061-3d-screen-share.md) — 3D screen share — a running app's pre-weave views are a stereo-camera source of kind app

@@ -138,6 +138,10 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		struct xrt_plugin_display_info pdi = {0};
 		pdi.struct_size = (uint32_t)sizeof(pdi);
 		if (plugin->get_display_info(target_plugin_get_active_instance(), head, &pdi)) {
+			// The per-monitor registry places this plug-in's back-compat
+			// display claim on its panel's monitor (multi-screen M0).
+			target_plugin_note_active_panel(&pdi);
+
 			screen_height_m = pdi.display_height_m;
 			nominal_z_m = pdi.nominal_viewer_z_m;
 
@@ -221,6 +225,43 @@ sim_display_open_system_impl(struct xrt_builder *xb,
 		}
 	}
 #endif
+
+	/*
+	 * No qwerty (Android: no SDL, no fly camera) but a provider that
+	 * NAVIGATES — the touch provider, #132. The rig composer is what turns a
+	 * NAVIGATION device into the head's pose, and until now it was only ever
+	 * created on the qwerty path above, so on Android a navigating provider
+	 * held the rig role and nothing read it. Bind the composer here with no
+	 * floor device: while the role sits on the floor it emits the head's own
+	 * static pose (seeded from the head, see t_rig_composer_create), so a
+	 * box whose provider never claims is byte-for-byte unchanged. Gated on a
+	 * navigation device actually being present so every other Android box —
+	 * no provider, or a vendor DP without the hook — keeps today's head
+	 * pose path untouched.
+	 */
+	if (qwerty_hmd == NULL && plugin != NULL &&
+	    plugin->struct_size >=
+	        offsetof(struct xrt_plugin_iface, set_pose_source) + sizeof(plugin->set_pose_source) &&
+	    plugin->set_pose_source != NULL) {
+		bool have_nav = false;
+		for (uint32_t i = 0; i < xsysd->xdev_count; i++) {
+			if (xsysd->xdevs[i] != NULL && xsysd->xdevs[i]->device_type == XRT_DEVICE_TYPE_NAVIGATION) {
+				have_nav = true;
+				break;
+			}
+		}
+		if (have_nav) {
+			struct sim_display_builder *sdb = (struct sim_display_builder *)xb;
+			t_rig_composer_destroy(&sdb->rig_composer);
+			sdb->rig_composer = t_rig_composer_create(NULL, xsysd, head);
+			if (sdb->rig_composer != NULL) {
+				plugin->set_pose_source(target_plugin_get_active_instance(), head, sdb->rig_composer);
+				U_LOG_W(
+				    "sim_display builder: no fly camera on this platform — the rig composer is bound "
+				    "for the navigating input provider (#132).");
+			}
+		}
+	}
 
 	return XRT_SUCCESS;
 }

@@ -13,11 +13,14 @@
  */
 
 #include "sim_display_interface.h"
+#include "sim_display_settings.h"
 #include "sim_display_zone_common.h"
 #include "sim_display_scanout_common.h"
+#include "sim_display_lift_d3d11.h"
 
 #include "xrt/xrt_display_processor_d3d11.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_plugin.h" // xrt_screen_binding (multi-screen M6)
 
 #include "util/u_debug.h"
 #include "util/u_logging.h"
@@ -32,7 +35,8 @@
 #include <cstdlib>
 #include <cstring>
 
-DEBUG_GET_ONCE_FLOAT_OPTION(sim_display_nominal_z_m_d3d11, "SIM_DISPLAY_NOMINAL_Z_M", 0.60f)
+/* Read through the host iface (N3c, sim_display_settings.h), cached per process. */
+#define debug_get_float_option_sim_display_nominal_z_m_d3d11() sim_display_setting_float("NOMINAL_Z_M", 0.60f)
 
 // ADR-021: this DP declares XRT_DP_COLOR_EITHER. When the runtime sends a
 // LINEAR atlas (Model B), the matched encode lives here in the DP. Shared HLSL:
@@ -130,7 +134,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
 	float2 right_uv = float2((uv.x + col1) * tile_cols_inv, (uv.y + row1) * tile_rows_inv);
 	float4 left  = atlas_tex.Sample(samp, left_uv);
 	float4 right = atlas_tex.Sample(samp, right_uv);
-	return out_finish(float4(left.r, right.g, right.b, 1.0), uv);
+	// Carry the atlas alpha: a present-owner weave (browser weave_frame_first) draws the tiles back
+	// whole-window and relies on transparent gaps to show the page through. Forcing alpha=1 painted
+	// everything outside the 3D tiles black (runtime#1742).
+	return out_finish(float4(left.r, right.g, right.b, max(left.a, right.a)), uv);
 }
 )";
 
@@ -209,6 +216,8 @@ struct sim_display_processor_d3d11_impl
 
 	//! Nominal viewer parameters for faked eye positions.
 	float ipd_m;
+	//! Holds a reference on the webcam tracker (#1855); see sim_display_webcam_tracking_apply.
+	bool webcam_ref;
 	float nominal_x_m;
 	float nominal_y_m;
 	float nominal_z_m;
@@ -241,6 +250,25 @@ struct sim_display_processor_d3d11_impl
 	ID3D11ShaderResourceView *wish_copy_srv;
 	uint32_t wish_copy_w, wish_copy_h;
 	bool wish_active; //!< wish_copy holds a live (not cleared) publish.
+
+	//! ADR-042: the FAKE lift module, only when SIM_DISPLAY_FAKE_LIFT=1 (else
+	//! NULL and the five lift slots stay NULL — sim_display ships no module).
+	struct sim_fake_lift *fake_lift;
+
+	//! Multi-screen M6: this instance was created for ONE screen
+	//! (`create_dp_d3d11_for_screen`); then it describes THAT screen and
+	//! confines its draw to the canvas it is handed. The unbound DP — every
+	//! pre-M6 caller — keeps the process-wide panel and the full-target draw.
+	bool screen_bound;
+	uint64_t screen_monitor_id;
+	int32_t screen_left, screen_top;
+	uint32_t screen_px_w, screen_px_h;
+	float screen_w_m, screen_h_m;
+	//! set_present_origin: the window's client-area origin on the bound
+	//! screen (device px). Stored for parity with the Vulkan DP; sim's D3D11
+	//! modes have no phase-sensitive interlace (#817), so it affects no pixel.
+	bool have_present_origin;
+	int32_t present_origin_x, present_origin_y;
 };
 
 static inline struct sim_display_processor_d3d11_impl *
@@ -355,7 +383,10 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	}
 	ctx->UpdateSubresource(sdp->tile_cb, 0, nullptr, &tile_data, 0, 0);
 
-	// Set viewport
+	// Set viewport. A screen-bound DP (multi-screen M6) is handed a canvas
+	// that is ITS segment of the target and must draw only there; the
+	// unbound DP keeps the pre-M6 full-target draw (its rasterizer state has
+	// scissor off, so the viewport alone confines the fullscreen strip).
 	D3D11_VIEWPORT viewport = {};
 	viewport.TopLeftX = 0.0f;
 	viewport.TopLeftY = 0.0f;
@@ -363,6 +394,12 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 	viewport.Height = static_cast<float>(target_height);
 	viewport.MinDepth = 0.0f;
 	viewport.MaxDepth = 1.0f;
+	if (sdp->screen_bound && canvas_width > 0 && canvas_height > 0) {
+		viewport.TopLeftX = static_cast<float>(canvas_offset_x);
+		viewport.TopLeftY = static_cast<float>(canvas_offset_y);
+		viewport.Width = static_cast<float>(canvas_width);
+		viewport.Height = static_cast<float>(canvas_height);
+	}
 	ctx->RSSetViewports(1, &viewport);
 
 	// Bind shaders, sampler, SRV, and constant buffer
@@ -388,35 +425,122 @@ sim_dp_d3d11_process_atlas(struct xrt_display_processor_d3d11 *xdp,
 }
 
 
-// #856: panel geometry -> compositor computes window-scoped Kooima.
-SIM_ZONE_DEFINE_PANEL_METRIC_FNS(sim_dp_d3d11, xrt_display_processor_d3d11)
+// #856: panel geometry -> compositor computes window-scoped Kooima. A
+// screen-bound instance (multi-screen M6) answers for ITS screen; the unbound
+// one for the process-wide panel at the desktop origin, as before.
+static bool
+sim_dp_d3d11_get_display_dimensions(struct xrt_display_processor_d3d11 *xdp, float *out_width_m, float *out_height_m)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	if (out_width_m == nullptr || out_height_m == nullptr) {
+		return false;
+	}
+	if (sdp->screen_bound) {
+		*out_width_m = sdp->screen_w_m;
+		*out_height_m = sdp->screen_h_m;
+	} else {
+		sim_display_get_panel_metrics(out_width_m, out_height_m, nullptr, nullptr);
+	}
+	return (*out_width_m > 0.0f && *out_height_m > 0.0f);
+}
+
+static bool
+sim_dp_d3d11_get_display_pixel_info(struct xrt_display_processor_d3d11 *xdp,
+                                    uint32_t *out_pixel_width,
+                                    uint32_t *out_pixel_height,
+                                    int32_t *out_screen_left,
+                                    int32_t *out_screen_top)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	if (out_pixel_width == nullptr || out_pixel_height == nullptr) {
+		return false;
+	}
+	int32_t left = 0, top = 0;
+	if (sdp->screen_bound) {
+		*out_pixel_width = sdp->screen_px_w;
+		*out_pixel_height = sdp->screen_px_h;
+		left = sdp->screen_left;
+		top = sdp->screen_top;
+	} else {
+		sim_display_get_panel_metrics(nullptr, nullptr, out_pixel_width, out_pixel_height);
+	}
+	if (out_screen_left != nullptr) {
+		*out_screen_left = left;
+	}
+	if (out_screen_top != nullptr) {
+		*out_screen_top = top;
+	}
+	return (*out_pixel_width > 0 && *out_pixel_height > 0);
+}
+
+/*!
+ * Multi-screen M6: the window's client-area origin on the bound screen. Kept
+ * for the Vulkan DP's parity (and for a future phase-sensitive D3D11 mode);
+ * no D3D11 sim mode reads it today (#817).
+ */
+static void
+sim_dp_d3d11_set_present_origin(struct xrt_display_processor_d3d11 *xdp, int32_t panel_x, int32_t panel_y)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	sdp->have_present_origin = true;
+	sdp->present_origin_x = panel_x;
+	sdp->present_origin_y = panel_y;
+}
+
+/*!
+ * Seed the per-instance screen from a binding (multi-screen M6). Physical size
+ * from the EDID mm, else the process-wide panel's; pixels from the device
+ * mode, else the desktop size; origin = the screen's desktop origin. Same
+ * rules as the Vulkan DP's sim_dp_bind_screen.
+ */
+static void
+sim_dp_d3d11_bind_screen(struct sim_display_processor_d3d11_impl *sdp, const struct xrt_screen_binding *b)
+{
+	if (b == nullptr || b->struct_size < offsetof(struct xrt_screen_binding, desktop_scale)) {
+		return;
+	}
+	float def_w_m = 0.0f, def_h_m = 0.0f;
+	uint32_t def_px_w = 0, def_px_h = 0;
+	sim_display_get_panel_metrics(&def_w_m, &def_h_m, &def_px_w, &def_px_h);
+
+	sdp->screen_bound = true;
+	sdp->screen_monitor_id = b->monitor_id;
+	sdp->screen_left = b->desktop_left;
+	sdp->screen_top = b->desktop_top;
+	sdp->screen_px_w = b->native_pixel_width != 0 ? b->native_pixel_width : b->desktop_width;
+	sdp->screen_px_h = b->native_pixel_height != 0 ? b->native_pixel_height : b->desktop_height;
+	if (sdp->screen_px_w == 0 || sdp->screen_px_h == 0) {
+		sdp->screen_px_w = def_px_w;
+		sdp->screen_px_h = def_px_h;
+	}
+	if (b->physical_width_mm != 0 && b->physical_height_mm != 0) {
+		sdp->screen_w_m = (float)b->physical_width_mm / 1000.0f;
+		sdp->screen_h_m = (float)b->physical_height_mm / 1000.0f;
+	} else {
+		sdp->screen_w_m = def_w_m;
+		sdp->screen_h_m = def_h_m;
+	}
+}
+
+//! N6 Part 1 (#2144): the synthetic viewer (nominal / fake-tracking sway,
+//! is_tracking, the opt-in webcam override through its ring — #1855; a
+//! screen-bound segment DP stays nominal) evaluated at the caller's target.
+static bool
+sim_dp_d3d11_get_eye_positions_at(struct xrt_display_processor_d3d11 *xdp,
+                                  int64_t target_ns,
+                                  struct xrt_eye_positions *out)
+{
+	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
+	return sim_display_eyes_at(out, sim_display_get_view_count(), sdp->nominal_x_m, sdp->nominal_y_m,
+	                           sdp->nominal_z_m, sdp->ipd_m, target_ns,
+	                           sdp->screen_bound ? NULL : &sdp->webcam_ref);
+}
 
 static bool
 sim_dp_d3d11_get_predicted_eye_positions(struct xrt_display_processor_d3d11 *xdp,
                                           struct xrt_eye_positions *out)
 {
-	struct sim_display_processor_d3d11_impl *sdp = sim_dp_d3d11(xdp);
-	float half_ipd = sdp->ipd_m / 2.0f;
-	uint32_t vc = sim_display_get_view_count();
-
-	if (vc == 1) {
-		out->eyes[0] = {sdp->nominal_x_m, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 1;
-	} else if (vc >= 4) {
-		out->eyes[0] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[1] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m - 0.032f, sdp->nominal_z_m};
-		out->eyes[2] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->eyes[3] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m + 0.032f, sdp->nominal_z_m};
-		out->count = 4;
-	} else {
-		out->eyes[0] = {sdp->nominal_x_m - half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->eyes[1] = {sdp->nominal_x_m + half_ipd, sdp->nominal_y_m, sdp->nominal_z_m};
-		out->count = 2;
-	}
-	out->timestamp_ns = os_monotonic_get_ns();
-	out->valid = true;
-	out->is_tracking = sim_display_fake_tracking_is_tracking(); // false unless SIM_DISPLAY_FAKE_TRACKING (#441)
-	return true;
+	return sim_dp_d3d11_get_eye_positions_at(xdp, (int64_t)os_monotonic_get_ns(), out);
 }
 
 static void
@@ -447,7 +571,10 @@ sim_dp_d3d11_destroy(struct xrt_display_processor_d3d11 *xdp)
 	if (sdp->wish_copy != nullptr) {
 		sdp->wish_copy->Release();
 	}
+	sim_fake_lift_destroy(sdp->fake_lift);
+	sdp->fake_lift = nullptr;
 
+	sim_display_webcam_tracking_release(&sdp->webcam_ref);
 	free(sdp);
 }
 
@@ -758,15 +885,97 @@ sim_dp_d3d11_set_window(struct xrt_display_processor_d3d11 *xdp, void *window_ha
 static bool
 sim_dp_d3d11_get_scanout_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_scanout_caps *out_caps)
 {
-	(void)xdp;
-	return sim_scanout_fill_caps(out_caps, "D3D11");
+	if (!sim_scanout_fill_caps(out_caps, "D3D11")) {
+		return false;
+	}
+	// ADR-060: no D3D11 sim mode has a position-dependent phase (#817), so a
+	// screen-bound instance — the one that confines itself to its canvas — is
+	// exact at any origin it is handed, window or not. The unbound DP draws
+	// the whole target and stays window-bound.
+	if (sim_dp_d3d11(xdp)->screen_bound) {
+		out_caps->flags |= XRT_DP_SCANOUT_FLAG_PHASE_FROM_PRESENT_ORIGIN;
+	}
+	return true;
 }
 
 
-extern "C" xrt_result_t
-sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
-                                   void *d3d11_device,
-                                   struct xrt_display_processor_d3d11 **out_xdp)
+/*
+ *
+ * ADR-042 lift slots — installed only with SIM_DISPLAY_FAKE_LIFT=1.
+ *
+ */
+
+static bool
+sim_dp_d3d11_lift_get_caps(struct xrt_display_processor_d3d11 *xdp, struct xrt_dp_lift_caps *out)
+{
+	return sim_fake_lift_get_caps(sim_dp_d3d11(xdp)->fake_lift, out);
+}
+
+static bool
+sim_dp_d3d11_lift_stream_create(struct xrt_display_processor_d3d11 *xdp,
+                                const struct xrt_dp_lift_stream_info *info,
+                                uint64_t *out_id)
+{
+	return sim_fake_lift_stream_create(sim_dp_d3d11(xdp)->fake_lift, info, out_id);
+}
+
+static void
+sim_dp_d3d11_lift_stream_destroy(struct xrt_display_processor_d3d11 *xdp, uint64_t id)
+{
+	sim_fake_lift_stream_destroy(sim_dp_d3d11(xdp)->fake_lift, id);
+}
+
+static bool
+sim_dp_d3d11_lift_convert(struct xrt_display_processor_d3d11 *xdp,
+                          uint64_t id,
+                          void *d3d11_context,
+                          void *input_resource,
+                          uint32_t w,
+                          uint32_t h,
+                          const struct xrt_dp_lift_params *p,
+                          const float *viewpoints_xyz,
+                          uint32_t viewpoint_floats,
+                          void **out_resource,
+                          uint32_t *out_w,
+                          uint32_t *out_h,
+                          uint32_t *out_format)
+{
+	// The fake derives each view's shift from its viewpoint (roadmap §10).
+	return sim_fake_lift_convert(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h, p,
+	                             viewpoints_xyz, viewpoint_floats, out_resource, out_w, out_h, out_format);
+}
+
+static bool
+sim_dp_d3d11_lift_convert_blob(struct xrt_display_processor_d3d11 *xdp,
+                               uint64_t id,
+                               void *d3d11_context,
+                               void *input_resource,
+                               uint32_t w,
+                               uint32_t h,
+                               const struct xrt_dp_lift_params *p,
+                               uint32_t *out_format,
+                               const void **out_bytes,
+                               size_t *out_size)
+{
+	(void)p;
+	return sim_fake_lift_convert_blob(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, input_resource, w, h,
+	                                  out_format, out_bytes, out_size);
+}
+
+static bool
+sim_dp_d3d11_lift_get_depth(struct xrt_display_processor_d3d11 *xdp,
+                            uint64_t id,
+                            void *d3d11_context,
+                            struct xrt_dp_lift_depth *out)
+{
+	return sim_fake_lift_get_depth(sim_dp_d3d11(xdp)->fake_lift, id, d3d11_context, out);
+}
+
+static xrt_result_t
+sim_display_processor_d3d11_create_bound(enum sim_display_output_mode mode,
+                                         void *d3d11_device,
+                                         const struct xrt_screen_binding *binding,
+                                         struct xrt_display_processor_d3d11 **out_xdp)
 {
 	if (out_xdp == nullptr) {
 		return XRT_ERROR_DEVICE_CREATION_FAILED;
@@ -788,6 +997,7 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.destroy = sim_dp_d3d11_destroy;
 	sdp->base.process_atlas = sim_dp_d3d11_process_atlas;
 	sdp->base.get_predicted_eye_positions = sim_dp_d3d11_get_predicted_eye_positions;
+	sdp->base.get_eye_positions_at = sim_dp_d3d11_get_eye_positions_at;       // N6 Part 1 (#2144)
 	sdp->base.get_display_dimensions = sim_dp_d3d11_get_display_dimensions;   // #856
 	sdp->base.get_display_pixel_info = sim_dp_d3d11_get_display_pixel_info;   // #856
 	sdp->base.is_alpha_native = sim_dp_d3d11_is_alpha_native;
@@ -799,6 +1009,8 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 	sdp->base.get_scanout_caps = sim_dp_d3d11_get_scanout_caps;
 	sdp->base.set_background_2d = sim_dp_d3d11_set_background_2d; // #491 part 3
 	sdp->base.set_window = sim_dp_d3d11_set_window;               // #1008
+	sdp->base.set_present_origin = sim_dp_d3d11_set_present_origin; // multi-screen M6
+	sim_dp_d3d11_bind_screen(sdp, binding);
 
 	// #224 / ADR-027 local-zone test double config (shared parser — see
 	// sim_display_zone_common.h for the SIM_DISPLAY_ZONE_GRID /
@@ -887,6 +1099,20 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
 		return XRT_ERROR_VULKAN;
 	}
 
+	// ADR-042: the FAKE lift module, env-gated. Without it every lift slot stays
+	// NULL (calloc) and the runtime reports XR_DXR_lift supportedModes = 0.
+	if (sim_fake_lift_enabled()) {
+		sdp->fake_lift = sim_fake_lift_create(d3d11_device);
+		if (sdp->fake_lift != nullptr) {
+			sdp->base.lift_get_caps = sim_dp_d3d11_lift_get_caps;
+			sdp->base.lift_stream_create = sim_dp_d3d11_lift_stream_create;
+			sdp->base.lift_stream_destroy = sim_dp_d3d11_lift_stream_destroy;
+			sdp->base.lift_convert = sim_dp_d3d11_lift_convert;
+			sdp->base.lift_convert_blob = sim_dp_d3d11_lift_convert_blob;
+			sdp->base.lift_get_depth = sim_dp_d3d11_lift_get_depth;
+		}
+	}
+
 	// Set the initial output mode (atomic global read by process_atlas each frame)
 	sim_display_set_output_mode(mode);
 
@@ -910,6 +1136,14 @@ sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
  */
 
 extern "C" xrt_result_t
+sim_display_processor_d3d11_create(enum sim_display_output_mode mode,
+                                   void *d3d11_device,
+                                   struct xrt_display_processor_d3d11 **out_xdp)
+{
+	return sim_display_processor_d3d11_create_bound(mode, d3d11_device, nullptr, out_xdp);
+}
+
+extern "C" xrt_result_t
 sim_display_dp_factory_d3d11(void *d3d11_device,
                               void *d3d11_context,
                               void *window_handle,
@@ -921,4 +1155,26 @@ sim_display_dp_factory_d3d11(void *d3d11_device,
 	enum sim_display_output_mode mode = sim_display_get_output_mode();
 
 	return sim_display_processor_d3d11_create(mode, d3d11_device, out_xdp);
+}
+
+/*
+ * Multi-screen M6: one D3D11 DP per screen a spanning window covers. The
+ * window handle is ignored like the plain factory's (sim weaves against no
+ * window, #1008); the binding seeds the instance's screen.
+ */
+extern "C" xrt_result_t
+sim_display_dp_factory_d3d11_for_screen(struct xrt_plugin_instance *inst,
+                                        void *d3d11_device,
+                                        void *d3d11_context,
+                                        void *window_handle,
+                                        const struct xrt_screen_binding *binding,
+                                        struct xrt_display_processor_d3d11 **out_xdp)
+{
+	(void)inst;
+	(void)d3d11_context;
+	(void)window_handle;
+	if (binding == nullptr) {
+		return XRT_ERROR_DEVICE_CREATION_FAILED;
+	}
+	return sim_display_processor_d3d11_create_bound(sim_display_get_output_mode(), d3d11_device, binding, out_xdp);
 }

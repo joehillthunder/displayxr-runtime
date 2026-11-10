@@ -33,7 +33,7 @@ App (any graphics API)
    Display
 ```
 
-Every graphics API gets its own native compositor — no Vulkan intermediary, no interop overhead. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
+Every graphics API gets its own native compositor — no Vulkan intermediary. On Windows the in-process compositors can hand the weave and present to one D3D11 hub ([ADR-059](docs/adr/ADR-059-d3d11-hub-compositor-windows.md)), which imports their atlas at a single shared-texture boundary. Vendor-specific processing (interlacing, lenticular weaving) is isolated in the display processor layer.
 
 | API | Windows | macOS | Linux | Android |
 |-----|---------|-------|-------|---------|
@@ -80,7 +80,7 @@ For full control, install each component directly from its release page. Order: 
 
 On Linux, every `v*` release attaches `displayxr-runtime_<ver>_amd64.deb` (`apt install ./displayxr-runtime_*_amd64.deb`); the user-level, no-root tarball (`scripts/package_linux.sh` → `dist/*.tar.gz` with `install.sh`) is the alternative. Both are built on Ubuntu 22.04 and CI-verified to install on 22.04, 24.04 and 26.04.
 
-The website's [Get Started](https://displayxr.org/getting-started) page walks through the manual flow end-to-end with verification steps.
+The website's [native quickstart](https://displayxr.org/developers/native) walks through the manual flow per platform, from install to a running app.
 
 ### Build from source
 

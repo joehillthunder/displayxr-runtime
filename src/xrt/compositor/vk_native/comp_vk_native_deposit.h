@@ -76,6 +76,8 @@
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_vulkan_includes.h"
 
+#include "hub_d3d11/comp_hub_d3d11_handoff.h"
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -101,60 +103,11 @@ extern "C" {
 bool
 comp_vk_deposit_requested(void);
 
-/*!
- * Everything a D3D consumer (VK-1's @ref comp_xbridge wiring) needs to pick the
- * deposit up. Pointers are BORROWED — the deposit owns them and outlives no
- * caller.
+/*
+ * The handoff (formerly `struct comp_vk_deposit_handoff`) is the hub's contract,
+ * not the deposit's: it moved to hub_d3d11/comp_hub_d3d11_handoff.h (#2317 P1a)
+ * so the hub and the D3D12 reroute build without Vulkan headers.
  */
-struct comp_vk_deposit_handoff
-{
-	void *d3d11_device;  //!< `ID3D11Device *` the deposit textures live on.
-	void *d3d11_context; //!< `ID3D11DeviceContext *`, its immediate context.
-	void *dxgi_adapter;  //!< `IDXGIAdapter *` — the VkDevice's adapter, LUID-matched.
-
-	void *texture;       //!< `ID3D11Texture2D *` — the slot Vulkan last wrote.
-	void *shared_handle; //!< `HANDLE` — NT share of @ref texture.
-
-	/*!
-	 * `IDXGIKeyedMutex *` of @ref texture, or NULL in fence mode. Non-NULL
-	 * means the deposit is in KEYED-MUTEX mode (no D3D12_FENCE import on this
-	 * driver — ADR-039 Phase A): @ref fence is NULL, and the consumer MUST
-	 * bracket its read with `AcquireSync(0, bounded_timeout)` /
-	 * `ReleaseSync(0)` — key 0, and SKIP the frame on timeout rather than
-	 * wait. The rationale for key 0 both sides (mutual exclusion, never a 0/1
-	 * ready-handshake) lives at the mode selection in
-	 * @ref comp_vk_deposit_create.
-	 */
-	void *keyed_mutex;
-
-	void *fence;               //!< `ID3D11Fence *` Vulkan signals from the atlas submit.
-	void *fence_shared_handle; //!< `HANDLE` — NT share of @ref fence.
-
-	/*!
-	 * The value @ref fence reaches once Vulkan's write to @ref texture has
-	 * completed on the GPU. A consumer waits for exactly this:
-	 * `ctx4->Wait(fence, fence_value)`. Zero before the first atlas submit.
-	 */
-	uint64_t fence_value;
-
-	uint64_t adapter_luid; //!< Packed LUID (HighPart<<32 | LowPart) of the shared adapter.
-	uint32_t width;
-	uint32_t height;
-	uint32_t slot; //!< Ring index of @ref texture.
-	/*!
-	 * The `DXGI_FORMAT` of @ref texture, as an integer so this header stays
-	 * free of `dxgi.h`.
-	 *
-	 * Published because a CONSUMER's copy of this texture is format-checked,
-	 * not merely size-checked: `ID3D11DeviceContext::CopySubresourceRegion`
-	 * requires source and destination to share a typeless family, and
-	 * `B8G8R8A8` and `R8G8B8A8` do not. A cross-family copy is not an error the
-	 * API reports — it is dropped, and the destination keeps whatever it held
-	 * (#1178). Consumers must compare this against their own chain's format
-	 * rather than assume.
-	 */
-	uint32_t dxgi_format;
-};
 
 /*!
  * Stand the deposit up: LUID-match a D3D11 device to @p vk, allocate the
@@ -210,9 +163,19 @@ comp_vk_deposit_resize(struct comp_vk_deposit *dep, uint32_t width, uint32_t hei
  * Advance to the next ring slot and return its images. Call once per APP frame,
  * before the atlas is drawn — never for a repaint, which replays the atlas the
  * last app frame left in the current slot.
+ *
+ * #2317 P2a review: advances only past a slot that was HANDED OFF
+ * (@ref comp_vk_deposit_note_handed); a frame that never reached the consumer
+ * leaves its slot to be re-rendered by the next one, so the ring can never lap
+ * onto the slot the hub's DIRECT ingress is still reading.
  */
 void
 comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64_t *out_view);
+
+//! #2317 P2a review: the current slot was handed to the consumer
+//! (comp_hub_d3d11_submit_atlas); the next advance may move past it.
+void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep);
 
 /*!
  * The current slot's images, without advancing.
@@ -298,13 +261,64 @@ VkSemaphore
 comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep);
 
 /*!
+ * @name #2317 P2a: the hub's DIRECT ingress (same adapter)
+ *
+ * The hub then opens each ring slot on its OWN device and weaves it in place —
+ * no staging copy, no @ref comp_vk_deposit_note_consumed. FENCE mode: its reads
+ * are released on a SEPARATE fence the hub owns (comp_hub_d3d11's consumer
+ * fence), imported here as a second timeline semaphore, so this deposit's own
+ * timeline keeps one signaller and can never step backwards. KEYED-MUTEX mode
+ * needs none of this: the hub brackets its reads with each slot's own mutex.
+ * @{
+ */
+
+/*!
+ * Import the hub's consumer fence (`HANDLE`, from
+ * comp_hub_d3d11_get_consumer_fence_handle) as a timeline semaphore. NULL
+ * unbinds (and forgets every owed release). False when the import failed or the
+ * deposit is in keyed-mutex mode — the caller must then keep the hub off DIRECT
+ * ingress in fence mode, since nothing else would order a slot rewrite after the
+ * hub's read. The caller guarantees no submit still references a semaphore it
+ * unbinds (the per-frame draw-fence wait does).
+ */
+bool
+comp_vk_deposit_bind_consumer_fence(struct comp_vk_deposit *dep, void *nt_handle);
+
+/*!
+ * The hub has moved off @p slot (comp_hub_d3d11_take_slot_release): its reads
+ * complete when the consumer fence reaches @p value. Vulkan's next write into
+ * the slot waits for it (@ref comp_vk_deposit_current_slot_hub_wait).
+ */
+void
+comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uint64_t value);
+
+/*!
+ * The CURRENT slot's owed hub release: the semaphore to wait on and the value,
+ * or `VK_NULL_HANDLE` / 0 when nothing is owed. Call after
+ * @ref comp_vk_deposit_advance, beside @ref comp_vk_deposit_current_slot_wait.
+ */
+void
+comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value);
+
+/*!
+ * #2317 P2c: the hub's consumer fence as imported by
+ * @ref comp_vk_deposit_bind_consumer_fence (a timeline semaphore), or
+ * `VK_NULL_HANDLE` when none is bound (keyed-mutex mode, or not DIRECT). The
+ * plane pass waits on it for comp_hub_d3d11_get_plane_release_value before it
+ * rewrites a plane the hub reads in place.
+ */
+VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep);
+/*! @} */
+
+/*!
  * Fill @p out with everything a D3D consumer needs. This is the VK-1 entry
  * point; nothing in the runtime calls it yet.
  *
  * @return false if the deposit is not active.
  */
 bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out);
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out);
 
 /*!
  * @name VK-1b (#1178) — the PLANE deposits.
@@ -367,6 +381,7 @@ struct comp_vk_deposit_plane
 	uint64_t view;       //!< `VkImageView` over @ref image.
 	uint32_t width;      //!< Allocated extent — the PANEL for the 2D planes.
 	uint32_t height;
+	VkFormat format; //!< #1795: the plane image's VkFormat (gates the scratch → plane raw copy).
 	/*!
 	 * Bumped on every REALLOCATION, never on a content change. This is what
 	 * `comp_xbridge_bind_plane`'s @p generation wants: a change re-opens the

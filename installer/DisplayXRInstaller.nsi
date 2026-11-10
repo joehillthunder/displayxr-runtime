@@ -4,11 +4,19 @@
 
 ;--------------------------------
 ; Build-time definitions (passed from CMake)
-; VERSION, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH
+; VERSION, VERSION_LABEL, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH
 ; BIN_DIR, SOURCE_DIR, OUTPUT_DIR
+;
+; VERSION is the plain X.Y.Z (registry Version, ARP DisplayVersion,
+; VIProductVersion -- other installers parse these). VERSION_LABEL is what the
+; installer is named after: X.Y.Z on a release tag, X.Y.Z+<n>.g<sha> on any
+; other commit (cmake/DisplayXRVersion.cmake, #1790).
 
 !ifndef VERSION
 	!define VERSION "25.0.0"
+!endif
+!ifndef VERSION_LABEL
+	!define VERSION_LABEL "${VERSION}"
 !endif
 !ifndef VERSION_MAJOR
 	!define VERSION_MAJOR "25"
@@ -58,13 +66,13 @@
 ;--------------------------------
 ; General Attributes
 
-Name "DisplayXR ${VERSION}"
+Name "DisplayXR ${VERSION_LABEL}"
 !ifdef INNER
 	; Throwaway inner installer: only emits the uninstaller to %TEMP%.
 	OutFile "$%TEMP%\DisplayXRSetup_inner.exe"
 	RequestExecutionLevel user
 !else
-	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION}.exe"
+	OutFile "${OUTPUT_DIR}\DisplayXRSetup-${VERSION_LABEL}.exe"
 	RequestExecutionLevel admin
 !endif
 InstallDir "$PROGRAMFILES64\DisplayXR\Runtime"
@@ -81,6 +89,87 @@ ShowUninstDetails show
 !include "LogicLib.nsh"
 !include "WordFunc.nsh"
 !insertmacro un.WordFind
+; Restart Manager: name the programs holding the runtime DLL (#1733).
+; __FILEDIR__, not a bare name: the INNER signing pass is compiled via
+; !makensis, so do not depend on the working directory.
+!include "${__FILEDIR__}\FilesInUse.nsh"
+
+; ADR-054 N4b (PR B): the provenance gate enforces by default — a plug-in DLL
+; must be signed or allowlisted (SHA-256 under HKLM\Software\DisplayXR\Trust\
+; Allowlist) or the runtime refuses to load it. installer/gen_allowlist_nsh.cmake
+; computes the rows for the DLL(s) this installer ships from the exact bytes
+; being packed; the macros below write them at install and drop them at
+; uninstall. A hand-run makensis without the define builds an installer that
+; writes nothing (a signed release needs no row).
+!ifdef ALLOWLIST_NSH
+	!include "${ALLOWLIST_NSH}"
+!else
+	!macro DXR_ALLOWLIST_WRITE
+	!macroend
+	!macro DXR_ALLOWLIST_REMOVE
+	!macroend
+!endif
+
+; ADR-054 N4b review: allowlist rows used to accumulate across in-place
+; upgrades — each build writes the digests of the DLLs IT ships, and only the
+; uninstaller removed rows, and only the current build's. So before writing
+; this build's rows (and again at uninstall), delete every value under
+; HKLM\Software\DisplayXR\Trust\Allowlist whose DATA carries this installer's
+; own note, "<dll> (DisplayXR runtime installer <version>)" — the text
+; installer/gen_allowlist_nsh.cmake writes. Rows any other installer, the
+; dev scripts or CI wrote carry other notes and are never touched. NSIS has no
+; regex: enumerate with EnumRegValue and scan the data with a case-sensitive
+; fixed-width window. Runs in whatever registry view the caller set (64-bit
+; in both sections, the view the loader reads).
+!define DXR_ALLOWLIST_KEY "Software\DisplayXR\Trust\Allowlist"
+!define DXR_ALLOWLIST_OWN_NOTE "(DisplayXR runtime installer "
+!macro DXR_ALLOWLIST_PURGE_OWN_FN PREFIX
+Function ${PREFIX}DxrAllowlistPurgeOwnRows
+	Push $0 ; value index
+	Push $1 ; value name
+	Push $2 ; value data
+	Push $3 ; note length
+	Push $4 ; data length
+	Push $5 ; scan position
+	Push $6 ; scan window / end
+	StrLen $3 "${DXR_ALLOWLIST_OWN_NOTE}"
+	StrCpy $0 0
+next_value:
+	ClearErrors
+	EnumRegValue $1 HKLM "${DXR_ALLOWLIST_KEY}" $0
+	IfErrors purge_done
+	StrCmp $1 "" purge_done
+	ClearErrors
+	ReadRegStr $2 HKLM "${DXR_ALLOWLIST_KEY}" $1
+	IfErrors keep_value ; not a string: not one of ours
+	StrLen $4 $2
+	StrCpy $5 0
+scan:
+	IntOp $6 $5 + $3
+	IntCmp $6 $4 0 0 keep_value ; window would run past the end
+	StrCpy $6 $2 $3 $5
+	StrCmpS $6 "${DXR_ALLOWLIST_OWN_NOTE}" own_value
+	IntOp $5 $5 + 1
+	Goto scan
+own_value:
+	DetailPrint "Allowlist: removing previous runtime-installer row $1 ($2)"
+	DeleteRegValue HKLM "${DXR_ALLOWLIST_KEY}" $1
+	Goto next_value ; the same index now names the next value
+keep_value:
+	IntOp $0 $0 + 1
+	Goto next_value
+purge_done:
+	Pop $6
+	Pop $5
+	Pop $4
+	Pop $3
+	Pop $2
+	Pop $1
+	Pop $0
+FunctionEnd
+!macroend
+!insertmacro DXR_ALLOWLIST_PURGE_OWN_FN ""
+!insertmacro DXR_ALLOWLIST_PURGE_OWN_FN "un."
 
 ; Windows constants for PATH modification
 !ifndef HWND_BROADCAST
@@ -88,6 +177,41 @@ ShowUninstDetails show
 !endif
 !ifndef WM_SETTINGCHANGE
 	!define WM_SETTINGCHANGE 0x001A
+!endif
+
+;--------------------------------
+; Conversion model store (ADR-053 P4, #2108)
+;
+; The runtime owns the machine's conversion model store. The default pack
+; manifest is published by the open conversion provider (its own repository,
+; DisplayXR/displayxr-conversion-open, packs/dxr-open-default.models.json);
+; the installer pre-fetches only that pack's `prefetch: true` models, and only
+; the commercial ones: `displayxr-cli conv models fetch --installer` never
+; fetches a non-commercial blob, whatever AllowResearchOnly says.
+;
+; Where the pack comes from (#2234), first match wins:
+;   1. /MODELSPACK=<url-or-path> on the command line;
+;   2. -DDXR_MODELS_PACK_URL=<url-or-path> at build time;
+;   3. the installed open provider's own copy: the first entry of its
+;      registry row's Packs (REG_MULTI_SZ, 64-bit view), if that file exists;
+;   4. the pack file in the provider's repository at the tag versions.json
+;      pins (`conversion_open`), injected as DXR_CONVERSION_OPEN_TAG by
+;      installer/CMakeLists.txt. A raw.githubusercontent.com URL at a tag is
+;      immutable and resolves (CI: scripts/check_models_pack_url.py), unlike the
+;      displayxr-models "packs" release this used to name, which never existed.
+; /NOMODELS deselects the default pack.
+!ifndef DXR_CONVERSION_OPEN_TAG
+	!define DXR_CONVERSION_OPEN_TAG "v0.1.1"
+!endif
+!ifdef DXR_MODELS_PACK_URL
+	!define DXR_MODELS_PACK_URL_OVERRIDDEN
+!else
+	!define DXR_MODELS_PACK_URL "https://raw.githubusercontent.com/DisplayXR/displayxr-conversion-open/${DXR_CONVERSION_OPEN_TAG}/packs/dxr-open-default.models.json"
+!endif
+; The open provider's registry row (its installer writes Packs there).
+!define DXR_OPEN_CONVERSION_ROW "Software\DisplayXR\ConversionProviders\open-conversion"
+!ifndef DXR_MODELS_LARGE_STILL
+	!define DXR_MODELS_LARGE_STILL "depth-still-large"
 !endif
 
 ;--------------------------------
@@ -104,6 +228,9 @@ ShowUninstDetails show
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "${SOURCE_DIR}\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY
+; ADR-053 P4 (#2108): the conversion-models components (default pack checked,
+; the large still-depth model unchecked).
+!insertmacro MUI_PAGE_COMPONENTS
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -669,6 +796,13 @@ Function CloseRuntimeClients
 	; The service is ours unconditionally and maps the DLL every time.
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
 	Pop $0
+	; ADR-053 P2: conversion hosts die with the service's job object
+	; (KILL_ON_JOB_CLOSE); sweep a straggler so its exe can be replaced.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
+	Pop $0
+	; The viewer-tracking host dies with the service's job object too.
+	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
+	Pop $0
 
 	; The browser records its own root; a missing key just means not installed,
 	; and the empty entry is filtered out below.
@@ -684,7 +818,24 @@ Function CloseRuntimeClients
 	; matched 0 of 10 live browser processes under SysWOW64 PowerShell while the
 	; CIM form matched all 10. WMI is bitness-agnostic, so this works whether the
 	; installer stays 32-bit or is ever built 64-bit.
-	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') }) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
+	;
+	; #1733: the same sweep also ends any Chromium browser's WebXR device
+	; service -- a sandboxed utility process started as
+	; `chrome.exe --type=utility --utility-sub-type=device.mojom.XRDeviceService`
+	; (Edge and other Chromium browsers use the same token). It loads the active
+	; OpenXR runtime through the loader, so it keeps DisplayXRClient.dll mapped
+	; long after the WebXR page that started it is gone. It is NOT the browser:
+	; the browser respawns it on demand, and ending it costs at most a live
+	; WebXR session, never a tab. Matched on that exact command-line token, so
+	; the user's browser windows are never touched. A live WebXR page could
+	; respawn it inside the install window; the ClientDllWritable recheck in
+	; the section still catches that.
+	;
+	; The token is split ('...mojom.' + 'XRDeviceService') and our own $$PID is
+	; excluded because THIS PowerShell's command line contains the pattern:
+	; spelled whole, the sweep matches itself, kills itself mid-pipeline and
+	; can stop before reaching the browser's process.
+	nsExec::ExecToLog `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference='SilentlyContinue'; $$roots=@('$INSTDIR','$1') | Where-Object { $$_ }; Get-CimInstance Win32_Process | Where-Object { $$e=$$_.ExecutablePath; $$c=$$_.CommandLine; ($$e -and ($$roots | Where-Object { $$e.StartsWith($$_ + '\', 'OrdinalIgnoreCase') })) -or ($$c -and $$_.ProcessId -ne $$PID -and $$c.Contains('--utility-sub-type=device.mojom.' + 'XRDeviceService')) } | ForEach-Object { Stop-Process -Id $$_.ProcessId -Force }"`
 	Pop $0
 
 	; Process exit and image unmap are not instantaneous even after
@@ -722,6 +873,27 @@ cdw_done:
 	Pop $0
 FunctionEnd
 
+; #2075: times the client-DLL write has been retried after losing a race.
+Var DxrDllWriteTries
+
+; Poll ClientDllWritable until the DLL is free or ~30 s pass.
+; $R0 = "1" free, "0" still held. Short steps on purpose: a respawned
+; XRDeviceService holds the DLL only while it probes, so the free window is
+; caught as soon as it opens.
+Function ClientDllSettle
+	Push $0
+	StrCpy $0 0
+cds_loop:
+	Call ClientDllWritable
+	StrCmp $R0 "1" cds_done
+	IntOp $0 $0 + 1
+	IntCmp $0 60 cds_done
+	Sleep 500
+	Goto cds_loop
+cds_done:
+	Pop $0
+FunctionEnd
+
 
 ;--------------------------------
 ; Installer Sections
@@ -744,29 +916,97 @@ Section "DisplayXR Runtime" SecRuntime
 	; beyond what runs from a directory we installed. The uninstall path runs
 	; cascade-uninstall first which handles their lifecycle.
 	Call CloseRuntimeClients
+	StrCpy $R3 0   ; 1 once the silent /CLOSEAPPS attempt has been made
+	StrCpy $R6 0   ; unnamed-holder settle rounds spent (#2075)
+	StrCpy $DxrDllWriteTries 0
 
+dll_check:
 	Call ClientDllWritable
 	StrCmp $R0 "1" dll_writable
 
-	; Give a straggler a second chance -- a process can be gone from the task
-	; list a moment before its image is unmapped.
-	Sleep 3000
-	Call ClientDllWritable
+	; #2075: wait for a hold to SETTLE, not for one fixed 3 s second chance.
+	; Some holds are ones our own sweep just caused, and they last longer than
+	; 3 s. Kill Chrome's XRDeviceService and Chrome respawns it within seconds
+	; while a WebXR page is open. The new one loads the runtime to probe it.
+	; With the service killed, that probe walks the client's no-pipe ->
+	; launch-service -> wait-for-pipe path (IPC_CONNECT_STARTING_TOTAL_MS plus
+	; the launch wait, ~10 s), then unloads the DLL. The old one-shot retry
+	; landed inside that window and aborted the bundle with code 6, though
+	; nothing held the DLL a few seconds later. Poll for up to 30 s; a real
+	; foreign holder still falls through to the naming/prompt path below.
+	DetailPrint "Waiting for DisplayXRClient.dll to be released..."
+	Call ClientDllSettle
 	StrCmp $R0 "1" dll_writable
 
 	; A holder we do NOT own is still running: a Unity editor, a customer app,
-	; an engine plug-in. Killing arbitrary user processes is not acceptable, so
-	; fail loudly instead. Aborting HERE is what makes this recoverable -- no
-	; file is written and, crucially, no Version stamp is left behind, so the
-	; bundle sees a real failure and its next run retries the component rather
-	; than skipping it forever.
-	SetErrorLevel 2
+	; an engine plug-in, a browser. Killing arbitrary user processes is not
+	; acceptable (#1268), so NAME them (#1733) and let the user decide.
+	; Aborting is still what makes this recoverable -- no file is written and,
+	; crucially, no Version stamp is left behind, so the bundle sees a real
+	; failure and its next run retries the component rather than skipping it
+	; forever.
+	Call FilesInUseList   ; $R1 = holder lines, $R2 = count
+	${If} $R2 == 0
+		; Restart Manager names nobody. The likeliest reason is that the hold
+		; ended between our check and RM's (#2075), so check again, and give
+		; the settle window one more round before blaming a program.
+		Call FilesInUseEnd
+		Call ClientDllWritable
+		StrCmp $R0 "1" dll_writable
+		${If} $R6 < 1
+			IntOp $R6 $R6 + 1
+			DetailPrint "DisplayXRClient.dll is busy, but no program is named as holding it -- waiting for it to settle..."
+			Goto dll_check
+		${EndIf}
+		StrCpy $R1 "  - (Windows did not say which program. Close every OpenXR application, including any web browser that has shown a WebXR page.)"
+	${EndIf}
+	DetailPrint "DisplayXRClient.dll is in use by:"
+	DetailPrint "$R1"
+
+	${If} ${Silent}
+		; Unattended: never prompt (a modal would hang the bundle chain). The
+		; opt-in /CLOSEAPPS switch asks the holders to close normally -- the
+		; same request as the interactive button -- once, then re-checks.
+		${GetParameters} $R4
+		ClearErrors
+		${GetOptions} $R4 "/CLOSEAPPS" $R5
+		${IfNot} ${Errors}
+		${AndIf} $R3 == 0
+			StrCpy $R3 1
+			Call FilesInUseClose
+			Call FilesInUseEnd
+			Sleep 2000
+			Goto dll_check
+		${EndIf}
+	${Else}
+		MessageBox MB_YESNOCANCEL|MB_ICONEXCLAMATION "DisplayXR can't update while these programs are using it:$\r$\n$\r$\n$R1$\r$\n$\r$\nYes$\t= close them for me (each is asked to close normally, so unsaved work can still be saved)$\r$\nNo$\t= I closed them myself, check again$\r$\nCancel$\t= stop the installation (nothing has been changed)" /SD IDCANCEL IDYES dll_close IDNO dll_retry
+		Goto dll_blocked
+	dll_close:
+		Call FilesInUseClose
+		Call FilesInUseEnd
+		Sleep 2000
+		Goto dll_check
+	dll_retry:
+		Call FilesInUseEnd
+		Goto dll_check
+	${EndIf}
+
+dll_blocked:
+	Call FilesInUseEnd
+	; Exit code 6 = "a program is using the runtime", distinct from a real
+	; failure (2) so a caller can tell "close something and retry" apart from
+	; "broken". The holder list goes to the registry for the bundle to show:
+	; under /S this installer has no window of its own. It is a diagnostic
+	; value, not install state -- the Version stamp is untouched.
+	WriteRegStr HKLM "Software\DisplayXR\Runtime" "LastInstallBlockers" "$R1"
+	SetErrorLevel 6
 	DetailPrint "FATAL: DisplayXRClient.dll is in use and cannot be replaced."
-	DetailPrint "Close every OpenXR application (the DisplayXR Browser included) and run this installer again."
-	MessageBox MB_OK|MB_ICONSTOP "DisplayXR cannot update: DisplayXRClient.dll is still in use by another program.$\n$\nClose every running OpenXR application -- including the DisplayXR Browser -- then run this installer again.$\n$\nNothing has been changed." /SD IDOK
+	DetailPrint "Close the programs listed above and run this installer again."
 	Abort "DisplayXRClient.dll is in use -- installation aborted, nothing was changed."
 
 dll_writable:
+	Call FilesInUseEnd
+	DeleteRegValue HKLM "Software\DisplayXR\Runtime" "LastInstallBlockers"
 
 	; Install runtime files. The client DLL is the one file whose silent loss
 	; produces the client/service skew, so verify this specific write landed
@@ -774,6 +1014,14 @@ dll_writable:
 	ClearErrors
 	File "${BIN_DIR}\DisplayXRClient.dll"
 	IfErrors 0 client_dll_ok
+	; #2075: a respawned probe can re-map the DLL between the writability
+	; proof and this write. Nothing has been written yet, so go back to the
+	; check (bounded) rather than fail a transient race as "broken".
+	${If} $DxrDllWriteTries < 3
+		IntOp $DxrDllWriteTries $DxrDllWriteTries + 1
+		DetailPrint "DisplayXRClient.dll was re-opened by another process mid-write -- checking again (attempt $DxrDllWriteTries)..."
+		Goto dll_check
+	${EndIf}
 	SetErrorLevel 2
 	DetailPrint "FATAL: failed to write DisplayXRClient.dll."
 	MessageBox MB_OK|MB_ICONSTOP "DisplayXR could not replace DisplayXRClient.dll.$\n$\nInstallation has been stopped rather than leave a runtime whose client and service are different builds." /SD IDOK
@@ -783,8 +1031,20 @@ client_dll_ok:
 	; Install service (needed for Chrome WebXR and other sandboxed apps)
 	File /nonfatal "${BIN_DIR}\displayxr-service.exe"
 
-	; Install manifest
-	File "${OUTPUT_DIR}\DisplayXR_win64.json"
+	; The conversion-host satellite (ADR-053 D5): the service spawns one per
+	; conversion-provider DLL, from its own directory. /nonfatal: without it
+	; every provider is hosted in the service (the documented fallback).
+	File /nonfatal "${BIN_DIR}\displayxr-conversion-host.exe"
+
+	; The viewer-tracking host (tracking-provider-discovery §4a): the service
+	; runs the viewer-tracking provider in it, writing the shared pose page.
+	; /nonfatal: without it the provider is hosted in the service (fallback).
+	File /nonfatal "${BIN_DIR}\displayxr-tracking-host.exe"
+
+	; Install manifest. Staged next to DisplayXRClient.dll in ${BIN_DIR}
+	; (library_path ".\DisplayXRClient.dll", valid in this flat layout too);
+	; the old top-level ${OUTPUT_DIR} copy is no longer produced.
+	File "${BIN_DIR}\DisplayXR_win64.json"
 
 	; Workspace controllers (the DisplayXR shell, third-party verticals, …)
 	; ship as their own products with dedicated installers — see
@@ -805,11 +1065,22 @@ client_dll_ok:
 	; nothing wrong. `displayxr-cli runtime` replaces it.
 	Delete "$INSTDIR\DisplayXRSwitcher.exe"
 
-	; Diagnostics CLI + Control Panel GUI (the Control Panel shells out to the
-	; CLI; both replace the retired DisplayXRSwitcher — #378). SDL2.dll (the
-	; Control Panel's only extra dep) is picked up by the *.dll sweep below.
+	; Sweep the retired ImGui Control Panel. The DisplayXR Dashboard below
+	; replaced it, and an in-place upgrade would otherwise leave the old exe
+	; (and its Start Menu shortcut) behind — still launchable, still looking
+	; current. The SDL2.dll it used stays: displayxr-service.exe and
+	; DisplayXRClient.dll import it too (debug GUI / qwerty), via the *.dll
+	; sweep below.
+	Delete "$INSTDIR\displayxr-control-panel.exe"
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk"
+
+	; Diagnostics CLI + DisplayXR Dashboard GUI (the Dashboard shells out to
+	; the CLI; together they replace the retired DisplayXRSwitcher — #378).
+	; The Dashboard (src/dashboard, Avalonia/.NET, ADR-051 D4) is a
+	; self-contained single-file exe. /nonfatal: a build without the .NET SDK
+	; has no dashboard, and the installer still builds.
 	File /nonfatal "${BIN_DIR}\displayxr-cli.exe"
-	File /nonfatal "${BIN_DIR}\displayxr-control-panel.exe"
+	File /nonfatal "${BIN_DIR}\displayxr-dashboard.exe"
 
 	; Sweep a STRAY vulkan-1.dll left by any pre-#105 install (#1229).
 	;
@@ -849,11 +1120,17 @@ client_dll_ok:
 	; plug-ins). It ships in the runtime installer because it's
 	; conceptually part of the runtime distribution.
 	;
-	; Vendor plug-ins (DisplayXR-LeiaSR.dll, future panels) are
+	; Vendor plug-ins (DisplayXR-<Vendor>.dll) are
 	; installed by their own installers, which register themselves
 	; under the same `HKLM\Software\DisplayXR\DisplayProcessors\*`
-	; root. The runtime uninstaller cascades over those keys (mirrors
-	; the workspace-controller cascade below).
+	; root. Those registrations belong to the plug-in, not to us
+	; (install-order epic #1803): a plug-in may be installed BEFORE the
+	; runtime, so its subkey can pre-exist here and is simply adopted.
+	; This section writes ONLY the sim-display subkey and never deletes
+	; or rewrites a vendor entry, so vendor registrations survive every
+	; runtime install, repair and upgrade. The runtime uninstaller
+	; likewise removes only the sim-display subkey (see Section
+	; "Uninstall").
 	; -----------------------------------------------------------------
 	SetOutPath "$INSTDIR\plugins"
 	File "${BIN_DIR}\plugins\DisplayXR-SimDisplay.dll"
@@ -870,8 +1147,95 @@ client_dll_ok:
 	WriteRegDWORD HKLM "Software\DisplayXR\DisplayProcessors\sim-display" \
 		"ProbeOrder" 200
 	; No UninstallString — sim-display is owned by this runtime
-	; installer, so the cascade pass below skips it; the runtime
-	; uninstaller drops the subkey + plugins dir directly.
+	; installer; the runtime uninstaller drops this subkey + its DLL
+	; directly.
+
+	; -----------------------------------------------------------------
+	; Reference input + conversion providers (ADR-054 §2 clause 3: every
+	; component class ships its sim_* reference so the system runs with
+	; no hardware, no vendor and no model — the macOS .pkg and the Linux
+	; packages already did; Windows shipped only sim-display until now).
+	;
+	; Registering them changes NOTHING for a user: both providers decline
+	; at probe unless their ENABLE setting is on (sim-input:
+	; `displayxr-cli input set sim-input ENABLE 1` / DXR_INPUT_SIM_INPUT_ENABLE;
+	; sim-conversion: `displayxr-cli conv set sim-conversion ENABLE 1` /
+	; DXR_CONV_SIM_CONVERSION_ENABLE), so qwerty keeps the hand roles and
+	; the vendor / open conversion providers keep every task. Same "only
+	; our rows" discipline as sim-display: this section writes exactly the
+	; two subkeys below and the uninstaller removes exactly those two.
+	; -----------------------------------------------------------------
+	SetOutPath "$INSTDIR\plugins"
+	File "${BIN_DIR}\plugins\DisplayXR-SimInput.dll"
+	File "${BIN_DIR}\plugins\DisplayXR-SimConversion.dll"
+	; The gamepad input provider (ADR-034 / ADR-054): XInput, presence-gated
+	; — inert until a pad is attached, then the pad takes the gamepad role,
+	; drives the rig and (by default) holds the hand roles with an emulated
+	; controller pair. ProbeOrder 150: a real tracking vendor (50) outranks
+	; it, it outranks sim-input (200). Allowlisted below with the sims.
+	File "${BIN_DIR}\plugins\DisplayXR-Gamepad.dll"
+	; The viewer-tracking reference provider (ADR-054 N6, sim-tracking): the
+	; DLL is staged and allowlisted but deliberately NOT registered — no
+	; TrackingProviders row is written, so the tracking class stays empty
+	; and no screen changes behaviour (tracking-provider-discovery.md §10.7).
+	; A developer registers it by hand (row Binary = this path) and turns it
+	; on with `displayxr-cli tracking set sim-tracking ENABLE 1`.
+	File "${BIN_DIR}\plugins\DisplayXR-SimTracking.dll"
+	; ADR-053 P4 (#2108): the sim's fake model pack (its DOWNLOAD_MS knob
+	; drives the model store's write protocol through it).
+	File "${BIN_DIR}\plugins\sim-conversion.models.json"
+	SetOutPath "$INSTDIR\plugins\sim-conversion-blobs"
+	File /r "${BIN_DIR}\plugins\sim-conversion-blobs\*.*"
+	SetOutPath "$INSTDIR"
+
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimInput.dll"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"DisplayName" "DisplayXR Sim Input"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"ProbeOrder" 200
+	; Version LAST — the "row complete" marker (input-provider-discovery.md §3).
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\sim-input" \
+		"Version" "${VERSION}"
+
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-Gamepad.dll"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"DisplayName" "DisplayXR Gamepad"
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"ProbeOrder" 150
+	WriteRegStr HKLM "Software\DisplayXR\InputProviders\gamepad" \
+		"Version" "${VERSION}"
+
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Binary" "$INSTDIR\plugins\DisplayXR-SimConversion.dll"
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"DisplayName" "DisplayXR Sim Conversion"
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Vendor" "DisplayXR"
+	WriteRegDWORD HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"ProbeOrder" 250
+	; Packs is a REG_MULTI_SZ (NSIS has no native writer); the service
+	; re-describes on Version, written after it (conversion spec §3.8).
+	nsExec::ExecToLog '"$SYSDIR\reg.exe" add "HKLM\Software\DisplayXR\ConversionProviders\sim-conversion" /v Packs /t REG_MULTI_SZ /d "$INSTDIR\plugins\sim-conversion.models.json" /f /reg:64'
+	Pop $0
+	${If} $0 != 0
+		DetailPrint "WARNING: could not write sim-conversion Packs (reg.exe exit $0); the provider still registers."
+	${EndIf}
+	WriteRegStr HKLM "Software\DisplayXR\ConversionProviders\sim-conversion" \
+		"Version" "${VERSION}"
+
+	; ADR-054 N4b: the digests of the three plug-in DLLs just written, so
+	; the enforcing provenance gate admits them even when this build is
+	; unsigned (installer/gen_allowlist_nsh.cmake, same list as above).
+	; Rows a previous runtime installer wrote go first: their DLLs were just
+	; overwritten, so their digests now admit nothing we ship.
+	Call DxrAllowlistPurgeOwnRows
+	!insertmacro DXR_ALLOWLIST_WRITE
 
 	; -----------------------------------------------------------------
 	; #902: VK_LAYER_DXR_queue_lock — per-queue submit serialization so
@@ -923,6 +1287,37 @@ client_dll_ok:
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "InstallPath" "$INSTDIR"
 	WriteRegStr HKLM "Software\DisplayXR\Runtime" "Version" "${VERSION}"
 
+	; ADR-053 P4 (#2108): the runtime-owned conversion model store. Root order
+	; as the runtime resolves it: an existing Models\Path, else the browser's
+	; ModelsPath (adopted, so its blobs are not downloaded twice), else
+	; %ProgramData%\DisplayXR\Models. Writing Models\Path + the owner marker
+	; is what tells a browser uninstaller not to delete blobs\ any more.
+	ReadRegStr $R2 HKLM "Software\DisplayXR\Models" "Path"
+	${If} $R2 == ""
+		ReadRegStr $R2 HKLM "Software\DisplayXR\Browser" "ModelsPath"
+	${EndIf}
+	${If} $R2 == ""
+		ReadEnvStr $R3 "ProgramData"
+		${If} $R3 == ""
+			StrCpy $R3 "C:\ProgramData"
+		${EndIf}
+		StrCpy $R2 "$R3\DisplayXR\Models"
+	${EndIf}
+	WriteRegStr HKLM "Software\DisplayXR\Models" "Path" "$R2"
+	; `conv models init` creates a missing root with the store ACL (Users read +
+	; create-files, AppContainer read) and the marker; an existing root keeps its ACL.
+	IfFileExists "$INSTDIR\displayxr-cli.exe" 0 +3
+		nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models init --root "$R2"'
+		Pop $R3
+	CreateDirectory "$R2\blobs"
+	ClearErrors
+	FileOpen $R3 "$R2\displayxr-runtime.owner" w
+	${IfNot} ${Errors}
+		FileWrite $R3 "displayxr-runtime$\n"
+		FileClose $R3
+	${EndIf}
+	DetailPrint "Conversion model store: $R2"
+
 	; Set as active OpenXR runtime (still in 64-bit view from section-start
 	; SetRegView; explicit no-op kept for clarity).
 	WriteRegStr HKLM "Software\Khronos\OpenXR\1" "ActiveRuntime" "$INSTDIR\DisplayXR_win64.json"
@@ -957,10 +1352,10 @@ client_dll_ok:
 	; transitive deps that previously *required* $INSTDIR on PATH are gone:
 	; cjson is compiled in from bundled source and pthreads is statically
 	; linked via the vcpkg overlay triplet at
-	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. The runtime DLL itself
-	; does not use SDL2; SDL2.dll ships only for the Control Panel GUI and
-	; sits next to displayxr-control-panel.exe in $INSTDIR, so it resolves via
-	; the exe's own directory without PATH.
+	; cmake/vcpkg-overlay-triplets/x64-windows.cmake. SDL2.dll (imported by
+	; displayxr-service.exe and DisplayXRClient.dll for the debug GUI /
+	; qwerty input) sits next to both in $INSTDIR, so it resolves via the
+	; module's own directory without PATH.
 	;
 	; Under the vendor plug-in architecture (ADR-019 / issue #256), the
 	; runtime DLL has zero vendor identifiers in its link line — no SR
@@ -1070,6 +1465,12 @@ client_dll_ok:
 			; service spawns would inherit the elevation). Route the launch through
 			; the user's explorer.exe, which is Medium, so the service starts the
 			; same way the logon Run key starts it.
+			; This is the ONLY place this installer starts the service, and it
+			; must stay explorer.exe-routed (install-order epic #1803, R-f): the
+			; service is long-lived and nothing later in an install sequence
+			; (vendor plug-in installers run before or after us, in any order)
+			; demotes it, so a High-integrity instance started here would keep
+			; every Medium app from connecting until the next restart/logon.
 			Exec 'explorer.exe "$INSTDIR\displayxr-service.exe"'
 		${EndIf}
 	skip_service_autostart:
@@ -1081,15 +1482,88 @@ client_dll_ok:
 
 SectionEnd
 
+; #2234: resolve the default conversion pack into $R2 (precedence in the
+; "Conversion model store" block near the top). Scratch: $R4-$R7.
+Function DxrResolveModelsPack
+	${GetParameters} $R4
+	ClearErrors
+	${GetOptions} $R4 "/MODELSPACK=" $R5
+	${IfNot} ${Errors}
+		StrCpy $R2 $R5
+		DetailPrint "Conversion models: pack from /MODELSPACK=: $R2"
+		Return
+	${EndIf}
+!ifdef DXR_MODELS_PACK_URL_OVERRIDDEN
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	DetailPrint "Conversion models: pack from the build-time DXR_MODELS_PACK_URL: $R2"
+	Return
+!endif
+	; The installed open provider's Packs value. NSIS's ReadRegStr cannot read
+	; a REG_MULTI_SZ, so RegGetValueW: RRF_RT_REG_MULTI_SZ (0x20) |
+	; RRF_SUBKEY_WOW6464KEY (0x10000) reads the 64-bit view without touching
+	; SetRegView, and the buffer's first NUL-terminated string is the first
+	; entry. HKLM = 0x80000002 (this installer is a 32-bit process). Size is
+	; in bytes: NSIS_MAX_STRLEN UTF-16 units, what System allocates for w .R5.
+	StrCpy $R5 ""
+	IntOp $R6 ${NSIS_MAX_STRLEN} * 2
+	System::Call 'advapi32::RegGetValueW(p 0x80000002, w "${DXR_OPEN_CONVERSION_ROW}", w "Packs", i 0x00010020, p 0, w .R5, *i R6 R6) i .R7'
+	${If} $R7 == 0
+	${AndIf} $R5 != ""
+		${If} ${FileExists} "$R5"
+			StrCpy $R2 $R5
+			DetailPrint "Conversion models: pack from the installed open provider (Packs): $R2"
+			Return
+		${EndIf}
+		DetailPrint "Conversion models: the open provider's Packs entry $R5 does not exist; using the pinned pack URL."
+	${EndIf}
+	StrCpy $R2 "${DXR_MODELS_PACK_URL}"
+	DetailPrint "Conversion models: pack from displayxr-conversion-open ${DXR_CONVERSION_OPEN_TAG}: $R2"
+FunctionEnd
+
+; ADR-053 P4 (#2108): pre-fetch the default conversion pack (the small video-
+; and still-depth models and the inpainter). Fail soft: a blob that does not
+; download is fetched on first use (it shows as DOWNLOADING), and the install
+; always succeeds. A stamped blob is skipped without hashing, never replaced
+; (a running process may have it mapped).
+Section "Conversion models (default pack)" SecModels
+	${GetParameters} $R0
+	ClearErrors
+	${GetOptions} $R0 "/NOMODELS" $R1
+	${IfNot} ${Errors}
+		DetailPrint "Conversion models: skipped (/NOMODELS)."
+		Goto models_done
+	${EndIf}
+	Call DxrResolveModelsPack
+	DetailPrint "Conversion models: pre-fetching the default pack from $R2"
+	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --prefetch --installer'
+	Pop $R3
+	${If} $R3 != 0
+		DetailPrint "Conversion models: pre-fetch incomplete (exit $R3); the missing models download on first use."
+	${EndIf}
+	models_done:
+SectionEnd
+
+; The large still-depth model: on demand otherwise (DOWNLOADING on first use).
+Section /o "Large still-depth model (on demand otherwise)" SecModelsLarge
+	Call DxrResolveModelsPack
+	nsExec::ExecToLog '"$INSTDIR\displayxr-cli.exe" conv models fetch "$R2" --model "${DXR_MODELS_LARGE_STILL}" --installer'
+	Pop $R3
+	${If} $R3 != 0
+		DetailPrint "Large still-depth model: not fetched (exit $R3); it downloads on first use."
+	${EndIf}
+SectionEnd
+
 Section "Start Menu Shortcuts" SecShortcuts
 	CreateDirectory "$SMPROGRAMS\DisplayXR"
 
 	; Workspace controllers add their own Start Menu shortcuts from their
 	; respective installers.
 
-	; Control Panel shortcut (replaces the retired Runtime Switcher — #378)
-	IfFileExists "$INSTDIR\displayxr-control-panel.exe" 0 +2
-		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk" "$INSTDIR\displayxr-control-panel.exe"
+	; Dashboard shortcut (replaces the retired Runtime Switcher — #378 — and
+	; the retired Control Panel, whose stale shortcut the install section
+	; sweeps)
+	IfFileExists "$INSTDIR\displayxr-dashboard.exe" 0 +2
+		CreateShortCut "$SMPROGRAMS\DisplayXR\DisplayXR Dashboard.lnk" "$INSTDIR\displayxr-dashboard.exe"
 
 	CreateShortCut "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk" "$INSTDIR\Uninstall.exe"
 SectionEnd
@@ -1101,18 +1575,26 @@ Section "Uninstall"
 	; Same 64-bit view as the install section — see Section "DisplayXR Runtime".
 	SetRegView 64
 
+	; ADR-053 P4 (#2108): the conversion model store outlives the runtime (other
+	; consumers may share it): the blobs stay. Only the runtime's claim goes —
+	; its owner marker and Models\Path. Never a recursive delete of the root.
+	ReadRegStr $R2 HKLM "Software\DisplayXR\Models" "Path"
+	${If} $R2 != ""
+		Delete "$R2\displayxr-runtime.owner"
+	${EndIf}
+	DeleteRegKey HKLM "Software\DisplayXR\Models"
+
 	; -----------------------------------------------------------------
-	; Kill displayxr-service BEFORE the cascade so vendor plug-in DLLs
-	; aren't locked when their own uninstallers try to delete them
-	; (#286). The service loads every registered DisplayProcessor
-	; plug-in at xrCreateInstance time; if the cascade runs first, the
-	; plug-in's `Delete "$INSTDIR\DisplayXR-<vendor>.dll"` silently
-	; fails on file-in-use and the DLL orphans. Remove auto-start
+	; Kill displayxr-service BEFORE touching any file: it maps
+	; DisplayXRClient.dll, the sim-display plug-in and the workspace
+	; controllers' runtime dependencies (#286). Remove auto-start
 	; registration here too so the service doesn't get re-launched by
 	; a re-logon mid-uninstall.
 	; -----------------------------------------------------------------
-	DetailPrint "Stopping DisplayXR Service before cascade..."
+	DetailPrint "Stopping DisplayXR Service..."
 	nsExec::ExecToLog 'taskkill /f /im displayxr-service.exe'
+	nsExec::ExecToLog 'taskkill /f /im displayxr-conversion-host.exe'
+	nsExec::ExecToLog 'taskkill /f /im displayxr-tracking-host.exe'
 	DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "DisplayXR Service"
 	; Also clear the stale 32-bit (WOW6432Node) Run entry left by interim
 	; installers that wrote it before this section moved to SetRegView 64.
@@ -1190,73 +1672,63 @@ Section "Uninstall"
 		cascade_run_done:
 	${EndIf}
 
-	; Drop the parent key (cleans any orphan entries whose uninstallers
-	; failed to remove themselves).
-	DeleteRegKey HKLM "Software\DisplayXR\WorkspaceControllers"
+	; Drop the parent key only if every controller removed its own
+	; subkey. A controller whose uninstaller failed (or has not finished
+	; yet) keeps its files and its Add/Remove Programs entry, so its
+	; registration must survive with them — deleting it would leave an
+	; installed-but-invisible controller that a later bundle run
+	; version-skips (install-order epic #1803). The runtime owns no
+	; subkey here.
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\WorkspaceControllers"
 	; -----------------------------------------------------------------
 
 	; -----------------------------------------------------------------
-	; Cascade-uninstall registered vendor display-processor plug-ins
-	; (issue #256 / ADR-019). Same shape as the workspace-controller
-	; cascade above:
-	;   - Each vendor plug-in registers under
-	;     HKLM\Software\DisplayXR\DisplayProcessors\<id> with an
-	;     UninstallString that honors /S.
-	;   - Sim-display lives under the same root but has no
-	;     UninstallString (its lifecycle belongs to this installer),
-	;     so the cascade silently skips it.
-	;   - Vendor plug-in installers own their own files + registry
-	;     entries; we run them before touching the runtime so they
-	;     can clean up while their dependency (DisplayXRClient.dll)
-	;     is still on disk.
+	; Display-processor plug-ins: remove ONLY our own registration.
+	;
+	; Install-order epic #1803 (R-a): a registered plug-in is a fact,
+	; not a decision. Vendor plug-ins are separate products with their
+	; own installers and Add/Remove Programs entries; they may be
+	; installed before the runtime and may outlive it (a runtime
+	; reinstall adopts their still-present registration). So this
+	; uninstaller never runs a vendor UninstallString and never deletes
+	; a vendor subkey — it removes the sim-display subkey it wrote,
+	; plus the root PreferredPlugin override when that override can no
+	; longer mean anything (it names sim-display, or a plug-in that is
+	; no longer registered), then drops the root key only if nothing
+	; else is left in it.
 	; -----------------------------------------------------------------
-	DetailPrint "Discovering registered display processor plug-ins..."
-	StrCpy $R0 ""
-	StrCpy $9 0
-	StrCpy $R9 0    ; entry count for the run-loop's exit condition
-	dp_cascade_collect_loop:
-		EnumRegKey $1 HKLM "Software\DisplayXR\DisplayProcessors" $9
-		StrCmp $1 "" dp_cascade_collect_done
-		ReadRegStr $2 HKLM "Software\DisplayXR\DisplayProcessors\$1" "UninstallString"
-		${If} $2 != ""
-			${If} $R0 == ""
-				StrCpy $R0 "$2"
-			${Else}
-				StrCpy $R0 "$R0|$2"
-			${EndIf}
-			IntOp $R9 $R9 + 1
+	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors\sim-display"
+	; The two reference providers this installer registered (ADR-054 §2
+	; clause 3). Only these subkeys: a vendor's or the open provider's row
+	; under the same roots belongs to its own installer (#1803), and the
+	; roots themselves are dropped only when nothing else is left in them.
+	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\sim-input"
+	DeleteRegKey HKLM "Software\DisplayXR\InputProviders\gamepad"
+	DeleteRegKey HKLM "Software\DisplayXR\ConversionProviders\sim-conversion"
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\InputProviders"
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\ConversionProviders"
+	; ADR-054 N4b: the allowlist rows this installer wrote for its own DLL(s);
+	; rows other installers or register_dev_plugin.bat wrote are left alone.
+	; The purge also catches rows an older runtime installer left behind.
+	Call un.DxrAllowlistPurgeOwnRows
+	!insertmacro DXR_ALLOWLIST_REMOVE
+	ReadRegStr $0 HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"
+	${If} $0 == "sim-display"
+		DeleteRegValue HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"
+	${ElseIf} $0 != ""
+		; A pin to a plug-in that is no longer registered would otherwise
+		; keep the (otherwise empty) root key alive forever.
+		ClearErrors
+		EnumRegValue $1 HKLM "Software\DisplayXR\DisplayProcessors\$0" 0
+		${If} ${Errors}
+			DeleteRegValue HKLM "Software\DisplayXR\DisplayProcessors" "PreferredPlugin"
 		${EndIf}
-		IntOp $9 $9 + 1
-		Goto dp_cascade_collect_loop
-	dp_cascade_collect_done:
-
-	${If} $R0 != ""
-		; Use the count tracked during the collect phase (see comment in
-		; the workspace-controller cascade above for the IfErrors /
-		; WordFind-"#" pitfalls that this approach sidesteps — #286).
-		StrCpy $R8 1
-		dp_cascade_run_loop:
-			IntCmp $R8 $R9 0 0 dp_cascade_run_done
-			${un.WordFind} "$R0" "|" "+$R8" $R7
-			${If} $R7 != ""
-				; $R7 has embedded quotes (the WriteRegStr in each
-				; plug-in's installer stores `"path"`); strip them
-				; then re-wrap so nsExec/cmd parses `"path" /S` cleanly.
-				StrCpy $R6 $R7 1
-				${If} $R6 == '$\"'
-					StrCpy $R7 $R7 "" 1
-					StrCpy $R7 $R7 -1
-				${EndIf}
-				DetailPrint "Uninstalling display processor plug-in: $R7"
-				ExecWait '"$R7" /S' $5
-				DetailPrint "  exit code: $5"
-			${EndIf}
-			IntOp $R8 $R8 + 1
-			Goto dp_cascade_run_loop
-		dp_cascade_run_done:
 	${EndIf}
+	DeleteRegKey /ifempty HKLM "Software\DisplayXR\DisplayProcessors"
+	DetailPrint "Vendor display plug-ins (if any) are left installed and registered."
+	DetailPrint "They are separate products: remove them from Add/Remove Programs (Apps & features) if no longer needed."
+	; -----------------------------------------------------------------
 
-	; Drop the parent key (cleans the sim-display subkey + any orphans).
 	; #902: drop the Vulkan layer registration before the files go.
 	; DeleteRegValue (not DeleteRegKey) — ExplicitLayers is a SHARED key
 	; owned by the Vulkan loader and holds other vendors' layers.
@@ -1264,12 +1736,10 @@ Section "Uninstall"
 	Delete "$INSTDIR\VkLayer_DXR_queue_lock.dll"
 	Delete "$INSTDIR\VkLayer_DXR_queue_lock.json"
 
-	DeleteRegKey HKLM "Software\DisplayXR\DisplayProcessors"
 	; -----------------------------------------------------------------
 
 	; (Service was already killed + Run key cleaned at the top of the
-	; uninstall section, before the cascades, so plug-in DLLs unlocked
-	; in time for their own uninstallers — see #286.)
+	; uninstall section, before the controller cascade — see #286.)
 
 	; Remove files. We name the high-value executables explicitly (so a
 	; failed Delete prints a clear log line), then wildcard-sweep the rest
@@ -1278,10 +1748,15 @@ Section "Uninstall"
 	; $INSTDIR across versions if we don't sweep them.
 	Delete "$INSTDIR\DisplayXRClient.dll"
 	Delete "$INSTDIR\displayxr-service.exe"
+	Delete "$INSTDIR\displayxr-conversion-host.exe"
+	Delete "$INSTDIR\displayxr-tracking-host.exe"
 	; Retired in #1180; kept so uninstalling an older install still cleans it.
 	Delete "$INSTDIR\displayxr-webxr-bridge.exe"
 	Delete "$INSTDIR\displayxr-cli.exe"
+	; Retired (superseded by the Dashboard); kept so uninstalling an older
+	; install still cleans it.
 	Delete "$INSTDIR\displayxr-control-panel.exe"
+	Delete "$INSTDIR\displayxr-dashboard.exe"
 	Delete "$INSTDIR\DisplayXR_win64.json"
 	Delete "$INSTDIR\install.log"
 
@@ -1290,9 +1765,16 @@ Section "Uninstall"
 	Delete "$INSTDIR\*.dll"
 	Delete "$INSTDIR\*.json"
 
-	; Plug-in DLLs (sim-display + any vendor plug-in whose installer
-	; failed to clean up). Issue #256.
+	; Runtime-owned plug-in dir: sim-display + leftovers from older
+	; runtime builds (issue #256). Vendor plug-ins install into their own
+	; directories (the sibling $PROGRAMFILES64\DisplayXR\Plugins\<Vendor>)
+	; and are never touched (#1803); the sweep is non-recursive and so is
+	; the RMDir, so a subdirectory someone else put here survives.
 	Delete "$INSTDIR\plugins\*.dll"
+	; The sim-conversion model pack this installer wrote (manifest + its
+	; blobs directory); still no recursive sweep of plugins\ itself.
+	Delete "$INSTDIR\plugins\sim-conversion.models.json"
+	RMDir /r "$INSTDIR\plugins\sim-conversion-blobs"
 	RMDir "$INSTDIR\plugins"
 
 	; Save uninstall log to temp before removing directory
@@ -1303,7 +1785,11 @@ Section "Uninstall"
 	; Remove uninstaller
 	Delete "$INSTDIR\Uninstall.exe"
 
-	; Remove install directory (if empty)
+	; Remove install directory (if empty). Both RMDirs are deliberately
+	; NON-recursive (never /r): $PROGRAMFILES64\DisplayXR is shared with
+	; vendor plug-ins and workspace controllers installed as separate
+	; products (e.g. ...\DisplayXR\Plugins\<Vendor>), which must survive a
+	; runtime uninstall (#1803).
 	RMDir "$INSTDIR"
 	RMDir "$PROGRAMFILES64\DisplayXR"
 
@@ -1313,6 +1799,7 @@ Section "Uninstall"
 	; Remove Start Menu shortcuts (workspace-controller shortcuts are
 	; removed by their own cascade-uninstaller; nothing left to clean here)
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Control Panel.lnk"
+	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Dashboard.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\DisplayXR Runtime Switcher.lnk"
 	Delete "$SMPROGRAMS\DisplayXR\Uninstall DisplayXR.lnk"
 	RMDir "$SMPROGRAMS\DisplayXR"
@@ -1362,6 +1849,8 @@ SectionEnd
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecRuntime} "DisplayXR OpenXR runtime files (required)"
 	!insertmacro MUI_DESCRIPTION_TEXT ${SecShortcuts} "Create Start Menu shortcuts"
+	!insertmacro MUI_DESCRIPTION_TEXT ${SecModels} "Download the default 2D-to-3D conversion models now (about 113 MB). Without it they download on first use."
+	!insertmacro MUI_DESCRIPTION_TEXT ${SecModelsLarge} "Also download the large still-image depth model now (about 0.7 GB). Without it it downloads when first needed."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ;--------------------------------
@@ -1378,7 +1867,7 @@ Function .onInit
 !endif
 	; Check for 64-bit Windows
 	${IfNot} ${RunningX64}
-		MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows."
+		MessageBox MB_ICONSTOP "DisplayXR requires 64-bit Windows." /SD IDOK
 		Abort
 	${EndIf}
 FunctionEnd
@@ -1392,4 +1881,4 @@ VIAddVersionKey "CompanyName" "DisplayXR"
 VIAddVersionKey "LegalCopyright" "Copyright (c) 2024-2026 DisplayXR"
 VIAddVersionKey "FileDescription" "DisplayXR OpenXR Runtime Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
-VIAddVersionKey "ProductVersion" "${VERSION}"
+VIAddVersionKey "ProductVersion" "${VERSION_LABEL}"

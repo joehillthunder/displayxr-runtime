@@ -1,0 +1,218 @@
+# ADR-050: On macOS the runtime owns window placement — phase-snapped, atomic drag and resize by default
+
+**Status:** Accepted (2026-10-08) · Metal in-process sessions implemented · extends
+[ADR-033](ADR-033-placement-reports-geometry-weaver-owns-phase.md) and
+[ADR-047](ADR-047-multi-screen-segments-and-per-screen-views.md) ·
+spec: [XR_DXR_cocoa_window_binding.md](../specs/extensions/XR_DXR_cocoa_window_binding.md) v8 ·
+code: `src/xrt/compositor/metal/comp_metal_placement.{h,m}`
+
+## In one paragraph
+
+A lenticular weave is a function of where the window's pixels land on the panel. On macOS the
+WindowServer performs a title-bar drag by itself: it slides the **last presented frame** to every
+intermediate position without the app re-weaving it, so the 3D stutters for the whole drag; and
+AppKit's live resize runs a tracking loop inside `-[NSApp sendEvent:]` that blocks the render
+loop. Neither can be fixed from the display processor. So, for every eligible DisplayXR session,
+**the runtime performs the gesture itself**: it makes the window non-movable for AppKit, takes the
+mouse-downs that would start a drag or a resize, asks the display processor for the
+phase-equivalent position of every step (`snap_window_rect`, anchored at the gesture start), and
+applies the move / resize in the **same Core Animation transaction** that presents the frame woven
+for it. This is the default; an app can opt out.
+
+## Context
+
+- **Measured, not theorised.** The recipe was developed and judged on the Odyssey panel with the
+  Leia SR Metal weaver (LeiaSR `tests/macos/metal_weaver/mtl_weaver_window.mm`, drag f2528fb33,
+  native-drag control 87b064bb4, resize a849a5c45 — "perfect" on drag, edge and corner resize).
+  The control (`SR_NATIVE_DRAG=1`, here `DXR_MACOS_NATIVE_DRAG=1`) shows the WindowServer drag's
+  stutter side by side.
+- **ADR-033** split placement from phase: placement reports geometry, the weaver owns all phase.
+  That split stays. What changes is *who moves the window*: on macOS nobody but the runtime can
+  move it in lockstep with the present, because only the presenter can put the move and the
+  frame in one transaction.
+- **Windows already does this** inside the vendor DP (`WM_WINDOWPOSCHANGING` snapping, see
+  `XR_DXR_win32_window_binding` §2.4); Linux X11 does it in the app via
+  `xrWeaveSnapWindowRectDXR` (#1588). macOS has no message hook a DP could use, and an app
+  would have to re-implement the whole recipe (and get every gotcha right) to match.
+
+## Decision
+
+1. **Default: runtime-owned.** An in-process Metal session whose bound view is its window's
+   `contentView` (`_handle`) or whose window the runtime created (`_hosted`) gets runtime-owned
+   placement. Title-bar drag, edge / corner resize (8 pt zone on both sides of each edge), the zoom
+   button and the title-bar double-click all go through it.
+2. **Not eligible** (AppKit keeps the window, logged once): `DXR_MACOS_NATIVE_DRAG=1`; an app that
+   chained `XrCocoaWindowPlacementInfoDXR` with `XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR`
+   (spec v8); offscreen and shared-IOSurface (`_texture`) sessions — the app presents, not us; a
+   workspace (shell) session (`DISPLAYXR_WORKSPACE_SESSION=1`); a bound view that is a sub-view
+   (the app laid it out; moving the window is not ours to decide).
+3. **DP contract.** A new Metal DP slot, appended after `set_present_origin` (ADR-020, no ABI
+   bump, `XRT_DP_METAL_HAS_SNAP_WINDOW_RECT`):
+   `bool snap_window_rect(xdp, origin_x, origin_y, target_x, target_y, *out_x, *out_y)` — the
+   exact twin of the VK / D3D11 slot: backing (device) px, only the displacement from the
+   gesture-start origin matters, a pure query. False (no slot, no lattice, no tracked viewer — SR's
+   `SR_DECLINED`) means "use the target": the move is still atomic, only unsnapped.
+4. **The runtime tells the DP the APPLIED origin.** Every frame of a runtime-placed session the
+   compositor calls `set_present_origin` with the content origin the window actually landed at
+   (read back after the move; AppKit may constrain a frame), relative to the screen holding it.
+   **A runtime `set_present_origin` call wins** over anything the DP derives itself: the Leia
+   plug-in's Metal DP currently polls its own present origin from the view
+   (`update_present_origin` on `displayxr-leia-plugin` `feat/macos-metal-dp`); once it receives
+   the runtime's call it must use that value for the frame (the polled one is the window's
+   position *before* this frame's move commits). That change is the plug-in's, tracked separately.
+5. **Multi-screen.** The snap uses the DP of the screen holding the content origin — the
+   session's primary DP, or that screen's per-screen segment DP (ADR-047). The segment table for a
+   frame is computed from the rect that frame is woven for.
+
+## Mechanism (Metal)
+
+- **Gesture** (main thread): `movable = NO`, `movableByWindowBackground = NO`; a local `NSEvent`
+  monitor for left-mouse down / dragged / up returns nil to swallow what it handles. The mouse-down
+  is hit-tested at the **event's** location (`convertPointToScreen:locationInWindow`), never
+  `NSEvent.mouseLocation` — by the time a queued event is pumped the cursor may have left the edge
+  zone. The traffic lights stay AppKit's. A drag step writes a pending content rect under a lock;
+  the commit applies the latest one — one move per rendered frame.
+- **Zoom** goes through a delegate **proxy** (`NSProxy`) installed as the window's delegate that
+  implements `windowShouldZoom:toFrame:` (decline AppKit's animated zoom, queue the proposed frame)
+  and `windowWillResize:toSize:` (tripwire) and forwards every other message to the app's own
+  delegate. Chosen over swizzling (process-global, fragile under KVO's own isa-swizzle) and over
+  notifications alone (there is no will-zoom notification). The app's delegate keeps receiving
+  everything; the one visible difference is `window.delegate` returns the proxy (compare with
+  `-isEqual:`, which the proxy forwards). If the app replaces its delegate later, the proxy
+  re-wraps it on the next event.
+- **Snap** (commit thread): drag / zoom = move semantics (origin snapped, size kept); resize by the
+  left / top edge = the far edges stay fixed and the **size absorbs** the snap's 1–2 px
+  correction; right / bottom-only resize needs no snap. Min content 320 × 200 pt. The DP's
+  answer is applied as-is (`px / scale`, half points on Retina), the same as the LeiaSR macOS
+  sample. An earlier whole-point search (the vk_native X11 `u_x11_reachable_round` lattice) made a
+  level drag bob 2–5 px vertically on a slanted lens, so it was removed. AppKit may round the
+  applied origin by one backing pixel; the present origin is read back from where it landed.
+- **Present** (`comp_metal_compositor.m` layer commit): `presentsWithTransaction = YES`;
+  `[CATransaction begin]` + `setDisableActions:YES` → apply the frame (`setFrameOrigin`, or
+  `setFrame:display:NO` + `drawableSize`; never `display:YES`) → `nextDrawable` →
+  `set_present_origin(applied)` → weave → `[cb commit]` → `waitUntilScheduled` →
+  `[drawable present]` → `[CATransaction commit]`. The drawable's texture size is the authority
+  for every downstream size.
+- **Rule: size the drawable from the content rect AppKit APPLIED, never the one asked for.**
+  Showing a window (`makeKeyAndOrderFront:`) constrains it to the screen's `visibleFrame`, and
+  `setFrame:` can be clamped by min / max sizes; a drawable sized from the requested rect is woven
+  at one size and scaled into another, which breaks the lens phase (LeiaSR's reference demo shipped
+  exactly that: `--window 1800x1100` on a 1080 pt screen wove 3600×2200 into 3600×2036). The layer
+  commit re-reads the content size (the view, or the placement frame's applied rect) every frame
+  before `nextDrawable`; the resize path reads `contentRectForFrameRect:` back after
+  `setFrame:display:NO` before setting `drawableSize`; and the hosted window re-reads it once it is
+  shown (logging `Hosted window constrained by the screen` when it changed). A window asked at
+  1000 × 1100 pt on a 982 pt screen comes back 823 pt tall and its first drawable is 2000 × 1646 px.
+- **Rule: the runtime that owns the resize also owns the resize cursor.** AppKit never sees the
+  edge mouse-downs, so it never shows its frame-resize cursors, and the 8 pt zone *outside* the
+  window gets no mouse-moved events at all. So every present polls `NSEvent.mouseLocation` (on the
+  main thread; from another commit thread one queued main-thread poll at a time) against the same
+  edge / corner zones the mouse-down hit-test uses, and sets
+  `+[NSCursor frameResizeCursorFromPosition:inDirections:]` (macOS 15+; before that
+  `resizeLeftRightCursor` / `resizeUpDownCursor`) while the mouse is in a zone or a resize is in
+  progress. Only when the app is active, the window is key, visible, not full-screen / minimised,
+  and topmost at that point; the traffic lights are excluded. It never fights the app's own cursor:
+  it touches the cursor only inside the resize zones, and on leaving restores the cursor it
+  replaced **only if its own cursor is still current**. Same opt-outs as the gesture
+  (`DXR_MACOS_NATIVE_DRAG=1`, the app-owned bit), since both live in the placement object.
+- **Rule: an activating click must reach AppKit.** A native title-bar or edge click on a window
+  that is not key activates the app and makes the window key. Measured on macOS 26: the
+  WindowServer may mark the app active before delivery, but AppKit makes the window key only when
+  the mouse-down itself passes through `-[NSApp sendEvent:]`. Swallowed, the app is left active
+  with **no key window** (no keyboard input, no resize cursor), and neither
+  `makeKeyAndOrderFront:`, `makeKeyWindow`, `[NSApp activate]` nor `NSRunningApplication`
+  activation, at once or retried later, repairs it. So when the window is not key the monitor
+  still starts the gesture but returns the mouse-down to AppKit (after `[NSApp activate]` /
+  `activateIgnoringOtherApps:` if the app is inactive), retargeted to the title-bar centre when it
+  was an edge click so AppKit does not start its own live resize. `movable = NO` keeps AppKit from
+  dragging; the drags and the mouse-up still go through the monitor, so a click-and-drag on a
+  background window activates it and moves / resizes it in one gesture (verified: 20 atomic
+  steps, 0 native-resize tripwires, rendering uninterrupted).
+- **App-initiated moves.** A frame change made outside this path (`setFrameOrigin` from the app, a
+  display reconfiguration) is detected at the next present by comparing the window frame with the
+  last frame the runtime applied; the new origin is snapped relative to the last **presented**
+  origin and applied atomically. **Limit: the one frame the app's own move showed is off-phase
+  (≤ 1 frame).** An app that moves its window continuously should opt out and snap its own moves
+  (`xrWeaveSnapWindowRectDXR`, now routed in-process to the Metal DP).
+- **Threading.** When `xrEndFrame` runs on the main thread (the test apps, hosted sessions, most
+  AppKit apps) the move and the present are one transaction. Otherwise the drawable is sized on
+  the commit thread, and the move + present are handed to the main queue and waited on for about
+  one refresh (20 ms); on timeout the commit thread presents itself and the move lands when the
+  main thread gets to it — non-atomic, ≤ 1 off-phase frame — **never a deadlock** (the main
+  thread may be the one waiting on us).
+- **Tripwires.** `windowWillResize:toSize:` during a live resize and
+  `NSWindowWillStartLiveResizeNotification` count AppKit-native resizes (must stay 0); a
+  post-present check compares the window's content origin with the origin the frame was woven for
+  (`DXR_MACOS_PLACEMENT_TRACE=1` logs every step). Totals are logged once at teardown.
+
+## Consequences
+
+- Every DisplayXR Metal app on macOS gets stutter-free windowed 3D on drag and resize without a
+  line of app code, and the vendor implements one pure query.
+- The runtime is now in the window-management business on macOS. Full screen (green button) stays
+  AppKit's: placement pauses while the window is full-screen or minimised.
+- `sim_display` leaves the slot NULL (no lens lattice): unsnapped but atomic.
+  `SIM_DISPLAY_METAL_SNAP_PERIOD=N` (N > 1) installs a test double that snaps horizontal
+  displacement to whole multiples of N backing px, to exercise the snap, the size absorption and
+  the Retina lattice without hardware.
+- Dragging a window across displays only shows it on both with macOS "Displays have separate
+  Spaces" OFF; with it ON (the default) the WindowServer clips it to the display holding most of
+  it — the segments path logs a one-shot WARN (comp-segments.md § macOS / Metal).
+- A window resized past the display the atlas was sized for no longer reads past the atlas (the
+  crop blit is clamped; it used to assert under `MTL_DEBUG_LAYER=1`).
+
+## Amendment 1 (2026-10-13): a replugged screen gets its window back
+
+**Symptom.** A `_handle` Metal window (`cube_handle_metal_macos`) on the Odyssey panel, the panel
+unplugged and plugged in again: the window comes back at the panel's **left edge**, wherever it was
+on the panel before.
+
+**Cause: AppKit, not the runtime.** When a screen goes away AppKit moves its windows onto a
+surviving screen, and when the same screen returns it does not move them back. Logged on the
+Odyssey (laptop 1512 × 982 pt as the main display, panel arranged right of it): at the unplug the
+window's content went to x = 1472 pt — parked against the laptop's right edge, 40 pt on it, the
+rest hanging where the panel had been — and at the replug the panel found it there. The runtime's
+own move at the unplug is the app-initiated-move re-snap above: it re-snaps the origin AppKit
+chose (a phase correction of a few px, anchored at the last presented origin); it does not choose
+the position. Nothing in the runtime, the plug-in or the test app moves the window back, or to the
+left edge.
+
+**Decision.** The placement object, which already owns this window's position (Decision 1) and
+already handles "a display reconfiguration" moving it, also restores it:
+
+- On every move / resize (`NSWindowDidMoveNotification`, `NSWindowDidResizeNotification`) and at
+  create it records the screen holding the window — by **display UUID**
+  (`CGDisplayCreateUUIDFromDisplayID`, stable across a replug; a `CGDirectDisplayID` is not) — and
+  the frame's offset from that screen's top-left.
+- A move or screen change (`NSApplicationDidChangeScreenParametersNotification`) that finds the
+  recorded screen gone (not in `+[NSScreen screens]`, or `CGDisplayIsOnline` false — CoreGraphics
+  drops it before AppKit does) marks the window **evicted** and freezes the record.
+- When a screen with that UUID is back (checked 300 ms after the last screen change, coalesced)
+  the window goes back to its offset on it — through the ordinary pending-rect path, so it is one
+  atomic present woven for where it lands — clamped only as far as needed to stay reachable
+  (title bar under the menu bar, 64 pt on screen: `util/u_window_replug.h`, unit-tested in
+  `tests_aux_window_replug`). Skipped when the window is already at that spot (judged by position,
+  not by "is it on that screen": a window left at the panel's edge is on the panel and still
+  wrong), and deferred while it is full-screen or minimised.
+- **The user's choice wins:** a runtime-owned drag, resize or zoom while the screen is away clears
+  the record; the window stays where they put it.
+- Same eligibility as the rest of this ADR: an app that opted out (`XR_COCOA_WINDOW_PLACEMENT_APP_OWNED_BIT_DXR`,
+  `DXR_MACOS_NATIVE_DRAG=1`) owns its window across a replug too. `DXR_MACOS_REPLUG_RESTORE=0`
+  turns only this behaviour off.
+
+Not covered: an app that moves its own window with `setFrame:` while the screen is away cannot be
+told apart from AppKit's eviction settling, so it is moved back on the replug. The Vulkan / GL
+macOS paths and IPC sessions inherit this with the rest of the model (Follow-ups).
+
+## Follow-ups (not in this ADR's implementation)
+
+- **Vulkan and GL on macOS** (`comp_vk_native` over a CAMetalLayer, the GL compositor): same
+  model, their own present paths.
+- **IPC / service sessions on macOS** (`comp_multi_weave_macos.c`): the service presents, so the
+  move must be carried to it — a different hand-off.
+- **Leia plug-in**: implement `snap_window_rect` on the Metal DP via `srWeaverSnapToPhase(weaver,
+  origin_x, origin_y, target_x, target_y, &x, &y)` (return false on `SR_DECLINED` / any non-success,
+  `true` with the snapped point otherwise), guarded by `#ifdef XRT_DP_METAL_HAS_SNAP_WINDOW_RECT`;
+  and let a runtime `set_present_origin` call win over its polled origin.
+- Hardware judgement on the panel with the Leia DP (the runtime path was validated with
+  sim-display only).

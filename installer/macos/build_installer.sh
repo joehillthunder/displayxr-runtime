@@ -196,6 +196,17 @@ EOF
 cp "$SCRIPT_DIR/uninstall.sh" "$RUNTIME_ROOT/"
 chmod +x "$RUNTIME_ROOT/uninstall.sh"
 
+# --- displayxr-cli (selftest / status / camera calibration) ---
+# The only installed way on macOS to diagnose the runtime or calibrate a camera.
+# postinstall links it into /usr/local/bin. Ships with or without the service.
+if [ -f "$ARTIFACT_DIR/bin/displayxr-cli" ]; then
+    mkdir -p "$RUNTIME_ROOT/bin"
+    cp "$ARTIFACT_DIR/bin/displayxr-cli" "$RUNTIME_ROOT/bin/displayxr-cli"
+    chmod 0755 "$RUNTIME_ROOT/bin/displayxr-cli"
+    codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-cli" 2>/dev/null || true
+    echo "Staged displayxr-cli into the runtime payload."
+fi
+
 # --- Service binary + LaunchAgent (macOS spatial shell, #61) ---
 # The installed spatial shell (DisplayXRShell .pkg) attaches to displayxr-service
 # as an IPC client. Ship the service (built HYBRID by build_macos.sh --installer)
@@ -209,6 +220,18 @@ if [ -f "$SERVICE_SRC" ]; then
     chmod 0755 "$RUNTIME_ROOT/bin/displayxr-service"
     # Re-sign defensively (a tar round-trip in CI can drop the signature).
     codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-service" 2>/dev/null || true
+    # ADR-053 P2: the conversion-host satellite, spawned by the service from bin/.
+    if [ -f "$ARTIFACT_DIR/bin/displayxr-conversion-host" ]; then
+        cp "$ARTIFACT_DIR/bin/displayxr-conversion-host" "$RUNTIME_ROOT/bin/displayxr-conversion-host"
+        chmod 0755 "$RUNTIME_ROOT/bin/displayxr-conversion-host"
+        codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-conversion-host" 2>/dev/null || true
+    fi
+    # Tracking-provider-discovery §4a: the viewer-tracking host, spawned by the service from bin/.
+    if [ -f "$ARTIFACT_DIR/bin/displayxr-tracking-host" ]; then
+        cp "$ARTIFACT_DIR/bin/displayxr-tracking-host" "$RUNTIME_ROOT/bin/displayxr-tracking-host"
+        chmod 0755 "$RUNTIME_ROOT/bin/displayxr-tracking-host"
+        codesign --force --sign - "$RUNTIME_ROOT/bin/displayxr-tracking-host" 2>/dev/null || true
+    fi
 
     LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
     mkdir -p "$LAUNCHAGENT_DIR"
@@ -261,9 +284,122 @@ else
     echo "Note: displayxr-service not in artifact (non-SERVICE build); .pkg ships runtime only."
 fi
 
+# --- Desktop-capture helper + on-demand LaunchAgent (#2264) ---
+# DisplayXRDesktopCapture.app is the ONE DisplayXR process that holds the macOS
+# Screen Recording grant: a transparent session on a weaving DP (Leia) composes
+# the desktop behind its window, and the in-process Metal compositor gets those
+# frames from this helper over XPC (Mach service com.displayxr.desktop-capture).
+# Unlike the service it ships on every .pkg — an in-process app needs it too.
+#
+# The agent has NO RunAtLoad: launchd starts the helper only when a compositor
+# connects to the Mach service, and the helper exits by itself once the last
+# client leaves. Opaque sessions never contact it, so a user who never runs a
+# transparent app on a Leia panel never sees the permission prompt.
+#
+# Signing is load-bearing for the grant: macOS pins an ad-hoc signature's grant
+# to its cdhash, so an unsigned (CI/contributor) .pkg loses the grant on every
+# reinstall. The Developer ID signature from sign-tree below (when
+# DXR_MACOS_APP_IDENTITY is set) pins it to bundle id + team instead, so it
+# survives upgrades. The helper needs no entitlements: Screen Recording is a
+# TCC grant, not an entitlement.
+CAPTURE_SRC="$ARTIFACT_DIR/bin/DisplayXRDesktopCapture.app"
+if [ -d "$CAPTURE_SRC" ]; then
+    mkdir -p "$RUNTIME_ROOT/bin"
+    rm -rf "$RUNTIME_ROOT/bin/DisplayXRDesktopCapture.app"
+    cp -R "$CAPTURE_SRC" "$RUNTIME_ROOT/bin/"
+    LAUNCHAGENT_DIR="$WORK_DIR/payload-runtime/Library/LaunchAgents"
+    mkdir -p "$LAUNCHAGENT_DIR"
+    cat > "$LAUNCHAGENT_DIR/com.displayxr.desktop-capture.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.displayxr.desktop-capture</string>
+    <key>Program</key>
+    <string>$INSTALL_PREFIX/bin/DisplayXRDesktopCapture.app/Contents/MacOS/DisplayXRDesktopCapture</string>
+    <key>MachServices</key>
+    <dict>
+        <key>com.displayxr.desktop-capture</key>
+        <true/>
+    </dict>
+    <key>LimitLoadToSessionType</key>
+    <string>Aqua</string>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/displayxr-desktop-capture.log</string>
+</dict>
+</plist>
+PLIST
+    echo "Staged DisplayXRDesktopCapture.app + on-demand LaunchAgent into the runtime payload."
+else
+    echo "Warning: DisplayXRDesktopCapture.app not in artifact; transparent sessions on a weaving DP will have no desktop backdrop."
+fi
+
+# --- 1b. Final code signature on the runtime payload (#280) ---
+# MUST stay the last thing that touches the payload's Mach-Os: every
+# install_name_tool above invalidated a signature (the ad-hoc re-signs only
+# keep the intermediate tree loadable). With DXR_MACOS_APP_IDENTITY set this is
+# a Developer ID + hardened-runtime signature, entitlements from
+# installer/macos/entitlements/map; unset, it is the ad-hoc '-' signature
+# contributor and fork-PR builds always had.
+SIGN="$REPO_ROOT/scripts/macos_sign_notarize.sh"
+
+# sign_tree <dir>: the final Mach-O signature. With DXR_MACOS_SIGN_FALLBACK=adhoc
+# (set by CI on signed tag builds) a failed Developer ID signature — typically
+# Apple's timestamp server being unreachable — degrades to the ad-hoc tree
+# instead of failing the build: signing never gates publishing. The fallback is
+# recorded in $DXR_MACOS_SIGN_STATUS_FILE so CI skips notarizing a tree that
+# can no longer pass it.
+sign_tree() {
+    if "$SIGN" sign-tree "$1" --entitlements-map "$SCRIPT_DIR/entitlements/map"; then
+        return 0
+    fi
+    if [ -n "${DXR_MACOS_APP_IDENTITY:-}" ] && [ "${DXR_MACOS_SIGN_FALLBACK:-}" = "adhoc" ]; then
+        echo "::warning::Developer ID signing of $(basename "$1") failed — falling back to ad-hoc; this .pkg will NOT be notarized"
+        [ -n "${DXR_MACOS_SIGN_STATUS_FILE:-}" ] && echo "adhoc-fallback" >> "$DXR_MACOS_SIGN_STATUS_FILE"
+        DXR_MACOS_APP_IDENTITY="" "$SIGN" sign-tree "$1" --entitlements-map "$SCRIPT_DIR/entitlements/map"
+        return $?
+    fi
+    return 1
+}
+
+# Every shipped Mach-O must resolve its deps on a Mac without Homebrew: an
+# absolute build-box path (Homebrew prefix, /usr/local, /tmp, a home dir)
+# loads on the build box and fails everywhere else. displayxr-conversion-host
+# shipped naming /opt/homebrew/.../libvulkan.1.dylib for exactly that reason.
+BAD_DEPS=""
+while IFS= read -r -d '' f; do
+    file -b "$f" | grep -q 'Mach-O' || continue
+    d="$(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local|/tmp|/private/tmp|/Users)/' || true)"
+    [ -n "$d" ] && BAD_DEPS="$BAD_DEPS
+  ${f#"$WORK_DIR/payload-runtime"}: $(echo $d)"
+done < <(find "$WORK_DIR/payload-runtime" -type f -print0)
+if [ -n "$BAD_DEPS" ]; then
+    echo "Error: payload Mach-Os depend on build-box paths:$BAD_DEPS" >&2
+    exit 1
+fi
+
+sign_tree "$WORK_DIR/payload-runtime"
+
 # --- 2. Build runtime component pkg ---
 echo "--- Building runtime component ---"
+# pkgbuild marks every bundle under --root relocatable by default, and a
+# relocatable bundle is installed OVER any other copy of the same bundle id that
+# Installer finds on the disk (a dev build tree, a moved copy) instead of into
+# the payload path. DisplayXRDesktopCapture.app (#2264) is such a bundle and its
+# LaunchAgent names the payload path, so pin every bundle in place.
+COMPONENT_PLIST="$WORK_DIR/runtime-components.plist"
+pkgbuild --analyze --root "$WORK_DIR/payload-runtime" "$COMPONENT_PLIST" >/dev/null
+i=0
+while /usr/libexec/PlistBuddy -c "Print :$i" "$COMPONENT_PLIST" >/dev/null 2>&1; do
+    /usr/libexec/PlistBuddy -c "Set :$i:BundleIsRelocatable false" "$COMPONENT_PLIST"
+    i=$((i + 1))
+done
+
 pkgbuild --root "$WORK_DIR/payload-runtime" \
+    --component-plist "$COMPONENT_PLIST" \
     --scripts "$SCRIPT_DIR/scripts/runtime" \
     --identifier com.displayxr.runtime \
     --version "$VERSION" \
@@ -274,6 +410,8 @@ pkgbuild --root "$WORK_DIR/payload-runtime" \
 echo "--- Building .app bundle ---"
 if [ -f "$ARTIFACT_DIR/bin/cube_handle_vk_macos" ]; then
     "$SCRIPT_DIR/create_app_bundle.sh" "$ARTIFACT_DIR" "$WORK_DIR/DisplayXRCube.app" cube_handle_vk_macos
+    # Sign the bundle's nested Mach-Os, then the bundle itself (#280).
+    sign_tree "$WORK_DIR/DisplayXRCube.app"
 
     # --- 4. Build test app component pkg ---
     echo "--- Building test app component ---"
@@ -322,6 +460,12 @@ productbuild --distribution "$DIST_XML" \
     --resources "$SCRIPT_DIR/resources" \
     --package-path "$WORK_DIR" \
     "$OUTPUT_PKG"
+
+# --- 6. Sign the product archive, notarize, staple (#280) ---
+# Each step runs only when its credentials are in the environment
+# (DXR_MACOS_INSTALLER_IDENTITY, DXR_NOTARY_PROFILE or DXR_NOTARY_KEY_*);
+# with none set the .pkg stays unsigned, exactly as before.
+"$SIGN" finalize-pkg "$OUTPUT_PKG"
 
 echo "=== Installer built: $OUTPUT_PKG ==="
 ls -lh "$OUTPUT_PKG"

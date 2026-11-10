@@ -55,6 +55,10 @@ extern "C" {
  *        enabled. Read only by the VK-0 deposit (#1178) — the runtime cannot
  *        turn the feature on after device creation, and the deposit's D3D-fence
  *        sync has no correct fallback without it.
+ * @param app_created_device True when the APP created the VkDevice
+ *        (XR_KHR_vulkan_enable v1). Known before the compositor exists, so the
+ *        weave-thread ownership decision can key on it (#2393); the later
+ *        comp_vk_native_compositor_set_vk_device_origin call only logs.
  * @param out_xc Pointer to receive the created compositor.
  *
  * @return XRT_SUCCESS on success, error code otherwise.
@@ -80,6 +84,7 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
                                  int32_t display_screen_top,
                                  bool app_timeline_semaphores,
                                  bool app_keyed_mutex,
+                                 bool app_created_device,
                                  struct xrt_compositor_native **out_xc);
 
 /*!
@@ -95,6 +100,38 @@ comp_vk_native_compositor_create(struct xrt_device *xdev,
 bool
 comp_vk_native_compositor_get_predicted_eye_positions(struct xrt_compositor *xc,
                                                       struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * The eye positions for a TARGET time (ADR-054 §4.1 / N6 Part 1, #2144):
+ * the DP's own target-time slot when it has one (if that slot fails, this
+ * compositor's ring of per-frame answers read at @p target_ns, clamped — never
+ * extrapolated); a DP WITHOUT the slot gets its "latest" answer unchanged.
+ *
+ * @param xc          The compositor.
+ * @param target_ns   When the pixels will be seen (monotonic, e.g. the
+ *                    frame's displayTime converted to os_monotonic_get_ns()).
+ * @param out_eye_pos Output eye positions (N-view).
+ * @return true if valid positions were produced.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_eye_positions_at(struct xrt_compositor *xc,
+                                               int64_t target_ns,
+                                               struct xrt_eye_positions *out_eye_pos);
+
+/*!
+ * ADR-047 Amendment 8 (#2305): whether the session's primary slot holds another
+ * screen's DP (the window was handed to a ready screen at the home-gone bound,
+ * or a stand-in serves the home), so that the eye set from
+ * @ref comp_vk_native_compositor_get_eye_positions_at must cover the views. Stays true until the
+ * update that gives the home its own DP back, a few ms after the screen list
+ * names the home again. Any thread.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_slot_holds_other_screen(struct xrt_compositor *xc);
 
 /*!
  * Get the display dimensions from the display processor.
@@ -127,6 +164,34 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
                                               struct xrt_window_metrics *out_metrics);
 
 /*!
+ * Multi-screen M3 (ADR-047 D3): the window's segment table for per-segment
+ * views — each segment's geometry, its screen's physical size and nominal
+ * viewer, whether it is woven, and that screen's DP eyes (predicted now).
+ *
+ * Non-zero `count` only while the compositor weaves the window per screen
+ * (desktop Linux, X11/XWayland, see docs/architecture/comp-segments.md);
+ * everything else — a window on the primary screen only, one screen,
+ * segmentation off — returns false, and the caller keeps one view set.
+ * Thread-safe against the weave.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_segment_metrics(struct xrt_compositor *xc, struct xrt_segment_metrics *out);
+
+/*!
+ * Multi-screen M3: which views of the frame about to be committed belong to
+ * which segment (what the app's last xrLocateViews handed out). The renderer
+ * places each segment's views at that segment's rect in every tile, so the
+ * per-segment crop hands each segment DP its OWN views. `count` 0 = one view
+ * set for the whole window. Call before xrt_comp_layer_begin.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_view_routing(struct xrt_compositor *xc, const struct xrt_segment_view_routing *routing);
+
+/*!
  * XR_DXR_depth_budget: whether this session asked for the rear depth budget.
  *
  * Latched exactly like the transparency flag, and for the same reason: the
@@ -138,6 +203,36 @@ comp_vk_native_compositor_get_window_metrics(struct xrt_compositor *xc,
  */
 void
 comp_vk_native_compositor_set_rear_budget_requested(struct xrt_compositor *xc, bool requested);
+
+/*!
+ * #886: tell the compositor who created the VkDevice it shares with the app,
+ * and whether the runtime itself injected VK_LAYER_DXR_queue_lock. Logs the
+ * layer's activation route once (`#886: VK_LAYER_DXR_queue_lock route=…`:
+ * injected / app-enabled / implicit / loader-env / absent). Call right after
+ * comp_vk_native_compositor_create.
+ *
+ * @param app_created_device  vulkan_enable1 — the app created the device.
+ * @param runtime_injected    the runtime named the layer at
+ *                            xrCreateVulkanInstanceKHR (enable2).
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_vk_device_origin(struct xrt_compositor *xc,
+                                               bool app_created_device,
+                                               bool runtime_injected);
+
+/*!
+ * #886: the queue-lock state resolved at create.
+ *
+ * @param[out] out_layer_live  VK_LAYER_DXR_queue_lock is live on the device.
+ * @param[out] out_repaint     the #868 repaint is enabled.
+ * @return true when the repaint shares the app's queue (layer tier).
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_get_queue_lock_state(struct xrt_compositor *xc, bool *out_layer_live, bool *out_repaint);
 
 /*!
  * XR_DXR_depth_budget: the latest budget the weave thread computed.
@@ -217,6 +312,26 @@ void
 comp_vk_native_compositor_set_eye_tracking_mode(struct xrt_compositor *xc, uint32_t mode);
 
 /*!
+ * Auto hardware 2D on a flat stereo submission (util/u_mono_auto_2d.h): hold
+ * the panel in hardware 2D and present the flat view over the whole output with
+ * no weave (@p hold), or release the hold and restore the session's own
+ * hardware state. Same degrade and the same runtime hold as the desktop-Linux
+ * refuse-rather-than-resample path (#1595): the frame collapses to tile 0, the
+ * display processor takes its mono passthrough, and a session request made
+ * while held is recorded and applied on release.
+ *
+ * Applied at the start of the next composed frame (the same place the #1595
+ * degrade is decided). Called on transitions only.
+ *
+ * @return true when this compositor enacts it (desktop Linux today); false
+ *         elsewhere, and the caller then leaves the session alone.
+ *
+ * @ingroup comp_vk_native
+ */
+bool
+comp_vk_native_compositor_set_mono_2d_hold(struct xrt_compositor *xc, bool hold);
+
+/*!
  * Set the system devices for the debug GUI (needed for qwerty driver support).
  *
  * @param xc The compositor.
@@ -236,6 +351,28 @@ comp_vk_native_compositor_set_system_devices(struct xrt_compositor *xc,
 void
 comp_vk_native_compositor_set_sys_info(struct xrt_compositor *xc,
                                         const struct xrt_system_compositor_info *info);
+
+struct xrt_screen_list;
+
+/*!
+ * Multi-screen M2: hand the compositor the system's screens so a window that
+ * spans several of them is woven per segment, each by its own screen's display
+ * processor (ADR-047 D2). @p info is the system info @p list was built from:
+ * the segment DPs come from its per-monitor DP registry, not from the
+ * session-start info of @ref comp_vk_native_compositor_set_sys_info, so a
+ * screen plugged in after the session started (or claimed by a plug-in a
+ * display hotplug loaded later) has its entry (#2305). Both are copied.
+ * @p pinned_display_id is the session's `XrSessionDisplayBindingDXR`
+ * (0 = none); a pinned session is never segmented.
+ * Desktop Linux X11/XWayland only; a no-op elsewhere.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_screens(struct xrt_compositor *xc,
+                                      const struct xrt_screen_list *list,
+                                      const struct xrt_system_compositor_info *info,
+                                      uint64_t pinned_display_id);
 
 /*!
  * Set legacy app tile scaling flag (gates 1/2/3 key mode selection).
@@ -325,6 +462,39 @@ comp_vk_native_compositor_snap_window_rect(struct xrt_compositor *xc,
  */
 struct vk_bundle *
 comp_vk_native_compositor_get_vk(struct comp_vk_native_compositor *c);
+
+/*!
+ * A swapchain is about to destroy these images (#1782).
+ *
+ * Caches keyed by VkImage must drop them before a new image can reuse the
+ * handle value; the compositor forgets them at the start of its next
+ * window-space pass. Callable from any thread.
+ */
+void
+comp_vk_native_compositor_swapchain_images_destroyed(struct comp_vk_native_compositor *c,
+                                                     const VkImage *images,
+                                                     uint32_t count);
+
+/*!
+ * #886: an app swapchain of @p image_count images was created — the guard
+ * that logs (once, never acts) when the queue-lock layer's per-call
+ * serialisation applies to a vulkan_enable1 app on a single-queue GPU.
+ */
+void
+comp_vk_native_compositor_note_app_swapchain(struct comp_vk_native_compositor *c, uint32_t image_count);
+
+/*!
+ * #2095 / ADR-055: wait (bounded) for the last chained in-process weave that
+ * reads image @p index of @p xsc — every image when @p index is UINT32_MAX —
+ * to retire on the GPU. No-op when nothing chained ever read it or it has
+ * already retired, which is the common case; a timeout WARNs (throttled) and
+ * returns. Any thread: xrWaitSwapchainImage and swapchain destroy call it
+ * from the app thread while the weave thread commits.
+ */
+void
+comp_vk_native_compositor_wait_swapchain_read(struct comp_vk_native_compositor *c,
+                                              struct xrt_swapchain *xsc,
+                                              uint32_t index);
 
 /*!
  * Get the queue family index from a VK native compositor (for sub-modules).
@@ -433,6 +603,41 @@ comp_vk_native_compositor_zones_set_frame_wish(struct xrt_compositor *xc, void *
  */
 bool
 comp_vk_native_compositor_get_recommended_view_size(struct xrt_compositor *xc, uint32_t *out_w, uint32_t *out_h);
+
+struct u_cursor_measure_request;
+struct u_cursor_measure_result;
+struct u_cursor_draw_request;
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): draw the cursor sprite into
+ * every view tile at the NEXT layer_commit only, after the layers the atlas
+ * pass composes and before the display processor. Called by the state
+ * tracker only on a frame whose locate chained XrCursorDepthDrawInfoDXR and
+ * reported willDraw; a compositor never handed a request does no cursor work.
+ *
+ * @ingroup comp_vk_native
+ */
+void
+comp_vk_native_compositor_set_cursor_draw_request(struct xrt_compositor *xc, const struct u_cursor_draw_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7 (ADR-046 Amendment 3): at the NEXT layer_commit only,
+ * copy a cursor-sized patch out of the two outermost views of the frame's
+ * first projection layer into a staging buffer; a later commit that finds the
+ * copy finished (polled, never waited on) block-matches it on the CPU
+ * (u_cursor_measure_run) and publishes the result. Called by the state
+ * tracker only on a frame whose locate chained the measured-disparity source;
+ * a compositor never handed a request allocates and copies nothing.
+ */
+void
+comp_vk_native_compositor_set_cursor_measure_request(struct xrt_compositor *xc, const struct u_cursor_measure_request *req);
+
+/*!
+ * XR_DXR_cursor_depth v7: the newest finished measurement (thread-safe).
+ * @return out->valid.
+ */
+bool
+comp_vk_native_compositor_get_cursor_measure_result(struct xrt_compositor *xc, struct u_cursor_measure_result *out);
 
 #ifdef __cplusplus
 }

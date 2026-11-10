@@ -24,6 +24,8 @@ struct xrt_system_devices;
 struct xrt_session;
 struct xrt_compositor_native;
 struct xrt_session_info;
+struct xrt_input_selection;
+struct xrt_viewer_tracking;
 
 
 /*
@@ -348,6 +350,23 @@ struct xrt_system_devices
 			} conforming;
 		} hand_tracking;
 	} static_roles;
+
+	/*!
+	 * Per-client input-provider selection (ADR-034 Amendment 5,
+	 * `xrt/xrt_input_selection.h`): enumerate the resident providers as this
+	 * client sees them and express a per-family preference. Not owned —
+	 * the implementation lives as long as this object. NULL = no selection
+	 * support on this system (the OpenXR layer then lists no providers).
+	 */
+	struct xrt_input_selection *input_selection;
+
+	/*!
+	 * The trunk's viewer source for look-around eyes (ADR-054 §4.1 / N6 Part 2,
+	 * `xrt/xrt_viewer_tracking.h`): DP eyes, a viewer-tracking provider, or the
+	 * nominal viewer. Not owned. NULL = no arbitration in this process (IPC
+	 * client, headless device-only system) — the DP's answer is used unchanged.
+	 */
+	struct xrt_viewer_tracking *viewer_tracking;
 
 
 	/*!

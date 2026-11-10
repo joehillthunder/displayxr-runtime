@@ -6,17 +6,28 @@
 #     runtime + plug-in     -> $XDG_DATA_HOME/displayxr            (~/.local/share/displayxr)
 #     OpenXR ActiveRuntime  -> $XDG_CONFIG_HOME/openxr/1/active_runtime.json
 #     DP discovery manifest -> $XDG_DATA_HOME/DisplayXR/DisplayProcessors/200-sim-display.json
-#     systemd --user unit   -> $XDG_CONFIG_HOME/systemd/user/displayxr.service (if service present)
+#     Vulkan layer manifest -> $XDG_DATA_HOME/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
+#                              + implicit_layer.d/ twin, inert unless DXR_VK_QUEUE_LOCK=1 (#886)
+#     systemd --user units  -> $XDG_CONFIG_HOME/systemd/user/displayxr.{socket,service}
+#                              socket enabled + started: displayxr-service is
+#                              socket-activated on first use, exits when idle (#1744)
 #     GNOME Shell extension -> $XDG_DATA_HOME/gnome-shell/extensions/window-geometry@displayxr.org
 #                              and enabled for this user (unless they disabled it)
+#     Dashboard menu entry  -> $XDG_DATA_HOME/applications/displayxr-dashboard.desktop
+#                              + icons/hicolor/256x256/apps/displayxr-dashboard.png
 #
 #   sudo ./install.sh --system
 #     runtime + plug-in     -> /usr/local/{bin,lib}
 #     OpenXR ActiveRuntime  -> /etc/xdg/openxr/1/active_runtime.json
 #     DP discovery manifest -> /usr/local/share/displayxr/DisplayProcessors/200-sim-display.json
-#     (no systemd unit in system mode, v1 — start displayxr-service per user)
+#     Vulkan layer manifest -> /usr/local/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json
+#                              + implicit_layer.d/ twin, inert unless DXR_VK_QUEUE_LOCK=1 (#886)
+#     systemd user units    -> /usr/local/lib/systemd/user/displayxr.{socket,service}
+#                              socket enabled for every user (systemctl --global)
 #     GNOME Shell extension -> /usr/local/share/gnome-shell/extensions/window-geometry@displayxr.org
 #                              + /etc/xdg/autostart entry enabling it once per user at login
+#     Dashboard menu entry  -> /usr/local/share/applications/displayxr-dashboard.desktop
+#                              + /usr/local/share/icons/hicolor/256x256/apps/displayxr-dashboard.png
 #
 # The DisplayProcessors directory is a SHARED discovery root: a vendor plug-in
 # installer (e.g. Leia SR) drops its own .so + <probe-order>-<id>.json next to
@@ -24,7 +35,7 @@
 # is the only display processor.
 #
 # Flags: --system  system-wide (needs root)
-#        --no-service  skip the systemd --user unit
+#        --no-service  skip the systemd user units (displayxr-service)
 #        --no-gnome-extension  skip the GNOME Shell extension
 
 set -euo pipefail
@@ -54,6 +65,7 @@ if [ "$SYSTEM" = 1 ]; then
     OPENXR_CONF_DIR=/etc/xdg/openxr/1
     DP_ROOT=/usr/local/share/displayxr/DisplayProcessors
     EXT_ROOT=/usr/local/share/gnome-shell/extensions
+    SHARE_ROOT=/usr/local/share
 else
     DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
     CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -61,6 +73,7 @@ else
     OPENXR_CONF_DIR="$CONFIG_ROOT/openxr/1"
     DP_ROOT="$DATA_ROOT/DisplayXR/DisplayProcessors"
     EXT_ROOT="$DATA_ROOT/gnome-shell/extensions"
+    SHARE_ROOT="$DATA_ROOT"
 fi
 EXT_UUID="window-geometry@displayxr.org"
 
@@ -122,29 +135,104 @@ cat > "$DP_ROOT/200-sim-display.json" <<EOF
 EOF
 echo "==> Display processor manifest: $DP_ROOT/200-sim-display.json"
 
-# --- systemd --user unit (user-level installs with the service binary) -----
-if [ "$SYSTEM" = 0 ] && [ "$NO_SERVICE" = 0 ] && [ -x "$PREFIX/bin/displayxr-service" ]; then
-    UNIT_DIR="$CONFIG_ROOT/systemd/user"
-    mkdir -p "$UNIT_DIR"
-    cat > "$UNIT_DIR/displayxr.service" <<EOF
-[Unit]
-Description=DisplayXR runtime service (out-of-process compositor)
-
-[Service]
-ExecStart=$PREFIX/bin/displayxr-service
-Restart=no
-
-[Install]
-WantedBy=default.target
+# --- Reference input + conversion provider manifests (ADR-054 §2 clause 3) --
+# Same discovery root; the `-input-provider.json` / `-conversion-provider.json`
+# suffixes route each manifest to its class loader. Both providers decline at
+# probe until their ENABLE setting is on (`displayxr-cli input set sim-input
+# ENABLE 1` / `conv set sim-conversion ENABLE 1`), so this changes nothing for
+# a user: qwerty keeps the hand roles and no conversion task moves.
+cat > "$DP_ROOT/200-sim-input-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-input",
+        "display_name": "DisplayXR Sim Input",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-SimInput.so",
+        "probe_order":  200
+    }
+}
 EOF
-    echo "==> systemd --user unit: $UNIT_DIR/displayxr.service"
-    # Containers / non-systemd sessions have no user bus — skip gracefully.
-    if [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
-        systemctl --user enable displayxr.service >/dev/null 2>&1 || true
-        echo "    enabled (start now: systemctl --user start displayxr)"
+cat > "$DP_ROOT/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "$(cat "$HERE/VERSION" 2>/dev/null || echo unknown)",
+        "binary_path":  "$PREFIX/lib/displayxr/plugins/DisplayXR-SimConversion.so",
+        "probe_order":  250,
+        "packs":        ["$PREFIX/lib/displayxr/plugins/sim-conversion.models.json"]
+    }
+}
+EOF
+echo "==> Reference provider manifests: $DP_ROOT/200-sim-input-input-provider.json, $DP_ROOT/250-sim-conversion-conversion-provider.json"
+
+# --- VK_LAYER_DXR_queue_lock (#902 / #2036) ---------------------------------
+# The Vulkan layer the runtime enables by name at xrCreateVulkanInstanceKHR so
+# the #868 repaint can share the app's only graphics queue (Intel and other
+# single-graphics-queue GPUs; without it repaint silently stays off). Its
+# manifest goes on the loader's DEFAULT explicit-layer path ($XDG_DATA_HOME, or
+# /usr/local/share for --system) with an ABSOLUTE library_path into $PREFIX.
+VKLAYER_JSON_IN="$HERE/share/vulkan/VkLayer_DXR_queue_lock.json.in"
+if [ -f "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" ] && [ -f "$VKLAYER_JSON_IN" ]; then
+    mkdir -p "$SHARE_ROOT/vulkan/explicit_layer.d"
+    sed "s|@DXR_QL_LIBRARY_PATH@|$PREFIX/lib/libVkLayer_DXR_queue_lock.so|" "$VKLAYER_JSON_IN" \
+        >"$SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+    echo "==> Vulkan layer manifest: $SHARE_ROOT/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json"
+fi
+# #886: the implicit twin for vulkan_enable1 apps (they create their own
+# VkInstance, so the runtime cannot inject the layer). Inert unless the app's
+# environment has DXR_VK_QUEUE_LOCK=1; DXR_VK_QUEUE_LOCK_DISABLE=1 vetoes it.
+VKLAYER_IMPLICIT_JSON_IN="$HERE/share/vulkan/VkLayer_DXR_queue_lock_implicit.json.in"
+if [ -f "$PREFIX/lib/libVkLayer_DXR_queue_lock.so" ] && [ -f "$VKLAYER_IMPLICIT_JSON_IN" ]; then
+    mkdir -p "$SHARE_ROOT/vulkan/implicit_layer.d"
+    sed "s|@DXR_QL_LIBRARY_PATH@|$PREFIX/lib/libVkLayer_DXR_queue_lock.so|" "$VKLAYER_IMPLICIT_JSON_IN" \
+        >"$SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
+    echo "==> Vulkan implicit layer manifest (DXR_VK_QUEUE_LOCK=1): $SHARE_ROOT/vulkan/implicit_layer.d/VkLayer_DXR_queue_lock.json"
+fi
+
+# --- displayxr-service: socket-activated systemd user units (#1744) --------
+# The runtime is HYBRID: ordinary apps run in-process; XR_DXR_weave
+# present-owners (the DisplayXR browser) and workspace controllers dial
+# $XDG_RUNTIME_DIR/displayxr_comp_ipc. displayxr.socket owns that path, so the
+# service starts only when such a client connects, and exits when idle.
+# (Replaces v1's always-on displayxr.service, WantedBy=default.target — which
+# also could not start at all: the service died on its /dev/null stdin.)
+UNIT_SRC="$HERE/share/systemd/user"
+if [ "$NO_SERVICE" = 0 ] && [ -x "$PREFIX/bin/displayxr-service" ] &&
+    [ -f "$UNIT_SRC/displayxr.socket" ] && [ -f "$UNIT_SRC/displayxr.service.in" ]; then
+    if [ "$SYSTEM" = 1 ]; then
+        UNIT_DIR=/usr/local/lib/systemd/user
     else
-        echo "    (no systemd user session detected — enable manually later:"
-        echo "     systemctl --user daemon-reload && systemctl --user enable displayxr)"
+        UNIT_DIR="$CONFIG_ROOT/systemd/user"
+        # v1 enabled a plain service into default.target: drop that link.
+        if [ -d /run/systemd/system ]; then
+            systemctl --user disable displayxr.service >/dev/null 2>&1 || true
+        fi
+        rm -f "$CONFIG_ROOT/systemd/user/default.target.wants/displayxr.service"
+    fi
+    mkdir -p "$UNIT_DIR"
+    cp "$UNIT_SRC/displayxr.socket" "$UNIT_DIR/displayxr.socket"
+    sed "s|@SERVICE_BIN@|$PREFIX/bin/displayxr-service|g" "$UNIT_SRC/displayxr.service.in" \
+        >"$UNIT_DIR/displayxr.service"
+    echo "==> systemd user units: $UNIT_DIR/displayxr.{socket,service}"
+    if [ "$SYSTEM" = 1 ]; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl --global enable displayxr.socket >/dev/null 2>&1; then
+            echo "    socket enabled for every user from their next login"
+            echo "    (now, per user: systemctl --user daemon-reload && systemctl --user start displayxr.socket)"
+        else
+            echo "    (systemctl unavailable — enable per user: systemctl --user enable --now displayxr.socket)"
+        fi
+    # Containers / non-systemd sessions have no user manager — skip gracefully.
+    elif [ -d /run/systemd/system ] && systemctl --user daemon-reload 2>/dev/null; then
+        systemctl --user enable --now displayxr.socket >/dev/null 2>&1 || true
+        echo "    socket enabled and listening (the service starts on first use)"
+    else
+        echo "    (no systemd user session detected — enable later:"
+        echo "     systemctl --user daemon-reload && systemctl --user enable --now displayxr.socket)"
     fi
 fi
 
@@ -181,6 +269,16 @@ EOF
         "$PREFIX/bin/displayxr-gnome-extension-enable" --install || true
     fi
     echo "    LOG OUT AND BACK IN for it to load: a Wayland session cannot reload GNOME Shell."
+fi
+
+# --- DisplayXR Dashboard: applications-menu entry ----------------------------
+# The binary went in with bin/ above, beside the displayxr-cli it runs.
+if [ -x "$PREFIX/bin/displayxr-dashboard" ] && [ -f "$HERE/share/applications/displayxr-dashboard.desktop.in" ]; then
+    mkdir -p "$SHARE_ROOT/applications" "$SHARE_ROOT/icons/hicolor/256x256/apps"
+    sed "s|@DASHBOARD_BIN@|$PREFIX/bin/displayxr-dashboard|g" \
+        "$HERE/share/applications/displayxr-dashboard.desktop.in" >"$SHARE_ROOT/applications/displayxr-dashboard.desktop"
+    cp "$HERE/share/icons/displayxr-dashboard.png" "$SHARE_ROOT/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+    echo "==> DisplayXR Dashboard: $SHARE_ROOT/applications/displayxr-dashboard.desktop"
 fi
 
 echo ""

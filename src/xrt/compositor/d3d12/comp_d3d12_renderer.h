@@ -13,6 +13,7 @@
 // #1580: the eye set and the canvas metres the per-view camera resolver takes.
 #include "xrt/xrt_display_metrics.h"
 #include "xrt/xrt_results.h"
+#include "xrt/xrt_limits.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -21,6 +22,8 @@
 struct comp_d3d12_renderer;
 struct comp_d3d12_compositor;
 struct comp_layer_accum;
+struct xrt_swapchain;
+struct comp_cursor_look;
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +44,27 @@ struct comp_d3d12_eff_layout
 	uint32_t rows;   //!< atlas tile rows
 	uint32_t tile_w; //!< per-tile width in pixels
 	uint32_t tile_h; //!< per-tile height in pixels
+
+	/*!
+	 * Multi-screen M3 (Windows D3D12, the twin of comp_d3d11_eff_layout's):
+	 * per-segment views. 0 = one view set fills every tile (the only case
+	 * before M3). Otherwise the projection layer carries one view set per
+	 * window segment and each tile is a MOSAIC: local view j of segment k is
+	 * placed at that segment's rect inside tile j, so cropping a segment's
+	 * rect out of every tile (comp_d3d12_segments) yields exactly that
+	 * segment's own views. Quads and equirect2 layers are drawn once per
+	 * segment with that segment's camera; zones are not routed. Filled by
+	 * the compositor after comp_d3d12_renderer_compute_effective_layout
+	 * (which zeroes it).
+	 */
+	uint32_t route_count;
+	struct
+	{
+		uint32_t first_view; //!< first layer view of the segment
+		uint32_t view_count; //!< its views (<= @ref views)
+		int32_t x, y;        //!< the segment's rect inside a tile, tile px
+		uint32_t w, h;
+	} route[XRT_MAX_SEGMENTS];
 };
 
 /*!
@@ -163,6 +187,104 @@ comp_d3d12_renderer_draw_window_space_pass(struct comp_d3d12_renderer *renderer,
                                             uint32_t target_width,
                                             uint32_t target_height,
                                             const struct comp_d3d12_eff_layout *layout);
+
+/*!
+ * XR_DXR_cursor_depth v5 (ADR-046 Amendment 2 B): one frame's runtime-drawn
+ * cursor, resolved by the compositor. The D3D12 twin of
+ * comp_d3d11_cursor_quads: drawn LAST by
+ * @ref comp_d3d12_renderer_draw_window_space_pass (over every app layer,
+ * before its final barrier and the display processor), one straight-alpha
+ * quad per tile, depth off, scissored to the tile, in the frame's colour
+ * treatment (ADR-044). A non-`_SRGB` sprite makes the frame compose.
+ */
+struct u_cursor_draw_request;
+
+struct comp_d3d12_cursor_quads
+{
+	//! Tiles to draw (view i -> tile i); 0 = no cursor this frame.
+	uint32_t count;
+	//! Per tile, the quad's corners in tile-normalised coordinates (origin
+	//! top-left, y down) in u_cursor_draw_corners() order.
+	float corners[XRT_MAX_VIEWS][4][2];
+	//! The draw's clip in every tile, tile-normalised (x, y, w, h; origin
+	//! top-left): the whole tile {0, 0, 1, 1}, or a display zone's sub-rect
+	//! (u_cursor_draw_into_zone, #1949). The scissor is tile box ∩ clip.
+	float clip[4];
+	//! The app's sprite swapchain (sampled at @ref image_index; its images
+	//! rest in RENDER_TARGET), or NULL for @ref look.
+	struct xrt_swapchain *xsc;
+	uint32_t image_index;
+	//! The default look (compositor-owned, outlives the frame).
+	//! Its pixels are PREMULTIPLIED (comp_cursor_look); an app sprite is
+	//! STRAIGHT (the spec). The renderer blends each accordingly.
+	const struct comp_cursor_look *look;
+	//! #1952: the state tracker's request, for the renderer to report what
+	//! it did (u_cursor_draw_report_drew / _refused). Must outlive the
+	//! window-space pass; only its report fields are used here.
+	const struct u_cursor_draw_request *req;
+	//! #1952: run every check, draw nothing (the request is report-only).
+	bool report_only;
+	/*!
+	 * ADR-046 Amendment 2 B.7: crosstalk softening of the lifted cursor
+	 * (the twin of comp_d3d11_cursor_quads'). False = the crisp draw
+	 * (corners as above, uv 0..1). True: @ref soft_corners holds the
+	 * corners padded by the blur radius (u_cursor_draw_soften_quad), @ref uv
+	 * the matching texture coordinates per tile, and @ref soften per tile =
+	 * (blur radius u, v in sprite uv, opacity, unused). @ref corners stay
+	 * crisp, so a renderer that cannot soften draws the unsoftened cursor.
+	 */
+	bool soft;
+	float soft_corners[XRT_MAX_VIEWS][4][2];
+	float uv[XRT_MAX_VIEWS][4][2];
+	float soften[XRT_MAX_VIEWS][4];
+};
+
+/*!
+ * Hand the renderer this frame's cursor (NULL or count 0 = none). Call before
+ * @ref comp_d3d12_renderer_draw_projection_pass and clear it after the
+ * window-space pass. A renderer never handed a cursor builds nothing for it.
+ *
+ * @ingroup comp_d3d12
+ */
+void
+comp_d3d12_renderer_set_cursor(struct comp_d3d12_renderer *renderer, const struct comp_d3d12_cursor_quads *quads);
+
+/*!
+ * Multi-screen M6: linearly scale one rect of a texture into one rect of a
+ * render target — the flat-2D fill of a segment no DP can weave (and of the
+ * canvas no screen covers), the D3D12 twin of comp_d3d11_renderer_blit_rect.
+ * Opaque, no colour transform, through the renderer's UNORM blit pipeline
+ * (the DXGI back buffer's format). Records onto @p cmd_list: binds
+ * @p srv_heap, the root signature + pipeline, @p rtv, viewport + scissor =
+ * @p dst; the caller re-binds whatever it needs afterwards. The source must
+ * already be in PIXEL_SHADER_RESOURCE.
+ *
+ * @param cmd_list   ID3D12GraphicsCommandList*.
+ * @param srv_heap   ID3D12DescriptorHeap* holding @p src_srv (shader-visible).
+ * @param src_srv    The source's SRV, D3D12_GPU_DESCRIPTOR_HANDLE::ptr.
+ * @param src_tex_w,src_tex_h  The source texture's size.
+ * @param src_x,src_y,src_w,src_h  Source rect in source texels.
+ * @param rtv        D3D12_CPU_DESCRIPTOR_HANDLE::ptr of the destination.
+ * @param dst_x,dst_y,dst_w,dst_h  Destination rect in target pixels.
+ *
+ * @ingroup comp_d3d12
+ */
+xrt_result_t
+comp_d3d12_renderer_blit_rect(struct comp_d3d12_renderer *renderer,
+                              void *cmd_list,
+                              void *srv_heap,
+                              uint64_t src_srv,
+                              uint32_t src_tex_w,
+                              uint32_t src_tex_h,
+                              int32_t src_x,
+                              int32_t src_y,
+                              uint32_t src_w,
+                              uint32_t src_h,
+                              uint64_t rtv,
+                              int32_t dst_x,
+                              int32_t dst_y,
+                              uint32_t dst_w,
+                              uint32_t dst_h);
 
 /*!
  * Get the atlas texture SRV GPU descriptor handle for weaving.
@@ -338,12 +460,16 @@ comp_d3d12_renderer_composite_2d_masked(struct comp_d3d12_renderer *renderer,
  *
  * @param renderer The renderer.
  * @param cmd_list Open D3D12 command list (void* = ID3D12GraphicsCommandList*).
- * @param scratch_rtv_handle CPU RTV handle of the Local2D scratch (R8G8B8A8_UNORM).
+ * @param scratch_rtv_handle CPU RTV handle of the Local2D scratch (R8G8B8A8_UNORM,
+ *        or R8G8B8A8_UNORM_SRGB on a TYPELESS scratch — see @p linear_target).
  * @param src_resource The layer's swapchain image (ID3D12Resource*).
  * @param slot_index Unique flatten-heap SRV slot for this draw (< XRT_MAX_LAYERS).
  * @param dst_x,dst_y,dst_w,dst_h Clipped dest sub-rect (viewport) in pixels.
  * @param src_x,src_y,src_w,src_h Source rect (normalized; src_h < 0 => flip_y).
  * @param unpremultiplied True for straight-alpha layers (XRT_LAYER_COMPOSITION_UNPREMULTIPLIED_ALPHA_BIT).
+ * @param linear_target #1795: true when @p scratch_rtv_handle is an `_SRGB` RTV — the source is
+ *        then sampled format-honestly (an `_SRGB` layer decodes) and the blend runs in linear;
+ *        false (legacy hatch, UNORM RTV) samples the non-decoding view.
  *
  * @ingroup comp_d3d12
  */
@@ -361,7 +487,17 @@ comp_d3d12_renderer_flatten_local_2d(struct comp_d3d12_renderer *renderer,
                                      float src_y,
                                      float src_w,
                                      float src_h,
-                                     bool unpremultiplied);
+                                     bool unpremultiplied,
+                                     bool linear_target);
+
+/*!
+ * #2564: the worst-case atlas extent (u_tiling_compute_system_atlas over the
+ * device's modes). A genuine atlas grow adds headroom up to it, so a window
+ * resize drag costs one or two reallocations instead of one per step.
+ * 0 = no cap known (the grow still never goes below what the content needs).
+ */
+void
+comp_d3d12_renderer_set_atlas_cap(struct comp_d3d12_renderer *renderer, uint32_t cap_width, uint32_t cap_height);
 
 /*!
  * Resize the renderer's atlas texture to match a new view size.

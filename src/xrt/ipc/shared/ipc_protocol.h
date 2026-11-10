@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "xrt/xrt_lift.h"
 #include "xrt/xrt_limits.h"
 #include "xrt/xrt_compiler.h"
 #include "xrt/xrt_compositor.h"
@@ -24,14 +25,25 @@
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_tracking.h"
 #include "xrt/xrt_display_metrics.h"
+#include "xrt/xrt_display_status.h"
+#include "xrt/xrt_conv_wire.h"
+#include "xrt/xrt_stereo_camera.h"
+#include "xrt/xrt_share_link.h"
+#include "xrt/xrt_screen.h"
+#include "xrt/xrt_input_selection.h"
 #include "xrt/xrt_config_build.h"
 
 #include <assert.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 
 #define IPC_CRED_SIZE 1    // auth not implemented
 #define IPC_BUF_SIZE 1024  // must be >= largest message length in bytes
+
+// ADR-053 (#2005): the conv_* wire family sizes every message against this
+// (xrt_conv_wire.h asserts each message <= XRT_CONV_WIRE_MSG_MAX_BYTES).
+XRT_CONV_ABI_ASSERT(XRT_CONV_WIRE_MSG_MAX_BYTES == IPC_BUF_SIZE, "XRT_CONV_WIRE_MSG_MAX_BYTES != IPC_BUF_SIZE");
 #define IPC_MAX_VIEWS 8    // max views we will return configs for
 #define IPC_MAX_FORMATS 32 // max formats our server-side compositor supports
 #define IPC_MAX_DEVICES 8  // max number of devices we will map using shared mem
@@ -352,6 +364,26 @@ struct ipc_client_list
 };
 
 /*!
+ * XR_DXR_input_providers (ADR-034 Amendment 5, #2181): the provider id an
+ * `input_set_provider_preference` names ("" = back to the default walk). A
+ * struct so the generator copies the fixed array by value.
+ *
+ * The connection is the client: nothing here identifies it. The service keys
+ * the per-app pin on the executable it resolved from the PEER process at
+ * accept (`ipc_client_state::input_exe_basename`).
+ *
+ * @ingroup ipc
+ */
+struct ipc_input_provider_id
+{
+	char id[XRT_INPUT_PROVIDER_ID_SIZE];
+};
+
+// One enumeration page is one reply: result + page must fit the message buffer.
+static_assert(sizeof(struct xrt_input_provider_page) + 16 <= IPC_BUF_SIZE,
+              "xrt_input_provider_page no longer fits one IPC reply — lower XRT_INPUT_PROVIDER_PAGE_MAX");
+
+/*!
  * XR_DXR_workspace_file_dialog wire format. Flat IPC translation of
  * XrFilePickerInfoDXR — no OpenXR-type dependency in IPC headers, no
  * pointer chasing (the proto generator copies by value).
@@ -402,6 +434,34 @@ struct ipc_file_picker_result_path
 };
 
 /*!
+ * Display dashboard phase 8: the workspace controller a DIAG client asks the
+ * service to launch (`system_workspace_launch`) — the registry subkey name
+ * under `HKLM\Software\DisplayXR\WorkspaceControllers`, NUL-terminated.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_controller_id
+{
+	char id[64];
+};
+
+/*!
+ * `system_workspace_launch` outcome (the `status` out-arg). The RPC itself
+ * returns XRT_SUCCESS whenever it was understood; these say what happened.
+ *
+ * @ingroup ipc
+ */
+enum ipc_workspace_launch_status
+{
+	IPC_WORKSPACE_LAUNCH_STARTED = 0,         //!< spawn posted (same path as the hotkey)
+	IPC_WORKSPACE_LAUNCH_NOT_ACTIVE = 1,      //!< id is not the controller the service spawns
+	IPC_WORKSPACE_LAUNCH_DISABLED = 2,        //!< the controller's mode is "disabled"
+	IPC_WORKSPACE_LAUNCH_ALREADY_RUNNING = 3, //!< it (or another instance) is already up
+	IPC_WORKSPACE_LAUNCH_NO_CONTROLLER = 4,   //!< no controller registered / detected
+	IPC_WORKSPACE_LAUNCH_UNSUPPORTED = 5,     //!< this service has no orchestrator
+};
+
+/*!
  * Phase 2.D: workspace input event wire format. Tagged union with
  * event_type as the discriminator. Mirrors the public XrWorkspaceInputEventDXR
  * but uses plain C types (no XR enum dependency in IPC headers). The state
@@ -433,6 +493,7 @@ enum ipc_workspace_input_event_type
 	IPC_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST = 10, //!< spec_version 11: client called xrRequestFilePickerDXR
 	IPC_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED  = 11, //!< spec_version 15: client's fullscreen/maximize state transitioned
 	IPC_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED    = 12, //!< spec_version 16: client connected (slot bound); controller owns per-client setup
+	IPC_WORKSPACE_INPUT_EVENT_SCREENS_CHANGED     = 13, //!< spec_version 25: the workspace screen set changed (ADR-052)
 };
 
 struct ipc_workspace_input_event
@@ -544,6 +605,11 @@ struct ipc_workspace_input_event
 		{
 			uint32_t client_id;
 		} client_connected;
+		struct                      //!< spec_version 25: the workspace screen set changed (ADR-052)
+		{
+			uint32_t generation;   //!< The set's new generation (as `workspace_enumerate_screens` reports).
+			uint32_t screen_count; //!< Screens in the new set.
+		} screens_changed;
 	} u;
 };
 
@@ -565,6 +631,13 @@ struct ipc_workspace_input_event_batch
 // readback lands in a follow-up (Phase 2b); until then the service writes nothing
 // for this bit and the caller sees it absent from views_written.
 #define IPC_CAPTURE_FLAG_PROJECTION_ONLY (1u << 1)
+// #1810: request-only MODIFIER, never a stage and never reported back in
+// views_written. Asks the service to write the atlas's TRUE alpha instead of
+// forcing it opaque — the client's DXR_ATLAS_CAPTURE_RAW_ALPHA, carried over the
+// wire because the service reads its OWN environment, not the client's. A service
+// that predates the bit ignores it (it only tests the two stage bits), so an old
+// service + new client degrades to "service env decides", exactly as before.
+#define IPC_CAPTURE_FLAG_RAW_ALPHA (1u << 2)
 #define IPC_CAPTURE_FLAG_ALL (IPC_CAPTURE_FLAG_ATLAS)
 
 #define IPC_CAPTURE_PATH_MAX 256
@@ -698,6 +771,86 @@ struct ipc_workspace_cursor_info
 };
 
 /*!
+ * XR_DXR_cursor_depth v5 over IPC (ADR-046 Phase 4): one frame's runtime-drawn
+ * cursor request, as the state tracker built it (`u_cursor_draw_request`), sent
+ * by `compositor_set_cursor_draw_request` right before the `layer_commit` it
+ * belongs to. POD mirror; only sent on a frame that armed the request (§0: no
+ * request, no IPC traffic, no service state).
+ *
+ * The app's own sprite swapchain does not cross yet (the default look only);
+ * the client refuses that case itself (`willDraw` = false).
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_draw_request
+{
+	uint32_t view_count; //!< views below, view i is drawn into atlas tile i
+	//! Per view: origin.xy, axis_x.xy, axis_y.xy (`u_cursor_draw_view`,
+	//! tile-normalised, origin top-left, y down).
+	float view[XRT_MAX_VIEWS][6];
+	float hot_u, hot_v; //!< the app sprite's hotspot (unused for the default look)
+	float size_m;       //!< sprite height on the panel, metres; <= 0 = the OS cursor's size
+	float disparity;    //!< the placement's FILTERED disparity (eye baselines; B.7 softening)
+	uint32_t report_only; //!< #1952 probe: run every check, report, draw nothing
+	uint32_t zone_valid;  //!< #1949 zone request (the service refuses these for now)
+	uint32_t zone_id;
+	int32_t zone_rect[4]; //!< x, y, w, h as submitted
+};
+
+/*!
+ * The service's answer to the PREVIOUS `compositor_set_cursor_draw_request` of
+ * this client (#1952 across the process boundary): the outcome of a request is
+ * only known when the frame it rode is drawn, so it comes back with the next
+ * request - one frame later than in-process. `answered` = 0 until the service
+ * has seen a request at all.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_draw_outcome
+{
+	uint32_t answered; //!< 0 = nothing to report yet
+	uint32_t drew;     //!< 1 = drawn (or, report-only, would have been)
+	uint32_t reason;   //!< enum u_cursor_draw_refusal when !drew
+	uint32_t _pad;
+};
+
+/*!
+ * XR_DXR_cursor_depth v7 over IPC (ADR-046 Amendment 3 point 6): what the
+ * client asks the D3D11 service to measure at its next commit - the
+ * `u_cursor_measure_request` of the frame, field for field.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_measure_request
+{
+	uint64_t tag;              //!< echoed in the result so the client can age it
+	float u, v;                //!< cursor hotspot, canvas-normalised (origin top-left)
+	float height;              //!< sprite height, canvas heights (sizes the footprint)
+	uint32_t view_index[2];    //!< projection-layer views: the outermost active pair, [0] left
+	uint32_t _pad;
+};
+
+/*!
+ * The service's newest finished measurement for this client (one to three
+ * frames old: the copy is read back without waiting) - the
+ * `u_cursor_measure_result` field for field. `valid` = 0 until one has come back.
+ *
+ * @ingroup ipc
+ */
+struct ipc_cursor_measure_result
+{
+	uint64_t tag;
+	uint32_t valid;
+	uint32_t confident;    //!< 0 = no confident content (the screen plane)
+	float disparity_px;    //!< x_B - x_A, sub-image px: < 0 = crossed (in front)
+	float sub_w;           //!< the sub-image width it was measured in
+	float ncc;             //!< diagnostics below
+	uint32_t matched;
+	uint32_t lr_rejected;
+	uint32_t reused;
+};
+
+/*!
  * spec_version 17: session-global overlay source. The controller renders a
  * display-spanning UI (e.g. taskbar) into a swapchain (allocated via
  * xrCreateWorkspaceOverlaySwapchainDXR) and docks it via xrSetWorkspaceOverlayDXR.
@@ -718,6 +871,55 @@ struct ipc_workspace_overlay_info
 	uint32_t visible;         //!< XrBool32; 0 = hidden even if swapchain valid
 	uint32_t stereo_sbs;      //!< spec_version 19: XrBool32; 1 = side-by-side stereo overlay
 	uint32_t overlay_id;      //!< spec_version 21: keyed-map slot; 0 = default slot. !visible or hidden swapchain removes this id.
+};
+
+/*!
+ * spec_version 25 (ADR-052): the workspace's screens, as
+ * `workspace_enumerate_screens` returns them. POD mirror of
+ * XrWorkspaceScreenDXR; flags are the `XR_WORKSPACE_SCREEN_*_BIT_DXR` bits.
+ * Sized so the reply stays inside IPC_BUF_SIZE.
+ *
+ * @ingroup ipc
+ */
+#define IPC_WORKSPACE_MAX_SCREENS 8
+#define IPC_WORKSPACE_SCREEN_PLUGIN_ID_MAX 48
+
+struct ipc_workspace_screen
+{
+	uint64_t id;              //!< Registry monitor id (= XR_DXR_display_info displayId).
+	int32_t desktop_x;        //!< Desktop rect, OS virtual-desktop pixels.
+	int32_t desktop_y;
+	uint32_t desktop_w;
+	uint32_t desktop_h;
+	float width_m;            //!< Physical size of the visible area, metres.
+	float height_m;
+	uint32_t flags;           //!< XR_WORKSPACE_SCREEN_*_BIT_DXR.
+	uint32_t mode_index;      //!< Presenter's rendering-mode index (presenters only).
+	uint32_t view_count;      //!< That mode's view count (0 = unknown).
+	uint32_t hardware_3d;     //!< XrBool32: the presenter's panel is in hardware 3D.
+	float nominal_viewer_m[3]; //!< Nominal viewer relative to the screen centre, metres.
+	char plugin_id[IPC_WORKSPACE_SCREEN_PLUGIN_ID_MAX]; //!< Claiming plug-in ("" = none).
+};
+
+struct ipc_workspace_screen_list
+{
+	uint32_t count;           //!< <= IPC_WORKSPACE_MAX_SCREENS
+	uint32_t generation;      //!< Bumped on every change a controller must react to.
+	struct ipc_workspace_screen screens[IPC_WORKSPACE_MAX_SCREENS];
+};
+
+/*!
+ * spec_version 25 (ADR-052): a window placement in one screen's display space
+ * — the wire form of XrWorkspaceWindowPlacementDXR. screen_id 0 = the primary.
+ *
+ * @ingroup ipc
+ */
+struct ipc_workspace_window_placement
+{
+	uint64_t screen_id;
+	struct xrt_pose pose;
+	float width_m;
+	float height_m;
 };
 
 /*!
@@ -892,6 +1094,24 @@ struct ipc_arg_weave_submit
 	//! xrCreateInstance, so a mismatched pair never connects in the first place.
 	uint32_t flat_rect_count; //!< 0..IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX (0 = no flat regions)
 	struct ipc_weave_rect flat_rects[IPC_WEAVE_SUBMIT_FLAT_RECTS_MAX]; //!< first flat_rect_count valid
+
+	//! XR_DXR_weave v13 (XrWeaveSubmitMonoIn2DDXR): 1 = while this session's
+	//! hardware state is 2D, present one view flat instead of the weave
+	//! (desktop-Linux engine; ignored elsewhere). Appended, same accounting as
+	//! v8: 824 + 4 = 828 B; the dma-buf call is 4 + 828 + 136 = 968 of 1024.
+	uint32_t mono_in_2d;
+
+	//! XR_DXR_weave v14 (XrWeaveSubmitOverlayUnchangedDXR): 1 = this submit's
+	//! overlay atlas holds exactly the previous accepted submit's pixels, so the
+	//! DP may reuse derived work (its lens prefilter of the 2D layer, ADR-027
+	//! Amendment). Advisory; 0 = may have changed (pre-v14 behaviour). Appended:
+	//! 828 + 4 = 832 B; the dma-buf call is 4 + 832 + 136 = 972 of 1024.
+	uint32_t overlay_unchanged;
+
+	//! XR_DXR_weave v15 (XrWeaveSubmitOverlayFilterDXR): the caller's lens-filter
+	//! strength for the overlay, [0,1]; NEGATIVE = not set (the DP's own default).
+	//! Appended: 832 + 4 = 836 B; the dma-buf call is 4 + 836 + 136 = 976 of 1024.
+	float overlay_filter_strength;
 };
 
 /*!
@@ -986,6 +1206,193 @@ struct ipc_weave_dmabuf_output
 	uint32_t plane_count;
 	uint32_t offsets[IPC_WEAVE_DMABUF_MAX_PLANES];
 	uint32_t strides[IPC_WEAVE_DMABUF_MAX_PLANES];
+};
+
+/*
+ *
+ * XR_DXR_lift (ADR-042) — 2D→3D conversion streams over IPC.
+ *
+ * Streams are owned by the IPC CLIENT (not a session): a stream created on a
+ * connection dies with it. The lift calls need no compositor session, so a
+ * headless probe (`displayxr-cli lift`) can drive them on a raw connection.
+ *
+ */
+
+//! Max explicit viewpoints on the wire. Mirrors XR_LIFT_MAX_VIEWS_DXR.
+#define IPC_LIFT_MAX_VIEWS 8
+//! Max lifted weave rects per submit. Mirrors XR_WEAVE_SUBMIT_MAX_LIFT_RECTS_DXR.
+#define IPC_LIFT_WEAVE_RECTS_MAX 8
+//! Largest blob the service will send in one lift_acquire_blob reply.
+#define IPC_LIFT_BLOB_MAX_BYTES (256u * 1024u * 1024u)
+
+/*!
+ * The conversion module's capabilities (xrGetLiftPropertiesDXR). Field values
+ * are the DP-side encoding (xrt_dp_lift.h), which XR_DXR_lift mirrors.
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_properties
+{
+	uint32_t modes;
+	uint32_t max_streams;
+	uint32_t max_views;
+	uint32_t depth_semantics;
+	uint32_t state;
+	uint32_t aux_outputs; //!< XRT_DP_LIFT_AUX_* (XR_DXR_lift v3)
+	uint64_t typical_latency_ns;
+	char backend[32];
+	uint32_t aux_depth_semantics; //!< XRT_DP_LIFT_DEPTH_* of the aux depth
+	uint32_t reserved;
+	//! XRT_DP_LIFT_HAS_MODULE_INFO: which module, and why it is (not) usable.
+	uint32_t module_status;
+	uint32_t reserved2;
+	char module_version[48];
+	char module_detail[96];
+};
+
+/*!
+ * Per-frame conversion parameters on the wire (XrLiftOptionsDXR).
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_params
+{
+	float convergence;         //!< < 0 = auto
+	float strength;
+	uint32_t inpaint;
+	uint32_t view_count;       //!< 0 = module default
+	uint32_t viewpoint_count;  //!< 0 = tracked eyes; else explicit, <= IPC_LIFT_MAX_VIEWS
+	float focal_px;            //!< input focal length, input pixels; <= 0 = unknown
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS]; //!< xyz, display space, metres
+	uint32_t has_view_control;                //!< XrLiftViewControlDXR chained (ADR-048)
+	struct xrt_lift_view_control view_control;
+	struct xrt_lift_rig rig; //!< XR_DXR_lift v3 app rig; type NONE = none
+};
+
+/*!
+ * lift_submit_frame arguments. The input texture rides as in_handle[0] (a
+ * D3D11 shared handle; legacy DXGI handles low-bit tagged, as weave_submit).
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_submit
+{
+	uint64_t stream_id;
+	int64_t source_time; //!< caller's timestamp, echoed on the result
+	uint32_t width;      //!< region of the input to convert, from (0,0)
+	uint32_t height;
+	uint32_t has_params; //!< 0 = the stream's last / default parameters
+	uint32_t reserved;
+	struct ipc_lift_params params;
+};
+
+/*!
+ * One finished texture result (xrAcquireLiftResultDXR). The shared texture and
+ * fence travel separately (lift_get_output / lift_get_fence), only when
+ * @c output_realloc says the caller needs them (first acquire, size/format
+ * change) — the weave output pattern.
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_result
+{
+	uint64_t frame_id;
+	int64_t source_time;
+	uint64_t fence_value;
+	uint64_t latency_ns;
+	uint32_t width;
+	uint32_t height;
+	uint32_t format;         //!< DXGI_FORMAT
+	uint32_t view_count;
+	uint32_t output_realloc; //!< 1 = the export texture changed since the last acquire
+	uint32_t viewpoint_count; //!< ADR-048 echo; 0 = none
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS];
+	float rect_center[3];
+	float rect_size[2];
+	struct xrt_lift_depth_info depth; //!< XR_DXR_lift v3 auxiliary depth (handle via lift_get_depth_output)
+};
+
+/*!
+ * One lift-flagged weave rect. EXPLICIT viewpoints (XR_DXR_lift v3) do NOT
+ * ride here — 8 rects of them would overflow IPC_BUF_SIZE — but in one
+ * lift_weave_rect_viewpoints call per such rect, sent just before
+ * lift_weave_rects; @c viewpoint_count says whether this rect expects them.
+ *
+ * @ingroup ipc
+ */
+struct ipc_lift_weave_rect
+{
+	uint64_t stream_id;
+	uint32_t rect_index; //!< index into the NEXT weave_submit's rects[]
+	uint32_t has_params;
+	float convergence;
+	float strength;
+	uint32_t inpaint;
+	uint32_t view_count;
+	float focal_px;
+	uint32_t has_view_control; //!< XrLiftViewControlDXR chained (ADR-048)
+	struct xrt_lift_view_control view_control;
+	uint32_t viewpoint_count; //!< XR_DXR_lift v3: EXPLICIT viewpoints staged for it; 0 = tracked
+	struct xrt_lift_rig rig;  //!< XR_DXR_lift v3 app rig; type NONE = none
+	uint32_t depth_cursor;    //!< XR_DXR_cursor_depth v6: draw the depth cursor on this rect
+	uint32_t reserved;
+};
+
+/*!
+ * lift_weave_rect_viewpoints arguments (XR_DXR_lift v3): the EXPLICIT
+ * viewpoints of one lifted rect of the NEXT lift_weave_rects on the same
+ * connection, keyed by stream (display space, metres). Consumed — and the
+ * staging cleared — by that lift_weave_rects.
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_rect_viewpoints
+{
+	uint64_t stream_id;
+	uint32_t viewpoint_count; //!< <= IPC_LIFT_MAX_VIEWS
+	uint32_t reserved;
+	float viewpoints[3 * IPC_LIFT_MAX_VIEWS];
+};
+
+/*!
+ * lift_weave_rects arguments: the lift-flagged rects of the weave_submit that
+ * immediately follows on the same connection (count 0 = none; the service
+ * consumes the set with that submit).
+ *
+ * @ingroup ipc
+ */
+struct ipc_arg_lift_weave_rects
+{
+	uint32_t count;
+	uint32_t reserved;
+	struct ipc_lift_weave_rect rects[IPC_LIFT_WEAVE_RECTS_MAX];
+};
+
+/*!
+ * XR_DXR_weave v12 (browser-pvt#180): the origin this submit's woven output was
+ * woven for, replied by weave_submit_dmabuf as its LAST out field (after the
+ * v10 fields, whose offsets it leaves untouched). POD mirror of
+ * @ref xrt_weave_woven_origin; explicit widths, no bool, 40 bytes.
+ *
+ * Per frame, so it rides the per-frame submit reply — not weave_get_output_dmabuf,
+ * which a client calls only when the output is (re)allocated. The wire has no
+ * version negotiation: a client DLL and a service that differ are refused at
+ * connect by the u_git_tag gate (XRT_ERROR_IPC_VERSION_SKEW), so a v11 reply
+ * size never meets a v12 reader.
+ *
+ * @ingroup ipc
+ */
+struct ipc_weave_woven_origin
+{
+	uint64_t serial; //!< monotonic per woven output; 0 = none
+	int32_t x;       //!< device px, desktop-absolute (the bound geometry)
+	int32_t y;
+	int32_t logical_x; //!< the bind's logical origin, verbatim
+	int32_t logical_y;
+	float logical_scale;    //!< the bind's scale, verbatim
+	uint32_t valid;         //!< 1 = x/y valid
+	uint32_t logical_valid; //!< 1 = logical_x/y/scale valid
+	uint32_t _reserved;     //!< zero; keeps the struct 8-byte sized
 };
 
 /*!
@@ -1083,6 +1490,30 @@ struct ipc_view_raw_info
 };
 
 /*!
+ * XR_DXR_view_rig spec 4 (#2189): the canvas and PHYSICAL display plane the
+ * server resolved for this locate's views, so the client maps rig-scoped hand
+ * joints into the same frame without re-deriving the canvas from window rects.
+ * @ref center / @ref orientation are what the server subtracted from / rotated
+ * the eyes by (window + zone centre offset, window orientation); @ref plane is
+ * the display plane BEFORE a rig pose replaced it, in the head device's
+ * tracking-origin space (the server's math frame).
+ *
+ * @ingroup ipc
+ */
+struct ipc_view_rig_canvas
+{
+	uint32_t valid;
+	float width_m;  //!< Kooima canvas width (after any portrait swap)
+	float height_m; //!< Kooima canvas height — the display rig's m2v denominator
+	struct xrt_vec3 center;
+	struct xrt_quat orientation;
+	uint32_t has_orientation;
+	float nominal_y_m;
+	float nominal_z_m;
+	struct xrt_pose plane;
+};
+
+/*!
  * XR_DXR_view_rig over IPC (#396 W7): reply for session_locate_views_rig.
  * head_relation/fovs/poses are the SAME outputs the legacy
  * device_get_view_poses handler produces (same server code path, with the
@@ -1115,7 +1546,19 @@ struct ipc_info_locate_views_rig
 	float rear_far_offset_vh; //!< vH; 0 = clip at the ZDP, 1000 = unrestricted
 	uint32_t rear_state;      //!< enum u_rear_budget_state / XrRearDepthBudgetStateDXR
 	float rear_cue;           //!< 0..1 background cue energy; 0 when no source
+
+	/*
+	 * XR_DXR_view_rig spec 4 (#2189) - append-only past this point.
+	 */
+	struct ipc_view_rig_canvas canvas;
 };
+
+// The rig reply is one message: it must still fit the buffer with the canvas appended.
+static_assert(sizeof(struct ipc_info_locate_views_rig) + 16 <= IPC_BUF_SIZE,
+              "ipc_info_locate_views_rig no longer fits one IPC reply");
+// Append-only (#2189): the canvas rides after every earlier field.
+static_assert(offsetof(struct ipc_info_locate_views_rig, canvas) > offsetof(struct ipc_info_locate_views_rig, rear_cue),
+              "ipc_info_locate_views_rig::canvas must stay appended after rear_cue");
 
 struct ipc_pcm_haptic_buffer
 {

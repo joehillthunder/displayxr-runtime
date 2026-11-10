@@ -16,14 +16,13 @@ if(XRT_MODULE_CLI)
 endif()
 
 # VK_LAYER_DXR_queue_lock (#902): per-queue submit serialization for the #868
-# late-weave repaint on single-graphics-queue GPUs (Intel iGPUs, AMD). Desktop
-# only — Android has no loader-layer discovery story for us yet.
-if(XRT_HAVE_VULKAN AND NOT ANDROID)
+# late-weave repaint on single-graphics-queue GPUs (Intel iGPUs, AMD). On
+# Android (#1905) it builds as libVkLayer_DXR_queue_lock.so — same per-queue
+# lock, which serializes the app's own submits with the runtime's (measured
+# sufficient on Adreno; `debug.dxr.ql_scope device` is an A/B option) — and is
+# packaged into the runtime APK's lib/arm64-v8a/ — see vk_layer/CMakeLists.txt.
+if(XRT_HAVE_VULKAN)
 	add_subdirectory(vk_layer)
-endif()
-
-if(XRT_MODULE_CONTROL_PANEL)
-	add_subdirectory(control_panel)
 endif()
 
 if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
@@ -32,6 +31,24 @@ if(XRT_FEATURE_SERVICE AND XRT_FEATURE_OPENXR)
 	else()
 		add_subdirectory(service)
 	endif()
+endif()
+
+# #2264: the macOS live-desktop producer for transparent sessions on a
+# weaving DP (holds the one Screen Recording grant; launchd on demand).
+if(APPLE AND NOT IOS)
+	add_subdirectory(desktop_capture_macos)
+endif()
+
+# ADR-053 D5 (#2033): the conversion-provider satellite host. Desktop only
+# (Android hosts providers in the runtime APK's :conversion process).
+if(XRT_FEATURE_SERVICE AND NOT ANDROID)
+	add_subdirectory(conversion_host)
+endif()
+
+# ADR-054 N8 / tracking-provider-discovery §4a: the viewer-tracking provider's
+# own host process, spawned and supervised by the service. Desktop only.
+if(XRT_FEATURE_SERVICE AND NOT ANDROID)
+	add_subdirectory(tracking_host)
 endif()
 
 # Android diagnostics dashboard JNI bridge (#558) — reuses the CLI's
@@ -44,7 +61,7 @@ endif()
 if(WIN32)
 	# (The standalone DisplayXRSwitcher was retired in #378 — its
 	# ActiveRuntime-switching function moved into `displayxr-cli runtime
-	# activate` and the Control Panel.)
+	# activate` and the DisplayXR Dashboard, src/dashboard/.)
 
 	# DisplayXR Shell (workspace controller) source has moved to
 	# DisplayXR/displayxr-shell-pvt and ships from there. The runtime

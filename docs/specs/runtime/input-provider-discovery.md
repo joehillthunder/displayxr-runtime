@@ -11,8 +11,13 @@ arbitration, `sim_input`, and the CLI/self-test diagnostics). §5 —
 (`src/xrt/drivers/net_input/`, `DisplayXR-NetInput`). §4b — the rig
 (navigation) role, the rig composer, rig-local anchoring and the
 persistent host iface — is **implemented** (#1380, ADR-034 *Amendment 4*).
-Still planned: the `PreferredPlugin` override (§3, noted inline), and the
-per-client recenter lease under a workspace controller (§4b, ADR-035 D2).
+The `Enabled` / `PreferredPlugin` pair and the `displayxr-cli input
+enable|disable|use|reset` verbs (§3, §6) are **implemented** (N3a of the
+ADR-054 component model: the same four verbs for every component class).
+Live re-select when either value changes under a running service is
+**implemented** (N3 step d, #2051 / PR #2129: `service_component_watch` +
+`t_input_arbiter_rerank`). Still planned: the per-client recenter lease under
+a workspace controller (§4b, ADR-035 D2).
 The authoritative
 rationale is `docs/adr/ADR-034-input-provider-plugins.md`. This spec
 intentionally mirrors the display-processor contract
@@ -98,8 +103,37 @@ xrtInputPluginNegotiate(uint32_t runtime_api_version,
 Per-provider subkey, same value schema as DisplayProcessors: `Binary`
 (absolute DLL path, required), `DisplayName` / `Vendor` / `Version`
 (optional strings), `ProbeOrder` (DWORD; missing = 100), optional
-`Enabled` (DWORD, 0 disables — implemented for input providers; the DP
-root has no such value).
+`Enabled` (DWORD, 0 disables; the DP root has the same value since N3b,
+plugin-discovery.md §2).
+
+**Per-user policy (N3a, ADR-054 verbs `enable|disable` and `prefer`).** Two
+values are also read from **HKCU**, where they win over HKLM; they are what
+`displayxr-cli input …` writes without admin (`--machine` writes the HKLM
+64-bit view instead). Nothing else is ever read from HKCU — the provider rows
+themselves (`Binary`, `ProbeOrder`, …) are HKLM-only, so a per-user key can
+never inject a DLL.
+
+| Location | Value | Type | Purpose | Written by |
+|---|---|---|---|---|
+| `HKCU\…\InputProviders\<id>` (overrides `HKLM\…\InputProviders\<id>`) | `Enabled` | DWORD | 0 = the loader skips `<id>` (logged `disabled (Enabled=0, user|machine)`); absent = enabled | `displayxr-cli input enable|disable <id> [--machine]` |
+| `HKCU\…\InputProviders` root, then `HKLM\…\InputProviders` root | `PreferredPlugin` | REG_SZ | `<id>` is hoisted to the front of the ProbeOrder sort and noted at arbitration priority 0, so it holds the hand/rig roles whenever it is present. Unregistered → one WARN, ignored; disabled → skipped (`Enabled=0` is the stronger verb); declines → normal fall-through | `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` |
+| `HKCU\…\InputProviders\Policy`, then `HKLM\…\InputProviders\Policy` | `EmulatedControllers` | DWORD | **The N7 gate (§4 item 3b).** 0 = the qwerty emulated controller pair is not published (no qwerty left/right device; the hand roles stay unassigned whenever no provider holds them); absent = 1. The qwerty head is not affected. Lives under the class root on purpose — one root per class — so the service's policy watch and the `Policy\Lock` rule cover it with no new plumbing | `displayxr-cli input emulated on\|off [--machine]` |
+| `HKCU\…\InputProviders\PerApp\<exe-basename>` (HKCU only) | `PreferredPlugin` | REG_SZ | **Per-app pin (ADR-034 Amendment 5).** That app's controller / hand-tracking / gamepad roles prefer `<id>` for every family `<id>` supplies, ahead of the app's own request and of the root `PreferredPlugin`; presence-gated. `<exe-basename>` is the executable's file name with extension (`SampleGame.exe`), resolved from the process — never `applicationName`. `PerApp` is a reserved subkey (never a provider row). Hidden under `Policy\Lock` | `displayxr-cli input use <id> --app <exe>` / `input reset --app <exe>`; an app's persisted `xrSetInputProviderPreferenceDXR` |
+
+The `Enabled` overlay is the shared component loader's
+(`target_component_apply_user_overlay`, ADR-054 N2), so the conversion root's
+kiosk rule applies here too: HKLM `InputProviders\Policy\Lock` = 1 makes the
+machine value win for every row (conversion-provider-discovery.md §3.1) **and
+hides the per-user `EmulatedControllers`, the per-user `PreferredPlugin` and every
+per-app pin** (the last two since #2181 — a behaviour change: before, a lock did not
+stop a per-user `input use <id>`; `input list --json` now reports
+`preferred_source: "machine (locked)"`) (the root-policy read,
+`target_component_read_policy_dword`); the `Policy` subkey is reserved and
+never read as a provider row. A change to any of the three values reaches a
+running service live — as a **re-rank** of the
+resident providers, since the provider set is fixed per process (see
+*Live re-select* under *Selection* below); in-process apps read it at their
+next launch.
 
 **Choosing a `ProbeOrder`:** lower wins. Pick a value distinct from every
 provider yours expects to coexist with — the in-tree Ultraleap provider
@@ -107,8 +141,10 @@ ships at **50** and `sim_input` at **200**. Equal values are broken
 deterministically by provider id (`strcmp`) and the loader logs one WARN
 naming both ids, because which of the two then outranks the other is an
 alphabetical accident rather than anyone's decision (#1466).
-A `PreferredPlugin` override mirroring DP spec §2.1 is *planned, not yet
-implemented* — v1 selection is pure ProbeOrder.
+The `PreferredPlugin` override mirroring DP spec §2.1 is implemented (ADR-054
+N3a; `displayxr-cli input use <id> [--machine]`, see the table above and the
+loader's `target_input_plugin_loader.h`): the preferred id is hoisted ahead of
+the ProbeOrder sort; without one, selection is pure ProbeOrder.
 
 `scripts\register_dev_plugin.bat input [dll]` registers the freshly-built
 sim-input (or a vendor DLL) from an elevated prompt;
@@ -122,10 +158,130 @@ the installed plugin dir otherwise; the roots are shared via
 `target_plugin_build_discovery_roots`). Schema is identical to the DP
 manifest (`file_format_version` "1.0" + a `plugin` object with `id`,
 `binary_path`, optional `display_name` / `vendor` / `version` /
-`probe_order`). The `-input-provider.json` suffix is the router: the DP
-loader skips such manifests, the input loader requires them, so both
-plug-in types co-habit one directory. Per-user manifests shadow system
-ones by `id`, as in the DP loader.
+`probe_order`, and optional boolean `enabled`, `false` = the loader skips
+the provider; a non-boolean rejects the manifest as malformed — the shared
+component loader's parser, ADR-054 N2). The
+`-input-provider.json` suffix is the router: the DP loader skips such
+manifests, the input loader requires them, so both plug-in types co-habit
+one directory. Per-user manifests shadow system ones by `id`, as in the DP
+loader.
+
+**Preferred provider (N3a).** The DP loader's §3.3 pattern, same semantics
+as the Windows `PreferredPlugin` above:
+
+1. **`XRT_PREFERRED_INPUT_PLUGIN_ID` env var** — wins when set; a dev/CI
+   override that needs no writable filesystem.
+2. **An `input-preferred` file** in the per-user manifest dir
+   (`~/Library/Application Support/DisplayXR/DisplayProcessors/input-preferred`
+   on macOS; `${XDG_DATA_HOME:-~/.local/share}/DisplayXR/DisplayProcessors/input-preferred`
+   on Linux — next to the DP loader's `preferred` and this loader's
+   `force_qwerty`) — a single line containing the provider id. This is what
+   `displayxr-cli input use <id>` / `input reset` write.
+
+**Emulated-controller gate (N7).** An `emulated_controllers` file in the same
+dir, the `force_qwerty` byte convention (first byte `'0'` = off, anything
+else = on; absent = on) — what `displayxr-cli input emulated on|off` writes
+(`on` writes `1`, so the source reads `file`; delete the file to return to
+`default`). There is no machine tier on POSIX (`--machine` is refused, as for
+the other verbs); the service's per-user-dir poll folds the file into the
+input class's fingerprint, so a write is picked up live.
+
+There is no per-user `Enabled` store on POSIX (nor is there one for
+conversion providers): `displayxr-cli input enable|disable` reports that
+and points at the manifest's `enabled` field. `--machine` is Windows-only.
+
+### Android — file-name convention in the runtime APK (#132)
+
+Android discovery is the same convention the display-processor and
+conversion classes use (`plugin-discovery.md` §3.2), with its own prefix:
+the shared component loader scans the runtime APK's native lib dir (the
+directory `openxr_displayxr.so` was loaded from, plus `XRT_PLUGIN_SEARCH_PATH`
+if set) for
+
+```
+libdxri<NNN>_<id>.so        NNN = ProbeOrder (three digits), id = the row id until negotiate
+```
+
+`TARGET_PLUGIN_ANDROID_PREFIX_INPUT` = `libdxri` (`target_component_loader.h`),
+set on the input class row in `target_input_plugin_loader.c`. There is no
+manifest and no per-user dir: ProbeOrder in the file name is the only ranking,
+`Enabled` / `PreferredPlugin` do not exist (the CLI verbs report that), and the
+settings store's only tier is the environment — `debug.xrt.DXR_INPUT_<ID>_<KEY>`
+(§*Component settings*). A provider ships by being packaged into the runtime
+APK's `jniLibs` (ADR-038's rule for vendor plug-ins applies to this class too):
+`build.gradle`'s `cmake.targets` lists `drv_touch_input_plugin`, which CMake
+emits as `libdxri100_touch_input.so`. A vendor's tracking provider takes a
+lower number. The DP loader's sibling preload (#333) skips the `libdxri` prefix
+exactly as it skips `libdxrp` / `libdxrc`, so a provider is only ever loaded
+through the input class's own load path.
+
+The platform stubs that said "no input providers on Android" are gone: the
+class row has a prefix, the loader enumerates, `displayxr-cli selftest` /
+`info --json` (and the dashboard's `displayxr-diag` query, which runs the same
+headless probe) list what they find under `input_providers`.
+
+### Component settings — the one options contract (ADR-054 decision 7, N3c)
+
+Every component class — display processors (plugin-discovery.md §2.3), input
+providers, conversion providers (conversion-provider-discovery.md §3.9) —
+carries its per-component settings the same way, and a provider reads them
+**only through its host iface**, never from its own environment
+(`xrt/xrt_component_settings.h`; the input slot is
+`xrt_input_plugin_host_iface::get_setting(id, key, buf, cap)`, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_GET_SETTING`, carved from `reserved[1]` at an
+unchanged ABI — the `get_display_geometry` precedent). In the service the
+environment is the host's, not the user's shell, which is why a `getenv` in a
+provider can never be reached by a CLI verb.
+
+| Tier | Where | Wins over |
+|---|---|---|
+| 1 — environment | `DXR_INPUT_<ID>_<KEY>` in the **hosting** process's environment; `<ID>` = the id upper-cased, `-` → `_` (`DXR_INPUT_SIM_INPUT_ENABLE`). Android: the `debug.xrt.` system property of the same name. A set-but-empty variable is unset. | everything — the `u_setting` rule: a launcher, a `.bat` or a harness can always take control back from a setting somebody left behind |
+| 2 — user | Windows: `HKCU\Software\DisplayXR\InputProviders\<id>\Settings\<KEY>` (`REG_SZ` or `REG_DWORD`). POSIX: `<id>.settings.json` in the per-user manifest dir (a flat object `{"KEY": "value"}`), next to `input-preferred`. | tier 3 — unless HKLM `InputProviders\Policy\Lock` = 1, the kiosk rule `Enabled` already follows (§3), which hides the user tier (never the environment) |
+| 3 — machine / manifest | Windows: `HKLM\Software\DisplayXR\InputProviders\<id>\Settings\<KEY>` (64-bit view). POSIX: the manifest's `plugin.settings` object (`"KEY": "value"`; numbers and booleans read as strings). | the provider's compiled default |
+
+Values are strings; the provider parses. Keys are `[A-Za-z0-9_]`, not
+digit-first, matched case-insensitively and conventionally upper-case.
+**Only `Settings\*` is ever read from HKCU / the per-user file**: a per-user
+store can change what a registered provider is *told*, never which binary
+loads. `u_setting_is_managed`'s allow-list (the runtime-policy `DXR_*`
+levers) is a different store this contract never touches.
+
+**`<id>` is the registration row, and should equal the provider's declared
+id.** The verbs below take — and write under — a row id (the same name
+`Enabled` / `PreferredPlugin` use), while a provider asks with its own
+`iface->id`. Every installer-written row is named after that id, so the two
+agree. A row named otherwise (a dev row once named after the DLL basename,
+`DisplayXR-Ultraleap` for `ultraleap`) is read as a **fallback**: when nothing
+is stored under the provider's id, the host reads the row's stores too — only
+when that row is unambiguous (exactly one resident row carries the iface id,
+or it is the row being negotiated / probed; two rows of one DLL, N3b, never
+read each other's). The loader WARNs once per load when a row's id differs
+from its provider's. `register_dev_plugin.bat input <dll> [id]` names the row
+after the declared id (in-tree DLLs are mapped; pass `[id]` for others).
+
+**Verbs** — one spelling across `dp` / `input` / `conv`
+(`cli_component_options.c`):
+
+| Verb | What |
+|---|---|
+| `displayxr-cli input options <id> [--json]` | Every key the provider declares (`xrt_input_plugin_iface::describe_settings`, `XRT_INPUT_PLUGIN_IFACE_HAS_DESCRIBE_SETTINGS`; or the POSIX manifest's `plugin.settings_schema` array `[{"key","type","default","help"}, …]`) unioned with every key the stores hold: key, type, default, effective value and its source (`environment` / `user` / `machine` / `manifest` / `absent`). Loads + negotiates the registered binary (no probe) to ask it. |
+| `input set <id> <KEY> <value> [--machine]` | Writes the per-user store (no admin) or, with `--machine`, the HKLM 64-bit view (admin). Refused on POSIX with `--machine` — the manifest's `settings` object is the machine store there and is edited by hand. An unregistered id or an invalid key is refused with nothing written. After the write the CLI reads the key back and prints *Effective now:* the value the provider will actually see and why — including when the environment or `Policy\Lock` overrides what was just written. |
+| `input unset <id> <KEY> [--machine]` | Removes it from that store; absent is success. |
+
+**When it applies.** A provider reads its settings at init through the host
+iface (`probe()` / `create_devices()`), so a write reaches the **next session
+/ service start**; the verbs never poke the running service — restart it, or
+launch a fresh app.
+
+**Reference implementation.** `sim_input` is opt-in through this contract:
+`displayxr-cli input set sim-input ENABLE 1` (or
+`DXR_INPUT_SIM_INPUT_ENABLE=1` in the hosting process) replaces the former
+`DXR_SIM_INPUT=1`; `NAV`, `NAV_HOLD_MS`, `NAV_RECENTER_MS` replace
+`DXR_SIM_INPUT_NAV*` (§5); `HANDS`, `PINCH`, `HAND_DISTANCE_M` (#2191, §5) are
+new and have no alias. The old names stay aliases for **one release**
+(deprecation WARN once per key), read in `drivers/sim_input/sim_input_settings.c`
+and nowhere else — `lint.yml`'s `sim-plugin-getenv-guard` fails any other
+`getenv` under the reference plug-ins.
 
 ### Selection
 
@@ -137,11 +293,59 @@ ranked list is exposed via `target_input_plugin_get_count()/get_iface(i)`;
 `get_active()` aliases index 0. No registered provider is not an error: the
 builder falls back to qwerty.
 
+**Live re-select (ADR-054 N3d, #2051).** The provider set is fixed per
+process (next section), so an `Enabled` / `PreferredPlugin` change while
+the service runs cannot add or remove a provider — it **re-ranks** the
+resident ones. The service re-reads both values
+(`target_input_plugin_reread_policy`) and hands the arbiter a new standing
+per resident provider (`t_input_arbiter_rerank`): the preferred one to
+priority 0, every other to its `ProbeOrder`, a disabled one **withdrawn** —
+skipped by every role walk exactly as presence loss skips it (§4), its
+devices left in `xsysd->xdevs`, still polled for presence so re-enabling is
+instant. The roles are recomputed at once and `generation_id` moves, so
+every client sees the flip on its next `xrSyncActions` (`input haptic-test`
+prints the new generation). The trigger is the DIAG call
+`system_request_component_reselect(input)` the CLI makes after each write,
+or the service's component-policy watch for an edit made without the CLI
+(`service-architecture.md` §3.1; on POSIX the `input-preferred` file and
+the manifests' `enabled` are polled). Two things stay a restart, and the
+`enable` verb says so: a provider that was disabled or unregistered when
+the service scanned is not resident and joins at the next service start
+(the service log names it), and in-process apps re-read at their next
+launch.
+
+**Per-client selection (ADR-034 Amendment 5, 2026-10-17 — implemented in #2181).**
+The ranked walk above is the *default*; the controller, hand-tracking and gamepad
+roles are resolved **per client** (IPC connection / in-process process) with an
+optional per-family preferred provider id layered on top: machine `Policy\Lock`
+→ per-app pin (`HKCU\…\InputProviders\PerApp\<exe-basename>\PreferredPlugin`;
+POSIX `input-preferred-<exe-basename>` in the per-user manifest dir; written by
+`displayxr-cli input use <id> --app <exe>` and by an app's persisted request)
+→ the app's session request (`XR_DXR_input_providers`) → `PreferredPlugin` →
+`ProbeOrder`. A pin applies only to the families the pinned provider claims and
+is still presence-gated. The rig role and the head are never per client. Each
+client gets its own monotonic `generation_id`. `DXR_INPUT_PROVIDERS=0` and
+`ForceQwerty` beat every pin.
+The precedence for one family is the pure `target_input_resolve_preference`
+(`target_input_plugin_loader.h`); the pin store is
+`target_input_plugin_{get,set,list}_app_pin(s)`. A pin write reaches a running
+service through the component-policy watch (the Windows watch covers the
+`PerApp` subtree; POSIX folds every `input-preferred-*` file into the input
+fingerprint). App-facing contract: [`XR_DXR_input_providers`](../extensions/XR_DXR_input_providers.md).
+In the arbiter the overlay is a per-client table — each IPC connection, plus
+the in-process implicit client whose view is `xsysd->get_roles` — whose
+resolved roles are cached and recomputed only when the arbiter's state epoch
+(a presence edge, a re-rank, a floor withdrawal) or the client's own overlay
+moved; never on the presence poll thread (#958). The IPC server answers
+`system_devices_get_roles` per connection.
+
 ### Lifetime — the provider is per-process, its devices are per-instance
 
 A provider is loaded, negotiated and probed **once per process** and then
 never unloaded (`target_input_plugin_loader.h`); the runtime does not call
-`destroy()` at all today. What DOES churn is `create_devices()`: the builder
+`destroy()` at all today. The same fixedness applies to the qwerty pair: it
+is created (or, with `EmulatedControllers = 0`, withheld) at system build,
+and a later gate flip can only withdraw or re-admit a pair that exists. What DOES churn is `create_devices()`: the builder
 calls it once per `xrt_system_devices`, i.e. once per `xrCreateInstance`,
 and the devices it returns are destroyed through their own
 `xrt_device::destroy` at `xrDestroyInstance`. A process may go round that
@@ -174,7 +378,10 @@ which pair holds each hand role is re-resolved for the life of the
 process: per hand, the highest-priority candidate that supplies that hand
 and reports `PRESENT` wins; qwerty (always present, priority
 `UINT32_MAX`) is the floor. Roles therefore move provider→provider on
-plug/unplug, not just provider↔qwerty.
+plug/unplug, not just provider↔qwerty. The floor is **optional** since N7:
+with `EmulatedControllers = 0` (item 3b below) no qwerty pair is noted, and
+the walk simply runs out of candidates — the hand lands on -1, the shape
+the rig role has always had.
 
 **Profile stability (masquerade).** When the qwerty floor wins a hand on a
 box that HAS ranked providers, the arbiter reports the top provider's
@@ -195,7 +402,8 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    `get_presence` slot, which means "assume present"), those devices hold
    `xrt_system_roles.left/right` and their `*_profile` fields. Otherwise
    qwerty holds them. Qwerty always registers as a device, so the roles
-   can come back to it.
+   can come back to it — unless the `EmulatedControllers` gate (3b) is 0,
+   in which case there is no qwerty pair and "otherwise" means **no role**.
 2a. `t_input_arbiter_install()` then replaces
    `xrt_system_devices::get_roles` with the arbiter's, which re-reads
    presence (rate-limited to ~250 ms) and bumps `generation_id` whenever
@@ -212,6 +420,42 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    anything else = on). Forces the fallback, registry/config-gated by
    convention (not an env var). Providers are then not loaded at all,
    so behavior is bit-identical to a box with none registered.
+3b. **`EmulatedControllers = 0`** (ADR-054 §4.7 / N7, #2143) is the *other*
+   half: it gates the **qwerty pair**, not the providers. Windows:
+   `InputProviders\Policy\EmulatedControllers` (DWORD), HKCU first, then the
+   HKLM 64-bit view, HKCU hidden under `InputProviders\Policy\Lock` = 1
+   (the shared loader's root-policy read — the same N3 overlay rules as
+   `Enabled`, which is why it lives under the class root rather than next
+   to `Input\ForceQwerty`). POSIX: the `emulated_controllers` per-user file
+   (§3). Absent = 1 = today's behaviour. Read through the input loader
+   (`target_input_plugin_get_emulated_controllers()`, value + source
+   `user|machine|file|default`), never `getenv` — this is class policy, not
+   a component setting. With it at 0, `t_builder_add_qwerty_input()`
+   publishes the qwerty **head only** (the look-around fallback is not a
+   controller): no qwerty left/right in `xsysd->xdevs`, no floor candidate
+   in the arbiter, and the hand roles sit at **-1 whenever no provider is
+   present or admitted** — `xrGetCurrentInteractionProfile` returns
+   `XR_NULL_PATH`, and the change-only event rule yields one
+   `XrEventDataInteractionProfileChanged` per flip, never a storm. A lone
+   provider is then still arbitrated (its hands must be able to fall to -1
+   and come back), where before a single candidate left the static roles in
+   place. Internally the qwerty driver still allocates the controller
+   objects — every input front-end addresses them — but as private state
+   that is never published and is freed with the head
+   (`qwerty_create_devices_ex`). Orthogonal to item 3: `ForceQwerty = 1`
+   skips the providers, `EmulatedControllers = 0` withholds the pair, and
+   both together is a box with **no hand devices at all** — the builder
+   logs one WARN naming both. **Live:** the policy watch covers the root
+   already; a flip is applied as a *withdrawal / re-admission* of a pair
+   that exists (`t_input_arbiter_set_floor_withdrawn`, exactly how
+   `Enabled = 0` withdraws a provider — devices stay resident, the roles
+   move on the next `xrSyncActions`), never as a device add: a pair the
+   service did not create at start (it started with the gate off) joins at
+   its next start, and on a box with no provider resident nothing
+   arbitrates, so the gate applies at the next start — both said once in
+   the log. The CTS lane relies on the pair being there (3a):
+   `scripts/run_cts.ps1` asserts the gate is absent or 1 before a run and
+   never writes it.
 3a. **`DXR_INPUT_PROVIDERS=0`** (process environment, all platforms) does the
    same thing for **one process**: the lazy discovery pass in
    `target_input_plugin_get_iface()` is skipped entirely, no provider DLL is
@@ -255,13 +499,15 @@ a provider whose profile qwerty cannot emulate is reported honestly.
    absent optical tracker reports inactive joints, and qwerty has no hand
    tracking to fall back to anyway.
 6. **`sim_input` is opt-in at run time.** Being registered is not enough
-   — its `probe()` declines unless `DXR_SIM_INPUT` is set in the
-   environment of the process loading the runtime. It synthesises a fixed
-   motion pattern, so an un-gated registration silently displaces the
-   qwerty fallback with phantom controllers. (Env var rather than the
-   usual registry gate on purpose: a per-run developer switch, not
-   machine configuration. Set it process-level — the runtime DLL has its
-   own static-CRT environment block.)
+   — its `probe()` declines unless its `ENABLE` setting is 1, read through
+   the host iface (§3 *Component settings*): `displayxr-cli input set
+   sim-input ENABLE 1`, or `DXR_INPUT_SIM_INPUT_ENABLE=1` in the
+   environment of the process loading the runtime, which always wins. It
+   synthesises a fixed motion pattern, so an un-gated registration silently
+   displaces the qwerty fallback with phantom controllers. The pre-N3c
+   `DXR_SIM_INPUT=1` keeps working for one release as an alias (deprecation
+   WARN). Environment caveat unchanged: set a variable process-level — the
+   runtime DLL has its own static-CRT environment block.
 
 ## 4a. Pose anchoring — provider volumes are rig-relative
 
@@ -294,10 +540,12 @@ Provider-facing consequences:
   This holds *especially* for a provider that also drives the rig (§4b): the
   rig role is what makes pre-compensating look attractive, and the runtime is
   about to add exactly the transform you would be subtracting.
-- Your mount offset stays in **stage** space (e.g. a desk-mounted Leap at
-  y≈1.45). Do not express it relative to the head. A provider that navigates
-  can skip the mount offset entirely by publishing `XRT_TRACKING_TYPE_RIG_LOCAL`
-  origins instead — see §4b.
+- A mount offset on an `OTHER` / `NONE` origin stays in **stage** space. Do
+  not express it relative to the head. Any provider — navigating or not — can
+  skip the stage mount offset entirely by publishing `XRT_TRACKING_TYPE_RIG_LOCAL`
+  origins instead (§4b.4), and on a 3D display that is the better frame: the
+  sensor sits on the desk next to the panel, not at a standing height.
+  `sim_input` (#2191) and `ultraleap` (§5) both do.
 - Devices that already follow the camera themselves are excluded — qwerty's
   controllers parent to the qwerty HMD (`follow_hmd`) and are never marked.
 - Applies uniformly to grip/aim action spaces, `xrLocateSpace`, and the
@@ -434,6 +682,90 @@ changes. Anchoring happens after the head's own tracking origin is settled and
 before the space overseer freezes each origin offset into a space; a head with
 no valid pose anchors at identity.
 
+**Where RIG_LOCAL lands, per session.** `L` is relative to the **virtual**
+display plane **the session sees** — the app's canvas (its window on the
+panel), mapped through its `XR_DXR_view_rig` if it chains one (for a camera rig
+that is the convergence plane) — the same plane `xrLocateViews` reports as
+`XrViewDisplayRawDXR::displayPlanePose` and `XR_DXR_display_info`'s DISPLAY
+space resolves to. The provider still publishes `L` in physical metres about
+the physical display; the runtime reads it as fractions of the physical display
+height `H_phys` and applies it to the canvas (*ADR-034 Amendment 7*,
+2026-11-03):
+
+```
+s        = canvas.height_m / H_phys          (1 when unknown)
+p_canvas = s · L.position                    origin at the CANVAS centre, canvas axes
+radius, linear velocity  × s                 (on top of a rig's own length scale)
+orientation, angular velocity                unchanged
+```
+
+So a hand that sits on the cube full screen sits on the cube in a window, and
+its size follows the window. A full-display canvas has `s = 1` and its centre
+at the display centre, so it is unchanged bit for bit; so is every session with
+no canvas of its own (runtime-window, bridge relay: `s = 1`, the plane as
+before).
+
+| Session | Its display plane `P` | A RIG_LOCAL pose `L` is located at | Follows rig motion? |
+|---|---|---|---|
+| Runtime-window (`_hosted`, legacy, headless without `XR_DXR_display_info`) — in-process or IPC | the head **device** pose, `rig(t)` (the head device *is* the display; qwerty / the composer move it) | `rig(t) ∘ L` | yes — WASD / mouse-look / a navigating provider carry the hands (*Amendment 2*) |
+| External-window (`_handle`, `_texture`, the Unity / Unreal providers) — in-process or IPC | the **canvas** pose (its centre offset + orientation) on the physical plane, which is the identity at the head's tracking origin (the app owns its camera) | `T_origin ∘ P ∘ (s L)` | no — the plane does not move for these sessions, so neither do the hands; an app that navigates declares it through `XR_DXR_view_rig` |
+| Bridge relay (`XR_DXR_display_info` + headless) | the identity at the head's tracking origin | `T_origin ∘ L` | no |
+| Any non-bridge session whose latest `xrLocateViews` chained an `XR_DXR_view_rig` descriptor | where the **rig** puts the plane, unscaled: for an external-window session the **canvas centre** mapped through the rig (`m_view_rig_canvas_plane`; for a full-canvas display rig, its `pose` — the `displayPlanePose` it reports), for a runtime-window one display point 0 mapped through the rig | `T_origin ∘ P ∘ (s L)` (`s = 1` for a runtime-window session) | with the rig — the app's views are in that frame |
+
+The space graph is session-agnostic and resolves every RIG_LOCAL pose to the
+first row's `rig(t) ∘ L`. For the other rows the state tracker re-bases it
+(`oxr_space.c::rig_local_plane_correction`, applied in `xrLocateSpace(s)` and
+in the hand-joint base): `C = T_origin ∘ P ∘ inv(head_pose(t)) ∘ inv(T_origin)`,
+left-multiplied, in the locate's base space, then — a uniform scale is not a
+pose — the result is scaled by `s` about `T_origin ∘ P`
+(`m_view_rig_scale_relation`; for hand joints after the joints are composed
+onto the rigidly placed hand, radii included). A RIG_LOCAL **base** space gets
+the inverse: its own origin lands at the scaled `C` and the target is
+re-expressed in it; a RIG_LOCAL target in a RIG_LOCAL base cancels as before.
+The canvas and `s` are the latest view locate's (in service mode the server's
+canvas, with `H_phys` the client's view of the session's display); before the
+session's first view locate, the session's own canvas in-process, and the
+physical plane (`s = 1`) in service mode. `H_phys` is the window metrics'
+display height (the screen the canvas is on), swapped by the #499 portrait rule
+like the canvas; a ratio within 1e-4 of 1 is taken as exactly 1. A **rotated**
+canvas (a workspace tile) reads `L` in the canvas axes — position and
+orientation — so the hand keeps its place on the canvas as the canvas turns.
+Stage-anchored (`OTHER` / `NONE`) sources are untouched in every session: they
+are real-world tracked objects with mount offsets, not display-relative.
+
+The rig row exists because `T_origin` is **not** the LOCAL origin: LOCAL sits
+at the builder's 1.6 m stage offset above the head's tracking origin, so an
+external-window app that chains a display rig at the LOCAL origin (the normal
+engine / cube-app shape) saw its hands and grips 1.6 m below its views until
+the rig plane was honoured (cube_handle_metal_macos `--hands --actions`,
+wrists at y ≈ −1.56 instead of +0.04). `P` is recorded by each view locate
+(in service mode from the server's applied rig, `raw.display_pose`) and cleared
+by one that chains nothing; it goes through the same point core as spec-4
+rig-scoped joints (`m_view_rig_map_relation`), so for an unscaled rig
+base-space joints equal the rig-frame ones, and the spec-4 mapping undoes `P`
+rather than the physical plane for RIG_LOCAL sources (for an external-window
+session `P ∘ inv(canvas pose)`, which hands the canvas rebase the point
+`canvas ∘ (s L)` and so the canvas point `s L`). A hand locate **before**
+the session's first rigged view locate still sees the physical plane — locate
+views first each frame. Under a camera rig, `P` is the camera's glass — the
+convergence plane, `XR_DXR_view_rig` spec 5 — not the nominal viewer distance
+in front of the camera, because it is that same point mapping. Pinned by `tests_oxr_view_space_rig_hands` ("RIG_LOCAL
+hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL"); the
+windowed placement (canvas centre + `s L`, radii and velocities × `s`, the
+spec-4 joint = the canvas point `s L` through the rig) by `tests_view_rig_point`
+("RIG_LOCAL is canvas-relative"), because the external-window class cannot
+come up headlessly. It has to be per session: one
+graph serves sessions of both kinds (several IPC clients), and an
+external-window session flips the head device into `EXT_APP_MODE` — which
+replaces the fly-camera pose with the display plug-in's static nominal viewer —
+at `xrCreateSession`, long after the builder anchored the origin. Before this
+re-base, an external-window session on a no-qwerty build saw the hands offset
+by exactly that nominal viewer (≈ +0.1 m up, +0.6 m out), and on a qwerty build
+by the 1.6 m fly-camera height. Pinned by
+`tests_oxr_view_space_rig_hands` ("RIG_LOCAL hands sit on the display plane
+the SESSION sees"): the runtime-window and bridge-relay classes must put the
+same scripted hands at the same display-plane point to the millimetre.
+
 **The recipe for a solver that already outputs world poses.** If your tracking
 stack produces product poses `C_W` in its own world `W` that *already* contains
 your navigation `P(t)` — which is the normal shape for a camera-drag solver —
@@ -530,19 +862,204 @@ your `struct_size` as you set it. Publication is logged once
 (`input plugin loader: display geometry published to providers: …`), so a bug
 report shows whether providers ever got geometry at all.
 
+**`host->get_camera_pose(host, camera_key, screen_key, &pose)`** — where a camera sits relative
+to a screen, for a camera-based input provider (hand tracking off a webcam). Carved from the former
+`reserved[3]` (size and offsets unchanged, API major stays 1; NULL on an older runtime, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_GET_CAMERA_POSE`). It is the **same function** the viewer-tracking host
+iface carries: the runtime's camera calibration store, resolved display-declared > user-calibration
+> placement-hint > default-prior (top centre of the bezel, `T = (0, H/2 + 8 mm, 0)`), so the
+answer is never "not found" and always says its `source`. A calibration done once for head
+tracking therefore serves the hands with no second procedure, and an uncalibrated camera gets the
+same prior head tracking assumes. Store, precedence, placement geometry and the per-user iris
+scale: `tracking-provider-discovery.md` §6 (*Camera calibration store*); struct:
+`xrt/xrt_camera_pose.h`. Read it at `create_devices` (or on a slow timer, following `generation`),
+never per frame.
+
 ### 4b.7 Testing without hardware
 
 `sim_input` carries a scripted navigation device so the role walk, the
 handover and the recenter path are exercised in CI with no hardware — see §5
 for the device and the `DXR_SIM_INPUT*` environment gates that drive it.
 
+## 4c. Gamepad role
+
+**Normative.** Implemented in `target_input_arbiter.c` (the role) and
+`target_builder_input_provider.c` (the device-type case); filled in-tree by the
+`gamepad` provider (§5).
+
+A provider may supply ONE device of type `XRT_DEVICE_TYPE_GAMEPAD` whose
+`name` selects a gamepad interaction profile (`XRT_DEVICE_XBOX_CONTROLLER` =
+`microsoft/xbox_controller`, the only one in `bindings.json`). It fills
+`xrt_system_roles::gamepad` / `::gamepad_profile` — the `/user/gamepad` top
+level path the action system has carried since Monado — which the legacy
+builder assigned statically and the component path never assigned at all.
+
+The role is arbitrated by the same presence-ranked walk as the hands and the
+rig, under the same `generation_id` and over the same IPC `get_roles`
+forwarding:
+
+> `xrt_system_roles::gamepad` is the `xsysd->xdevs` index of the gamepad
+> device of the **highest-priority present candidate that has one**.
+> Otherwise **-1**, and `gamepad_profile` is `XRT_DEVICE_INVALID`.
+
+What differs from the hands: **there is no floor candidate** (qwerty has no
+pad), so -1 is the ordinary state of a box without a pad provider or with its
+pad unplugged; the OpenXR layer then reports `XR_NULL_PATH` for
+`/user/gamepad`, exactly as it does for an unassigned hand under N7. What
+differs from the rig: the builder DOES seed a static assignment
+(`u_builder_roles_helper::gamepad`, the highest-ranked candidate's device),
+because `u_builder_setup_tracking_origins` and the static-roles cache expect
+one — and the arbiter installs itself whenever a gamepad candidate exists
+(like a lone navigating provider forces it in, §4b.1) so that seed is
+presence-gated from the first `get_roles` on. A seeded-but-unplugged pad reads
+-1 before any app can see it.
+
+**Presence is "last-used input wins", not "plugged in".** A pad that merely
+lives in a USB port must not hold the rig and the hands forever — that would
+silently disable WASD / mouse-look for everyone whose pad is plugged in but
+unused. So the in-tree provider reports `PRESENT` only while a pad is
+connected **and** was touched (any button, a stick past the deadzone, a
+trigger pull) within `IDLE_TIMEOUT_S` seconds (default 20; `0` = the
+connected-only rule), timestamping activity on its poll thread; a freshly
+plugged pad counts as untouched. Touch the pad and it takes the gamepad, rig
+and hand roles at the arbiter's next presence poll (≤ ~250 ms, §4b.2); leave
+it and the floor (fly camera / qwerty) comes back `IDLE_TIMEOUT_S` later.
+This is a provider policy, expressed entirely through `get_presence` — the
+arbiter's walk is unchanged, and a vendor provider may choose another rule.
+
+At most one gamepad device per provider; a second is a provider bug (warned,
+first kept), same rule as the navigation device. The gamepad device is NOT
+rig-composed through the space graph (it has no pose), and it is not a hand:
+`t_input_arbiter_provider_holds_roles` — the "does a provider hold the
+HANDS" question `selftest` asks — ignores it, so a pad-only provider leaves
+the hands to the floor and does not fail the self-test.
+
+Why this matters on a flat 3D display: there is no tracked head and no
+tracked hands, so VR-authored content needs a synthesised rig, and the
+in-tree qwerty fly camera is withheld from HANDLE apps because their own
+window owns the keyboard (`oxr_input.c`, `has_external_window`). A pad is
+focus-independent, so one provider can fill all three roles for such an app at
+once: `/user/gamepad` (this section), the rig (§4b — left stick = translate,
+right stick = look / orbit, triggers = up / down, following the rig rule of
+ADR-034 *Amendment 2*: navigation moves the rig, eye-tracked head parallax is
+applied separately at view level and never enters N), and, optionally, an
+emulated `khr/simple_controller` pair driven by the pad's buttons so the app
+gets `xrSyncActions` controllers for the first time.
+
+## 4d. Shared stereo camera — hands from the display's tracker camera
+
+**Normative.** A hands provider may read the display's own stereo tracker camera — the ADR-043
+camera the display plug-in exposes — instead of a camera of its own. Whether that camera streams without a 3D session is the display vendor's behaviour
+(`tracking-provider-discovery.md` §7: an older Leia SR delivered frames only while a 3D session
+held the display's tracker; the current one streams on open), so a provider on it follows the
+stream's state. Either way it is a **hands** source, never a viewer source, and its consumer is
+an input provider.
+Input providers run inside the service process on every desktop OS, so the open is **in-process**,
+straight into the service's camera manager; it never goes over IPC (a provider connecting to its
+own service as a `CAMERA_CONSUMER` would be a self-connection, and the consent prompt would name
+the service).
+
+### 4d.1 Host slots
+
+Four slots on `struct xrt_input_plugin_host_iface`, carved append-only from the reserved slots
+(size and offsets unchanged, API major stays 1; NULL on an older runtime, announced by
+`XRT_INPUT_PLUGIN_HOST_HAS_SHARED_CAMERA` — cover-check `struct_size` before use):
+
+| Slot | Contract |
+|---|---|
+| `open_shared_camera(provider_id, req, out)` | Opens a RECTIFIED stream on the requested camera and returns an opaque `struct xrt_input_host_camera *`. `provider_id` is the provider's iface `id`; consent and the in-use indicator key on it (§4d.3). Fails when no camera manager exists in the process, no matching camera exists, sharing is off, or consent refuses. |
+| `camera_acquire(cam, timeout_ms, frame, out_state)` | Waits up to `timeout_ms` for the next frame. On a frame it fills `*frame` and reports the stream as flowing in `*out_state`; otherwise `*out_state` says why there is none (WAITING — the display has no tracking party — or suspended / ended). |
+| `camera_release(cam, frame_index)` | Returns the frame's slot. The plane pointers of `frame_index` are valid from `camera_acquire` until this call and not after. |
+| `close_shared_camera(cam)` | Stops the stream and frees the handle. |
+
+`struct xrt_input_host_camera_open` is in/out — what the provider asks for, then what it got:
+
+| Field | Dir | Meaning |
+|---|---|---|
+| `struct_size` | in | `sizeof` the caller's struct (prefix semantics) |
+| `camera_id` | in | the camera to open; 0 = the camera of the screen the session is on |
+| `max_frame_rate` | in | an upper bound; 0 = the camera's own rate |
+| `output` | in | RECTIFIED only; RAW is refused, as for every non-plug-in consumer |
+| `props`, `calib` | out | `struct xrt_stereo_camera_properties` and `struct xrt_stereo_camera_calibration` of the opened stream (rectified calibration) |
+| `layout` | out | `struct xrt_stereo_camera_stream_layout` of the stream's ring — the IPC transport's layout, so a provider is one transport away from the IPC form |
+| `wake` | out | `xrt_graphics_sync_handle_t` signalled on each new frame, for a provider that waits on its own thread instead of polling `camera_acquire` |
+
+`struct xrt_input_host_camera_frame` is what `camera_acquire` fills:
+
+| Field | Meaning |
+|---|---|
+| `struct_size` | prefix semantics, as above |
+| `frame_index`, `timestamp_ns`, `time_is_exposure` | monotonic frame counter (the key for `camera_release`), the frame time in the runtime's monotonic domain, and whether that time is the exposure (true) or the arrival (false) |
+| `width`, `height`, `format` | full side-by-side size; `format` is GRAY8 |
+| `plane[2]`, `row_pitch[2]` | plane 0 is the full rectified side-by-side image (left eye = left half) with its row pitch; plane 1 is the second plane of a two-plane format, NULL for GRAY8 |
+| `calibration_generation` | moves when the stream's calibration changes |
+
+The layout is the IPC transport's (ADR-043: planes at the slot's offset, per-plane row pitch,
+calibration, a wake handle), so a provider written against the slot is one transport away from the
+IPC form if it is ever hosted out of process.
+
+### 4d.2 Provider contract
+
+- `probe()` **never** opens the camera (§3 — probe is cheap and side-effect free).
+  `create_devices()` opens it through `open_shared_camera`, on demand, and `destroy()` closes it.
+- Frames are rectified GRAY8 side by side at the display tracker's native rate. The provider takes
+  `props` / `calib` once from the open and re-reads them when a frame's `calibration_generation`
+  differs from the one it holds.
+- The camera's pose relative to the panel is the **display vendor's** calibration, carried in
+  `props` / `calib`: no `CAMERA_POSE_<n>` setting, no `get_camera_pose` lookup and no
+  `tracking-provider-discovery.md` §6 solve — this is the display's own tracker camera, not a
+  webcam on the bezel.
+- Hand poses go out through the existing hands path (§4a anchoring, rig-local devices, §4b.4); the
+  slot changes only where the landmarks come from.
+- Presence follows the stream: on a display that delivers frames only while a 3D session holds
+  its tracker, the hands exist only during such sessions; on one that streams on open, they are
+  present whenever the camera is shared:
+
+| Slot state | Provider presence | Arbiter effect (§4) |
+|---|---|---|
+| Slots NULL (older runtime), or `open_shared_camera` fails | `XRT_INPUT_PROVIDER_PRESENCE_ABSENT` | the hands go to the next present candidate (e.g. a cabled Ultraleap), else the floor |
+| `camera_acquire` reports WAITING (the display delivers frames only with a 3D party, and none holds its tracker) | `ABSENT` — the rig releases the hands rather than freezing the last pose | same fall-through |
+| frames flowing | `XRT_INPUT_PROVIDER_PRESENCE_PRESENT` | the provider holds the hand roles at the next presence poll (≤ ~250 ms, §4b.2) |
+| suspended or ended (sharing turned off, session locked, stream ended) | `ABSENT` | same fall-through; PRESENT again when frames flow |
+
+### 4d.3 Consent
+
+The open is evaluated by the **`component`** consent verdict of
+[ADR-043 *Amendment 6*](../../adr/ADR-043-stereo-camera-source.md): sharing off → refused and a
+locked session → suspended, as for an app; a provider the ADR-054 N4b provenance gate admitted as
+`signed` / `allowlisted` / `platform-trusted` is allowed with no per-executable prompt and no store
+lookup; any other classification (`unverified`, loadable only under `Trust\Enforce` = 0, or
+`dev-override`) is evaluated per executable like an app, prompt included. The in-use indicator
+fires with the provider's `display_name` (*"3D camera in use by <provider display name>"*). The
+stream is visibility-exempt (no window, like a `CAMERA_CONSUMER`) and counts against the
+`CAMERA_CONSUMER` quota.
+
+### 4d.4 In-process runtimes
+
+An app that runs the runtime **in-process** loads its input providers into the app (*Host process*, at the top of
+this spec), where there is no camera manager. The slots are still present, `open_shared_camera`
+fails as unavailable, and the provider reports `ABSENT` for the life of the instance — the hands
+fall to the next candidate. The in-process runtime never reaches for the service's camera over IPC
+on the provider's behalf.
+
+### 4d.5 Testing without hardware
+
+`sim_input` exercises the contract with `SOURCE` = `shared-camera` (§5): it opens the slot at
+`create_devices` and drives its scripted hands only while frames flow — `PRESENT` with frames,
+`ABSENT` on WAITING, suspend, end or a failed open — logging one WARN per transition with the frame
+count, so the fall-through and the hand-back can be watched in the service log (on a display that
+streams on open, the WAITING leg shows only as the open handshake; the FLOWING leg and the role
+hand-over still show). The default `SOURCE` = `script` never touches the camera.
+
 ## 5. In-tree reference providers
 
 | Provider | Status | Purpose |
 |---|---|---|
-| `sim_input` | **Shipped** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
+| `sim_input` | **Shipped and packaged** (`src/xrt/drivers/sim_input/`, plug-in DLL `DisplayXR-SimInput`; the Windows installer registers the `sim-input` row and allowlists the DLL, the `.deb` / tarball / `.pkg` ship it with `200-sim-input-input-provider.json` — ADR-054 §2 clause 3; inert until `ENABLE` = 1) | Deterministic synthetic motion controllers (circular motion, scripted button presses; `khr/simple_controller`) — hardware-free CI gate, adapted from Monado's `simulated_controller.c`. Also serves scripted 26-joint hand tracking (#825 Tier 2: curl wave over the same analytic circle, via `u_hand_simulation`) — the hardware-free test vehicle for `XR_EXT_hand_tracking`. Hands and controllers are **display-plane-relative** (`RIG_LOCAL`, §4b.4) and placed in front of the glass; `HANDS` / `PINCH` / `HAND_DISTANCE_M` shape them (below, #2191). ProbeOrder 200. **Test vehicle only — not a product path:** `probe()` declines unless `DXR_SIM_INPUT` is set (§4.6). Dev builds stage it automatically (`build_macos.sh` / `build_linux.sh`); Windows registers via `register_dev_plugin.bat input sim`. |
 | `net_input` | **Shipped** (`src/xrt/drivers/net_input/`, plug-in DLL `DisplayXR-NetInput`) | Loopback-TCP-fed devices — an external tracking process feeds timestamped poses + button state and receives haptic events back (wire protocol below). Opt-in: never registered by default. |
-| `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
+| `gamepad` | **Shipped and packaged** (`src/xrt/drivers/gamepad/`, plug-in DLL `DisplayXR-Gamepad`; the Windows installer registers the `gamepad` row at ProbeOrder 150 and allowlists the DLL; `build_macos.sh` / `build_linux.sh` stage `150-gamepad-input-provider.json`; Windows dev boxes: `register_dev_plugin.bat input gamepad`) | The one controller every desk has, on the existing input-provider class (§4c): a `XRT_DEVICE_TYPE_GAMEPAD` device on `microsoft/xbox_controller` (every button, stick, trigger and the four haptic outputs; `XR_EXT_dpad_binding` works over its sticks through the runtime's generic dpad emulation), a NAVIGATION device so a present pad drives the rig (§4b: left stick = translate in the rig's yaw frame, right stick = yaw / pitch, triggers = up / down, right-stick click = recenter — the durable level-with-timestamp of §4b.3, with the pose reset to F's origin in the same publication), and — `EMULATE_CONTROLLERS` = 1, the default — an emulated left / right `khr/simple_controller` pair at fixed display-plane-relative (`RIG_LOCAL`, §4b.4) poses: shoulders / X / A = select, View / Menu = menu, vibration → the pad's motors. **Presence-gated, so registered-by-default is inert:** `probe()` claims wherever the platform has a pad reader (on Windows XInput + HID: an XInput pad is read through XInput, and while none is connected a Sony DualSense / DualSense Edge / DualShock 4 — plain HID game controllers with no XInput node — is read over HID, USB or Bluetooth; GameController.framework on macOS with `shouldMonitorBackgroundEvents` so it is focus-independent too) and declines where it has none (desktop Linux — an evdev backend is the follow-up); `get_presence` follows the hub's hot-plug poll (250 Hz attached, 2 Hz detached) under the "last-used input wins" rule of §4c — touching a pad mid-session takes the gamepad, rig and hand roles at the arbiter's next presence poll; leaving it idle for `IDLE_TIMEOUT_S` (or unplugging it) hands them all back. Settings (ADR-054 decision 7, `displayxr-cli input options gamepad`): `DEADZONE` (radial, 0.15), `NAV_SPEED` (m/s, 1.0), `NAV_TURN_SPEED` (deg/s, 90), `NAV` (1), `EMULATE_CONTROLLERS` (1), `INVERT_LOOK_Y` (0), `IDLE_TIMEOUT_S` (20; the "last-used input wins" window of §4c — `0` = connected-only). The whole mapping policy is one table (`gamepad_map.c`, pinned by `tests/tests_gamepad_map.cpp`), so a per-title bindings mechanism (#1381) replaces the table, not the devices. |
+| `touch_input` | **Shipped on Android** (`src/xrt/drivers/touch_input/`; `libdxri100_touch_input.so` in the runtime APK, `DisplayXR-TouchInput` on desktop builds where it is a dev-only artefact — not staged, not registered, `probe()` declines unless `ENABLE` = 1 because nothing feeds pointer events there) | The first Android input provider (#132, §5.2): touch gestures → a `NAVIGATION` device (the rig role of §4b) + an emulated `khr/simple_controller` (`ANY_HAND`, aim ray under the finger, SELECT on tap / hold). ProbeOrder 100. Presence is unconditional — the touch screen is the hardware. Settings (§3): `ENABLE` (Android default 1, `0` withdraws it), `CONTROLLER` (default 1; `0` = navigation only), `SENSITIVITY` (orbit-rate multiplier, default 1.0). |
+| `ultraleap` | **Shipped, SDK-gated** (`src/xrt/drivers/ultraleap/`, plug-in DLL `DisplayXR-Ultraleap`; builds only where the Ultraleap Gemini SDK / LeapC is found — `LEAPSDK_DIR`) | Hand-as-motion-controller provider (#825 Tier 1, adapted from Monado's removed `ultraleap_v5`): palm pose → grip/aim, pinch → select, grab → menu; 26-joint sets filled for the Tier-2 `XR_EXT_hand_tracking` wiring. Hands, joints and controllers are **display-plane-relative** (`RIG_LOCAL`, §4b.4), placed by a **relative** mapping in display heights by default (`MAPPING` / `ANCHOR_*_H` / `GAIN_H_PER_M`, or `physical` + `MOUNT_*_M`; below). On Windows the SDK's `LeapC.dll` is staged **next to the plug-in** (#933) — the loader's `LOAD_WITH_ALTERED_SEARCH_PATH` then resolves it app-locally instead of from the system PATH, where the LeiaSR Platform ships its own shadowing copy. Opt-in: never registered by default. |
 
 **`sim_input` and the rig role (#1380).** A *second*, independent opt-in,
 `DXR_SIM_INPUT_NAV=1`, adds one scripted `XRT_DEVICE_TYPE_NAVIGATION` device
@@ -550,9 +1067,10 @@ for the device and the `DXR_SIM_INPUT*` environment gates that drive it.
 so every pre-existing `DXR_SIM_INPUT=1` run is byte-for-byte unchanged: no
 navigation device, the rig stays on the qwerty floor. With it on, `N(t)` is a
 slow figure-eight plus yaw in the provider's own frame F — a pure function of
-the requested timestamp, so prediction is exact and CI is reproducible — and
-the controllers switch to `XRT_TRACKING_TYPE_RIG_LOCAL`, because a provider
-that navigates publishes display-plane-relative poses (§4b). Two optional
+the requested timestamp, so prediction is exact and CI is reproducible. The
+controllers are `XRT_TRACKING_TYPE_RIG_LOCAL` either way (since #2191; with
+`NAV` = 1 that is what the contract *requires* of a provider that navigates,
+§4b.4). Two optional
 fault knobs, both off by default: `DXR_SIM_INPUT_NAV_HOLD_MS=<n>` makes the
 pose report invalid for 500 ms every *n* ms (the composer's hold / re-align
 path) and `DXR_SIM_INPUT_NAV_RECENTER_MS=<n>` fires a scripted reset every *n*
@@ -561,6 +1079,166 @@ scripted pose in the same publication. All three are env vars, not registry
 values, for the reason `DXR_SIM_INPUT` is (§4.6): per-run developer switches,
 not machine configuration — and the process-level caveat applies, set them
 before launching the host process.
+
+**`sim_input` hands (#2191).** Each hand's root — and the grip / aim / palm
+poses, which ride the same circle so a marker drawn from the grip action lands
+inside the rendered hand — sweeps a circle (4 s period) in the display
+plane's XY, centred `HAND_DISTANCE_M` in front of the glass. Placement is by
+**projection from the nominal viewer**: each centre sits on the viewer's
+sightline to the display-plane point (±0.30·H, 0), so it projects
+vertically centred and 0.30·H left / right of the display centre whatever the
+viewer height and hand distance; the circle's projected radius is 0.10·H
+capped at 4 cm. (Placing at a fixed height does not work: the nominal eye sits
+above the centre, so a point floating in front of the glass at the centre's
+height projects below it — the earlier −0.10·H placement landed on the bottom
+edge of the view on a 0.30 × 0.19 m panel. Same intent as the reference viewer
+app, whose Leap hands land centred on the display at a typical hand height.)
+H and the nominal viewer come from `host->get_display_geometry` (§4b.6 — the
+display plug-in's `get_display_info`); a host that publishes none falls back
+to H = 0.40 m and the viewer (0, 0.10, 0.60). `HAND_DISTANCE_M` stays metres
+and is capped at 0.8 of the viewer distance. The poses are published on a `RIG_LOCAL` origin, so they sit in
+front of the panel the session sees in every reference space (§4b.4).
+(Before #2191 a NAV-off run kept a stage-anchored circle that ended up 5 cm
+*behind* the glass on a headless sim-display system and far out of view on
+others.) The plug-in logs the resolved script once at `create_devices`
+(`sim-input: hands=LR pinch=wave; display height 0.196 m (host display geometry); circle centres (display-plane frame, …)`).
+Settings, through the options contract above (no legacy aliases — they are
+new):
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `HANDS` | enum | `both` | `both` \| `left` \| `right` \| `none` — which hands track. A hand left out stays a device (roles unchanged) but is never active: invalid poses, `isActive` false. |
+| `PINCH` | enum | `wave` | `wave` — the #825 open→fist curl wave (3 s), both hands staggered half a cycle; `hold` — thumb and index tips held pinched (≈ 6.5 mm apart), other fingers relaxed; `open` — every finger relaxed, never a pinch. `HANDS=right PINCH=hold` is a single sustained pinch whose root moves on the circle: a one-hand drag. |
+| `HAND_DISTANCE_M` | float | `0.25` | distance of the circle centres in front of the glass, metres; ≤ 0 / unparseable = the default |
+| `HAND_SCALE_H_PER_M` | float | `2.5` | the hand's **own** size, in display heights per metre of real hand: joint offsets about the root (wrist / palm) and joint radii (and joint linear velocities relative to the root) scale by `gain·H`. The default is the Ultraleap provider's relative-mapping gain, so the sim hand is drawn the way the reference viewer app shows a Leap hand — a 10 cm hand on a 0.194 m panel shows as 0.25·H ≈ 4.9 cm. ≤ 0 = 1:1 metres (the pre-gain behaviour). The circle centres and radius are unchanged (the circle is already in display heights) |
+| `SOURCE` | enum | `script` | `script` — the scripted hands above, always present; `shared-camera` — open the display's shared stereo camera through the host slots (§4d) and report the scripted hands `PRESENT` only while frames flow, `ABSENT` otherwise (no 3D party, suspended, ended, or the open failed, e.g. in an in-process runtime), one WARN per transition. The poses stay scripted; the camera only gates presence |
+
+**The sim hands are published display-metric; the runtime maps them onto the
+canvas.** `H` in the placement and in `HAND_SCALE_H_PER_M` is the PHYSICAL
+display height, never the window or canvas — a provider never knows the app's
+window (the Ultraleap provider's relative mapping is display-metric in the same
+way). Since *ADR-034 Amendment 7* (2026-11-03) the runtime reads those poses
+relative to the app's **virtual** display plane (§4b.4): in a windowed
+external-window app the hands sit at the same place **on the canvas** as full
+screen and scale with the window's height, the way the reference viewer app
+parents its Leap rig to its virtual display rig. (Until then the window was a
+portal: the hands kept their physical place and size on the panel, so a window
+in a corner showed none.) Full screen nothing changes.
+
+Pinned by `tests/tests_sim_input_hands.cpp` (the pure script: placement, the
+pinch-hold tip gap through the real `u_hand_simulation`, the hand scale — 0.25·H
+± 10% per 10 cm of real hand by default, 1:1 at 0) and end to end by the
+`[rig_hands]` / `[rig_hands_hold]` arms of `tests_oxr_view_space` (wrists
+located in LOCAL against the `displayPlanePose` `xrLocateViews` reports).
+
+**`ultraleap` placement (display plane, relative mapping).** The Leap runs in
+DESKTOP tracking mode (device on the desk, facing up). Its frame — +X right,
++Y up, +Z toward the user, millimetres — has the display plane's axes, so
+every joint, palm, grip / aim pose is published on a `RIG_LOCAL` origin
+(§4b.4) with orientations passed through unchanged and only positions mapped.
+On a 3D display the Leap's physical pose relative to the panel is usually not
+known, so the default mapping is **relative**, expressed in **display heights
+`H`** (the physical panel height from the host's `get_display_geometry`,
+§4b.6) so the hands feel the same on any panel size:
+
+```
+p_display = H · anchor_h + H · gain_h_per_m · leap_m
+```
+
+The defaults come from the reference viewer app's scene (a Leap desktop
+provider and its ghost hands parented to one root at y = −0.75, scale 3, under
+a display rig whose virtual height is 1.2 units, i.e. 1.2 units = H): the
+Leap origin sits **on the display plane, 0.625 H below the display centre**
+(just under the bottom edge), and hand motion maps at **2.5 H per metre** — so
+a hand held 25 cm above the device lands at the display centre. Joint radii and the palm's linear
+velocity scale by the same gain, so the hand is drawn at the scene's scale and
+prediction moves it at that scale. A user who has measured the setup can pick
+`physical` instead: 1:1 metres from an explicit mount, relative to the display
+centre (no stage height — the old stage offset `{0, 1.45, -0.10}` was an
+HMD / standing-VR assumption and is gone). With no display geometry (a host
+predating the slot, or no display plug-in) the relative mapping falls back to
+a nominal 0.194 m panel and logs it. The resolved mapping is logged once per
+`create_devices` (`ultraleap: mapping = relative, display height … m: anchor
+… H = … m, gain … H/m …`). Settings, through the options contract (§3; read
+at `create_devices`, so a change applies to the next session):
+
+| Key | Type | Default | Effect |
+|---|---|---|---|
+| `MAPPING` | enum | `relative` | `relative` \| `physical` |
+| `ANCHOR_X_H` | float | `0.0` | relative: Leap origin right of the display centre, display heights |
+| `ANCHOR_Y_H` | float | `-0.625` | relative: Leap origin above the display centre, display heights |
+| `ANCHOR_Z_H` | float | `0.0` | relative: Leap origin in front of the glass, display heights (0 = on the plane) |
+| `GAIN_H_PER_M` | float | `2.5` | relative: display heights per metre of hand motion; ≤ 0 = default |
+| `MOUNT_X_M` / `MOUNT_Y_M` / `MOUNT_Z_M` | float | `0.0` / `-0.15` / `0.10` | physical: Leap origin relative to the display centre, metres |
+
+The provider owns only `L` (the display-plane pose); where the display plane
+lands in the world is the builder's `RIG_LOCAL` anchoring (§4b.4), shared with
+`sim_input` — an anchoring defect moves both providers' hands identically.
+
+The same values are u_var debug tunables on the "Ultraleap Input Hub" root
+(`mapping_physical`, `anchor_h`, `gain_h_per_m`, `mount_m`,
+`display_height_m`), re-resolved every tracking frame. The mapping is the pure
+`ultraleap_map.c`, pinned by `tests/tests_ultraleap_map.cpp` (both modes, the
+25 cm-above-the-device → display-centre placement, panel-size invariance,
+radius / velocity gain, the settings parse) — compiled on every box, since CI
+carries no Leap SDK and never builds the plug-in itself.
+
+### 5.2 touch_input — gestures, and where its events come from (#132)
+
+On a flat 3D display there is no tracked head or hand, so content needs a
+synthesised rig; on desktops the qwerty floor builds one from the keyboard and
+mouse, and on a tablet the only thing the user has is the touch screen. The
+touch provider is therefore first a **navigation** provider (§4b) and only
+second a controller.
+
+**Events reach it through the host iface, never through platform code of its
+own.** `xrt_input_plugin_host_iface::poll_pointer_events` (carved from
+`reserved[2]`, API major still 1, cover-check `struct_size` before use) drains
+a process-wide ring of `struct xrt_input_pointer_event` — `DOWN` / `MOVE` /
+`UP` / `CANCEL`, one event per pointer, surface pixels plus the surface extent
+— that every surface the runtime owns pushes into (`util/u_pointer_sink`):
+
+| Surface | Who pushes | Status |
+|---|---|---|
+| the runtime-spawned hosted `SurfaceView` (`_hosted`, in-process) | `MonadoView.onTouchEvent` → `nativeTouchEvent` (RegisterNatives in `android_custom_surface.cpp`); the app still receives every event through `Activity.dispatchTouchEvent` as before | **done** |
+| an app-owned surface (`XR_DXR_android_surface_binding`) | the app, with `xrSubmitAndroidInputEventDXR` (spec v3) — it owns its `MotionEvent`s, so it chooses which to submit | **done** (in-process sessions) |
+| the workspace overlay (ADR-036 D4): the controller owns the fullscreen surface | the controller, once #1996 settles how it forwards hit-tested events to a member client; the queue is per-process, so over IPC the events must cross to the service | **open — #1996** |
+
+The provider owns every gesture rule (ADR-034 Amendment 4: no gesture policy
+enters the runtime), in `touch_gesture.{h,c}` — platform-free, a pure function
+of the events and timestamps fed in, pinned by `tests_touch_gesture`:
+
+| Gesture | Effect |
+|---|---|
+| one-finger drag (past the slop) | **orbit** the rig about the pivot: yaw from dx (a full-width drag = half a turn), pitch from dy (full height = a quarter turn, clamped at ±85°) |
+| two-finger pinch | **dolly**: pivot distance `d = d_at_pinch_start * dist0 / dist`, clamped to 0.1–10 × the rest distance |
+| two-finger drag (centroid moves) | **pan**: the pivot slides in the rig's own XY plane, 1:1 with the fingers in display metres |
+| tap (up within 300 ms, inside the slop) | **SELECT click**: a 120 ms pulse — longer than one `xrSyncActions` interval at any frame rate, so a sweep never eats it |
+| press-and-hold (still past 300 ms) | **SELECT held** until the finger lifts; the aim ray follows the finger and the motion is *not* an orbit (a select-drag) |
+| double tap | **recenter**: orbit / pan / dolly reset, and the durable `NAVIGATION_RECENTER` level advances (§4b.3) |
+
+`N(t)` is absolute in the provider's frame F: F's origin is the rig at rest,
+and the orbit pivot starts `d0` metres straight ahead, where `d0` is the
+nominal viewer-to-panel distance from `get_display_geometry` (§4b.6) — so an
+untouched scene orbits about the display plane, which is where its content
+sits. `N = T(pivot) ∘ Ry(yaw) ∘ Rx(pitch) ∘ T(0,0,d)`; validity is
+unconditional (an untouched rig is at rest, not lost) and the runtime's
+alignment absorbs the initial pose (§4b.5). The controller is
+`XRT_TRACKING_TYPE_RIG_LOCAL` (§4b.4): AIM at the nominal viewer pointing
+through the finger's point on the display plane, GRIP at that point, MENU
+never, haptics accepted and dropped. The surface is mapped onto the whole
+panel — exact for a fullscreen `_hosted` surface, an approximation for a
+sub-panel window.
+
+**What makes it move the head.** The rig composer (§4b.5) is the head's pose
+source through the display plug-in's `set_pose_source` hook. Android has no
+qwerty, and the composer used to be created only on the qwerty path; the
+builder now binds it without a floor device whenever a `NAVIGATION` device
+exists (`target_builder_sim_display.c`), seeded from the head's own static
+pose so a box whose provider never takes the role is unchanged. That still
+needs the active DP to implement `set_pose_source`: `sim_display` does; a
+vendor Android DP that leaves the slot NULL gets the controller but not the
+rig — the plug-in's job to add, not the runtime's.
 
 ### 5.1 net_input wire protocol (v1)
 
@@ -594,10 +1272,71 @@ Normative definition: `src/xrt/drivers/net_input/net_input_proto.h`
 ## 6. Diagnostics
 
 - `displayxr-cli input list [--json]` — enumerate registered providers
-  (no DLL load), the predicted active one, ProbeOrder/Enabled, and the
-  ForceQwerty state (mirror of `dp list`).
+  (no DLL load): ProbeOrder, `Enabled` and where it came from, the
+  `PreferredPlugin` override (`preferred`, root-level; per row `preferred`),
+  the one the loader would rank first (`*` / `active`), and the ForceQwerty
+  state (mirror of `dp list`; what the dashboard's component row renders,
+  ADR-051). The JSON `enabled_source` field reads, precisely:
+  `user` = a per-user HKCU `Enabled` is in force, whatever its value (so an
+  explicit HKCU `Enabled` = 1 is `user`); `machine` = disabled by HKLM
+  `Enabled` = 0; `manifest` = disabled by the POSIX manifest's
+  `"enabled": false`; `default` = enabled with no per-user value — which
+  includes an explicit HKLM `Enabled` = 1 or `"enabled": true`, because the
+  shared row reader records the value, not its presence. The root carries
+  `policy.policy_lock` (bool; the key `dp list` / `conv list` emit too): HKLM
+  `InputProviders\Policy\Lock` = 1, under which no row is `user` and a
+  per-user `input enable|disable` is ignored (the CLI prints a `note:`);
+  always false on POSIX.
+- `displayxr-cli input enable | disable <id> [--machine]` — the ADR-054
+  `enable|disable` verb: `Enabled` on the provider's row, HKCU (per user, no
+  admin) by default, HKLM 64-bit view with `--machine`; HKCU wins (§3).
+  Refuses an id that is not registered (HKLM row / manifest) — non-zero
+  exit, nothing written — since a per-user `Enabled` for it would be an
+  orphan row `input list` can never show.
+- `displayxr-cli input use <id> [--machine]` / `input reset [--machine]` —
+  the ADR-054 `prefer` verb: the `PreferredPlugin` override (§3; the
+  `input-preferred` file on POSIX, where `--machine` is refused). Every
+  write says that it applies to processes started afterwards.
+- `displayxr-cli input use <id> --app <exe>` / `input reset --app <exe>` — the
+  per-app pin (ADR-034 Amendment 5, §3): per user only (`--machine` refused —
+  `Policy\Lock` is the machine's say); `--app` takes an executable name or a
+  path, reduced to its basename. `input list` prints the pins; `input list
+  --json` carries them as `per_app: [{app, preferred, registered}]` (what is
+  stored — `policy.policy_lock` says whether they apply) and the running
+  service's per-client LIVE holders as `holders: [{client, app, generation,
+  holders{controllers, hand_tracking, gamepad}, preferred{…}}]` (`null` when
+  no service is reachable); the ADR-051 snapshot carries the same rows as
+  `input_holders`.
+- `displayxr-cli input emulated on|off [--machine]` — the N7
+  `EmulatedControllers` gate (§4 item 3b): HKCU by default, the HKLM 64-bit
+  view with `--machine` (POSIX: the per-user `emulated_controllers` file;
+  `--machine` refused). `input list` prints `Emulated controllers: on|off
+  (source)` (JSON: `emulated_controllers: {value, source}`), and both
+  `selftest --json` and `info --json` carry
+  `input_providers.emulated_controllers: {"value": 0|1, "source":
+  "user|machine|file|default"}` plus `input_providers.devices` (the system's
+  device list as `{str, type}` rows) — what the conformance cell asserts the
+  qwerty pair's presence / absence from. The write pokes the running service
+  like `input disable` does; the verb says which half applies live (a pair
+  that exists is withdrawn / re-admitted) and which waits for the next start.
+- `displayxr-cli input options <id> [--json]` / `input set <id> <KEY>
+  <value> [--machine]` / `input unset <id> <KEY> [--machine]` — the ADR-054
+  `options` verb (§3 *Component settings*, N3c): what the provider declares
+  + what the stores hold, with the effective value and its source; writes go
+  to `Settings\<KEY>` on the provider's row (HKCU; HKLM with `--machine`) or
+  the POSIX per-user `<id>.settings.json`, and the provider reads them at
+  its next init.
+- The gamepad role has no self-test arm of its own yet: `selftest --json` /
+  `info --json` show the pad through `input_providers.devices` (a
+  `{str: "Gamepad", type: XRT_DEVICE_TYPE_GAMEPAD}` row) and the provider
+  through `input_providers.ranked` / `active_id` like any other, and the
+  service log's `input arbiter: hand roles -> … gamepad -> '…'` line says who
+  holds it. A pad-only provider never fails the hand-role check (§4c).
 - `displayxr-cli selftest` — when a provider is registered and not
-  ForceQwerty-overridden, asserts provider-claimed left+right
+  ForceQwerty-overridden (the `EmulatedControllers` gate does not change the
+  verdict: a present provider must still yield its pair, and with the gate
+  at 0 and no provider the hand roles are legitimately unassigned), asserts
+  provider-claimed left+right
   motion-controller role devices exist with a valid interaction profile
   (`CLI_SELFTEST_BAD_INPUT` on failure), and (#825 Tier 2) that any role
   device advertising `supported.hand_tracking` actually claimed a static

@@ -2,19 +2,27 @@
 # SPDX-License-Identifier: BSL-1.0
 
 cmake_minimum_required(VERSION 3.22)
-# VERSION below is patched at build time by CI from the latest vX.Y.Z tag —
-# see .github/workflows/build-windows.yml ("Sync CMake VERSION from latest
-# vX.Y.Z tag" step) and build-macos.yml ("steps.version"). The /release skill
-# no longer touches this value; what's committed here is a historical
-# placeholder and may be stale on `main` between releases. Installer artifact
-# names and the runtime's reported version always come from the tag, not from
-# this line. Local-dev builds embed whatever was last committed.
+# The version is derived, never written here (#1790): the nearest vX.Y.Z tag
+# reachable from HEAD -- exactly the tag on a release build, the last release
+# on every commit after it (u_git_tag then says v2.51.1-3-g<sha>). One
+# derivation for every platform and every build (CI, /release, local): see
+# cmake/DisplayXRVersion.cmake for the scheme and the source-tarball fallbacks.
+include("${CMAKE_CURRENT_LIST_DIR}/cmake/DisplayXRVersion.cmake")
+dxr_runtime_version_resolve()
 project(
 	XRT
-	VERSION 1.6.0
+	VERSION ${DXR_RUNTIME_VERSION}
 	LANGUAGES C CXX
 	DESCRIPTION "DisplayXR Runtime (based on Monado/XRT)"
 	)
+message(
+	STATUS
+		"DisplayXR runtime version ${DXR_RUNTIME_VERSION} (${DXR_RUNTIME_VERSION_DESCRIBE}, from ${DXR_RUNTIME_VERSION_SOURCE})"
+	)
+# What the binaries in this tree were built as, for packaging scripts
+# (package_deb_linux.sh, build_macos.sh) that must name their output after it.
+dxr_runtime_version_lines(_dxr_version_lines)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/displayxr-version.txt" "${_dxr_version_lines}")
 
 if(APPLE)
 	enable_language(OBJC)
@@ -89,10 +97,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/sanitizers")
 include(OptionWithDeps)
 include(SPIR-V)
 include(GNUInstallDirs)
-if(NOT GIT_DESC)
-	include(GetGitRevisionDescription)
-	git_describe(GIT_DESC "--always")
-endif()
+# u_git_tag (runtimeName, `displayxr-cli info`, the IPC client<->service gate):
+# the same describe the version number above came from.
+set(GIT_DESC "${DXR_RUNTIME_VERSION_DESCRIBE}")
 if(NOT ${CMAKE_VERSION} VERSION_LESS 3.9)
 	include(CheckIPOSupported)
 	check_ipo_supported(RESULT HAS_IPO)
@@ -138,7 +145,7 @@ find_package(cJSON MODULE)
 include(FetchContent)
 FetchContent_Declare(displayxr_mcp
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-mcp.git
-    GIT_TAG v0.5.3)
+    GIT_TAG v0.5.6)
 # Build the stdio↔socket adapter alongside the lib so the Phase A test
 # scripts under tests/mcp/ can find a binary at a known path during dev
 # (build/_deps/displayxr_mcp-build/displayxr-mcp). Production
@@ -220,6 +227,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	find_package(udev)
 	if(PKGCONFIG_FOUND)
 		pkg_check_modules(XCB xcb xcb-randr x11-xcb)
+		# xcb-shape: optional — gives the adopt-own-window hosted child window an
+		# empty input region so input falls through to the app (#2322). Without
+		# it the mode still works but the child takes pointer events.
+		pkg_check_modules(XCB_SHAPE xcb-shape)
 		# Xlib + Xrandr: only needed for the direct-scanout present path
 		# (VK_EXT_acquire_xlib_display steals a RandR output as a VkDisplayKHR,
 		# bypassing Xorg/compositor — ST-5539). Optional; absence just leaves
@@ -292,9 +303,6 @@ option(XRT_MODULE_COMPOSITOR "Enable the compositor at all" ON)
 set(XRT_MODULE_COMPOSITOR_MAIN OFF CACHE BOOL "Build main compositor (DISABLED — lightweight runtime)" FORCE)
 option_with_deps(XRT_MODULE_COMPOSITOR_NULL "Build testing null compositor" DEPENDS XRT_MODULE_COMPOSITOR XRT_HAVE_VULKAN)
 option(XRT_MODULE_CLI "Build displayxr-cli" ON)
-option_with_deps(
-	XRT_MODULE_CONTROL_PANEL "Build the DisplayXR Control Panel GUI (ImGui+SDL2)" DEPENDS XRT_HAVE_SDL2
-	)
 option(XRT_MODULE_OPENXR_STATE_TRACKER "Build OpenXR State Tracker" ON)
 
 # Feature configuration (sorted)
@@ -315,8 +323,11 @@ option_with_deps(XRT_FEATURE_DEBUG_GUI "Enable debug window to be used" DEPENDS 
 # sandbox detection). Windows has shipped this since day one; ANDROID joins it
 # in the flavor merge (#1031) so a single runtime APK serves in-process apps
 # (Arch A) and IPC clients (Arch C satellites, weave present-owners, the
-# browser) without two mutually-exclusive installs.
-option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID")
+# browser) without two mutually-exclusive installs. Desktop LINUX joins it for
+# the .deb (#1744): the packaged runtime keeps in-process native Vulkan for
+# ordinary apps and routes XR_DXR_weave present-owners (the browser) and
+# workspace controllers to displayxr-service, which the .deb socket-activates.
+option_with_deps(XRT_FEATURE_HYBRID_MODE "Enable hybrid in-process/IPC mode (native compositor for normal apps, IPC for sandboxed/present-owner apps)" DEFAULT OFF DEPENDS "WIN32 OR APPLE OR ANDROID OR XRT_HAVE_LINUX" XRT_MODULE_IPC XRT_FEATURE_OPENXR "XRT_HAVE_D3D11 OR APPLE OR ANDROID OR XRT_HAVE_LINUX")
 
 # Desktop-Linux XR_DXR_weave engine on the comp_multi service path (#1699, piece
 # R2): comp_multi_weave_linux.c, the counterpart of comp_multi_weave_macos.c /
@@ -354,7 +365,7 @@ option_with_deps(XRT_INSTALL_SYSTEMD_UNIT_FILES "Install user unit files for sys
 option_with_deps(XRT_INSTALL_ABSOLUTE_SYSTEMD_UNIT_FILES "Use an absolute path to monado-system in installed user unit files for systemd socket activation" DEPENDS XRT_HAVE_SYSTEMD)
 
 # Drivers to build
-option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE")
+option_with_deps(XRT_BUILD_DRIVER_QWERTY "Enable Qwerty driver" DEPENDS "XRT_HAVE_SDL2 OR WIN32 OR APPLE OR XRT_HAVE_XCB")
 set(XRT_IPC_MSG_SOCK_FILENAME displayxr_comp_ipc CACHE STRING "Service socket filename")
 set(XRT_IPC_SERVICE_PID_FILENAME displayxr.pid CACHE STRING "Service pidfile filename")
 set(XRT_OXR_RUNTIME_SUFFIX displayxr CACHE STRING "OpenXR client library suffix")
@@ -386,7 +397,7 @@ option(XRT_FEATURE_OPENXR_BODY_TRACKING_FB "Enable XR_FB_body_tracking" OFF)
 option(XRT_FEATURE_OPENXR_DISPLAY_REFRESH_RATE "Enable XR_FB_display_refresh_rate" ON)
 option(XRT_FEATURE_OPENXR_FACE_TRACKING2_FB "Enable XR_FB_face_tracking2" OFF)
 option(XRT_FEATURE_OPENXR_FACIAL_TRACKING_HTC "Enable XR_HTC_facial_tracking" OFF)
-option(XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL "Enable XR_MNDX_force_feedback_curl" ON)
+option(XRT_FEATURE_OPENXR_FORCE_FEEDBACK_CURL "Enable XR_MNDX_force_feedback_curl" OFF)
 option(XRT_FEATURE_OPENXR_HAND_TRACKING_EXT "Enable XR_EXT_hand_tracking" ON)
 option_with_deps(XRT_FEATURE_OPENXR_HAND_TRACKING_DATA_SOURCE_EXT DEPENDS XRT_FEATURE_OPENXR_HAND_TRACKING_EXT)
 option(XRT_FEATURE_OPENXR_HAPTIC_PCM "Enable XR_FB_haptic_pcm" OFF)
@@ -394,7 +405,7 @@ option(XRT_FEATURE_OPENXR_HEADLESS "Enable XR_MND_headless" ON)
 option(XRT_FEATURE_OPENXR_OVERLAY "Enable XR_EXTX_overlay" ON)
 option(XRT_FEATURE_OPENXR_PERFORMANCE_SETTINGS "Enable XR_EXT_performance_settings" OFF)
 option(XRT_FEATURE_OPENXR_PLANE_DETECTION "Enable XR_EXT_plane_detection" OFF)
-option(XRT_FEATURE_OPENXR_USER_PRESENCE "Enable XR_EXT_user_presence" ON)
+option(XRT_FEATURE_OPENXR_USER_PRESENCE "Enable XR_EXT_user_presence" OFF)
 option(XRT_FEATURE_OPENXR_VISIBILITY_MASK "Enable XR_KHR_visibility_mask" ON)
 option(XRT_FEATURE_OPENXR_VULKAN_SWAPCHAIN_FORMAT_LIST "Enable XR_KHR_vulkan_swapchain_format_list" ON)
 option(XRT_FEATURE_OPENXR_XDEV_SPACE "Enable XR_MNDX_xdev_space" ON)
@@ -402,20 +413,29 @@ option_with_deps(XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META "Enable XR_META
 option_with_deps(XRT_FEATURE_OPENXR_BODY_TRACKING_CALIBRATION_META "Enable XR_META_body_tracking_calibration" DEPENDS XRT_FEATURE_OPENXR_BODY_TRACKING_FULL_BODY_META)
 
 # Interaction extension support.
-option(XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE "Enable XR_EXT_eye_gaze_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND "Enable XR_EXT_hand_interaction" ON)
+#
+# Default OFF for every extension / interaction profile no in-tree or planned
+# provider can serve (#703): the `eyes` role is never assigned, nothing creates
+# an XRT_DEVICE_EYE_GAZE_INTERACTION / HAND_INTERACTION device, and the vendor
+# controller profiles below describe headset controllers a 3D display never
+# sees. The qwerty floor + Ultraleap emulate simple / touch / index / vive /
+# WMR, which are core (not extension) profiles and stay. XR_EXT_hand_tracking
+# stays ON (Ultraleap serves it, gated at runtime by xrGetSystemProperties).
+# A vendor can flip any of these back on at configure time.
+option(XRT_FEATURE_OPENXR_INTERACTION_EXT_EYE_GAZE "Enable XR_EXT_eye_gaze_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_EXT_HAND "Enable XR_EXT_hand_interaction" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_EXT_PALM_POSE "Enable XR_EXT_palm_pose" OFF)
-option(XRT_FEATURE_OPENXR_INTERACTION_ML2 "Enable XR_ML_ml2_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_MNDX "Enable XR_MNDX_ball_on_a_stick_controller, XR_MNDX_hydra and XR_MNDX_system_buttons" ON)
+option(XRT_FEATURE_OPENXR_INTERACTION_ML2 "Enable XR_ML_ml2_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_MNDX "Enable XR_MNDX_ball_on_a_stick_controller, XR_MNDX_hydra and XR_MNDX_system_buttons" OFF)
 option(XRT_FEATURE_OPENXR_INTERACTION_MSFT_HAND "Enable XR_MSFT_hand_interaction" OFF)
-option(XRT_FEATURE_OPENXR_INTERACTION_OPPO "Enable XR_OPPO_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_WINMR "Enable XR_EXT_hp_mixed_reality_controller and XR_EXT_samsung_odyssey_controller" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE "Enable XR_BD_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS "Enable XR_HTC_vive_cosmos_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_controller_interaction" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" ON)
-option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" ON)
+option(XRT_FEATURE_OPENXR_INTERACTION_OPPO "Enable XR_OPPO_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_WINMR "Enable XR_EXT_hp_mixed_reality_controller and XR_EXT_samsung_odyssey_controller" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_BYTEDANCE "Enable XR_BD_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_COSMOS "Enable XR_HTC_vive_cosmos_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3 "Enable XR_HTC_vive_focus3_controller_interaction" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_FB_PROXIMITY "Enable XR_FB_touch_controller_proximity" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO "Enable XR_FB_touch_controller_pro" OFF)
+option(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS "Enable XR_META_touch_controller_plus" OFF)
 
 # Defaults for OpenXR layer support
 # Off: DisplayXR is a flat lightfield display, not a reprojecting HMD, so a
@@ -683,7 +703,6 @@ message(STATUS "#    MODULE_COMPOSITOR_MAIN:      ${XRT_MODULE_COMPOSITOR_MAIN}"
 message(STATUS "#    MODULE_COMPOSITOR_NULL:      ${XRT_MODULE_COMPOSITOR_NULL}")
 message(STATUS "#    MODULE_IPC:                  ${XRT_MODULE_IPC}")
 message(STATUS "#    MODULE_CLI:                  ${XRT_MODULE_CLI}")
-message(STATUS "#    MODULE_CONTROL_PANEL:        ${XRT_MODULE_CONTROL_PANEL}")
 message(STATUS "#    MODULE_OPENXR_STATE_TRACKER: ${XRT_MODULE_OPENXR_STATE_TRACKER}")
 message(STATUS "#")
 message(STATUS "#    FEATURE_AHARDWARE_BUFFER:                      ${XRT_FEATURE_AHARDWARE_BUFFER}")

@@ -1,0 +1,2075 @@
+// Copyright 2026, The DisplayXR Project
+// SPDX-License-Identifier: BSL-1.0
+/*!
+ * @file
+ * @brief  `displayxr-cli camera` — XR_DXR_stereo_camera (ADR-043) over IPC.
+ *
+ *   camera list  [--json]                         properties + state of every camera
+ *   camera calib <id> [--raw|--rectified] [--json]
+ *   camera probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F]
+ *                [--frames N] [--seconds S] [--out DIR]
+ *                [--max-disparity N] [--max-dy N] [--min-ncc C]
+ *
+ * R3 consent / privacy (ADR-043 §7) — the store is edited LOCALLY (no service
+ * needed), the control ops go over IPC as a DIAG client:
+ *   camera consent                               list the store (apps, delegating, sharing)
+ *   camera allow|deny|revoke <exe>|--self        stored per-app decision
+ *   camera trust|untrust <exe>|--self            user-level consent-DELEGATING list
+ *          [--signer "<CN>"]                     (trust clears a stored Deny for <exe>, which
+ *                                                would otherwise keep refusing it — spec §7.1;
+ *                                                --signer records the Authenticode signer CN a
+ *                                                user-writable <exe> must carry — §7.1.1)
+ *   camera signer <exe>|--self                   what §7.1.1 sees: path class + valid signer
+ *   list / calib / probe ... --decline-delegation declare XR_STEREO_CAMERA_CLIENT_DECLINE_
+ *                                                DELEGATION_BIT_DXR (spec v3) for this connection
+ *   <exe> is stored as the service will see the peer: made absolute / resolved
+ *   (and, on Windows, read from the UTF-16 command line, not the ANSI argv).
+ *   camera status                                sharing / locked / started streams (IPC)
+ *   camera stop-all                              the user kill switch (IPC)
+ *   camera sharing on|off                        the persistent sharing toggle (IPC)
+ *   camera fake-lock on|off                      simulate the OS session lock (IPC, diagnostics)
+ *   camera uvc-devices [--modes]                 ADR-043 Amendment 4, LOCAL: the UVC stereo webcam
+ *                                                config (stereo-cameras.json) + the capture devices
+ *                                                present, each marked with the entry claiming it;
+ *                                                --modes lists the modes of CLAIMED devices only;
+ *                                                --decoder: the MJPEG decode path (Windows: hardware
+ *                                                MFT + adapter, or software; Linux: libturbojpeg or
+ *                                                the built-in decoder) — touches no camera
+ *   camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N] [--verbose]
+ *                                                a media file (Windows: a 4K MJPEG AVI; Linux: a
+ *                                                concatenated .mjpeg stream) through the identical
+ *                                                webcam decode / readback / split path, no camera
+ *
+ * `list` prints each camera's source: "plugin" (the display plug-in's slots),
+ * "uvc" (the service's own side-by-side webcam source; Amendment 4), "app" or
+ * "app-link" (ADR-061: a running app's pre-weave views — XR_DXR_app_share; the
+ * CLI declares it, so it sees app entries like an extension-enabled consumer).
+ *
+ * ADR-061 aliases (`displayxr-cli share ...`):
+ *   share list [--json]                          `camera list` restricted to app entries,
+ *                                                plus each app's XR_DXR_app_share description
+ *   share probe [<id>] [--frames N] [--seconds S] [--out DIR]
+ *                                                `camera probe` of an app entry (the first one
+ *                                                when no id): RECTIFIED NV12, rate, disparity,
+ *                                                and the frame metadata — zeroDisparityShiftFrac
+ *                                                must be 0 (spec v1; exit 5 otherwise). On the
+ *                                                DXR_APP_SHARE_FAKE source it also measures the
+ *                                                zero-disparity band (|d| <= 0.5 px)
+ *   share settings [prompt always|per-app-run] [resolution 720p|1080p]
+ *                                                LOCAL: the per-user share.* settings (no service)
+ *
+ * `list` / `calib` / `probe` connect as the CAMERA_CONSUMER class (ADR-043 R3)
+ * — the same class a browser's video-capture utility declares — so the CLI
+ * exercises exactly the consumer path: it is prompted / refused / allowed like
+ * any app. `probe` is a real consumer: it creates and starts a stream (so it
+ * goes through the service's consent decision: a refusal prints the distinct
+ * result and exits 4 / 6 / 7), maps the ring READ-ONLY, waits on the per-stream wake
+ * handle, acquires, and reports the measured delivery rate, frame-index gaps,
+ * the SBS layout, block-matched disparities of the last frame (the sim fake's
+ * scene is 12 px background / 40 px bar), and the service's stream stats.
+ * With --out it writes the last frame as cam_<frameIndex>.png.
+ *
+ * R2: every probe also reports ROW ALIGNMENT — 2-D block matching (dx AND dy)
+ * of the last frame on textured 32x32 blocks: the vertical disparity a
+ * rectified pair must bring to ~0 (median / p90 / max |dy|) and the dominant
+ * horizontal disparities, each converted to a depth Z = f * B / d with the
+ * RECTIFIED calibration. `--rectified` insists on RECTIFIED output and fails
+ * (exit 5) if the frames came back RAW-flagged or the rows do not align:
+ * |SIGNED median dy| > 0.5 px (a constant vertical offset), a robust spread
+ * (MAD about that median) > 1.5 px, or fewer than 20 accepted blocks. The
+ * unsigned |dy| statistics are printed but not gated (block-match noise). Matching is zero-mean NCC with sub-pixel
+ * refinement; the disparity window comes from the camera's own f * B (a subject at 0.4 m), the vertical one is +-24 px,
+ * blocks under NCC 0.90 or peaking ON either bound are counted and excluded (a bound hit is a clamp, not a measurement
+ * — the first Leia SR run read "d = 64, |dy| = 10.000" that way). On the distorted sim fake
+ * (SIM_DISPLAY_FAKE_STEREO_CAMERA_DISTORT=1) the depths read back 2.00 m
+ * (background) and 0.60 m (bar); `--raw` shows the misalignment it fixes.
+ *
+ * The service stats line is followed by the ONLINE VERTICAL REFINEMENT state
+ * (R2): applied correction a / b, match count, and the signed dy of its first
+ * (uncorrected) window next to its latest one and this probe's own last-frame
+ * measurement. It settles in ~1 s after a stream starts, so give the probe a
+ * few seconds (the default 90 frames is ~3 s at 30 Hz). On the fake, inject a
+ * calibration error with SIM_DISPLAY_FAKE_STEREO_CAMERA_DY=2.6 and
+ * _DY_SLOPE=-0.47 (px per 100 px) next to _DISTORT=1.
+ *
+ * Connects as a DIAG client, like `clients`: on Windows run it NON-elevated.
+ */
+
+#include "cli_common.h"
+#include "cli_ipc.h"
+
+#ifdef CLI_HAVE_IPC
+
+#include "xrt/xrt_instance.h"
+#include "util/u_camera_consent.h"
+#include "xrt/xrt_plugin.h"
+#include "xrt/xrt_results.h"
+#include "xrt/xrt_stereo_camera.h"
+#include "os/os_time.h"
+#include "util/u_logging.h"
+#include "util/u_stereo_camera.h"
+#include "util/u_stereo_uvc.h"
+#include "util/u_app_share_fake.h"
+#include "os/os_uvc_capture.h"
+
+#include "client/ipc_client_connection.h"
+#include "client/ipc_client.h"
+#include "client/ipc_client_stereo_camera.h"
+
+#define STB_IMAGE_WRITE_STATIC
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef XRT_OS_WINDOWS
+#include <windows.h>
+#include <shellapi.h> // CommandLineToArgvW
+#else
+#include <poll.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+#ifdef XRT_OS_MACOS
+#include <mach-o/dyld.h>
+#endif
+
+static const char *
+state_str(uint32_t s)
+{
+	switch (s) {
+	case XRT_STEREO_CAMERA_STATE_AVAILABLE: return "AVAILABLE";
+	case XRT_STEREO_CAMERA_STATE_WAITING: return "WAITING";
+	case XRT_STEREO_CAMERA_STATE_SUSPENDED: return "SUSPENDED";
+	case XRT_STEREO_CAMERA_STATE_UNAVAILABLE: return "UNAVAILABLE";
+	default: return "?";
+	}
+}
+
+//! Why the service ended a stream (XrStereoCameraStreamEndReasonDXR).
+static const char *
+end_reason_str(uint32_t r)
+{
+	switch (r) {
+	case XRT_STEREO_CAMERA_END_USER_STOPPED: return "USER_STOPPED";
+	case XRT_STEREO_CAMERA_END_DISABLED: return "DISABLED";
+	case XRT_STEREO_CAMERA_END_SOURCE_LOST: return "SOURCE_LOST";
+	case XRT_STEREO_CAMERA_END_SOURCE_BUSY:
+		return "SOURCE_BUSY (the device could not start: held by another process, or no first frame)";
+	default: return "?";
+	}
+}
+
+static const char *
+format_str(uint32_t f)
+{
+	switch (f) {
+	case XRT_STEREO_CAMERA_FORMAT_GRAY8: return "GRAY8";
+	case XRT_STEREO_CAMERA_FORMAT_NV12: return "NV12";
+	case XRT_STEREO_CAMERA_FORMAT_BGRA8: return "BGRA8";
+	default: return "?";
+	}
+}
+
+static void
+flags_str(uint64_t f, char *out, size_t cap)
+{
+	out[0] = '\0';
+	static const struct
+	{
+		uint64_t bit;
+		const char *name;
+	} k[] = {
+	    {XRT_PLUGIN_STEREO_CAMERA_SHARED_WITH_EYE_TRACKING, "SHARED_WITH_EYE_TRACKING"},
+	    {XRT_PLUGIN_STEREO_CAMERA_USER_FACING, "USER_FACING"},
+	    {XRT_PLUGIN_STEREO_CAMERA_CALIBRATED, "CALIBRATED"},
+	    {XRT_PLUGIN_STEREO_CAMERA_NATIVELY_RECTIFIED, "NATIVELY_RECTIFIED"},
+	    {XRT_PLUGIN_STEREO_CAMERA_MONOCHROME, "MONOCHROME"},
+	    {XRT_PLUGIN_STEREO_CAMERA_RECTIFIABLE, "RECTIFIABLE"},
+	    {XRT_STEREO_CAMERA_APP_CONTENT, "APP_CONTENT"},
+	};
+	for (size_t i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+		if (f & k[i].bit) {
+			size_t n = strlen(out);
+			snprintf(out + n, cap - n, "%s%s", n ? "|" : "", k[i].name);
+		}
+	}
+}
+
+static const char *
+result_hint(xrt_result_t x)
+{
+	switch (x) {
+	case XRT_ERROR_NOT_AUTHORIZED:
+		return " = NOT_AUTHORIZED (OS camera privacy switch off, RAW to a delegating client, or wrong client class)";
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED:
+		return " = CONSENT_REFUSED (no consent for this executable: the prompt was refused / unavailable, or a "
+		       "stored Deny; `displayxr-cli camera allow --self` or `camera trust --self` grants it)";
+	case XRT_ERROR_STEREO_CAMERA_DISABLED:
+		return " = DISABLED (camera sharing is off: tray toggle or DXR_STEREO_CAMERA=0)";
+	case XRT_ERROR_STEREO_CAMERA_BUSY: return " = BUSY (the source cannot be opened right now; retry)";
+	case XRT_ERROR_STEREO_CAMERA_STREAM_ENDED:
+		return " = STREAM_ENDED (the service ended this stream: user stop / sharing off / source lost or busy)";
+	case XRT_ERROR_FEATURE_NOT_SUPPORTED: return " = FEATURE_NOT_SUPPORTED";
+	case XRT_ERROR_INPUT_UNSUPPORTED: return " = INPUT_UNSUPPORTED (bad id / format / output)";
+	case XRT_ERROR_CLIENT_LIMIT_REACHED: return " = LIMIT_REACHED (8 streams per camera)";
+	case XRT_ERROR_IPC_FAILURE: return " = IPC_FAILURE";
+	default: return "";
+	}
+}
+
+//! Exit code for a refused start, so a script can tell the refusals apart.
+static int
+refusal_exit_code(xrt_result_t x)
+{
+	switch (x) {
+	case XRT_ERROR_STEREO_CAMERA_CONSENT_REFUSED: return 4;
+	case XRT_ERROR_STEREO_CAMERA_DISABLED: return 6;
+	case XRT_ERROR_STEREO_CAMERA_BUSY: return 7;
+	default: return 2;
+	}
+}
+
+//! @p client_flags: XRT_STEREO_CAMERA_CLIENT_* (what XrStereoCameraClientInfoDXR::flags carries).
+static bool
+cam_connect(struct ipc_connection *ipc_c, uint32_t client_class, uint64_t client_flags)
+{
+	struct xrt_instance_info ii = {0};
+	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
+	ii.app_info.declared_client_class = client_class;
+	// ADR-061: the CLI is an XR_DXR_app_share consumer too (`camera list` tags
+	// app entries, `share list|probe` addresses them).
+	ii.app_info.stereo_camera_client_flags = client_flags | XRT_STEREO_CAMERA_CLIENT_INTERNAL_APP_SHARE;
+	xrt_result_t xret = cli_ipc_connect(ipc_c, U_LOGGING_ERROR, &ii);
+	if (xret != XRT_SUCCESS) {
+		printf("displayxr-cli camera: not connected to the service (xrt_result=%d).\n", (int)xret);
+		printf("  Is displayxr-service running? On Windows, run from a NON-elevated prompt.\n");
+		return false;
+	}
+	return true;
+}
+
+
+/*!
+ * True when the service reports camera sharing OFF. While sharing is off the service enumerates
+ * no camera at all, so "this machine has no stereo camera" and "sharing is off" look identical
+ * from the enumeration; only the status control tells them apart, and that control is DIAG-only,
+ * hence a second, short-lived connection.
+ */
+static bool
+cam_sharing_is_off(void)
+{
+	struct ipc_connection diag = {0};
+	struct xrt_instance_info ii = {0};
+	snprintf(ii.app_info.application_name, sizeof(ii.app_info.application_name), "%s", "displayxr-cli");
+	ii.app_info.declared_client_class = XRT_CLIENT_CLASS_DIAG;
+	if (cli_ipc_connect(&diag, U_LOGGING_ERROR, &ii) != XRT_SUCCESS) {
+		return false; // cannot tell: report what the enumeration said
+	}
+	uint32_t value = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_control(&diag, XRT_STEREO_CAMERA_CONTROL_STATUS, 0, &value);
+	ipc_client_connection_fini(&diag);
+	return xret == XRT_SUCCESS && (value & 1u) == 0;
+}
+
+
+/*
+ *
+ * list / calib.
+ *
+ */
+
+/*!
+ * JSON-escape @p in into @p out (backslash, quote, control characters as
+ * \u00XX). Device hints carry backslashes; app entries carry app-controlled
+ * names (ADR-061) — a name must never be able to break or inject JSON.
+ * Truncates (never splits an escape) when @p cap is too small.
+ */
+static void
+json_escape(const char *in, char *out, size_t cap)
+{
+	size_t n = 0;
+	for (const unsigned char *c = (const unsigned char *)in; *c != '\0'; c++) {
+		char esc[8];
+		size_t len;
+		if (*c == '\\' || *c == '"') {
+			esc[0] = '\\';
+			esc[1] = (char)*c;
+			len = 2;
+		} else if (*c < 0x20) {
+			len = (size_t)snprintf(esc, sizeof(esc), "\\u%04x", (unsigned)*c);
+		} else {
+			esc[0] = (char)*c;
+			len = 1;
+		}
+		if (n + len + 1 > cap) {
+			break;
+		}
+		memcpy(out + n, esc, len);
+		n += len;
+	}
+	out[n] = '\0';
+}
+
+static const char *
+cam_source_str(uint32_t source)
+{
+	switch (source) {
+	case XRT_STEREO_CAMERA_SOURCE_UVC: return "uvc";
+	case XRT_STEREO_CAMERA_SOURCE_APP: return "app";
+	case XRT_STEREO_CAMERA_SOURCE_APP_LINK: return "app-link";
+	default: return "plugin";
+	}
+}
+
+static const char *
+availability_str(uint32_t a)
+{
+	switch (a) {
+	case XRT_APP_SHARE_AVAILABLE: return "available";
+	case XRT_APP_SHARE_UNAVAILABLE_NO_TAP: return "no share tap on this platform";
+	case XRT_APP_SHARE_UNAVAILABLE_EXITED: return "app exited";
+	case XRT_APP_SHARE_UNAVAILABLE_NO_COMPOSITOR: return "no projection compositor to tap";
+	case XRT_APP_SHARE_UNAVAILABLE_UNSUPPORTED_API: return "graphics API has no tap";
+	case XRT_APP_SHARE_UNAVAILABLE_SHARED_TEXTURE: return "shared-texture session (needs DXR_HUB=1)";
+	case XRT_APP_SHARE_UNAVAILABLE_SPLIT_DISABLED: return "split kill-switched";
+	case XRT_APP_SHARE_UNAVAILABLE_LEGACY_STANDALONE: return "DXR_LEGACY_STANDALONE";
+	case XRT_APP_SHARE_UNAVAILABLE_OTHER_ADAPTER: return "renders on another adapter";
+	case XRT_APP_SHARE_UNAVAILABLE_LINK_NOT_READY: return "in-process service link not ready";
+	default: return "unavailable";
+	}
+}
+
+static bool
+source_is_app(uint32_t source)
+{
+	return source == XRT_STEREO_CAMERA_SOURCE_APP || source == XRT_STEREO_CAMERA_SOURCE_APP_LINK;
+}
+
+static int
+cmd_list(struct ipc_connection *ipc_c, bool json, bool apps_only)
+{
+	uint32_t n = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_count(ipc_c, &n);
+	if (xret != XRT_SUCCESS) {
+		printf("stereo_camera_count failed: %d%s\n", (int)xret, result_hint(xret));
+		return 2;
+	}
+	uint32_t shown = 0;
+	if (json) {
+		printf("{\"cameras\": [");
+	} else if (!apps_only) {
+		printf("%u stereo camera(s) (app entries included)\n", n);
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct xrt_stereo_camera_properties p;
+		xret = ipc_client_stereo_camera_get_properties(ipc_c, i, &p);
+		if (xret != XRT_SUCCESS || (apps_only && !source_is_app(p.source))) {
+			continue;
+		}
+		const bool is_app = source_is_app(p.source);
+		struct xrt_app_share_source_info ai;
+		memset(&ai, 0, sizeof(ai));
+		const bool have_ai = is_app && ipc_client_stereo_camera_get_app_source(ipc_c, p.camera_id, &ai) == XRT_SUCCESS;
+		char flags[160];
+		flags_str(p.flags, flags, sizeof(flags));
+		// Amendment 4: which source the service reads it from ("plugin" / "uvc").
+		const char *source = cam_source_str(p.source);
+		// A device id (Windows symbolic link) carries backslashes; an app entry's
+		// name is the app's own (ADR-061): JSON-escape both.
+		char hint[6 * sizeof(p.platform_device_hint)];
+		json_escape(p.platform_device_hint, hint, sizeof(hint));
+		char name_j[6 * sizeof(p.display_name)];
+		json_escape(p.display_name, name_j, sizeof(name_j));
+		// Spec v5: the screen it belongs to, as `displays` prints ids (0 = unknown).
+		char disp[24];
+		snprintf(disp, sizeof(disp), "0x%016llx", (unsigned long long)p.display_id);
+		// Spec v7: clockwise turn to upright in the natural orientation (JSON null = unknown).
+		const bool orient_known = p.frame_orientation_deg != XRT_STEREO_CAMERA_FRAME_ORIENTATION_UNKNOWN;
+		char orient[16];
+		snprintf(orient, sizeof(orient), "%u", p.frame_orientation_deg);
+		if (json) {
+			printf(
+			    "%s{\"id\": %llu, \"name\": \"%s\", \"source\": \"%s\", \"persistentId\": \"%s\", "
+			    "\"state\": \"%s\", "
+			    "\"flags\": \"%s\", \"viewCount\": %u, \"eyeWidth\": %u, \"eyeHeight\": %u, "
+			    "\"maxFrameRate\": %.2f, \"baselineMm\": %.2f, \"horizontalFovDeg\": %.2f, "
+			    "\"formats\": \"0x%llx\", \"transports\": \"0x%llx\", \"platformDeviceHint\": \"%s\", "
+			    "\"displayId\": \"%s\", \"frameOrientationDeg\": %s",
+			    shown ? ", " : "", (unsigned long long)p.camera_id, name_j, source, p.persistent_id,
+			    state_str(p.state), flags, p.view_count, p.eye_width, p.eye_height, p.max_frame_rate,
+			    p.baseline_mm, p.horizontal_fov_deg, (unsigned long long)p.supported_formats,
+			    (unsigned long long)p.supported_transports, hint, disp, orient_known ? orient : "null");
+			if (have_ai) {
+				char exe_j[6 * sizeof(ai.executable_name)], app_j[6 * sizeof(ai.application_name)];
+				json_escape(ai.executable_name, exe_j, sizeof(exe_j));
+				json_escape(ai.application_name, app_j, sizeof(app_j));
+				printf(", \"app\": {\"pid\": %llu, \"executable\": \"%s\", \"applicationName\": \"%s\", "
+				       "\"instance\": %u, \"availability\": \"%s\", \"window\": [%d, %d, %u, %u], "
+				       "\"contentEye\": [%u, %u], \"viewCount\": %u, \"activeViewCount\": %u, "
+				       "\"zeroDisparityShiftFrac\": %.4f, \"encodingIsLinear\": %s}",
+				       (unsigned long long)ai.pid, exe_j, app_j,
+				       ai.instance_ordinal, availability_str(ai.availability), ai.window_x, ai.window_y,
+				       ai.window_width, ai.window_height, ai.content_eye_width, ai.content_eye_height,
+				       ai.view_count, ai.active_view_count, ai.zero_disparity_shift_frac,
+				       ai.encoding_is_linear ? "true" : "false");
+			}
+			printf("}");
+		} else {
+			printf("  [%llu] \"%s\"  %s  (source: %s)\n", (unsigned long long)p.camera_id, p.display_name,
+			       state_str(p.state), source);
+			printf("       persistentId %s\n", p.persistent_id);
+			printf("       display      %s\n", p.display_id != 0 ? disp : "unknown");
+			printf("       flags        %s\n", flags);
+			if (orient_known) {
+				printf("       orientation  turn %s deg cw to upright (natural orientation)\n", orient);
+			} else {
+				printf("       orientation  unknown\n");
+			}
+			char rate[64];
+			if (p.max_frame_rate > 0.0f) {
+				snprintf(rate, sizeof(rate), "%.1f Hz", p.max_frame_rate);
+			} else {
+				snprintf(rate, sizeof(rate), "rate unknown (measured once a stream runs)");
+			}
+			printf("       eye          %ux%u (SBS %ux%u), %u views, %s\n", p.eye_width, p.eye_height,
+			       2 * p.eye_width, p.eye_height, p.view_count, rate);
+			if (p.source == XRT_STEREO_CAMERA_SOURCE_UVC &&
+			    (p.flags & XRT_PLUGIN_STEREO_CAMERA_CALIBRATED) == 0) {
+				printf(
+				    "       baseline     %.2f mm, HFOV %.2f deg per eye (NOMINAL, from the config; "
+				    "0 = not configured)\n",
+				    p.baseline_mm, p.horizontal_fov_deg);
+			} else {
+				printf("       baseline     %.2f mm, HFOV %.2f deg per eye\n", p.baseline_mm,
+				       p.horizontal_fov_deg);
+			}
+			printf("       formats      0x%llx  transports 0x%llx  platform hint \"%s\"\n",
+			       (unsigned long long)p.supported_formats, (unsigned long long)p.supported_transports,
+			       p.platform_device_hint);
+			if (have_ai) {
+				printf("       app          %s (pid %llu, copy #%u) \"%s\" — %s\n", ai.executable_name,
+				       (unsigned long long)ai.pid, ai.instance_ordinal, ai.application_name,
+				       availability_str(ai.availability));
+				printf("       app views    %u (active %u), content %ux%u per view, window %d,%d %ux%u, "
+				       "zero-disparity shift %.4f, %s source\n",
+				       ai.view_count, ai.active_view_count, ai.content_eye_width, ai.content_eye_height,
+				       ai.window_x, ai.window_y, ai.window_width, ai.window_height,
+				       ai.zero_disparity_shift_frac, ai.encoding_is_linear ? "LINEAR" : "encoded");
+			}
+		}
+		shown++;
+	}
+	if (apps_only && !json) {
+		printf("%u app share source(s)%s\n", shown,
+		       shown == 0 ? " — no shareable app is running (or the service lists none: DXR_APP_SHARE=0)" : "");
+	}
+	if (json) {
+		printf("]}\n");
+	}
+	return 0;
+}
+
+static int
+cmd_calib(struct ipc_connection *ipc_c, uint64_t id, uint32_t output, bool json)
+{
+	struct xrt_stereo_camera_calibration c;
+	xrt_result_t xret = ipc_client_stereo_camera_get_calibration(ipc_c, id, output, &c);
+	if (xret != XRT_SUCCESS) {
+		printf("stereo_camera_get_calibration(%llu) failed: %d%s\n", (unsigned long long)id, (int)xret,
+		       result_hint(xret));
+		return refusal_exit_code(xret);
+	}
+	if (json) {
+		printf("{\"output\": \"%s\", \"baselineMm\": %.3f, \"eyes\": [",
+		       output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED", c.baseline_mm);
+		for (int e = 0; e < 2; e++) {
+			printf(
+			    "%s{\"w\": %u, \"h\": %u, \"fx\": %.3f, \"fy\": %.3f, \"cx\": %.3f, \"cy\": %.3f, "
+			    "\"model\": %u}",
+			    e ? ", " : "", c.eye[e].width, c.eye[e].height, c.eye[e].fx, c.eye[e].fy, c.eye[e].cx,
+			    c.eye[e].cy, c.eye[e].model);
+		}
+		printf(
+		    "], \"rightFromLeft\": {\"orientation\": [%.6f, %.6f, %.6f, %.6f], \"position\": [%.6f, "
+		    "%.6f, %.6f]}}\n",
+		    c.orientation[0], c.orientation[1], c.orientation[2], c.orientation[3], c.position[0],
+		    c.position[1], c.position[2]);
+		return 0;
+	}
+	printf("calibration (%s), baseline %.3f mm\n", output == XRT_STEREO_CAMERA_OUTPUT_RAW ? "RAW" : "RECTIFIED",
+	       c.baseline_mm);
+	for (int e = 0; e < 2; e++) {
+		printf("  %s eye: %ux%u fx %.3f fy %.3f cx %.3f cy %.3f model %u\n", e ? "right" : "left ",
+		       c.eye[e].width, c.eye[e].height, c.eye[e].fx, c.eye[e].fy, c.eye[e].cx, c.eye[e].cy,
+		       c.eye[e].model);
+	}
+	printf("  right camera in left frame: q (%.5f %.5f %.5f %.5f)  p (%.5f %.5f %.5f) m\n", c.orientation[0],
+	       c.orientation[1], c.orientation[2], c.orientation[3], c.position[0], c.position[1], c.position[2]);
+	if (output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+		// OpenCV-style projection matrices of the rectified pair (Tx in mm).
+		double tx = -(double)c.position[0] * 1000.0;
+		printf("  P1 = [%.3f 0 %.3f 0; 0 %.3f %.3f 0; 0 0 1 0]\n", c.eye[0].fx, c.eye[0].cx, c.eye[0].fy,
+		       c.eye[0].cy);
+		printf("  P2 = [%.3f 0 %.3f %.3f; 0 %.3f %.3f 0; 0 0 1 0]   (P2[0][3] = f * Tx, Tx = %.3f mm)\n",
+		       c.eye[1].fx, c.eye[1].cx, c.eye[1].fx * tx, c.eye[1].fy, c.eye[1].cy, tx);
+		printf("  depth from disparity: Z = f * B / d = %.1f / d(px) m\n",
+		       c.eye[0].fx * c.baseline_mm / 1000.0);
+	}
+	return 0;
+}
+
+
+/*
+ *
+ * probe.
+ *
+ */
+
+struct ro_map
+{
+	const uint8_t *ptr;
+	uint64_t size;
+#ifdef XRT_OS_WINDOWS
+	HANDLE section;
+#else
+	int section;
+#endif
+};
+
+static bool
+map_readonly(struct ro_map *m, xrt_shmem_handle_t h, uint64_t size)
+{
+	m->size = size;
+	m->section = h;
+#ifdef XRT_OS_WINDOWS
+	m->ptr = (const uint8_t *)MapViewOfFile(h, FILE_MAP_READ, 0, 0, (SIZE_T)size);
+	return m->ptr != NULL;
+#else
+	void *p = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, h, 0);
+	m->ptr = p == MAP_FAILED ? NULL : (const uint8_t *)p;
+	return m->ptr != NULL;
+#endif
+}
+
+static void
+unmap_readonly(struct ro_map *m)
+{
+#ifdef XRT_OS_WINDOWS
+	if (m->ptr != NULL) {
+		UnmapViewOfFile(m->ptr);
+	}
+	if (m->section != NULL) {
+		CloseHandle(m->section);
+	}
+#else
+	if (m->ptr != NULL) {
+		munmap((void *)m->ptr, (size_t)m->size);
+	}
+	if (m->section >= 0) {
+		close(m->section);
+	}
+#endif
+	memset(m, 0, sizeof(*m));
+}
+
+//! Wait for the stream's wake handle, then drain it. true = signalled.
+static bool
+wait_wake(xrt_graphics_sync_handle_t w, int timeout_ms)
+{
+#ifdef XRT_OS_WINDOWS
+	return WaitForSingleObject(w, (DWORD)timeout_ms) == WAIT_OBJECT_0;
+#else
+	struct pollfd pfd = {.fd = w, .events = POLLIN, .revents = 0};
+	if (poll(&pfd, 1, timeout_ms) <= 0) {
+		return false;
+	}
+	char buf[64];
+	while (read(w, buf, sizeof(buf)) > 0) {
+	}
+	return true;
+#endif
+}
+
+static void
+close_wake(xrt_graphics_sync_handle_t w)
+{
+#ifdef XRT_OS_WINDOWS
+	if (w != NULL) {
+		CloseHandle(w);
+	}
+#else
+	if (w >= 0) {
+		close(w);
+	}
+#endif
+}
+
+static int
+cmp_int(const void *a, const void *b)
+{
+	return *(const int *)a - *(const int *)b;
+}
+
+//! Nearest subject the probe expects: its disparity bounds the search.
+#define PROBE_NEAREST_M 0.4
+
+/*!
+ * Disparity search bound from the camera's own geometry: the disparity of a
+ * subject at PROBE_NEAREST_M, f * B / Z, with f from the per-eye HFOV. A fixed
+ * 64 px was fine for the 50 mm sim fake and useless on the 120 mm Leia SR
+ * tracking camera, where a face at 0.6 m is ~95 px and every block clamped at
+ * 64. Uncalibrated: a quarter of the eye width. Always within [64, 0.6 * eye].
+ */
+static uint32_t
+probe_max_disparity(const struct xrt_stereo_camera_properties *p, uint32_t eye_w)
+{
+	double d = eye_w / 4.0;
+	if (p != NULL && p->baseline_mm > 0.0f && p->horizontal_fov_deg > 1.0f && p->horizontal_fov_deg < 179.0f) {
+		double f = (eye_w / 2.0) / tan(p->horizontal_fov_deg * 0.5 * 3.14159265358979323846 / 180.0);
+		d = f * (p->baseline_mm / 1000.0) / PROBE_NEAREST_M;
+	}
+	double cap = eye_w * 0.6;
+	if (d > cap) {
+		d = cap;
+	}
+	return d < 64.0 ? 64u : (uint32_t)ceil(d);
+}
+
+//! Block-match the last frame on a 64x64 grid and print the two dominant
+//! disparities (the sim fake: background 12 px, bar 40 px). Blocks whose best
+//! match sits ON the search bound are a clamp, not a measurement: counted and
+//! reported, never folded into the modes.
+static void
+report_disparity(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, uint32_t max_d, char *out, size_t cap)
+{
+	int vals[512];
+	int n = 0, at_edge = 0;
+	for (uint32_t y = 48; y + 64 <= h && n < 512; y += 64) {
+		for (uint32_t x = 64; x + 64 <= eye_w && n < 512; x += 64) {
+			float d = 0.0f;
+			if (u_stereo_camera_estimate_disparity(gray, pitch, eye_w, h, x, y, 64, 64, max_d, &d)) {
+				uint32_t lim = max_d < x ? max_d : x;
+				if (d >= (float)lim - 0.5f) {
+					at_edge++;
+					continue;
+				}
+				vals[n++] = (int)(d + 0.5f);
+			}
+		}
+	}
+	if (n == 0) {
+		snprintf(out, cap, "n/a (%s)", at_edge > 0 ? "every block hit the search bound" : "frame too small");
+		return;
+	}
+	qsort(vals, (size_t)n, sizeof(int), cmp_int);
+	// Histogram modes.
+	int best_v[2] = {-1, -1}, best_c[2] = {0, 0};
+	for (int i = 0; i < n;) {
+		int j = i;
+		while (j < n && vals[j] == vals[i]) {
+			j++;
+		}
+		int c = j - i;
+		if (c > best_c[0]) {
+			best_v[1] = best_v[0];
+			best_c[1] = best_c[0];
+			best_v[0] = vals[i];
+			best_c[0] = c;
+		} else if (c > best_c[1]) {
+			best_v[1] = vals[i];
+			best_c[1] = c;
+		}
+		i = j;
+	}
+	int k = snprintf(out, cap, "%d px (%d/%d blocks), %d px (%d/%d blocks), range %d..%d px (search 0..%u)",
+	                 best_v[0], best_c[0], n, best_v[1], best_c[1], n, vals[0], vals[n - 1], max_d);
+	if (at_edge > 0 && k > 0 && (size_t)k < cap) {
+		snprintf(out + k, cap - (size_t)k, "; %d block(s) AT THE SEARCH BOUND, excluded", at_edge);
+	}
+}
+
+static int
+cmp_float(const void *a, const void *b)
+{
+	float x = *(const float *)a, y = *(const float *)b;
+	return (x > y) - (x < y);
+}
+
+struct row_alignment
+{
+	int textured;            //!< blocks that passed the texture gate and were matched
+	int blocks;              //!< ...of which accepted (NCC >= min, peak inside both windows)
+	int low_corr;            //!< rejected: peak NCC below the threshold
+	int dx_edge;             //!< rejected: peak ON the disparity bound (a clamp, not a measurement)
+	int dy_edge;             //!< rejected: peak ON the vertical bound
+	float dy_signed_median;  //!< right y - left y, px (a constant vertical offset shows here)
+	float dy_median, dy_p90; //!< |dy|, px (informational: block-match noise on a face scene inflates these)
+	float dy_mad;            //!< median |dy - signed median|, px: the robust spread the gate uses
+	int outliers;            //!< accepted blocks with |dy| > 1 px
+	int modes;
+	float mode_dx[2];
+	int mode_count[2];
+};
+
+struct row_params
+{
+	uint32_t max_d;  //!< disparity window (probe_max_disparity)
+	uint32_t max_dy; //!< vertical window, +-px
+	float min_ncc;   //!< acceptance threshold on the peak correlation
+};
+
+/*!
+ * 2-D NCC block matching (u_stereo_camera_match_block) of a GRAY8 SBS frame on
+ * a 32 px grid, textured blocks only (a flat wall matches anywhere): signed and
+ * |dy| statistics and the two dominant horizontal disparities (1 px clusters).
+ * Blocks below the correlation threshold or whose peak sits on either window's
+ * bound are counted and excluded — never clamped into the statistics.
+ */
+static void
+measure_rows(const uint8_t *gray,
+             uint32_t pitch,
+             uint32_t eye_w,
+             uint32_t h,
+             const struct row_params *rp,
+             struct row_alignment *out)
+{
+	memset(out, 0, sizeof(*out));
+	enum
+	{
+		B = 32,
+		MAXB = 1024
+	};
+	static float dxs[MAXB], ady[MAXB], sdy[MAXB];
+	int n = 0;
+	for (uint32_t y = 16; y + B + 16 <= h && out->textured < MAXB; y += B) {
+		for (uint32_t x = 16; x + B + 8 <= eye_w && out->textured < MAXB; x += B) {
+			// Texture gate: standard deviation of the left block >= 6 levels.
+			double sum = 0, sq = 0;
+			for (uint32_t j = 0; j < B; j++) {
+				const uint8_t *r = gray + (size_t)(y + j) * pitch + x;
+				for (uint32_t i = 0; i < B; i++) {
+					sum += r[i];
+					sq += (double)r[i] * r[i];
+				}
+			}
+			double mean = sum / (B * B);
+			if (sq / (B * B) - mean * mean < 36.0) {
+				continue;
+			}
+			struct u_stereo_camera_block_match m;
+			if (!u_stereo_camera_match_block(gray, pitch, eye_w, h, x, y, B, B, rp->max_d, rp->max_dy,
+			                                 &m)) {
+				continue;
+			}
+			out->textured++;
+			if (m.ncc < rp->min_ncc) {
+				out->low_corr++;
+				continue;
+			}
+			if (m.dx_at_edge) {
+				out->dx_edge++;
+				continue;
+			}
+			if (m.dy_at_edge) {
+				out->dy_edge++;
+				continue;
+			}
+			dxs[n] = m.dx;
+			sdy[n] = m.dy;
+			ady[n] = m.dy < 0 ? -m.dy : m.dy;
+			n++;
+		}
+	}
+	out->blocks = n;
+	if (n == 0) {
+		return;
+	}
+	qsort(sdy, (size_t)n, sizeof(float), cmp_float);
+	out->dy_signed_median = sdy[n / 2];
+	qsort(ady, (size_t)n, sizeof(float), cmp_float);
+	out->dy_median = ady[n / 2];
+	out->dy_p90 = ady[(n * 9) / 10];
+	// Robust spread about the signed median (MAD). ady[] is free again once its stats are read.
+	for (int i = 0; i < n; i++) {
+		float r = sdy[i] - out->dy_signed_median;
+		ady[i] = r < 0 ? -r : r;
+	}
+	qsort(ady, (size_t)n, sizeof(float), cmp_float);
+	out->dy_mad = ady[n / 2];
+	for (int i = 0; i < n; i++) {
+		out->outliers += ady[i] > 1.0f;
+	}
+	qsort(dxs, (size_t)n, sizeof(float), cmp_float);
+	// Greedy 1 px clusters; keep the two most populated.
+	for (int i = 0; i < n;) {
+		int j = i;
+		double s = 0;
+		while (j < n && dxs[j] - dxs[i] <= 1.0f) {
+			s += dxs[j];
+			j++;
+		}
+		int c = j - i;
+		float mean = (float)(s / c);
+		if (c > out->mode_count[0]) {
+			out->mode_dx[1] = out->mode_dx[0];
+			out->mode_count[1] = out->mode_count[0];
+			out->mode_dx[0] = mean;
+			out->mode_count[0] = c;
+		} else if (c > out->mode_count[1]) {
+			out->mode_dx[1] = mean;
+			out->mode_count[1] = c;
+		}
+		i = j;
+	}
+	out->modes = out->mode_count[1] > 0 ? 2 : 1;
+}
+
+/*!
+ * ADR-061: |disparity| (px) in the DXR_APP_SHARE_FAKE zero-disparity band of
+ * a GRAY8 SBS frame — the median of a row of blocks inside the band. false =
+ * the band is too small to measure.
+ */
+static bool
+measure_fake_band(const uint8_t *gray, uint32_t pitch, uint32_t eye_w, uint32_t h, float *out_abs_d)
+{
+	uint32_t y0 = 0, y1 = 0;
+	u_app_share_fake_band(h, &y0, &y1);
+	const uint32_t bh = 16;
+	if (y1 < y0 + bh + 6) {
+		return false;
+	}
+	const uint32_t by = y0 + (y1 - y0 - bh) / 2;
+	float v[64];
+	int n = 0;
+	for (uint32_t bx = 16; bx + 32 + 16 < eye_w && n < 64; bx += 48) {
+		float dx = 0.0f, dy = 0.0f;
+		if (u_stereo_camera_estimate_offset(gray, pitch, eye_w, h, bx, by, 32, bh, 8, 2, &dx, &dy)) {
+			v[n++] = dx < 0.0f ? -dx : dx;
+		}
+	}
+	if (n == 0) {
+		return false;
+	}
+	qsort(v, (size_t)n, sizeof(v[0]), cmp_float);
+	*out_abs_d = v[n / 2];
+	return true;
+}
+
+static int
+cmd_probe(struct ipc_connection *ipc_c, int argc, const char **argv, bool apps_only)
+{
+	uint64_t id = 0;
+	uint32_t output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+	uint32_t format = XRT_STEREO_CAMERA_FORMAT_NV12;
+	float fps = 0.0f;
+	int frames = 90;
+	float seconds = 0.0f;
+	const char *out_dir = NULL;
+	bool require_rectified = false;
+	uint32_t max_d_arg = 0; // 0 = from the camera's geometry
+	struct row_params rp = {.max_d = 0, .max_dy = 24, .min_ncc = 0.90f};
+	char rows_txt[64] = "";
+	bool have_rows = false;
+	for (int i = 3; i < argc; i++) {
+		if (strcmp(argv[i], "--raw") == 0) {
+			output = XRT_STEREO_CAMERA_OUTPUT_RAW;
+		} else if (strcmp(argv[i], "--rectified") == 0) {
+			output = XRT_STEREO_CAMERA_OUTPUT_RECTIFIED;
+			require_rectified = true;
+		} else if (strcmp(argv[i], "--format") == 0 && i + 1 < argc) {
+			const char *f = argv[++i];
+			format = strcmp(f, "gray8") == 0   ? XRT_STEREO_CAMERA_FORMAT_GRAY8
+			         : strcmp(f, "bgra8") == 0 ? XRT_STEREO_CAMERA_FORMAT_BGRA8
+			                                   : XRT_STEREO_CAMERA_FORMAT_NV12;
+		} else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
+			fps = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+			frames = atoi(argv[++i]);
+		} else if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc) {
+			seconds = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "--max-disparity") == 0 && i + 1 < argc) {
+			max_d_arg = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--max-dy") == 0 && i + 1 < argc) {
+			rp.max_dy = (uint32_t)strtoul(argv[++i], NULL, 10);
+		} else if (strcmp(argv[i], "--min-ncc") == 0 && i + 1 < argc) {
+			rp.min_ncc = (float)atof(argv[++i]);
+		} else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+			out_dir = argv[++i];
+		} else if (argv[i][0] != '-') {
+			id = strtoull(argv[i], NULL, 10);
+		}
+	}
+	struct xrt_stereo_camera_properties props;
+	memset(&props, 0, sizeof(props));
+	{
+		uint32_t n = 0;
+		bool found = false;
+		if (ipc_client_stereo_camera_count(ipc_c, &n) == XRT_SUCCESS) {
+			for (uint32_t i = 0; i < n && !found; i++) {
+				if (ipc_client_stereo_camera_get_properties(ipc_c, i, &props) == XRT_SUCCESS &&
+				    (id == 0 || props.camera_id == id) && (!apps_only || source_is_app(props.source))) {
+					found = true;
+				}
+			}
+		}
+		if (!found && apps_only) {
+			// Never fall through to a camera: `share probe <camera id>` must not
+			// open (and prompt for) a real camera stream.
+			if (id != 0) {
+				printf("share probe: %llu is not an app share source this consumer sees (a camera? use "
+				       "`camera probe`).\n",
+				       (unsigned long long)id);
+			} else {
+				printf("share probe: no app share source is listed (no shareable app running?).\n");
+			}
+			return 3;
+		}
+		if (!found && id == 0) {
+			if (cam_sharing_is_off()) {
+				printf("camera probe: refused%s\n", result_hint(XRT_ERROR_STEREO_CAMERA_DISABLED));
+				return refusal_exit_code(XRT_ERROR_STEREO_CAMERA_DISABLED); // 6, as documented
+			}
+			printf("camera probe: the service exposes no stereo camera.\n");
+			return 3;
+		}
+		if (!found) {
+			memset(&props, 0, sizeof(props)); // stream_create reports the bad id
+		}
+		id = found ? props.camera_id : id;
+	}
+
+	struct xrt_stereo_camera_stream_request req = {
+	    .camera_id = id,
+	    .output = output,
+	    .format = format,
+	    .transport = XRT_STEREO_CAMERA_TRANSPORT_SHARED_MEMORY,
+	    .max_frame_rate = fps,
+	};
+	uint64_t sid = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_stream_create(ipc_c, &req, &sid);
+	if (xret != XRT_SUCCESS) {
+		printf("stream create failed: %d%s\n", (int)xret, result_hint(xret));
+		return 2;
+	}
+	xret = ipc_client_stereo_camera_stream_start(ipc_c, sid);
+	if (xret != XRT_SUCCESS) {
+		printf("stream start failed: %d%s\n", (int)xret, result_hint(xret));
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return refusal_exit_code(xret);
+	}
+	struct xrt_stereo_camera_stream_layout lay;
+	xrt_shmem_handle_t section;
+	xrt_graphics_sync_handle_t wake;
+	xret = ipc_client_stereo_camera_stream_get_transport(ipc_c, sid, &lay, &section, &wake);
+	if (xret != XRT_SUCCESS) {
+		printf("stream transport failed: %d%s\n", (int)xret, result_hint(xret));
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return 2;
+	}
+	struct ro_map map;
+	memset(&map, 0, sizeof(map));
+	if (!map_readonly(&map, section, lay.section_size)) {
+		printf("could not map the ring read-only\n");
+		close_wake(wake);
+		ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+		return 2;
+	}
+	char cap[48];
+	if (lay.max_frame_rate > 0.0f) {
+		snprintf(cap, sizeof(cap), "cap %.1f Hz", lay.max_frame_rate);
+	} else {
+		snprintf(cap, sizeof(cap), "cap = source rate (not measured yet)");
+	}
+	printf("stream %llu on camera %llu: %ux%u %s SBS (%s), %s, ring %u x %llu B (section %llu B)\n",
+	       (unsigned long long)sid, (unsigned long long)id, lay.width, lay.height, format_str(lay.format),
+	       lay.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW (flagged)", cap, lay.slot_count,
+	       (unsigned long long)lay.slot_stride, (unsigned long long)lay.section_size);
+
+	int64_t t_start = os_monotonic_get_ns();
+	int64_t deadline = seconds > 0.0f ? t_start + (int64_t)(seconds * 1e9) : t_start + 60ll * 1000000000;
+	int got = 0, wakes = 0, not_ready = 0;
+	bool rows_ok = true;
+	bool ended = false;
+	uint32_t end_reason = 0;
+	int events = 0;
+	uint64_t first_index = 0, last_index = 0, gaps = 0;
+	int64_t t_first = 0, t_last = 0;
+	struct xrt_stereo_camera_frame_info last;
+	memset(&last, 0, sizeof(last));
+	// ADR-061: an app entry's per-frame metadata (valid = 0 for a camera).
+	const bool is_app = source_is_app(props.source);
+	struct xrt_app_share_frame_info last_app, first_app;
+	memset(&last_app, 0, sizeof(last_app));
+	memset(&first_app, 0, sizeof(first_app));
+	uint32_t generations = 0;
+	while ((seconds > 0.0f || got < frames) && os_monotonic_get_ns() < deadline && !ended) {
+		// R3: the service's events (state changes, a stream it ended) are
+		// polled like xrPollEvent would; printed with the time since start.
+		for (;;) {
+			bool has = false;
+			struct xrt_stereo_camera_event ev;
+			if (ipc_client_stereo_camera_poll_event(ipc_c, &has, &ev) != XRT_SUCCESS || !has) {
+				break;
+			}
+			events++;
+			double t = (double)(os_monotonic_get_ns() - t_start) * 1e-9;
+			if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERA_STATE) {
+				printf("[%6.2f s] event: camera %llu state -> %s\n", t, (unsigned long long)ev.camera_id,
+				       state_str(ev.value));
+			} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
+				printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
+				       (unsigned long long)ev.stream_id, ev.value, end_reason_str(ev.value));
+				if (ev.stream_id == sid) {
+					ended = true;
+					end_reason = ev.value;
+				}
+			} else {
+				printf("[%6.2f s] event: cameras changed\n", t);
+			}
+		}
+		if (ended) {
+			break;
+		}
+		if (!wait_wake(wake, 250)) {
+			continue;
+		}
+		wakes++;
+		bool ready = false;
+		struct xrt_stereo_camera_frame_info fi;
+		struct xrt_app_share_frame_info afi;
+		xret = ipc_client_stereo_camera_acquire(ipc_c, sid, &ready, &fi, &afi);
+		if (xret == XRT_ERROR_STEREO_CAMERA_STREAM_ENDED) {
+			printf("acquire: %d%s\n", (int)xret, result_hint(xret));
+			ended = true;
+			continue; // drain the ENDED event on the next pass
+		}
+		if (xret != XRT_SUCCESS) {
+			printf("acquire failed: %d%s\n", (int)xret, result_hint(xret));
+			break;
+		}
+		if (!ready) {
+			not_ready++;
+			continue;
+		}
+		int64_t now = os_monotonic_get_ns();
+		if (got == 0) {
+			first_index = fi.frame_index;
+			t_first = now;
+		} else if (fi.frame_index > last_index + 1) {
+			gaps += fi.frame_index - last_index - 1;
+		}
+		last_index = fi.frame_index;
+		t_last = now;
+		last = fi;
+		if (afi.valid) {
+			if (got == 0) {
+				first_app = afi;
+			}
+			if (got > 0 && afi.content_generation != last_app.content_generation) {
+				generations++;
+			}
+			last_app = afi;
+		}
+		got++;
+	}
+	// One last drain: a stream the service ended queued its STREAM_ENDED event
+	// behind the acquire that reported it.
+	for (;;) {
+		bool has = false;
+		struct xrt_stereo_camera_event ev;
+		if (ipc_client_stereo_camera_poll_event(ipc_c, &has, &ev) != XRT_SUCCESS || !has) {
+			break;
+		}
+		events++;
+		double t = (double)(os_monotonic_get_ns() - t_start) * 1e-9;
+		if (ev.kind == XRT_STEREO_CAMERA_EVENT_STREAM_ENDED) {
+			printf("[%6.2f s] event: stream %llu ENDED by the service (reason %u = %s)\n", t,
+			       (unsigned long long)ev.stream_id, ev.value, end_reason_str(ev.value));
+			if (ev.stream_id == sid) {
+				ended = true;
+				end_reason = ev.value;
+			}
+		} else if (ev.kind == XRT_STEREO_CAMERA_EVENT_CAMERA_STATE) {
+			printf("[%6.2f s] event: camera %llu state -> %s\n", t, (unsigned long long)ev.camera_id,
+			       state_str(ev.value));
+		}
+	}
+	double span = (double)(t_last - t_first) * 1e-9;
+	double rate = (got > 1 && span > 0.0) ? (got - 1) / span : 0.0;
+	printf(
+	    "received %d frames (index %llu..%llu, %llu source frames not delivered to this stream), %d wakes, "
+	    "%d not-ready, %d event(s)%s\n",
+	    got, (unsigned long long)first_index, (unsigned long long)last_index, (unsigned long long)gaps, wakes,
+	    not_ready, events, ended ? " — STREAM ENDED BY THE SERVICE" : "");
+	printf("measured delivery rate: %.2f Hz over %.2f s\n", rate, span);
+
+	bool app_ok = true;
+	if (got > 0 && is_app) {
+		// ADR-061 spec §4: the frame metadata.
+		printf(
+		    "app frame metadata: %s — content %d,%d %ux%u per eye, mono %s, generation %u (%u change(s) seen), "
+		    "zeroDisparityShiftFrac %.4f, commit -> acquire %.2f ms\n",
+		    last_app.valid ? "present" : "MISSING", last_app.content_x, last_app.content_y,
+		    last_app.content_width, last_app.content_height, last_app.mono ? "yes" : "no",
+		    last_app.content_generation, generations, last_app.zero_disparity_shift_frac,
+		    last_app.commit_time_ns > 0 ? (double)(t_last - last_app.commit_time_ns) * 1e-6 : 0.0);
+		(void)first_app;
+		const float zs = last_app.zero_disparity_shift_frac;
+		app_ok = last_app.valid && (zs < 0 ? -zs : zs) < 1e-6f;
+		printf("zero-disparity plane (metadata): %s — spec v1 frames are display-referred (shift 0)\n",
+		       app_ok ? "PASS" : "FAIL");
+	}
+	if (got > 0) {
+		const uint8_t *slot = map.ptr + (uint64_t)last.slot * lay.slot_stride;
+		printf(
+		    "last frame: index %llu, slot %u, %ux%u %s, pitch %u/%u, planes @%llu/%llu, %s time, output %s, "
+		    "calibration gen %u\n",
+		    (unsigned long long)last.frame_index, last.slot, last.width, last.height, format_str(last.format),
+		    last.row_pitch[0], last.row_pitch[1], (unsigned long long)last.plane_offset[0],
+		    (unsigned long long)last.plane_offset[1], last.time_is_exposure ? "exposure" : "arrival",
+		    last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW",
+		    last.calibration_generation);
+
+		// Luma of the last frame, for the disparity probe and a GRAY8 PNG.
+		struct u_stereo_camera_planes gl;
+		u_stereo_camera_layout(XRT_STEREO_CAMERA_FORMAT_GRAY8, last.width, last.height, &gl);
+		uint8_t *gray = calloc((size_t)gl.size, 1);
+		const uint8_t *src[2] = {slot + last.plane_offset[0], slot + last.plane_offset[1]};
+		if (gray != NULL &&
+		    u_stereo_camera_convert(last.format, src, last.row_pitch, XRT_STEREO_CAMERA_FORMAT_GRAY8, gray, &gl,
+		                            last.width, last.height)) {
+			if (is_app) {
+				struct xrt_app_share_source_info ai;
+				float band = 0.0f;
+				if (ipc_client_stereo_camera_get_app_source(ipc_c, id, &ai) == XRT_SUCCESS &&
+				    strcmp(ai.executable_name, "displayxr-app-share-fake") == 0) {
+					if (measure_fake_band(gray, gl.pitch[0], last.width / 2, last.height, &band)) {
+						const bool band_ok = band <= 0.5f;
+						app_ok = app_ok && band_ok;
+						printf("zero-disparity band (DXR_APP_SHARE_FAKE): |d| median %.3f px — %s\n", band,
+						       band_ok ? "PASS (<= 0.5 px)" : "FAIL");
+					} else {
+						printf("zero-disparity band (DXR_APP_SHARE_FAKE): too small to measure\n");
+					}
+				}
+			}
+			char disp[256];
+			rp.max_d = max_d_arg > 0 ? max_d_arg : probe_max_disparity(&props, last.width / 2);
+			report_disparity(gray, gl.pitch[0], last.width / 2, last.height, rp.max_d, disp, sizeof(disp));
+			printf("block disparity (left x - right x): %s\n", disp);
+
+			// R2: row alignment + depth of the dominant disparities.
+			struct row_alignment ra;
+			measure_rows(gray, gl.pitch[0], last.width / 2, last.height, &rp, &ra);
+			struct xrt_stereo_camera_calibration rc;
+			double fb = 0.0; // f * B, px * m
+			if (last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED &&
+			    ipc_client_stereo_camera_get_calibration(ipc_c, id, XRT_STEREO_CAMERA_OUTPUT_RECTIFIED,
+			                                             &rc) == XRT_SUCCESS) {
+				fb = rc.eye[0].fx * rc.baseline_mm / 1000.0;
+			}
+			const char *out_name = last.output == XRT_STEREO_CAMERA_OUTPUT_RECTIFIED ? "RECTIFIED" : "RAW";
+			printf(
+			    "row alignment (%s): NCC 32x32 blocks, search d -8..%u px, dy +-%u px, accept NCC >= "
+			    "%.2f\n",
+			    out_name, rp.max_d, rp.max_dy, rp.min_ncc);
+			printf(
+			    "  %d textured block(s): %d accepted, %d below NCC %.2f, %d AT the disparity bound, %d AT "
+			    "the dy bound\n",
+			    ra.textured, ra.blocks, ra.low_corr, rp.min_ncc, ra.dx_edge, ra.dy_edge);
+			if (ra.dx_edge * 5 > ra.textured || ra.dy_edge * 5 > ra.textured) {
+				printf(
+				    "  WARNING: over 20%% of blocks peak ON a search bound — that is a clamp, not a "
+				    "measurement; widen it (--max-disparity N / --max-dy N)\n");
+			}
+			if (ra.blocks < 5) {
+				printf("  row alignment: n/a (fewer than 5 accepted blocks)\n");
+				rows_ok = false;
+			} else {
+				printf(
+				    "  dy (right - left) median %+.3f px SIGNED; |dy| median %.3f px, p90 %.3f px, %d "
+				    "block(s) > 1 px\n",
+				    ra.dy_signed_median, ra.dy_median, ra.dy_p90, ra.outliers);
+				for (int k = 0; k < ra.modes; k++) {
+					if (fb > 0.0 && ra.mode_dx[k] > 0.25f) {
+						printf(
+						    "  disparity mode %d: %.2f px (%d blocks) -> Z = f*B/d = %.3f m\n",
+						    k + 1, ra.mode_dx[k], ra.mode_count[k], fb / ra.mode_dx[k]);
+					} else {
+						printf("  disparity mode %d: %.2f px (%d blocks)\n", k + 1,
+						       ra.mode_dx[k], ra.mode_count[k]);
+					}
+				}
+				snprintf(rows_txt, sizeof(rows_txt), "%+.2f px (%d blocks)", ra.dy_signed_median,
+				         ra.blocks);
+				have_rows = true;
+				// A constant vertical offset fails even when |dy| scatter is small.
+				// The gate is ROBUST: |signed median| <= 0.5 px (the rows' actual offset) with a
+				// bounded MAD spread and enough blocks. The unsigned |dy| median is NOT gated: on a
+				// face scene block-match noise alone put it at ~1.0 px while the signed median was
+				// -0.1 px (SR laptop, 2026-09-27).
+				float sm = ra.dy_signed_median < 0 ? -ra.dy_signed_median : ra.dy_signed_median;
+				rows_ok = sm <= 0.5f && ra.dy_mad <= 1.5f && ra.blocks >= 20;
+				printf("  row gate: |signed median| %.3f px (<= 0.5), MAD %.3f px (<= 1.5), %d blocks "
+				       "(>= 20)\n",
+				       sm, ra.dy_mad, ra.blocks);
+			}
+		}
+		if (out_dir != NULL) {
+			char path[1024];
+			snprintf(path, sizeof(path), "%s/cam_%llu.png", out_dir, (unsigned long long)last.frame_index);
+			int ok = 0;
+			if (last.format == XRT_STEREO_CAMERA_FORMAT_GRAY8 && gray != NULL) {
+				ok = stbi_write_png(path, (int)last.width, (int)last.height, 1, gray, (int)gl.pitch[0]);
+			} else {
+				struct u_stereo_camera_planes bl;
+				u_stereo_camera_layout(XRT_STEREO_CAMERA_FORMAT_BGRA8, last.width, last.height, &bl);
+				uint8_t *rgba = calloc((size_t)bl.size, 1);
+				if (rgba != NULL && u_stereo_camera_convert(last.format, src, last.row_pitch,
+				                                            XRT_STEREO_CAMERA_FORMAT_BGRA8, rgba, &bl,
+				                                            last.width, last.height)) {
+					for (uint32_t y = 0; y < last.height; y++) {
+						uint8_t *r = rgba + (size_t)y * bl.pitch[0];
+						for (uint32_t x = 0; x < last.width; x++) {
+							uint8_t t = r[4 * x];
+							r[4 * x] = r[4 * x + 2];
+							r[4 * x + 2] = t;
+						}
+					}
+					ok = stbi_write_png(path, (int)last.width, (int)last.height, 4, rgba,
+					                    (int)bl.pitch[0]);
+				}
+				free(rgba);
+			}
+			printf("%s %s\n", ok ? "wrote" : "FAILED to write", path);
+		}
+		free(gray);
+	}
+
+	struct xrt_stereo_camera_stream_stats st;
+	if (ipc_client_stereo_camera_stats(ipc_c, sid, &st) == XRT_SUCCESS) {
+		printf(
+		    "service stats: source %.2f Hz, delivered %.2f Hz, published %llu, skipped %llu, acquired %llu, "
+		    "mean latency %.3f ms\n",
+		    st.source_frame_rate, st.delivered_frame_rate, (unsigned long long)st.frames_published,
+		    (unsigned long long)st.frames_skipped, (unsigned long long)st.frames_acquired,
+		    (double)st.mean_latency_ns * 1e-6);
+		// R2: the service's online vertical-alignment refinement.
+		static const char *const rs[] = {"n/a", "OFF (DXR_STEREO_CAMERA_REFINE=0)", "MEASURING",
+		                                 "ALIGNED (calibration within 0.2 px)", "APPLIED"};
+		if (st.refine_state != XRT_STEREO_CAMERA_REFINE_NONE &&
+		    st.refine_state <= XRT_STEREO_CAMERA_REFINE_APPLIED) {
+			printf(
+			    "vertical refinement: %s — correction a %+.2f px, b %+.3f px/100 px; %u update(s), "
+			    "%u window(s), %u matches in the latest, %.2f ms per measurement\n",
+			    rs[st.refine_state], st.refine_offset_px, st.refine_slope_per_100px, st.refine_updates,
+			    st.refine_windows, st.refine_matches, st.refine_measure_ms);
+			if (st.refine_windows > 0) {
+				printf(
+				    "vertical refinement: signed dy BEFORE (first window, uncorrected) %+.2f px -> "
+				    "latest window %+.2f px; this probe's last frame %s\n",
+				    st.refine_initial_dy_px, st.refine_residual_dy_px, have_rows ? rows_txt : "n/a");
+			}
+		}
+	}
+
+	unmap_readonly(&map);
+	close_wake(wake);
+	ipc_client_stereo_camera_stream_stop(ipc_c, sid);
+	ipc_client_stereo_camera_stream_destroy(ipc_c, sid);
+	if (ended) {
+		if (end_reason == XRT_STEREO_CAMERA_END_SOURCE_BUSY) {
+			printf(
+			    "stream ended: SOURCE_BUSY — the device could not start (held by another process, or no "
+			    "first frame); the camera reads UNAVAILABLE until the service's retry succeeds\n");
+			return 7; // same code as a BUSY refusal: a script treats both as "retry later"
+		}
+		return 8; // the service ended the stream (user stop / sharing off / source lost)
+	}
+	if (got == 0) {
+		return 9;
+	}
+	if (is_app && !app_ok) {
+		printf("share probe: FAIL — the frames are not display-referred as spec v1 requires\n");
+		return 5;
+	}
+	if (require_rectified) {
+		if (last.output != XRT_STEREO_CAMERA_OUTPUT_RECTIFIED) {
+			printf("--rectified: FAIL — frames are RAW (the camera is not calibrated / not rectifiable)\n");
+			return 5;
+		}
+		if (!rows_ok) {
+			printf(
+			    "--rectified: FAIL — rows do not align (|signed median dy| > 0.5 px, MAD > 1.5 px, or fewer "
+			    "than 20 matched blocks)\n");
+			return 5;
+		}
+		printf("--rectified: PASS — rows aligned\n");
+	}
+	return 0;
+}
+
+
+/*
+ *
+ * R3: consent store (local) and control ops (IPC, DIAG).
+ *
+ */
+
+//! Absolute path of this executable — what the service sees as the peer.
+static bool
+self_exe_path(char *out, size_t cap)
+{
+	out[0] = '\0';
+#if defined(XRT_OS_WINDOWS)
+	wchar_t w[1024];
+	DWORD n = GetModuleFileNameW(NULL, w, (DWORD)(sizeof(w) / sizeof(w[0])));
+	if (n == 0) {
+		return false;
+	}
+	int m = WideCharToMultiByte(CP_UTF8, 0, w, (int)n, out, (int)cap - 1, NULL, NULL);
+	if (m <= 0) {
+		return false;
+	}
+	out[m] = '\0';
+	return true;
+#elif defined(XRT_OS_MACOS)
+	char tmp[1024];
+	uint32_t sz = sizeof(tmp);
+	if (_NSGetExecutablePath(tmp, &sz) != 0) {
+		return false;
+	}
+	// proc_pidpath (what the service uses) returns the resolved path.
+	return realpath(tmp, out) != NULL || snprintf(out, cap, "%s", tmp) > 0;
+#else
+	ssize_t n = readlink("/proc/self/exe", out, cap - 1);
+	if (n <= 0) {
+		return false;
+	}
+	out[n] = '\0';
+	return true;
+#endif
+}
+
+//! Index of @p flag in argv (from 3, after "camera <sub>"), or -1.
+static int
+cli_flag_index(int argc, const char **argv, const char *flag)
+{
+	for (int i = 3; i < argc; i++) {
+		if (strcmp(argv[i], flag) == 0) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+//! argv[@p idx] as UTF-8 (Windows: re-read from the UTF-16 command line, argv is ANSI).
+static bool
+arg_utf8(int argc, const char **argv, int idx, char *out, size_t cap)
+{
+	if (idx < 0 || idx >= argc || cap == 0) {
+		return false;
+	}
+#if defined(XRT_OS_WINDOWS)
+	int wargc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+	bool ok = false;
+	if (wargv != NULL && wargc == argc) {
+		ok = WideCharToMultiByte(CP_UTF8, 0, wargv[idx], -1, out, (int)cap, NULL, NULL) > 1;
+	}
+	if (wargv != NULL) {
+		LocalFree(wargv);
+	}
+	if (ok) {
+		return true;
+	}
+#endif
+	snprintf(out, cap, "%s", argv[idx]);
+	return out[0] != '\0';
+}
+
+//! "<exe>" or "--self" -> the path to act on.
+static bool
+resolve_exe_arg(int argc, const char **argv, int idx, char *out, size_t cap)
+{
+	if (idx >= argc) {
+		return false;
+	}
+	if (strcmp(argv[idx], "--self") == 0) {
+		return self_exe_path(out, cap);
+	}
+	// Store the path the way the service will see the peer (full, OS-derived),
+	// or a Deny typed with '/' or a relative path would never match it.
+#if defined(XRT_OS_WINDOWS)
+	// argv is in the ANSI code page; the store is keyed by UTF-8. Re-read the
+	// argument as UTF-16 from the command line, then make it absolute.
+	int wargc = 0;
+	wchar_t **wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+	bool ok = false;
+	if (wargv != NULL && wargc == argc) {
+		wchar_t full[2048];
+		DWORD n = GetFullPathNameW(wargv[idx], (DWORD)(sizeof(full) / sizeof(full[0])), full, NULL);
+		const wchar_t *src = (n > 0 && n < sizeof(full) / sizeof(full[0])) ? full : wargv[idx];
+		int m = WideCharToMultiByte(CP_UTF8, 0, src, -1, out, (int)cap, NULL, NULL);
+		ok = m > 1;
+	}
+	if (wargv != NULL) {
+		LocalFree(wargv);
+	}
+	if (!ok) {
+		snprintf(out, cap, "%s", argv[idx]);
+	}
+#else
+	// The service reads proc_pidpath / /proc/<pid>/exe: the resolved path.
+	char *resolved = realpath(argv[idx], NULL); // malloc'd: never overruns a PATH_MAX buffer
+	snprintf(out, cap, "%s", resolved != NULL ? resolved : argv[idx]);
+	free(resolved);
+#endif
+	return out[0] != '\0';
+}
+
+static void
+consent_list_cb(void *ctx, char kind, const char *exe, const char *value)
+{
+	(void)ctx;
+	switch (kind) {
+	case 's': printf("  sharing:      %s\n", value); break;
+	case 'a': printf("  app %-6s    %s\n", value, exe); break;
+	case 'd': printf("  delegating    %s  (%s list)\n", exe, value); break;
+	default: break;
+	}
+}
+
+static int
+cmd_consent(void)
+{
+	char path[1024];
+	if (u_camera_consent_store_path(path, sizeof(path))) {
+		printf("stereo camera consent store: %s\n", path);
+	}
+	u_camera_consent_store_list(consent_list_cb, NULL);
+	char self[1024];
+	if (self_exe_path(self, sizeof(self))) {
+		printf("  (this CLI: %s)\n", self);
+	}
+	return 0;
+}
+
+static int
+cmd_store(const char *op, int argc, const char **argv)
+{
+	char exe[1024];
+	if (!resolve_exe_arg(argc, argv, 3, exe, sizeof(exe))) {
+		printf("usage: displayxr-cli camera %s <exe>|--self\n", op);
+		return 1;
+	}
+	const struct u_camera_consent_store_ops *st = u_camera_consent_store_default();
+	bool ok;
+	if (strcmp(op, "allow") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_ALLOW);
+	} else if (strcmp(op, "deny") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_DENY);
+	} else if (strcmp(op, "revoke") == 0) {
+		ok = st->set(NULL, exe, U_CAMERA_CONSENT_STORED_NONE);
+	} else if (strcmp(op, "trust") == 0) {
+		// A stored Deny outranks delegation (spec §7.1), so trusting over it
+		// would "succeed" and change nothing. `trust` is the user's newer,
+		// explicit word on this executable — like `allow` replacing a Deny —
+		// so it clears the Deny first and says so. (An installer's machine-
+		// wide registration never does: there the user's Deny keeps winning.)
+		enum u_camera_consent_stored prev = U_CAMERA_CONSENT_STORED_NONE;
+		if (st->get(NULL, exe, &prev) && prev == U_CAMERA_CONSENT_STORED_DENY) {
+			if (!st->set(NULL, exe, U_CAMERA_CONSENT_STORED_NONE)) {
+				printf(
+				    "trust %s: FAILED to clear the stored Deny (which would keep refusing it); nothing "
+				    "changed\n",
+				    exe);
+				return 2;
+			}
+			printf("trust %s: cleared the stored Deny for it\n", exe);
+		}
+		// Spec §7.1.1: an executable outside the admin-protected folders is only
+		// delegated when it is Authenticode-signed by the signer recorded here.
+		char signer[U_CAMERA_CONSENT_SIGNER_MAX] = {0};
+		int si = cli_flag_index(argc, argv, "--signer");
+		if (si > 0 && !arg_utf8(argc, argv, si + 1, signer, sizeof(signer))) {
+			printf("usage: displayxr-cli camera trust <exe>|--self [--signer \"<CN>\"]\n");
+			return 1;
+		}
+		ok = u_camera_consent_store_set_delegating(exe, true, signer);
+		if (ok && u_camera_consent_path_user_writable(exe)) {
+			char actual[U_CAMERA_CONSENT_SIGNER_MAX];
+			bool is_signed = u_camera_consent_exe_signer(exe, actual, sizeof(actual));
+			if (signer[0] == '\0') {
+				printf(
+				    "  note: %s is in a user-writable location: without --signer \"<CN>\" this entry "
+				    "is NOT "
+				    "applied (the app is prompted like any other)%s%s%s\n",
+				    exe, is_signed ? "; it is signed by \"" : "", is_signed ? actual : "",
+				    is_signed ? "\"" : "");
+			} else if (!is_signed) {
+				printf("  note: %s has no valid code signature: this entry is NOT applied\n", exe);
+			} else if (!u_camera_consent_signer_equal(actual, signer)) {
+				printf("  note: %s is signed by \"%s\", not \"%s\": this entry is NOT applied\n", exe,
+				       actual, signer);
+			}
+		}
+	} else { // untrust
+		ok = u_camera_consent_store_set_delegating(exe, false, NULL);
+	}
+	printf("%s %s: %s\n", op, exe, ok ? "ok (takes effect on the next stream start)" : "FAILED to write the store");
+	if (ok && strcmp(op, "deny") == 0 && u_camera_consent_is_registered_delegating(st, NULL, exe)) {
+		printf("  note: %s is also a registered consent-delegating client; the stored Deny wins\n", exe);
+	}
+	return ok ? 0 : 2;
+}
+
+/*!
+ * `camera signer <exe>|--self`: what §7.1.1 sees for an executable — is its
+ * path user-writable, and its valid Authenticode signer (if any). Exit 0 when
+ * validly signed, 3 when not (so a script can tell).
+ */
+static int
+cmd_signer(int argc, const char **argv)
+{
+	char exe[1024];
+	if (!resolve_exe_arg(argc, argv, 3, exe, sizeof(exe))) {
+		printf("usage: displayxr-cli camera signer <exe>|--self\n");
+		return 1;
+	}
+	char cn[U_CAMERA_CONSENT_SIGNER_MAX];
+	bool is_signed = u_camera_consent_exe_signer(exe, cn, sizeof(cn));
+	bool uw = u_camera_consent_path_user_writable(exe);
+	printf("%s\n  path:      %s\n  signature: %s%s%s\n", exe,
+	       uw ? "USER-WRITABLE (a delegating entry needs a matching signer)"
+	          : "admin-protected (a delegating entry is trusted by path)",
+	       is_signed ? "valid, signer \"" : "none / not valid", is_signed ? cn : "", is_signed ? "\"" : "");
+	return is_signed ? 0 : 3;
+}
+
+static int
+cmd_control(uint32_t op, uint32_t arg, const char *what)
+{
+	struct ipc_connection ipc_c = {0};
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_DIAG, 0)) {
+		return 2;
+	}
+	uint32_t value = 0;
+	xrt_result_t xret = ipc_client_stereo_camera_control(&ipc_c, op, arg, &value);
+	if (xret != XRT_SUCCESS) {
+		printf("%s failed: %d%s\n", what, (int)xret, result_hint(xret));
+	} else if (op == XRT_STEREO_CAMERA_CONTROL_STATUS) {
+		printf("stereo camera: sharing %s, session %s, %u started stream(s)\n", (value & 1u) ? "on" : "OFF",
+		       (value & 2u) ? "LOCKED" : "unlocked", (value >> 8) & 0xffu);
+	} else if (op == XRT_STEREO_CAMERA_CONTROL_STOP_ALL) {
+		printf("%s: %u stream(s) ended\n", what, value);
+	} else {
+		printf("%s: ok\n", what);
+	}
+	ipc_client_connection_fini(&ipc_c);
+	return xret == XRT_SUCCESS ? 0 : 2;
+}
+
+static bool
+on_off_arg(int argc, const char **argv, int idx, uint32_t *out)
+{
+	if (idx >= argc) {
+		return false;
+	}
+	if (strcmp(argv[idx], "on") == 0 || strcmp(argv[idx], "1") == 0) {
+		*out = 1;
+		return true;
+	}
+	if (strcmp(argv[idx], "off") == 0 || strcmp(argv[idx], "0") == 0) {
+		*out = 0;
+		return true;
+	}
+	return false;
+}
+
+/*
+ *
+ * uvc-devices (ADR-043 Amendment 4): local, no service.
+ *
+ */
+
+static const char *
+uvc_layout_str(uint32_t l)
+{
+	return l == U_STEREO_UVC_LAYOUT_SBS_HALF ? "sbs-half" : "sbs-full";
+}
+
+/*!
+ * `camera uvc-devices [--modes]`: the UVC stereo camera config as the service
+ * would read it (path, parse result, entries) and the capture devices present,
+ * each marked with the entry that would claim it. Enumeration activates no
+ * device. --modes lists the capture modes of the MATCHED devices only (that
+ * instantiates the device object, never starts it): an unmatched device — the
+ * display's own tracker camera, say — is never touched.
+ */
+static int
+cmd_uvc_devices(int argc, const char **argv)
+{
+	bool modes = cli_has_flag(argc, argv, "--modes");
+	if (cli_has_flag(argc, argv, "--decoder")) {
+		// The decode path the service's open() would take — touches no camera.
+		static char report[8192];
+		os_uvc_capture_decoder_report(report, sizeof(report));
+		printf("UVC MJPEG decode path:\n%s", report);
+		printf(
+		    "(the service log line \"uvc capture (<backend>): started ... decoder ...\" confirms the "
+		    "decoder actually used, per open)\n\n");
+	}
+	struct u_stereo_uvc_config cfg;
+	char path[1024], err[256] = {0};
+	enum u_stereo_uvc_config_load_result r = u_stereo_uvc_config_load(&cfg, path, sizeof(path), err, sizeof(err));
+	printf("UVC stereo camera config: %s\n", path[0] ? path : "(no per-user config directory)");
+	switch (r) {
+	case U_STEREO_UVC_CONFIG_OK:
+		printf("  OK — %u entr%s%s\n", cfg.count, cfg.count == 1 ? "y" : "ies",
+		       cfg.fake ? ", FAKE synthetic device (replaces real capture)" : "");
+		break;
+	case U_STEREO_UVC_CONFIG_INVALID: printf("  INVALID — %s (the service claims nothing)\n", err); break;
+	default: printf("  none — %s (the service claims nothing; this is the default)\n", err); break;
+	}
+	for (uint32_t e = 0; e < cfg.count; e++) {
+		const struct u_stereo_uvc_entry *en = &cfg.entries[e];
+		char mode[48] = "auto", eye[32] = "auto";
+		if (en->mode_width > 0) {
+			snprintf(mode, sizeof(mode), "%ux%u@%.1f", en->mode_width, en->mode_height, en->mode_fps);
+		}
+		if (en->eye_width > 0) {
+			snprintf(eye, sizeof(eye), "%ux%u", en->eye_width, en->eye_height);
+		}
+		printf("  entry %u: match \"%s\"", e, en->name_contains);
+		if (en->match_vid_pid) {
+			printf(" vid_pid %04x:%04x", en->vid, en->pid);
+		}
+		printf(", layout %s, eyes %s, mode %s, eye_size %s, baseline %.1f mm, hfov %.1f deg%s%s\n",
+		       uvc_layout_str(en->layout), en->swap_eyes ? "rl" : "lr", mode, eye, en->baseline_mm,
+		       en->hfov_deg, en->calibration[0] ? ", calibration " : " (nominal model)", en->calibration);
+	}
+
+	struct u_stereo_uvc_backend backend;
+	if (cfg.fake) {
+		u_stereo_uvc_fake_backend_init(&backend, &cfg.fake_params);
+	} else if (!os_uvc_capture_backend(&backend)) {
+		printf("capture backend: none on this platform\n");
+		return 0;
+	}
+	struct u_stereo_uvc_device devs[U_STEREO_UVC_MAX_DEVICES];
+	memset(devs, 0, sizeof(devs));
+	uint32_t n = backend.enumerate(backend.ctx, devs, U_STEREO_UVC_MAX_DEVICES);
+	n = n > U_STEREO_UVC_MAX_DEVICES ? U_STEREO_UVC_MAX_DEVICES : n;
+	printf("capture backend: %s, %u device(s)\n", backend.name, n);
+	// The service's own rule (u_stereo_uvc_assign) with the built-in
+	// tracker-camera denylist (Amendment 5); the plug-in's own camera hints and
+	// declared cameras are applied by the service, which the CLI cannot see.
+	bool refused[U_STEREO_UVC_MAX_DEVICES] = {0};
+	for (uint32_t i = 0; i < n; i++) {
+		refused[i] = u_stereo_uvc_refusal(&devs[i], NULL) != U_STEREO_UVC_REFUSAL_NONE;
+	}
+	int32_t assigned[U_STEREO_UVC_MAX_ENTRIES];
+	u_stereo_uvc_assign(&cfg, devs, n, refused, assigned);
+	for (uint32_t e = 0; e < cfg.count; e++) {
+		if (assigned[e] == U_STEREO_UVC_ASSIGN_AMBIGUOUS) {
+			printf(
+			    "  entry %u: AMBIGUOUS — \"%s\" matches several devices; the service claims none for it "
+			    "(make \"match\" more specific or add \"vid_pid\")\n",
+			    e, cfg.entries[e].name_contains);
+		} else if (assigned[e] < 0) {
+			printf("  entry %u: matches no device present\n", e);
+		}
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		struct u_stereo_uvc_device *d = &devs[i];
+		int32_t entry = -1;
+		for (uint32_t e = 0; e < cfg.count; e++) {
+			if (assigned[e] == (int32_t)i) {
+				entry = (int32_t)e;
+			}
+		}
+		char vp[16] = "none";
+		if (d->has_vid_pid) {
+			snprintf(vp, sizeof(vp), "%04x:%04x", d->vid, d->pid);
+		}
+		printf("  [%u] \"%s\"  VID:PID %s  %s\n", i, d->name, vp,
+		       refused[i]   ? "REFUSED: built-in tracker-camera denylist (never claimed or opened)"
+		       : entry >= 0 ? "<- CLAIMED by the config"
+		                    : "(not claimed: never touched)");
+		printf("       id %s\n", d->id);
+		if (entry >= 0) {
+			const struct u_stereo_uvc_entry *en = &cfg.entries[entry];
+			printf(
+			    "       entry %d; the service refuses it if the display plug-in reports or declares it as "
+			    "its (tracker) camera\n",
+			    entry);
+			if (modes && backend.list_modes != NULL) {
+				struct u_stereo_uvc_mode ms[U_STEREO_UVC_MAX_MODES];
+				uint32_t nm = backend.list_modes(backend.ctx, d->id, ms, U_STEREO_UVC_MAX_MODES);
+				printf("       %u mode(s) (NV12 / YUY2 / MJPEG):\n", nm);
+				for (uint32_t k = 0; k < nm; k++) {
+					uint32_t ew = 0, eh = 0;
+					bool ok = u_stereo_uvc_eye_size(en->layout, ms[k].width, ms[k].height,
+					                                en->eye_width, en->eye_height, &ew, &eh);
+					printf("         %ux%u@%.2f", ms[k].width, ms[k].height, ms[k].fps);
+					if (ok) {
+						printf("  -> %s %ux%u per eye (SBS %ux%u)", uvc_layout_str(en->layout),
+						       ew, eh, 2 * ew, eh);
+					}
+					printf("\n");
+				}
+			}
+		}
+	}
+	if (!modes && cfg.count > 0) {
+		printf("(add --modes to list the capture modes of the claimed device(s); the device is not started)\n");
+	}
+	return 0;
+}
+
+/*!
+ * `camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N]`:
+ * decode a media FILE (Windows: e.g. a 4K MJPEG AVI, through the GPU decode +
+ * scale and staging readback; Linux: a concatenated MJPEG stream such as
+ * `ffmpeg -f mjpeg` writes, through the CPU decoder) along the exact open /
+ * read path the service uses for a UVC webcam (same decoder policy, then the
+ * source's split), unpaced, and report the throughput. No camera, no service. DXR_STEREO_CAMERA_UVC_DECODER applies.
+ */
+static int
+cmd_uvc_decode_bench(int argc, const char **argv)
+{
+	if (argc < 4 || argv[3][0] == '-') {
+		printf(
+		    "usage: displayxr-cli camera uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] "
+		    "[--frames N]\n");
+		return 1;
+	}
+	uint32_t layout = U_STEREO_UVC_LAYOUT_SBS_HALF, want_w = 0, want_h = 0, max_frames = 600;
+	bool verbose = cli_has_flag(argc, argv, "--verbose");
+	for (int i = 4; i < argc; i++) {
+		if (strcmp(argv[i], "--layout") == 0 && i + 1 < argc) {
+			layout = strcmp(argv[++i], "sbs-full") == 0 ? U_STEREO_UVC_LAYOUT_SBS_FULL
+			                                            : U_STEREO_UVC_LAYOUT_SBS_HALF;
+		} else if (strcmp(argv[i], "--eye") == 0 && i + 1 < argc) {
+			if (sscanf(argv[++i], "%ux%u", &want_w, &want_h) != 2) {
+				want_w = want_h = 0;
+			}
+		} else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+			max_frames = (uint32_t)strtoul(argv[++i], NULL, 10);
+		}
+	}
+	struct u_stereo_uvc_backend b;
+	if (!os_uvc_capture_backend(&b)) {
+		printf("no capture backend on this platform\n");
+		return 2;
+	}
+	char id[1100];
+	snprintf(id, sizeof(id), "file:%s", argv[3]);
+	struct u_stereo_uvc_mode modes[U_STEREO_UVC_MAX_MODES];
+	uint32_t nm = b.list_modes(b.ctx, id, modes, U_STEREO_UVC_MAX_MODES);
+	if (nm == 0) {
+		printf("cannot read \"%s\" (no NV12 / YUY2 / MJPEG video stream)\n", argv[3]);
+		return 2;
+	}
+	uint32_t ew = 0, eh = 0;
+	if (!u_stereo_uvc_eye_size(layout, modes[0].width, modes[0].height, want_w, want_h, &ew, &eh)) {
+		printf("%ux%u cannot be split\n", modes[0].width, modes[0].height);
+		return 2;
+	}
+	struct u_stereo_camera_planes lay;
+	if (!u_stereo_camera_layout(XRT_STEREO_CAMERA_FORMAT_NV12, 2 * ew, eh, &lay)) {
+		return 2;
+	}
+	uint8_t *dst = malloc((size_t)lay.size);
+	void *h = NULL;
+	if (dst == NULL || !b.open(b.ctx, id, &modes[0], 2 * ew, eh, &h)) {
+		printf("open failed (see the WARN lines above)\n");
+		free(dst);
+		return 2;
+	}
+	printf("file %ux%u@%.2f -> %s, %ux%u per eye (SBS %ux%u)\n", modes[0].width, modes[0].height, modes[0].fps,
+	       layout == U_STEREO_UVC_LAYOUT_SBS_FULL ? "sbs-full" : "sbs-half", ew, eh, 2 * ew, eh);
+	uint32_t frames = 0, raw_w = 0, raw_h = 0;
+	int64_t read_ns = 0, split_ns = 0, lat_ns = 0, t_first = 0, t_last = 0;
+	const int64_t t_start = os_monotonic_get_ns();
+	while (frames < max_frames) {
+		struct u_stereo_uvc_raw_frame raw;
+		int64_t t0 = os_monotonic_get_ns();
+		uint32_t r = b.read(h, 100ll * 1000 * 1000, &raw);
+		int64_t t1 = os_monotonic_get_ns();
+		// A TIMEOUT is not the end (the GPU path's first read only primes its
+		// readback ring): stop after 2 s without a frame, or on ERROR (end of file).
+		if (r == U_STEREO_UVC_READ_TIMEOUT && t1 - (frames > 0 ? t_last : t_start) < 2000ll * 1000 * 1000) {
+			continue;
+		}
+		if (r != U_STEREO_UVC_READ_OK) {
+			if (verbose) {
+				printf("  read #%u -> %s after %.2f ms\n", frames,
+				       r == U_STEREO_UVC_READ_TIMEOUT ? "TIMEOUT" : "ERROR", (double)(t1 - t0) * 1e-6);
+			}
+			break; // end of file (or a failure)
+		}
+		bool ok = u_stereo_uvc_split(&raw, false, ew, eh, dst, &lay);
+		int64_t t2 = os_monotonic_get_ns();
+		if (verbose && frames < 8) {
+			printf("  frame %u: read %.2f ms, split %.2f ms, %ux%u\n", frames, (double)(t1 - t0) * 1e-6,
+			       (double)(t2 - t1) * 1e-6, raw.width, raw.height);
+		}
+		if (!ok) {
+			printf("split failed on a %ux%u frame\n", raw.width, raw.height);
+			break;
+		}
+		if (frames == 0) {
+			t_first = t2;
+			raw_w = raw.width;
+			raw_h = raw.height;
+		} else {
+			read_ns += t1 - t0;
+			split_ns += t2 - t1;
+			// Arrival of the decoded sample in the reader callback -> split done.
+			lat_ns += raw.time_ns > 0 && t2 > raw.time_ns ? t2 - raw.time_ns : 0;
+		}
+		t_last = t2;
+		frames++;
+	}
+	b.close(h);
+	// Image-content check of the last delivered SBS frame: per eye, the mean
+	// luma of its outer 5 % columns against its centre half. A letterboxed /
+	// pillarboxed scale (black side bars) shows as dark edges — meaningful on
+	// a test file whose picture is bright edge to edge.
+	bool bars = false;
+	if (frames > 0) {
+		const uint32_t edge = ew / 20 > 0 ? ew / 20 : 1;
+		for (uint32_t e = 0; e < 2; e++) {
+			double sum[3] = {0, 0, 0};
+			uint64_t cnt[3] = {0, 0, 0};
+			for (uint32_t y = 0; y < eh; y++) {
+				const uint8_t *row = dst + lay.offset[0] + (size_t)y * lay.pitch[0] + (size_t)e * ew;
+				for (uint32_t x = 0; x < ew; x++) {
+					int k = x < edge                          ? 0
+					        : x >= ew - edge                  ? 2
+					        : (x >= ew / 4 && x < ew * 3 / 4) ? 1
+					                                          : -1;
+					if (k >= 0) {
+						sum[k] += row[x];
+						cnt[k]++;
+					}
+				}
+			}
+			double l = sum[0] / (double)cnt[0], c = sum[1] / (double)cnt[1], r = sum[2] / (double)cnt[2];
+			bool dark = c > 40.0 && (l < 0.5 * c || r < 0.5 * c);
+			bars |= dark;
+			printf("content check, %s eye: mean luma outer-left %.1f / centre %.1f / outer-right %.1f%s\n",
+			       e == 0 ? "left" : "right", l, c, r,
+			       dark ? "  <- DARK SIDE BARS (letterboxed scale?)" : "");
+		}
+	}
+	free(dst);
+	if (frames < 2) {
+		printf("decoded %u frame(s) — nothing to measure\n", frames);
+		return 3;
+	}
+	double secs = (double)(t_last - t_first) * 1e-9;
+	printf(
+	    "delivered %u frames in %.2f s = %.1f frames/s (read rate; requests paced to the file's frame rate); "
+	    "raw frame %ux%u%s\n",
+	    frames, secs, (frames - 1) / secs, raw_w, raw_h,
+	    raw_w == 2 * ew && raw_h == eh ? " (scaled by the decoder path)" : " (full size: CPU downscale)");
+	printf(
+	    "per frame: read (wait + readback) %.2f ms, split / resample %.2f ms; decoded-sample -> split-done "
+	    "latency %.2f ms\n",
+	    (double)read_ns / (frames - 1) * 1e-6, (double)split_ns / (frames - 1) * 1e-6,
+	    (double)lat_ns / (frames - 1) * 1e-6);
+	if (bars) {
+		printf("FAIL: dark side bars in the delivered frame — the scale is not a plain resize\n");
+		return 4;
+	}
+	return 0;
+}
+
+static void
+usage(void)
+{
+	printf(
+	    "usage: displayxr-cli camera list [--json] | calib <id> [--raw|--rectified] [--json] |\n"
+	    "       probe [<id>] [--raw|--rectified] [--format gray8|nv12|bgra8] [--fps F] [--frames N] "
+	    "[--seconds S] "
+	    "[--out DIR]\n"
+	    "             [--max-disparity N] [--max-dy N (24)] [--min-ncc C (0.90)]\n"
+	    "       list|calib|probe ... --decline-delegation   declare DECLINE_DELEGATION (spec v3)\n"
+	    "       consent                      list the consent store\n"
+	    "       allow|deny|revoke <exe>|--self   stored per-app decision (local)\n"
+	    "       trust <exe>|--self [--signer \"<CN>\"] | untrust <exe>|--self\n"
+	    "                                    user-level consent-delegating list (local; trust clears a stored "
+	    "Deny;\n"
+	    "                                    a user-writable <exe> needs --signer, spec 7.1.1)\n"
+	    "       signer <exe>|--self          path class + Authenticode signer (exit 3 = not validly signed)\n"
+	    "       uvc-devices [--modes] [--decoder]  UVC stereo webcam config + capture devices (local;\n"
+	    "                                    --modes: capture modes of the CLAIMED devices only, never\n"
+	    "                                    started; --decoder: hardware/software MJPEG decode path)\n"
+	    "       uvc-decode-bench <file> [--layout sbs-half|sbs-full] [--eye WxH] [--frames N]\n"
+	    "                                    decode a media file through the webcam path (no camera)\n"
+	    "       status | stop-all | sharing on|off | fake-lock on|off   (over IPC, DIAG)\n"
+	    "exit codes: 4 consent refused, 6 sharing off, 7 busy, 8 ended by the service, 5 rows misaligned\n");
+}
+
+int
+cli_cmd_camera(int argc, const char **argv)
+{
+	const char *sub = argc >= 3 ? argv[2] : "list";
+	bool json = cli_has_flag(argc, argv, "--json");
+
+	// Local store edits: no service needed.
+	if (strcmp(sub, "consent") == 0) {
+		return cmd_consent();
+	}
+	if (strcmp(sub, "allow") == 0 || strcmp(sub, "deny") == 0 || strcmp(sub, "revoke") == 0 ||
+	    strcmp(sub, "trust") == 0 || strcmp(sub, "untrust") == 0) {
+		return cmd_store(sub, argc, argv);
+	}
+	if (strcmp(sub, "signer") == 0) {
+		return cmd_signer(argc, argv);
+	}
+	if (strcmp(sub, "uvc-devices") == 0) {
+		return cmd_uvc_devices(argc, argv);
+	}
+	if (strcmp(sub, "uvc-decode-bench") == 0) {
+		return cmd_uvc_decode_bench(argc, argv);
+	}
+	// Control ops: DIAG class over IPC.
+	uint32_t onoff = 0;
+	if (strcmp(sub, "status") == 0) {
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_STATUS, 0, "status");
+	}
+	if (strcmp(sub, "stop-all") == 0) {
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_STOP_ALL, 0, "stop-all");
+	}
+	if (strcmp(sub, "sharing") == 0) {
+		if (!on_off_arg(argc, argv, 3, &onoff)) {
+			usage();
+			return 1;
+		}
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_SET_SHARING, onoff, onoff ? "sharing on" : "sharing off");
+	}
+	if (strcmp(sub, "fake-lock") == 0) {
+		if (!on_off_arg(argc, argv, 3, &onoff)) {
+			usage();
+			return 1;
+		}
+		return cmd_control(XRT_STEREO_CAMERA_CONTROL_SET_LOCKED, onoff, onoff ? "fake-lock on" : "fake-lock off");
+	}
+	if (strcmp(sub, "list") != 0 && strcmp(sub, "calib") != 0 && strcmp(sub, "probe") != 0) {
+		usage();
+		return 1;
+	}
+
+	// The consumer path: the same class a browser's capture utility declares.
+	struct ipc_connection ipc_c = {0};
+	// --decline-delegation: XR_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION_BIT_DXR, as a
+	// browser running with its own permission prompt bypassed declares it (spec v3).
+	uint64_t client_flags = XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY;
+	if (cli_has_flag(argc, argv, "--decline-delegation")) {
+		client_flags |= XRT_STEREO_CAMERA_CLIENT_DECLINE_DELEGATION;
+	}
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER, client_flags)) {
+		return 2;
+	}
+	int ret;
+	if (strcmp(sub, "list") == 0) {
+		ret = cmd_list(&ipc_c, json, false);
+	} else if (strcmp(sub, "calib") == 0 && argc >= 4) {
+		uint32_t output = cli_has_flag(argc, argv, "--rectified") ? XRT_STEREO_CAMERA_OUTPUT_RECTIFIED
+		                                                          : XRT_STEREO_CAMERA_OUTPUT_RAW;
+		ret = cmd_calib(&ipc_c, strtoull(argv[3], NULL, 10), output, json);
+	} else if (strcmp(sub, "probe") == 0) {
+		ret = cmd_probe(&ipc_c, argc, argv, false);
+	} else {
+		usage();
+		ret = 1;
+	}
+	ipc_client_connection_fini(&ipc_c);
+	return ret;
+}
+
+static void
+share_settings_print(void)
+{
+	struct u_app_share_settings st;
+	u_app_share_settings_load(&st);
+	char path[1024] = "";
+	(void)u_camera_consent_store_path(path, sizeof(path));
+	printf("share.prompt     %s\nshare.resolution %s\n(per-user consent store, namespace \"share\"%s%s)\n",
+	       u_app_share_prompt_mode_str(st.prompt), u_app_share_resolution_str(st.resolution), path[0] ? ": " : "",
+	       path);
+}
+
+/*!
+ * ADR-061: `displayxr-cli share list|probe|settings` — aliases of `camera
+ * list|probe` restricted to app entries, plus the local share.* settings.
+ */
+int
+cli_cmd_share(int argc, const char **argv)
+{
+	const char *sub = argc >= 3 ? argv[2] : "list";
+	if (strcmp(sub, "settings") == 0) {
+		if ((argc - 3) % 2 != 0) {
+			printf("usage: displayxr-cli share settings [prompt always|per-app-run] [resolution 720p|1080p]\n");
+			return 1;
+		}
+		for (int i = 3; i + 1 < argc; i += 2) {
+			if (!u_app_share_settings_set(argv[i], argv[i + 1])) {
+				printf("share settings: cannot set %s = %s (prompt always|per-app-run, resolution "
+				       "720p|1080p)\n",
+				       argv[i], argv[i + 1]);
+				return 1;
+			}
+			printf("share.%s = %s\n", argv[i], argv[i + 1]);
+		}
+		share_settings_print();
+		return 0;
+	}
+	if (strcmp(sub, "list") != 0 && strcmp(sub, "probe") != 0) {
+		printf(
+		    "usage: displayxr-cli share list [--json]\n"
+		    "       displayxr-cli share probe [<id>] [--frames N] [--seconds S] [--out DIR]\n"
+		    "       displayxr-cli share settings [prompt always|per-app-run] [resolution 720p|1080p]\n");
+		return 1;
+	}
+	struct ipc_connection ipc_c = {0};
+	if (!cam_connect(&ipc_c, XRT_CLIENT_CLASS_CAMERA_CONSUMER, XRT_STEREO_CAMERA_CLIENT_CONSUMER_ONLY)) {
+		return 2;
+	}
+	int ret = strcmp(sub, "list") == 0 ? cmd_list(&ipc_c, cli_has_flag(argc, argv, "--json"), true)
+	                                   : cmd_probe(&ipc_c, argc, argv, true);
+	ipc_client_connection_fini(&ipc_c);
+	return ret;
+}
+
+#else // !CLI_HAVE_IPC
+
+#include <stdio.h>
+
+int
+cli_cmd_camera(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	printf("displayxr-cli camera: this build has no IPC client (XRT_FEATURE_SERVICE off).\n");
+	return 1;
+}
+
+int
+cli_cmd_share(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	printf("displayxr-cli share: this build has no IPC client (XRT_FEATURE_SERVICE off).\n");
+	return 1;
+}
+
+#endif

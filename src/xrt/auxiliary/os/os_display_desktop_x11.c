@@ -36,6 +36,32 @@
  * same `XRRGetMonitors` result (@ref query_monitors), so they cannot disagree
  * about the layout — which matters, because panel selection consults both.
  *
+ * ## An X error on our connection stays on our connection (#2311)
+ *
+ * Every connection here is private and only queried, so an X error on it just
+ * means "that output is gone / unreadable", which every caller already treats
+ * as unknown. Left to Xlib, though, it goes to the process-global error
+ * handler, and the default one prints "X Error of failed request" and exits
+ * the HOST process. Since the in-process display-hotplug sweep (#2305) re-reads
+ * RandR around every topology change, an output destroyed between
+ * XRRGetMonitors and XRRGetOutputProperty (XWayland destroys a monitor's
+ * output with it) killed the app with BadRROutput.
+ *
+ * So each connection carries its own error hook (@ref x11_open_private): the
+ * per-display hook of Xlib's extension interface (XAddExtension + XESetError),
+ * which `_XReply` offers every error on that connection before the global
+ * handler. Every request here waits for its reply, so every error passes it.
+ *
+ * Not XSetErrorHandler: that handler is process-wide. Swapped in from the
+ * sweep's worker thread it would also swallow the app's own errors raised on
+ * its render / event thread meanwhile (a toolkit's error trap then misses
+ * them), and a save / restore interleaved with the app or a toolkit doing the
+ * same can leave the wrong handler installed for good. The hook is state of a
+ * Display only the calling thread uses and dies with XCloseDisplay: no global
+ * state, nothing to restore, nothing to race. xcb's checked requests would
+ * isolate errors too, at the price of rewriting both readers against two more
+ * dlopen'd libraries.
+ *
  * ## Wayland
  *
  * Not handled here, and not handleable: a Wayland client is deliberately denied
@@ -46,6 +72,8 @@
  */
 
 #include "os_display_desktop.h"
+#include "os_display_connector_linux.h"
+#include "os_display_edid_linux.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -74,6 +102,18 @@ struct os_xrr_monitor_info
 	void *outputs;
 };
 
+//! XExtCodes; only `extension` is read.
+struct os_x_ext_codes
+{
+	int extension;
+	int major_opcode;
+	int first_event;
+	int first_error;
+};
+
+//! An XESetError hook: (display, xError *, codes, ret_code), True suppresses the error.
+typedef int (*os_x_error_hook)(os_x_display *, void *, struct os_x_ext_codes *, int *);
+
 struct x11_fns
 {
 	void *lib_x11;
@@ -84,9 +124,28 @@ struct x11_fns
 	os_x_window (*XDefaultRootWindow)(os_x_display *);
 	char *(*XGetAtomName)(os_x_display *, os_x_atom);
 	int (*XFree)(void *);
+	struct os_x_ext_codes *(*XAddExtension)(os_x_display *);
+	os_x_error_hook (*XESetError)(os_x_display *, int, os_x_error_hook);
 
 	struct os_xrr_monitor_info *(*XRRGetMonitors)(os_x_display *, os_x_window, int, int *);
 	void (*XRRFreeMonitors)(struct os_xrr_monitor_info *);
+
+	// Optional: only the EDID reader uses these, and a missing one just means
+	// "no EDID from the X server".
+	os_x_atom (*XInternAtom)(os_x_display *, const char *, int);
+	int (*XRRGetOutputProperty)(os_x_display *,
+	                            unsigned long,
+	                            os_x_atom,
+	                            long,
+	                            long,
+	                            int,
+	                            int,
+	                            os_x_atom,
+	                            os_x_atom *,
+	                            int *,
+	                            unsigned long *,
+	                            unsigned long *,
+	                            unsigned char **);
 };
 
 static bool
@@ -120,10 +179,17 @@ x11_fns_load(struct x11_fns *f)
 	LOAD(lib_x11, XDefaultRootWindow, "XDefaultRootWindow");
 	LOAD(lib_x11, XGetAtomName, "XGetAtomName");
 	LOAD(lib_x11, XFree, "XFree");
+	// Required, not optional: no request goes out on a connection without
+	// the error hook (#2311). Both are in every libX11 since X11R4.
+	LOAD(lib_x11, XAddExtension, "XAddExtension");
+	LOAD(lib_x11, XESetError, "XESetError");
 	LOAD(lib_xrandr, XRRGetMonitors, "XRRGetMonitors");
 	LOAD(lib_xrandr, XRRFreeMonitors, "XRRFreeMonitors");
 
 #undef LOAD
+
+	*(void **)(&f->XInternAtom) = dlsym(f->lib_x11, "XInternAtom");
+	*(void **)(&f->XRRGetOutputProperty) = dlsym(f->lib_xrandr, "XRRGetOutputProperty");
 
 	return true;
 
@@ -144,6 +210,44 @@ x11_fns_unload(struct x11_fns *f)
 		dlclose(f->lib_x11);
 	}
 	memset(f, 0, sizeof(*f));
+}
+
+/*!
+ * Every X error on a private connection: suppressed, and the request that
+ * raised it returns its failure value (NULL / None / the error code), which
+ * the callers already handle as "unknown" (#2311).
+ */
+static int
+x11_private_error_hook(os_x_display *dpy, void *err, struct os_x_ext_codes *codes, int *ret_code)
+{
+	(void)dpy;
+	(void)err;
+	(void)codes;
+	*ret_code = 0; // what _XReply returns: no reply
+	return 1;
+}
+
+/*!
+ * XOpenDisplay(NULL) with @ref x11_private_error_hook installed on the new
+ * connection, before its first request (see "An X error on our connection" at
+ * the top). NULL when there is no display, or when the hook cannot be
+ * installed: then no request is sent at all.
+ */
+static os_x_display *
+x11_open_private(const struct x11_fns *f)
+{
+	// NULL honours $DISPLAY.
+	os_x_display *dpy = f->XOpenDisplay(NULL);
+	if (dpy == NULL) {
+		return NULL;
+	}
+	const struct os_x_ext_codes *codes = f->XAddExtension(dpy);
+	if (codes == NULL) {
+		f->XCloseDisplay(dpy);
+		return NULL;
+	}
+	(void)f->XESetError(dpy, codes->extension, x11_private_error_hook);
+	return dpy;
 }
 
 //! Squared distance from (x, y) to the nearest edge of a monitor rect, 0 inside.
@@ -189,9 +293,9 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 
 	uint32_t written = 0;
 
-	// NULL honours $DISPLAY. No display (headless, or pure Wayland with no
-	// XWayland) is a normal "unknown", not a failure to report.
-	os_x_display *dpy = f.XOpenDisplay(NULL);
+	// No display (headless, or pure Wayland with no XWayland) is a normal
+	// "unknown", not a failure to report.
+	os_x_display *dpy = x11_open_private(&f);
 	if (dpy != NULL) {
 		int count = 0;
 		os_x_window root = f.XDefaultRootWindow(dpy);
@@ -212,8 +316,10 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 				o->height = (uint32_t)m->height;
 				o->is_primary = m->primary != 0;
 
-				// X11 root coordinates are device pixels with no scaling
-				// layer, so the plug-in reads the same space we do.
+				// The plug-in has no DPI virtualisation to undo here, so
+				// it reads the same space we do. NOTE this is NOT device
+				// pixels under XWayland at a non-unit scale — the
+				// connector's device mode is native_width/height.
 				o->width_in_caller_dpi = o->width;
 				o->height_in_caller_dpi = o->height;
 
@@ -244,6 +350,77 @@ query_monitors(struct os_display_desktop_info *out_infos, uint32_t max_infos)
 
 	x11_fns_unload(&f);
 
+	// The device mode behind each X11 rect (#1831): under XWayland the rect
+	// is in the scaled X screen, and the panel can only be recognised — and
+	// a 1:1 presentation only be judged — by what the connector runs.
+	os_display_connector_annotate(out_infos, written);
+
+	return written;
+}
+
+uint32_t
+os_display_x11_read_monitor_edids(struct os_display_randr_edid *out, uint32_t max)
+{
+	if (out == NULL || max == 0) {
+		return 0;
+	}
+	memset(out, 0, sizeof(*out) * max);
+
+	struct x11_fns f;
+	if (!x11_fns_load(&f)) {
+		return 0;
+	}
+	uint32_t written = 0;
+	// The output can be destroyed between XRRGetMonitors and its property read
+	// (a monitor unplugged mid-sweep): BadRROutput, absorbed by the
+	// connection's hook, and that monitor reads as having no EDID (#2311).
+	os_x_display *dpy = (f.XInternAtom != NULL && f.XRRGetOutputProperty != NULL) ? x11_open_private(&f) : NULL;
+	if (dpy != NULL) {
+		// only_if_exists: a server that never published an EDID property
+		// has no such atom, and creating one would be a side effect.
+		const os_x_atom edid_atom = f.XInternAtom(dpy, "EDID", 1);
+		int count = 0;
+		struct os_xrr_monitor_info *mons =
+		    edid_atom != 0 ? f.XRRGetMonitors(dpy, f.XDefaultRootWindow(dpy), 1, &count) : NULL;
+		for (int i = 0; mons != NULL && i < count && written < max; i++) {
+			const struct os_xrr_monitor_info *m = &mons[i];
+			if (m->width <= 0 || m->height <= 0) {
+				continue; // same filter as query_monitors, so names line up
+			}
+			struct os_display_randr_edid *o = &out[written++];
+			char *name = f.XGetAtomName(dpy, m->name);
+			if (name != NULL) {
+				(void)snprintf(o->name, sizeof(o->name), "%s", name);
+				f.XFree(name);
+			}
+			if (m->noutput < 1 || m->outputs == NULL) {
+				continue;
+			}
+			const unsigned long output = ((const unsigned long *)m->outputs)[0];
+			os_x_atom actual_type = 0;
+			int actual_format = 0;
+			unsigned long nitems = 0, bytes_after = 0;
+			unsigned char *prop = NULL;
+			// Length is in 32-bit units: 64 = 256 bytes.
+			if (f.XRRGetOutputProperty(dpy, output, edid_atom, 0, OS_DISPLAY_RANDR_EDID_MAX / 4, 0, 0,
+			                           0 /* AnyPropertyType */, &actual_type, &actual_format, &nitems,
+			                           &bytes_after, &prop) == 0 /* Success */
+			    && prop != NULL && actual_format == 8 && nitems >= 128) {
+				const uint32_t n =
+				    nitems > OS_DISPLAY_RANDR_EDID_MAX ? OS_DISPLAY_RANDR_EDID_MAX : (uint32_t)nitems;
+				memcpy(o->edid, prop, n);
+				o->len = n;
+			}
+			if (prop != NULL) {
+				f.XFree(prop);
+			}
+		}
+		if (mons != NULL) {
+			f.XRRFreeMonitors(mons);
+		}
+		f.XCloseDisplay(dpy);
+	}
+	x11_fns_unload(&f);
 	return written;
 }
 
@@ -283,4 +460,16 @@ os_display_desktop_info_at(int32_t x, int32_t y, struct os_display_desktop_info 
 	*out_info = mons[best];
 
 	return true;
+}
+
+bool
+os_display_desktop_info_for_handle(void *platform_handle, struct os_display_desktop_info *out_info)
+{
+	// No monitor handle on this platform: identity is the device name, which
+	// os_display_desktop_info_for_device matches against the enumeration.
+	(void)platform_handle;
+	if (out_info != NULL) {
+		memset(out_info, 0, sizeof(*out_info));
+	}
+	return false;
 }

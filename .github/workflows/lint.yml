@@ -23,6 +23,10 @@ name: lint
 #   plug-in built against another apiVersion and every in-process app
 #   silently runs in 2D. See scripts/check_cnsdk_pins.py.
 #
+# - Model-pack URL guard: the runtime installer's default conversion pack
+#   URL is derived from versions.json[conversion_open] (#2234). See
+#   scripts/check_models_pack_url.py.
+#
 # - GNOME Shell extension guard: contrib/gnome-shell/ has to load on
 #   every GNOME our .deb installs on, and those straddle the GNOME 45
 #   ES-module break (Ubuntu 22.04 is GNOME 42, 26.04 is GNOME 50). The
@@ -109,6 +113,56 @@ jobs:
         # extensions (displayxr-extensions#2).
         run: python3 scripts/gen_extensions_index.py --check --github
 
+      - name: XR_DXR_* ABI snapshot matches the headers
+        # tests/tests_dxr_abi_snapshot.cpp pins struct layouts, XrStructureType
+        # values and SPEC_VERSIONs that shipped apps are compiled against (its
+        # static_asserts fail the build on every platform when something moves).
+        # This step catches what the build cannot: an ADDITIVE change (a new
+        # struct or type value) that was never snapshotted and so is unpinned.
+        # Re-run the script and commit the diff to make the change deliberate.
+        run: python3 scripts/gen_dxr_abi_snapshot.py --check
+
+      - name: Developer-settings lever catalog matches the census
+        # src/xrt/targets/cli/cli_lever_catalog.h (what `displayxr-cli perf list
+        # --all` and the Dashboard's Developer settings list) is generated from
+        # Appendix A of docs/roadmap/control-panel-performance-settings.md. Fails
+        # when the header is stale, and when a Tier 1/2 name in the census no
+        # longer occurs as a string literal under src/xrt (a stale census row).
+        # Regenerate locally with: python3 scripts/gen_lever_catalog.py
+        run: python3 scripts/gen_lever_catalog.py --check --github
+
+  sim-plugin-getenv-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Reference plug-ins read settings through the host iface, never getenv
+        run: |
+          # ADR-054 decision 7 (N3c, #2050): a component reads its settings
+          # ONLY through its host iface (`get_setting`), never from its own
+          # environment -- in a satellite / the service the environment is the
+          # host's, not the user's shell, and the CLI's `options|set|unset`
+          # cannot reach a getenv. The in-tree reference plug-ins are the
+          # worked example every vendor copies, so they must not regress. The
+          # one allow-listed file per plug-in is its settings shim, where the
+          # legacy SIM_DISPLAY_* / DXR_SIM_INPUT* names live as aliases for one
+          # release. Add a key to the shim's table; never add a getenv.
+          MATCHES=$(grep -rnE '\b_?w?getenv(_s)?\s*\(' \
+            src/xrt/drivers/sim_display src/xrt/drivers/sim_input src/xrt/drivers/sim_conversion \
+            src/xrt/drivers/remote_conversion src/xrt/drivers/touch_input src/xrt/drivers/sim_tracking \
+            --include='*.c' --include='*.cpp' --include='*.h' --include='*.hpp' --include='*.m' --include='*.mm' \
+            | grep -vE '^src/xrt/drivers/(sim_display/sim_display_settings\.c|sim_input/sim_input_settings\.c):' \
+            || true)
+          if [ -n "$MATCHES" ]; then
+            echo "::error::getenv in a reference plug-in outside its settings shim (ADR-054 decision 7, N3c):"
+            echo "$MATCHES"
+            echo ""
+            echo "Read the knob through host->get_setting (sim_display_settings.h / sim_input_settings.h /"
+            echo "the conversion host iface) and declare it in describe_settings instead."
+            exit 1
+          fi
+          echo "Reference plug-ins read settings through the host iface only. ✓"
+
   vendor-docs-guard:
     runs-on: ubuntu-latest
     steps:
@@ -164,6 +218,75 @@ jobs:
         # shell. No GNOME needed.
         run: ./scripts/test_gnome_extension_variant.sh
 
+      - name: Drag-lattice entry choice
+        # Unit test for LatticeChoice in lib.js (extension version 9, #1748):
+        # which phase-correct table entry a compositor drag move lands on.
+        # Plain gjs drives the shipped file; no GNOME Shell needed.
+        run: gjs scripts/test_gnome_extension_lattice.js
+
+      - name: Move-sync frame logic
+        # Unit test for MoveSyncChoice in lib.js (extension versions 9-12,
+        # #1748): the frame-tag decode (against the runtime's encode), which
+        # position the actor is painted at, the stalled-app fallback, the
+        # v10 tag gate (no tag -> no hold; tag mid-drag; tag lost), and the
+        # v12 surface pick (main surface by texture, not size). Plain gjs.
+        run: gjs scripts/test_gnome_extension_move_sync.js
+
+      - name: Pointer drag ends on its button
+        # Unit test for PointerDrag in lib.js (extension version 9): the
+        # extension's own drag for a secondary-button content drag, which
+        # mutter's move grab would never end. Plain gjs drives the shipped
+        # file; no GNOME Shell needed.
+        run: gjs scripts/test_gnome_extension_pointer_drag.js
+
+      - name: Stage space follows mutter's layout mode
+        # Unit test for StageScale in lib.js (extension version 11): the
+        # snapshot's layout_mode + monitor.device_scale, read from the stage
+        # view scales. In mutter's PHYSICAL layout the stage is device px and
+        # the monitor scale must not be applied. Plain gjs.
+        run: gjs scripts/test_gnome_extension_stage_scale.js
+
+      - name: Workspace hotkey bookkeeping
+        # Unit test for WorkspaceHotkey in lib.js (extension version 13,
+        # org.displayxr.WorkspaceHotkey1): what Configure accepts (incl. every
+        # accelerator the runtime's mapping writes), press with the client
+        # registered vs gone (StartUnit + pending carried to the next
+        # Configure, 30 s window), release, suspend cap, cache round trip.
+        run: gjs scripts/test_gnome_extension_workspace_hotkey.js
+
+      - name: Own-window requests
+        # Unit test for OwnWindow in lib.js (extension version 15,
+        # WindowPlacement1 SetKeepAbove / ActivateWindow / SetMinimized): the
+        # gate (own window only, not during a grab or pointer drag, not on the
+        # lock screen), maximized on both sides of mutter 49's API change, and
+        # the undo on disconnect touching only the keep-above the extension
+        # set, and ActivateWindow's focus policy (version 17). Plain gjs.
+        run: gjs scripts/test_gnome_extension_own_window.js
+
+      - name: Pointer reply
+        # Unit test for PointerPick in lib.js (extension version 16,
+        # WindowGeometry1.GetPointer / GetWindowAt): the window under the
+        # pointer is the picked actor's window actor (a subsurface counts),
+        # desktop vs shell UI (incl. Ubuntu's desktop-icons window), points on
+        # no monitor, parent_id, and the reply (nothing while locked). Plain gjs.
+        run: gjs scripts/test_gnome_extension_pointer.js
+
+      - name: Window-title access
+        # Unit test for TitleAccess in lib.js (extension version 18,
+        # WindowGeometry1.SetTitleAccess): the grant gate (the caller names
+        # itself, never on the lock screen), titles only to the granted bus
+        # connection and never while locked, the bookkeeping, a withheld title
+        # is a missing key, and lib.js reads a title in one place only. Plain gjs.
+        run: gjs scripts/test_gnome_extension_title_access.js
+
+      - name: Monitor work area
+        # Unit test for WorkArea in lib.js (extension version 19,
+        # monitor.work_area): the window's own workspace else the active one,
+        # [x, y, w, h] from a Meta.Rectangle (GNOME 42-44) or an Mtk.Rectangle
+        # (45+), absent when it cannot be told, and the shipped wiring (the
+        # entry, the workareas-changed emit). Plain gjs.
+        run: gjs scripts/test_gnome_extension_work_area.js
+
   cnsdk-pin-guard:
     runs-on: ubuntu-latest
     steps:
@@ -190,6 +313,14 @@ jobs:
         # scripts/check_cnsdk_pins.py.
         run: python3 scripts/check_cnsdk_pins.py
 
+      - name: Default model-pack URL is derived from versions.json
+        # Offline, same reasoning as the CNSDK step: the Windows installer's
+        # fallback conversion pack URL must be built from the conversion_open
+        # pin CMake injects, not a hand-typed URL (#2234: the old one 404'd for
+        # every install). Whether the URL actually resolves is a network
+        # question, checked weekly by pin-rot-canary.yml.
+        run: python3 scripts/check_models_pack_url.py
+
   downstream-pin-guard:
     runs-on: ubuntu-latest
     steps:
@@ -204,3 +335,36 @@ jobs:
 
       - name: Pin-bump gate unit tests
         run: python3 scripts/tests/test_downstream_pin_bump.py
+
+      - name: Runtime version derivation unit tests (#1790)
+        # Hermetic (throwaway git repos + `cmake -P`): tag build = exactly the
+        # tag, dev build = last release + describe, rc / bookmark tags ignored,
+        # git archive tarballs, the versions.json fallback, the override, and
+        # never a made-up number.
+        run: python3 scripts/tests/test_runtime_version.py
+
+      - name: App-linter INV-4.6 colour-swapchain unit tests
+        # Hermetic (synthetic app trees). Pins the per-leg _SRGB-first check that
+        # would have caught the gauss demo's Android leg preferring UNORM after
+        # #1589 made UNORM swapchains linear.
+        run: python3 scripts/tests/test_check_displayxr_app_color.py
+
+      - name: App-linter INV-4.10 Vulkan frame-submit unit tests
+        # Hermetic (synthetic app trees). Pins the per-function submit/drain,
+        # wait-own-fence and per-frame command-buffer checks (#1917: a serialised
+        # submit -> wait loop parks Adreno at ~1/3 clock), and that one-off
+        # uploads, VkFrameRing-style rings and the exemption comment stay quiet.
+        run: python3 scripts/tests/test_check_displayxr_app_vk_frame.py
+
+      - name: App-linter build-tree exclusion unit tests
+        # Hermetic (synthetic app trees + a throwaway git repo). Pins that every
+        # directory walk skips build output (.cxx/, .externalNativeBuild/, .gradle/,
+        # _deps/, build/) and git-ignored untracked files: a local Gradle build's
+        # .cxx/ holds FetchContent'd displayxr-common tests/ that tripped false
+        # INV-3.1 errors.
+        run: python3 scripts/tests/test_check_displayxr_app_skip_build_trees.py
+
+      - name: App-linter INV-2.9 mode-switch easing unit tests
+        # Hermetic. Pins the per-leg "requests modes but never uses dxr::ModeSwitch"
+        # check: the runtime never eases a 2D<->3D switch, the app must.
+        run: python3 scripts/tests/test_check_displayxr_app_mode_switch.py

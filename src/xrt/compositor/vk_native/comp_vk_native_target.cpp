@@ -9,6 +9,7 @@
 
 #include "comp_vk_native_target.h"
 #include "comp_vk_native_compositor.h"
+#include "comp_vk_native_swapchain.h"
 
 #include "xrt/xrt_config_os.h"
 #include "xrt/xrt_vulkan_includes.h"
@@ -16,6 +17,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "util/u_setting.h"
 #include "util/u_misc.h"
 #include "util/u_git_tag.h"
 #include "util/comp_late_weave_lookahead.h"
@@ -46,6 +48,7 @@ static std::atomic<uint32_t> g_vk_repaint_presents_since_app{0};
 // Portable (all OSes) — the witness is exactly for paths/platforms the
 // Windows-only latency harness cannot measure.
 #include "util/comp_vblank_grid.h"
+#include "util/comp_residual_window.h"
 #include "util/comp_frame_witness.h"
 static comp_frame_witness g_frame_witness_vk{"vk"};
 
@@ -303,8 +306,47 @@ dxr_acquire_timeout_ns(void)
 // carried in struct comp_vk_native_xcb_handle. (VK_USE_PLATFORM_XCB_KHR is
 // defined by CMake via xrt_config_vulkan.h when XRT_HAVE_XCB.)
 #include <vulkan/vulkan_xcb.h>
+#include <X11/Xlib.h>
+#include <vulkan/vulkan_xlib.h> // Xlib surface fallback (#2322)
 #include <xcb/xcb.h>
 #include "comp_vk_native_window_xcb.h"
+// #902: the desktop-Linux vblank-grid source (wp_presentation / X11 Present).
+#include "comp_vk_native_present_feedback.h"
+#include "util/comp_late_weave_adapt.h"
+#include "util/comp_feedback_pace.h"
+#include "util/comp_late_weave_depth.h"
+
+//! vkCreateXcbSurfaceKHR on this instance, or NULL when VK_KHR_xcb_surface is
+//! not enabled on it (the instance is the app's, vk_init_from_given).
+static PFN_vkCreateXcbSurfaceKHR
+target_xcb_surface_fn(struct vk_bundle *vk)
+{
+	PFN_vkCreateXcbSurfaceKHR fn = vk->vkCreateXcbSurfaceKHR;
+	if (fn == NULL) {
+		fn = (PFN_vkCreateXcbSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
+	}
+	return fn;
+}
+
+//! The Xlib connection the Xlib-surface fallback builds on (#2322). One per
+//! process, opened on first use and kept open: every VkSurfaceKHR built on it
+//! must not outlive it, and a surface is rebuilt per session.
+static Display *
+target_xlib_display(void)
+{
+	static Display *dpy = XOpenDisplay(NULL); // C++11: initialized once, thread-safe
+	return dpy;
+}
+
+extern "C" bool
+comp_vk_native_target_instance_has_xcb_surface(struct comp_vk_native_compositor *c)
+{
+	return target_xcb_surface_fn(comp_vk_native_compositor_get_vk(c)) != NULL;
+}
+
+struct comp_vk_native_target;
+static void
+target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd, bool is_wayland);
 
 #endif
 
@@ -337,6 +379,9 @@ dxr_acquire_timeout_ns(void)
  * apps do when the runtime advertises the extensions); when the proc is
  * missing the harness stays dormant.
  */
+#endif // XRT_OS_WINDOWS
+
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 /*
  * Late-weave (DXR_LATE_WEAVE=1): pace the frame on the PREVIOUS present
  * hitting glass (vkWaitForPresentKHR in acquire) — the VK equivalent of the
@@ -344,11 +389,25 @@ dxr_acquire_timeout_ns(void)
  * runs inside one refresh interval and the FIFO queue stays empty.
  */
 
-// #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..3, default 1). N>1 paces on the
+// #850: DXR_LATE_WEAVE_MAX_LATENCY=N (1..4, default 1). N>1 paces on the
 // present N-1 back, restoring N-1 frames of CPU/GPU overlap on a saturated
 // pipeline at the cost of that much extra weave-time prediction horizon.
-// (The DXGI paths additionally auto-back-off on measured saturation; the VK
-// pacer honors the explicit knob only for now.)
+// (The DXGI paths auto-back-off on measured saturation in
+// comp_weave_latency_win.h. On desktop Linux the present_wait pacer derives
+// its depth from measurements since #2119 — max(commit-to-glass lag floor,
+// slip level), util/comp_late_weave_depth.h + util/comp_feedback_pace.h — and
+// an explicit value here pins the depth for the session. The Windows VK pacer
+// still honours the knob only.)
+#ifdef XRT_OS_LINUX_DESKTOP
+//! True when DXR_LATE_WEAVE_MAX_LATENCY was set (non-empty) in the environment.
+static bool
+vk_late_weave_max_latency_explicit()
+{
+	const char *e = getenv("DXR_LATE_WEAVE_MAX_LATENCY");
+	return e != nullptr && e[0] != '\0';
+}
+#endif
+
 static int
 vk_late_weave_max_latency()
 {
@@ -362,7 +421,9 @@ vk_late_weave_max_latency()
 	}
 	return lat;
 }
+#endif // XRT_OS_WINDOWS || XRT_OS_LINUX_DESKTOP
 
+#ifdef XRT_OS_WINDOWS
 struct wl_harness
 {
 	FILE *f = nullptr;
@@ -452,11 +513,25 @@ struct comp_vk_native_target
 	//! Swapchain image views.
 	VkImageView views[MAX_TARGET_IMAGES];
 
+	//! @ref images carry VK_IMAGE_USAGE_SAMPLED_BIT (see
+	//! comp_vk_native_target_images_sampled).
+	bool images_sampled;
+
 	//! Number of swapchain images.
 	uint32_t image_count;
 
 	//! Current acquired image index.
 	uint32_t current_index;
+
+	/*!
+	 * An image that was ACQUIRED but never presented, held for the next
+	 * acquire (see comp_vk_native_target_hold_unpresented). Valid only for
+	 * the image set it came from: @ref held_generation must equal
+	 * @ref generation, and a recreate bumps that.
+	 */
+	bool held_valid;
+	uint32_t held_index;
+	uint32_t held_generation;
 
 	//! Semaphore signaled when image is available.
 	VkSemaphore image_available;
@@ -585,6 +660,115 @@ struct comp_vk_native_target
 	uint64_t residual_ns;
 	uint32_t residual_samples;
 	uint64_t residual_last_log_ns;
+	//! #2068: every residual sample of the current 5 s trace window, so the
+	//! trace reports a distribution rather than the last sample.
+	struct comp_residual_window residual_win;
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*!
+	 * #902 desktop Linux: the window system's presentation feedback, the grid
+	 * source where the driver has no VK_GOOGLE_display_timing (measured: every
+	 * Intel iGPU). wp_presentation on native Wayland, Present CompleteNotify
+	 * on X11. NULL when the driver HAS display timing (that path stays the
+	 * source), when the window system offers neither, or with
+	 * DXR_VK_PRESENT_FEEDBACK=0.
+	 */
+	struct comp_vk_native_present_feedback *present_fb;
+	//! What the samples did to the grid (trust, debounced state, totals).
+	struct comp_present_feedback pf_state;
+	bool pf_period_refused_logged;
+	/*!
+	 * #2068: per-request bookkeeping, keyed by the feedback tag (a sequence
+	 * number): when the weave started (the #206 residual) and which vblank
+	 * the grid gate aimed it at (0 = not aimed — the gate did not sleep).
+	 */
+	uint64_t pf_seq;
+	//! #2119: highest request tag the feeder has answered (presented or
+	//! discarded) — pf_seq minus this = our presents still outstanding.
+	uint64_t pf_answered_seq;
+	struct
+	{
+		uint64_t seq;
+		uint64_t weave_start_ns;
+		uint64_t aimed_vblank_ns;
+		//! vkQueuePresentKHR return — the WSI's wl_surface.commit is inside it.
+		uint64_t commit_ns;
+		//! #2119: our own presents still outstanding when this one was committed.
+		uint32_t queued_ahead;
+	} pf_ring[16];
+	//! Set by the grid gate when it aims a weave, consumed by the request.
+	uint64_t lw_aimed_vblank_ns;
+	//! #2068: the compositor lead the grid gate learned (comp_late_weave_adapt.h).
+	struct comp_lw_lead lw_lead;
+	uint32_t lw_raise_logs;
+	bool lw_grid_optin_logged;
+
+	/*!
+	 * #2068 feedback pacing (opt-in, DXR_LATE_WEAVE_LINUX_PACE=1): the
+	 * present_wait latency-1 behaviour for enable1 apps, paced on the
+	 * wp_presentation feedback the feeder already receives.
+	 */
+	struct comp_fb_pace fb_pace;
+	bool fb_pace_inited;
+	bool fb_pace_logged;
+	bool fb_pace_unavailable_logged;
+	//! The swapchain's real image count has been logged (queue depth).
+	bool swapchain_depth_logged;
+
+	/*!
+	 * #2060 / #902 desktop Linux: the VK_KHR_present_wait late-weave tier —
+	 * the Windows tier's twin, minus the QPC harness. The enable2 path enables
+	 * present_id + present_wait on every device it creates (oxr_vulkan.c), and
+	 * Mesa supports both on Wayland and X11, so enable2 apps pace on the
+	 * previous present hitting glass. Ids are per-swapchain; reset on
+	 * recreate. Where it is absent (enable1 apps that did not chain the
+	 * features) the grid tier above takes over.
+	 */
+	PFN_vkWaitForPresentKHR present_wait_fn;
+	bool present_wait_probed;
+	//! The wait never resolved (features not enabled by an enable1 app):
+	//! the tier stands down for the session, the grid tier takes over.
+	bool present_wait_latched_off;
+	bool present_wait_ever_ok;
+	bool present_wait_logged;
+	uint32_t present_wait_timeouts;
+	uint64_t present_id_counter;
+	uint64_t last_present_id;
+	/*!
+	 * #2119: the present_wait tier's depth governor. effective depth =
+	 * max(commit-to-glass lag floor, slip level), base 1, ceiling 4:
+	 * pw_pace is the shared slip machine (comp_feedback_pace.h), pw_lag the
+	 * measured floor fed to it (comp_late_weave_depth.h). Pinned by an
+	 * explicit DXR_LATE_WEAVE_MAX_LATENCY, held at 1 by AUTOBACKOFF=0.
+	 */
+	struct comp_fb_pace pw_pace;
+	struct comp_lw_lag pw_lag;
+	bool pw_pace_inited;
+	bool pw_governing;
+	//! A correlated wp_presentation sample arrived: the lag comes from the
+	//! feeder from now on, not from present_wait returns.
+	bool pw_lag_from_feedback;
+	uint64_t pw_last_frame_ns;
+	uint32_t pw_depth_changes;
+	//! Our presents outstanding when the last present was committed.
+	uint32_t pw_last_outstanding;
+	uint64_t pw_cap_log_ns;
+	uint32_t pw_cap_windows;
+	uint32_t pw_drains;
+	//! #2119/#867: xrWaitFrame return (mark) and the EMA of mark -> weave
+	//! start, the app-side half of the lookahead once depth > 1.
+	uint64_t pw_wait_frame_ns;
+	double pw_wait_to_weave_ema_ns;
+	//! vkQueuePresentKHR return per present id (id % 8, keyed by
+	//! present_weave_ring_id) — the commit time for the present_wait lag.
+	uint64_t present_commit_ring_ns[8];
+	//! #2119: presents queued ahead at commit (effective depth − 1), so the
+	//! lag floor only takes samples committed with nothing of ours ahead.
+	uint32_t present_commit_queued[8];
+	//! Weave start per present id (id % 8), for the residual at wait return.
+	uint64_t present_weave_ring_id[8];
+	uint64_t present_weave_ring_ns[8];
+#endif
 
 	//! When the refresh period was last re-read (ns). The panel is
 	//! variable-refresh, so this is polled rather than latched.
@@ -907,6 +1091,19 @@ create_swapchain(struct comp_vk_native_target *target)
 		}
 	}
 
+	// SAMPLED: the post-weave Local2D composite snapshots the woven target
+	// into its weave scratch with a draw rather than a per-frame
+	// vkCmdCopyImage (DXR_VK_ZONES_COPY_TO_DRAW, default on). Only when the
+	// surface allows it; otherwise the snapshot keeps the copy.
+	VkImageUsageFlags image_usage =
+	    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	target->images_sampled = false;
+	if (comp_vk_native_zones_copy_to_draw_enabled() &&
+	    (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) != 0) {
+		image_usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+		target->images_sampled = true;
+	}
+
 	VkSwapchainCreateInfoKHR ci = {
 	    .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 	    .surface = target->surface,
@@ -915,8 +1112,7 @@ create_swapchain(struct comp_vk_native_target *target)
 	    .imageColorSpace = color_space,
 	    .imageExtent = extent,
 	    .imageArrayLayers = 1,
-	    .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-	                  VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+	    .imageUsage = image_usage,
 	    .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 	    .preTransform = pre_transform,
 	    .compositeAlpha = composite_alpha,
@@ -970,6 +1166,17 @@ create_swapchain(struct comp_vk_native_target *target)
 		U_LOG_E("Failed to get swapchain images: %d", res);
 		return XRT_ERROR_VULKAN;
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2068: the FIFO queue an unpaced producer can fill is this deep — the
+	// number the weave->scanout residual is read against. Once per target.
+	if (!target->swapchain_depth_logged) {
+		target->swapchain_depth_logged = true;
+		U_LOG_W("#2068: VK native swapchain — %u images (surface minImageCount %u, maxImageCount %u), "
+		        "FIFO, %ux%u",
+		        target->image_count, caps.minImageCount, caps.maxImageCount, target->width,
+		        target->height);
+	}
+#endif
 
 	// Create image views
 	xrt_result_t vres = create_swapchain_views(target);
@@ -1445,6 +1652,7 @@ dcomp_setup(struct comp_vk_native_target *target, HWND hwnd, uint32_t w, uint32_
 		target->images[i] = target->dcomp_vk_image[i];
 		target->views[i] = target->dcomp_vk_view[i];
 	}
+	target->images_sampled = true; // dcomp_import_one creates them SAMPLED
 	target->format = VK_FORMAT_B8G8R8A8_UNORM;
 	target->width = w;
 	target->height = h;
@@ -1854,43 +2062,70 @@ comp_vk_native_target_create(struct comp_vk_native_compositor *c,
 	const struct comp_vk_native_xcb_handle *xcb_handle =
 	    (const struct comp_vk_native_xcb_handle *)hwnd;
 
-	PFN_vkCreateXcbSurfaceKHR pfnCreateXcbSurface = vk->vkCreateXcbSurfaceKHR;
-	if (pfnCreateXcbSurface == NULL) {
-		pfnCreateXcbSurface = (PFN_vkCreateXcbSurfaceKHR)
-		    vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXcbSurfaceKHR");
-	}
-	if (pfnCreateXcbSurface == NULL) {
-		U_LOG_E("vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled");
-		free(target);
-		return XRT_ERROR_VULKAN;
-	}
+	PFN_vkCreateXcbSurfaceKHR pfnCreateXcbSurface = target_xcb_surface_fn(vk);
+	const char *surface_kind = "XCB";
+	if (pfnCreateXcbSurface != NULL) {
+		VkXcbSurfaceCreateInfoKHR surface_ci = {
+		    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .connection = (xcb_connection_t *)xcb_handle->connection,
+		    .window = (xcb_window_t)xcb_handle->window,
+		};
 
-	VkXcbSurfaceCreateInfoKHR surface_ci = {
-	    .sType = VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR,
-	    .pNext = NULL,
-	    .flags = 0,
-	    .connection = (xcb_connection_t *)xcb_handle->connection,
-	    .window = (xcb_window_t)xcb_handle->window,
-	};
-
-	VkResult res = pfnCreateXcbSurface(vk->instance, &surface_ci, NULL, &target->surface);
-	if (res != VK_SUCCESS) {
-		U_LOG_E("Failed to create XCB surface: %d", res);
-		free(target);
-		return XRT_ERROR_VULKAN;
+		VkResult res = pfnCreateXcbSurface(vk->instance, &surface_ci, NULL, &target->surface);
+		if (res != VK_SUCCESS) {
+			U_LOG_E("Failed to create XCB surface: %d", res);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+	} else {
+		// The app's VkInstance has no VK_KHR_xcb_surface. A hosted Windows app
+		// running under a translation layer gets a host instance that enables
+		// VK_KHR_xlib_surface only. An X11 window id is the same server object
+		// to both bindings, so build an Xlib surface over the same window (#2322).
+		PFN_vkCreateXlibSurfaceKHR pfnCreateXlibSurface =
+		    (PFN_vkCreateXlibSurfaceKHR)vk->vkGetInstanceProcAddr(vk->instance, "vkCreateXlibSurfaceKHR");
+		Display *dpy = pfnCreateXlibSurface != NULL ? target_xlib_display() : NULL;
+		if (dpy == NULL) {
+			U_LOG_E(
+			    "vkCreateXcbSurfaceKHR not available — VK_KHR_xcb_surface must be enabled "
+			    "(Xlib fallback: vkCreateXlibSurfaceKHR=%p, display=%p)",
+			    (void *)pfnCreateXlibSurface, (void *)dpy);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		VkXlibSurfaceCreateInfoKHR xlib_ci = {
+		    .sType = VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR,
+		    .pNext = NULL,
+		    .flags = 0,
+		    .dpy = dpy,
+		    .window = (Window)xcb_handle->window,
+		};
+		VkResult xres = pfnCreateXlibSurface(vk->instance, &xlib_ci, NULL, &target->surface);
+		if (xres != VK_SUCCESS) {
+			U_LOG_E("Failed to create Xlib surface: %d", xres);
+			free(target);
+			return XRT_ERROR_VULKAN;
+		}
+		surface_kind = "Xlib";
+		U_LOG_W(
+		    "VK native target: no VK_KHR_xcb_surface on this instance — created an Xlib surface for window "
+		    "0x%x (#2322)",
+		    (unsigned)xcb_handle->window);
 	}
 
 	VkBool32 present_support = VK_FALSE;
-	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device,
-	                                          queue_family_index,
-	                                          target->surface, &present_support);
+	vk->vkGetPhysicalDeviceSurfaceSupportKHR(vk->physical_device, queue_family_index, target->surface,
+		                                 &present_support);
 	if (!present_support) {
-		U_LOG_E("Queue family does not support presentation to XCB surface");
+		U_LOG_E("Queue family does not support presentation to %s surface", surface_kind);
 		vk->vkDestroySurfaceKHR(vk->instance, target->surface, NULL);
 		free(target);
 		return XRT_ERROR_VULKAN;
 	}
 	} // end XCB (non-Wayland) branch
+	target_present_feedback_create(target, hwnd, is_wayland);
 #else
 	U_LOG_E("VK native target: no supported surface type on this platform");
 	free(target);
@@ -2030,6 +2265,13 @@ comp_vk_native_target_destroy(struct comp_vk_native_target **target_ptr)
 #endif
 
 	vk->vkDeviceWaitIdle(vk->device);
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Before the surface: the protocol objects reference the app's surface /
+	// window, and the connection outlives the target (the compositor tears
+	// the target down before its window and before the app's own teardown).
+	comp_vk_native_present_feedback_destroy(&target->present_fb);
+#endif
 
 #ifdef XRT_OS_WINDOWS
 	if (target->dcomp_active) {
@@ -2205,7 +2447,10 @@ dxr_late_weave_enabled()
 	static int enabled = -1;
 	if (enabled < 0) {
 		enabled = 1;
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// Environment, then the Dashboard's persisted stores (perf-settings
+		// Phase 2B); u_setting keeps the environment authoritative.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		if (e != nullptr && e[0] != '\0') {
 			enabled = (e[0] == '0') ? 0 : 1;
 		}
@@ -2279,6 +2524,384 @@ comp_vk_native_target_vblank_period_ns(struct comp_vk_native_target *target)
 	return target->vblank_grid.period_ns;
 }
 
+/*!
+ * #206: report the measured weave->scanout residual periodically. This is the
+ * number the whole CNSDK horizon question turns on — whether the vendor's
+ * hardcoded 40 ms matches what this pipeline actually does — so it is worth
+ * saying out loud rather than only exposing through an accessor nobody reads
+ * yet. Shared by both grid sources.
+ */
+static void
+target_log_residual(struct comp_vk_native_target *target)
+{
+	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 && target->vblank_grid.period_ns != 0) {
+		const uint64_t now2 = os_monotonic_get_ns();
+		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
+			target->residual_last_log_ns = now2;
+			// #2068: the window's distribution, not the last sample — an
+			// early transient read as the steady state on a panel A/B.
+			const double per = (double)target->vblank_grid.period_ns;
+			const struct comp_residual_stats st =
+			    comp_residual_window_take(&target->residual_win, target->vblank_grid.period_ns);
+			// #2119: the present_wait depth governor's state rides along, so
+			// one line says whether the residual moved with the depth.
+			char gov[256] = "";
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (target->pw_pace_inited) {
+				snprintf(
+				    gov, sizeof(gov),
+				    " | depth %d (floor %d, slip level %d, %s), lag at 0 outstanding %.2f periods, "
+				    "outstanding at last commit %u, drains %u",
+				    comp_fb_pace_effective(&target->pw_pace), target->pw_pace.floor,
+				    target->pw_pace.depth, target->pw_governing ? "governed" : "fixed",
+				    target->pw_lag.ema_ns / per, target->pw_last_outstanding, target->pw_drains);
+			}
+#endif
+			if (st.n != 0) {
+				U_LOG_W(
+				    "#206: weave->scanout residual over 5 s — n=%llu mean %.2f ms (%.2f periods), "
+				    "p50 %.2f ms (%.2f), p95 %.2f ms (%.2f), max %.2f ms (%.2f), >1.5 periods "
+				    "%.1f%%%s%s",
+				    (unsigned long long)st.n, st.mean_ns / 1e6, st.mean_ns / per, st.p50_ns / 1e6,
+				    (double)st.p50_ns / per, st.p95_ns / 1e6, (double)st.p95_ns / per, st.max_ns / 1e6,
+				    (double)st.max_ns / per, st.frac_over_1p5 * 100.0,
+				    st.truncated ? " (percentiles over the first 2048)" : "", gov);
+			}
+#ifdef XRT_OS_LINUX_DESKTOP
+			if (target->fb_pace_inited) {
+				uint64_t waits = 0, slips = 0, sum = 0;
+				comp_fb_pace_take_stats(&target->fb_pace, &waits, &slips, &sum);
+				U_LOG_W("#2068: feedback pacing — waits %llu, slips %llu, mean wait %.2f ms (latency %d)%s",
+				        (unsigned long long)waits, (unsigned long long)slips,
+				        waits != 0 ? (double)sum / (double)waits / 1e6 : 0.0, target->fb_pace.depth,
+				        target->fb_pace.off ? " [OFF]" : "");
+			}
+			if (target->lw_lead.base_vblanks != 0) {
+				U_LOG_W("#2068: grid late weave — desktop floor %u vblank(s) commit-to-glass; %s lead "
+				        "%.2f ms, aimed hits %llu, misses %llu%s",
+				        target->lw_lead.base_vblanks,
+				        target->lw_lead.initialised ? "compositor" : "not aiming yet,",
+				        target->lw_lead.lead_ns / 1e6, (unsigned long long)target->lw_lead.hits,
+				        (unsigned long long)target->lw_lead.misses, target->lw_lead.off ? " [OFF]" : "");
+			}
+#endif
+		}
+	}
+}
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #902 desktop Linux: stand up the window-system grid source for this target.
+ *
+ * Only where the driver has NO VK_GOOGLE_display_timing — that path stays the
+ * source wherever it exists, and two sources anchoring one grid would only
+ * fight over sub-millisecond phase differences. The protocol objects live on
+ * the connection the surface belongs to (the app's wl_display / Xlib
+ * connection, or the runtime's own XCB connection for a self-created window),
+ * on private queues.
+ */
+static void
+target_present_feedback_create(struct comp_vk_native_target *target, void *hwnd, bool is_wayland)
+{
+	const char *e = getenv("DXR_VK_PRESENT_FEEDBACK");
+	if (e != nullptr && e[0] == '0') {
+		U_LOG_W(
+		    "#902: present-feedback feeder — DXR_VK_PRESENT_FEEDBACK=0, off; the vblank grid "
+		    "is unfed unless the driver has VK_GOOGLE_display_timing");
+		return;
+	}
+	if (hwnd == nullptr) {
+		return;
+	}
+	if (target->vk->has_GOOGLE_display_timing) {
+		U_LOG_W(
+		    "#902: present-feedback feeder — not needed, the driver has "
+		    "VK_GOOGLE_display_timing (that feeds the vblank grid)");
+		return;
+	}
+	if (is_wayland) {
+		const struct comp_vk_native_wayland_handle *wl = (const struct comp_vk_native_wayland_handle *)hwnd;
+		target->present_fb = comp_vk_native_present_feedback_create_wayland(wl->display, wl->surface);
+	} else {
+		const struct comp_vk_native_xcb_handle *xh = (const struct comp_vk_native_xcb_handle *)hwnd;
+		target->present_fb = comp_vk_native_present_feedback_create_xcb(xh->connection, xh->window);
+	}
+}
+
+/*!
+ * #2119: the present_wait tier's effective depth (1 until the governor runs).
+ */
+static int
+target_pw_depth(const struct comp_vk_native_target *target)
+{
+	return target->pw_pace_inited ? comp_fb_pace_effective(&target->pw_pace) : 1;
+}
+
+/*!
+ * #2119: one WARN per effective-depth change, throttled to one per 2 s with a
+ * suppressed count, naming the signal that drove it. A silent depth change
+ * would make A/B numbers non-reproducible (the Windows governor's rule).
+ */
+static void
+target_pw_log_change(struct comp_vk_native_target *target, int from, const char *why, uint64_t now_ns)
+{
+	// Every transition logs: the governor's dwells bound the rate (a lowering
+	// needs a whole dwell of slack), and a suppressed outcome line hid the
+	// round-3 probe reverts.
+	target->pw_depth_changes++;
+	(void)now_ns;
+	const uint64_t period_ns = target->vblank_grid.period_ns;
+	U_LOG_W(
+	    "#2119: late-weave depth %d -> %d (%s; commit-to-glass lag at 0 outstanding %.2f ms = %.2f periods, "
+	    "floor %d, slip level %d, period %.3f ms, lowering dwell %llu s; change #%u)",
+	    from, target_pw_depth(target), why, target->pw_lag.ema_ns / 1e6,
+	    period_ns != 0 ? target->pw_lag.ema_ns / (double)period_ns : 0.0, target->pw_lag.depth,
+	    target->pw_pace.depth, period_ns / 1e6, (unsigned long long)(target->pw_lag.dwell_ns / 1000000000ULL),
+	    target->pw_depth_changes);
+}
+
+/*!
+ * #2119: feed one commit-to-glass sample to the lag floor (signal a). Inert
+ * unless the governor runs (present_wait tier live, no explicit depth,
+ * auto-backoff on).
+ */
+static void
+target_pw_note_lag(struct comp_vk_native_target *target, uint64_t lag_ns, uint32_t queued_ahead, uint64_t now_ns)
+{
+	if (!target->pw_governing || target->present_wait_latched_off) {
+		return;
+	}
+	const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
+	if (period_ns == 0) {
+		return; // cannot remove our own queue time without a period
+	}
+	// #2119: only samples committed with 0 of ours outstanding count, and they
+	// can only RAISE the floor — how much of a sample taken behind our own
+	// queue is queueing is not observable (FIFO withholding vs a pipelined
+	// compositor); lowering is the verified probe's job.
+	if (comp_lw_lag_on_sample(&target->pw_lag, lag_ns, queued_ahead, period_ns, now_ns)) {
+		const int from = target_pw_depth(target);
+		if (comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth, now_ns)) {
+			target_pw_log_change(target, from, "commit-to-glass lag", now_ns);
+		}
+	}
+}
+
+/*!
+ * #902 desktop Linux: drain the window system's presentation feedback into the
+ * vblank grid. Non-blocking (see comp_vk_native_present_feedback_poll); the
+ * decisions — vsync only, discards counted, timebase guard, period from the
+ * refresh value or the vblank counter — are comp_present_feedback_apply's and
+ * unit-tested on the host.
+ */
+static void
+target_feed_present_feedback(struct comp_vk_native_target *target)
+{
+	const char *kind = comp_vk_native_present_feedback_kind(target->present_fb);
+	struct comp_vk_native_present_feedback_event evs[16];
+	uint32_t n = 0;
+	do {
+		n = comp_vk_native_present_feedback_poll(target->present_fb, evs, 16);
+		const uint64_t now_ns = os_monotonic_get_ns();
+		for (uint32_t i = 0; i < n; i++) {
+			const struct comp_present_feedback_sample *s = &evs[i].sample;
+			const uint64_t before = target->vblank_grid.period_ns;
+			const struct comp_present_feedback_result r =
+			    comp_present_feedback_apply(&target->pf_state, &target->vblank_grid, s, now_ns);
+
+			if (r.period_changed) {
+				const uint64_t p = target->vblank_grid.period_ns;
+				U_LOG_W("#902: %s grid — refresh %.3f ms (%.2f Hz)%s%s", kind, p / 1e6, 1e9 / (double)p,
+				        before == 0 ? " [initial]" : " [CHANGED]",
+				        r.period_derived ? " (derived from the vblank counter)" : "");
+			}
+			if (r.period_refused && !target->pf_period_refused_logged) {
+				target->pf_period_refused_logged = true;
+				U_LOG_W("#902: %s reported an implausible refresh (%llu ns) — ignored", kind,
+				        (unsigned long long)s->refresh_ns);
+			}
+			if (r.state_changed) {
+				const struct comp_present_feedback *f = &target->pf_state;
+				switch (f->state) {
+				case COMP_PRESENT_FEEDBACK_STATE_FEEDING:
+					U_LOG_W(
+					    "#902: %s feed — feeding the vblank grid (vsync'd presents, hw_clock=%d; "
+					    "accepted %llu, not-vsync %llu, discarded %llu)",
+					    kind, (int)s->hw_clock, (unsigned long long)f->accepted,
+					    (unsigned long long)f->not_vsync, (unsigned long long)f->discarded);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_NOT_VSYNC:
+					U_LOG_W(
+					    "#902: %s feed — presents are NOT vsync'd, ignored; grid not fed "
+					    "(accepted %llu, not-vsync %llu)",
+					    kind, (unsigned long long)f->accepted, (unsigned long long)f->not_vsync);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_DISCARDING:
+					U_LOG_W(
+					    "#902: %s feed — every recent present was discarded (window hidden or "
+					    "superseded); grid not fed (accepted %llu, discarded %llu)",
+					    kind, (unsigned long long)f->accepted, (unsigned long long)f->discarded);
+					break;
+				case COMP_PRESENT_FEEDBACK_STATE_TIMEBASE_REFUSED:
+					U_LOG_W(
+					    "#902: %s feed — presentation time %llu is not in os_monotonic (now %llu) "
+					    "— DIFFERENT CLOCK, grid refused",
+					    kind, (unsigned long long)s->present_ns, (unsigned long long)now_ns);
+					break;
+				default: break;
+				}
+			}
+
+			// Resolve the request this sample answers (Wayland; X11 cannot
+			// correlate, tag 0).
+			const uint64_t tag = evs[i].tag;
+			if (tag > target->pf_answered_seq) {
+				target->pf_answered_seq = tag; // #2119 outstanding count
+			}
+			if (tag == 0 || target->pf_ring[tag % 16].seq != tag) {
+				continue;
+			}
+			const uint64_t started = target->pf_ring[tag % 16].weave_start_ns;
+			const uint64_t aimed = target->pf_ring[tag % 16].aimed_vblank_ns;
+
+			// #206: the weave->scanout residual.
+			if (r.anchored && started != 0 && s->present_ns > started) {
+				const uint64_t res = s->present_ns - started;
+				if (res < 200ULL * 1000 * 1000) { // a stalled frame is not a latency
+					target->residual_ns = res;
+					target->residual_samples++;
+					comp_residual_window_add(&target->residual_win, res);
+				}
+			}
+
+			// #2068: commit-to-glass in vblanks, against the desktop's own
+			// floor — un-aimed frames teach the floor and the starting lead,
+			// aimed frames that take one vblank more are misses.
+			const uint64_t period = target->vblank_grid.period_ns;
+			const uint64_t commit = target->pf_ring[tag % 16].commit_ns;
+			// #2119: the same commit-to-glass span is the present_wait
+			// tier's lag floor — exact here (compositor timestamps).
+			if (commit != 0 && !s->discarded && s->present_ns > commit) {
+				target->pw_lag_from_feedback = true;
+				target_pw_note_lag(target, s->present_ns - commit,
+				                   target->pf_ring[tag % 16].queued_ahead, now_ns);
+			}
+			if (commit != 0 && period != 0 && !s->discarded && s->vsync && s->present_ns != 0) {
+				const enum comp_lw_adapt_event e =
+				    comp_lw_lead_observe(&target->lw_lead, commit, s->present_ns, aimed != 0, period,
+				                         target->weave_cost_ns, 1500ULL * 1000);
+				if (e == COMP_LW_ADAPT_RAISED && target->lw_raise_logs < 3) {
+					target->lw_raise_logs++;
+					U_LOG_W("#902: grid late weave — an aimed frame took %u vblanks commit-to-glass "
+					        "(desktop floor %u): compositor lead now %.2f ms (%s)",
+					        comp_lw_lead_vblanks(commit, s->present_ns, period, NULL),
+					        target->lw_lead.base_vblanks, target->lw_lead.lead_ns / 1e6,
+					        target->lw_raise_logs == 3 ? "further changes in the cadence trace"
+					                                   : "learning");
+				} else if (e == COMP_LW_ADAPT_DISABLED) {
+					U_LOG_W("#902: grid late weave OFF for this session — the desktop compositor needs "
+					        "%.2f ms of lead + %.2f ms weave + 1.50 ms margin of a %.3f ms period: no "
+					        "slack to weave late into (hits %llu, misses %llu)",
+					        target->lw_lead.lead_ns / 1e6, target->weave_cost_ns / 1e6, period / 1e6,
+					        (unsigned long long)target->lw_lead.hits,
+					        (unsigned long long)target->lw_lead.misses);
+				}
+			}
+		}
+	} while (n == 16);
+	target_log_residual(target);
+}
+#endif // XRT_OS_LINUX_DESKTOP
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2068: the grid-paced late-weave tier is OPT-IN on desktop Linux
+ * (DXR_LATE_WEAVE_LINUX_GRID=1).
+ *
+ * Measured on an Intel box, native enable1 app, window 1:1 on a 60 Hz panel
+ * under GNOME: 40.5-43.4 presents/s with the grid tier pacing at the fixed
+ * 1.5 ms margin against 52.9-56.7 with DXR_LATE_WEAVE=0 — the compositor
+ * latches before the vblank the weave is aimed at, so aimed frames land a
+ * refresh late. The adaptive lead (comp_late_weave_adapt.h) is the fix, but it
+ * has no panel A/B yet, and the rule is that default behaviour must not lower
+ * the present rate. The feeder keeps running either way (the #206 residual,
+ * the repaint loop's measured period). The present_wait tier is unaffected:
+ * measured at the panel rate on and off (59.2-60.0 vs 59.4-60.0).
+ */
+/*!
+ * #2068 feedback pacing knobs. DXR_LATE_WEAVE_LINUX_PACE=1 opts in;
+ * DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY (1..4, default 1) mirrors
+ * DXR_LATE_WEAVE_MAX_LATENCY; DXR_LATE_WEAVE_AUTOBACKOFF=0 holds the latency.
+ */
+static bool
+dxr_late_weave_linux_pace()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_PACE");
+		v = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return v == 1;
+}
+
+static int
+dxr_late_weave_linux_pace_latency()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_PACE_MAX_LATENCY");
+		v = (e != nullptr && e[0] != '\0') ? atoi(e) : 1;
+	}
+	return v;
+}
+
+static bool
+dxr_late_weave_autobackoff()
+{
+	const char *e = getenv("DXR_LATE_WEAVE_AUTOBACKOFF");
+	return !(e != nullptr && e[0] == '0');
+}
+
+static bool
+dxr_late_weave_linux_grid_optin()
+{
+	static int v = -1;
+	if (v < 0) {
+		const char *e = getenv("DXR_LATE_WEAVE_LINUX_GRID");
+		v = (e != nullptr && e[0] == '1') ? 1 : 0;
+	}
+	return v == 1;
+}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+/*!
+ * #2060: resolve vkWaitForPresentKHR once per target (Linux twin of the
+ * Windows resolver). NULL when late weave is off, when the app's device did not
+ * enable VK_KHR_present_wait, or once the tier latched off because the wait
+ * never resolved.
+ */
+static PFN_vkWaitForPresentKHR
+target_present_wait_fn(struct comp_vk_native_target *target)
+{
+	if (!dxr_late_weave_enabled() || target->present_wait_latched_off) {
+		return nullptr;
+	}
+	if (!target->present_wait_probed) {
+		struct vk_bundle *vk = target->vk;
+		target->present_wait_probed = true;
+		target->present_wait_fn =
+		    (PFN_vkWaitForPresentKHR)vk->vkGetDeviceProcAddr(vk->device, "vkWaitForPresentKHR");
+		U_LOG_W("#902: VK_KHR_present_wait %s — %s", target->present_wait_fn != nullptr ? "present" : "absent",
+		        target->present_wait_fn != nullptr
+		            ? "late weave paces on the previous present hitting glass (enable2 apps)"
+		            : "late weave uses the measured vblank grid (enable1 apps that did not chain "
+		              "presentId/presentWait)");
+	}
+	return target->present_wait_fn;
+}
+#endif
+
 static void
 target_feed_vblank_grid(struct comp_vk_native_target *target)
 {
@@ -2298,6 +2921,14 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 			        (vk != NULL && vk->vkGetRefreshCycleDurationGOOGLE != NULL));
 		}
 	}
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Created only where the driver has no display timing, so it is the
+	// grid's sole source whenever it exists.
+	if (target->present_fb != NULL) {
+		target_feed_present_feedback(target);
+		return;
+	}
+#endif
 	if (vk == NULL || !vk->has_GOOGLE_display_timing || target->swapchain == VK_NULL_HANDLE) {
 		return;
 	}
@@ -2442,24 +3073,10 @@ target_feed_vblank_grid(struct comp_vk_native_target *target)
 		 */
 		target->residual_ns = r;
 		target->residual_samples++;
+		comp_residual_window_add(&target->residual_win, r);
 	}
 
-	// Report it periodically. This is the number the whole CNSDK horizon
-	// question turns on — whether the vendor's hardcoded 40 ms matches what
-	// this pipeline actually does — so it is worth saying out loud rather
-	// than only exposing through an accessor nobody reads yet.
-	if (dxr_weave_cadence_trace_target() && target->residual_samples > 0 &&
-	    target->vblank_grid.period_ns != 0) {
-		const uint64_t now2 = os_monotonic_get_ns();
-		if (now2 - target->residual_last_log_ns > (5ULL * 1000 * 1000 * 1000)) {
-			target->residual_last_log_ns = now2;
-			U_LOG_W("#206: last measured weave->scanout residual %.2f ms "
-			        "(%.2f refresh periods, n=%u)",
-			        target->residual_ns / 1e6,
-			        (double)target->residual_ns / (double)target->vblank_grid.period_ns,
-			        target->residual_samples);
-		}
-	}
+	target_log_residual(target);
 }
 
 #ifdef XRT_OS_WINDOWS
@@ -2801,6 +3418,10 @@ comp_vk_native_target_mark_wait_frame(struct comp_vk_native_target *target)
 #ifdef XRT_OS_WINDOWS
 	(void)target;
 	g_lw_gov_vk_bridge.on_wait_frame(); // #912: governor owns the EMAs now
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	if (target != NULL) {
+		target->pw_wait_frame_ns = os_monotonic_get_ns();
+	}
 #else
 	(void)target;
 #endif
@@ -2841,6 +3462,20 @@ comp_vk_native_target_get_predicted_lookahead_ns(struct comp_vk_native_target *t
 #ifdef XRT_OS_WINDOWS
 	return late_weave_lookahead_ns(g_lw_gov_vk_bridge.wait_to_weave_ema_ns, target->measured_r_ns,
 	                               target->period_hint_ns);
+#elif defined(XRT_OS_LINUX_DESKTOP)
+	/*
+	 * #2119: at present_wait depth > 1 the app runs depth-1 frames further
+	 * ahead of glass, so the period x 2 constant (right for an app keeping up
+	 * at depth 1) under-predicts. Use the measured form the Windows paths use
+	 * (#867): xrWaitFrame -> weave start, plus the measured weave -> scanout
+	 * residual. At depth 1 keep the constant (0 = caller's fallback): that
+	 * case is unchanged by #2119.
+	 */
+	if (target == NULL || target_pw_depth(target) <= 1) {
+		return 0;
+	}
+	return late_weave_lookahead_ns(target->pw_wait_to_weave_ema_ns, target->residual_ns,
+	                               (double)comp_vk_native_target_vblank_period_ns(target));
 #else
 	(void)target;
 	return 0;
@@ -2943,7 +3578,45 @@ target_note_swap_result(struct comp_vk_native_target *target, VkResult res, enum
 xrt_result_t
 comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *out_index, VkQueue queue, bool is_repaint)
 {
+	return comp_vk_native_target_acquire_ex(target, out_index, queue, is_repaint, VK_NULL_HANDLE, NULL);
+}
+
+void
+comp_vk_native_target_consume_acquire_signal(struct comp_vk_native_target *target, VkQueue queue, VkSemaphore sem)
+{
 	struct vk_bundle *vk = target->vk;
+	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+	VkSubmitInfo wait_submit = {
+	    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+	    .waitSemaphoreCount = 1,
+	    .pWaitSemaphores = &sem,
+	    .pWaitDstStageMask = &wait_stage,
+	};
+#ifdef XRT_OS_ANDROID
+	comp_vk_native_queue_submit_retry(vk, queue, &wait_submit, VK_NULL_HANDLE, "acquire-stale-consume");
+#else
+	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+#endif
+	vk->vkQueueWaitIdle(queue);
+}
+
+xrt_result_t
+comp_vk_native_target_acquire_ex(struct comp_vk_native_target *target,
+                                 uint32_t *out_index,
+                                 VkQueue queue,
+                                 bool is_repaint,
+                                 VkSemaphore acquire_sem,
+                                 bool *out_acquire_sem_signalled)
+{
+	struct vk_bundle *vk = target->vk;
+
+	// #2095 / ADR-055: which semaphore this acquire signals. The target's own
+	// is consumed below by the dummy submit (host-wait path); a caller-owned
+	// one is left signalled for the caller's first GPU batch to wait.
+	const VkSemaphore acq_sem = acquire_sem != VK_NULL_HANDLE ? acquire_sem : target->image_available;
+	if (out_acquire_sem_signalled != NULL) {
+		*out_acquire_sem_signalled = false;
+	}
 
 	// #1236: refuse to enter the driver with a destroyed swapchain. A failed
 	// recreate below leaves this NULL, and vkAcquireNextImageKHR(…, VK_NULL_HANDLE, …)
@@ -2998,12 +3671,93 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	 * not its competitor.
 	 */
 	bool have_present_wait = false;
-#ifdef XRT_OS_WINDOWS
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
 	// present_wait is the better tier where it exists — a real sync point
-	// rather than a projection — so the grid stands down for it.
+	// rather than a projection — so the grid stands down for it. (Desktop
+	// Linux since #2060.)
 	have_present_wait = (target_present_wait_fn(target) != NULL);
 #endif
-	if (dxr_late_weave_enabled() && !have_present_wait) {
+	/*
+	 * #2068: stamp the weave start UNCONDITIONALLY, so the #206 weave->scanout
+	 * residual exists in every arm of an A/B — DXR_LATE_WEAVE=0 and the
+	 * grid-not-engaged default included. It was stamped only inside the
+	 * pacing tiers, so the off arm of a panel A/B printed no residual and the
+	 * benefit could not be stated. A pacing tier below re-stamps it after its
+	 * wait/sleep (the weave starts then); without one the weave starts here.
+	 * Also feeds weave_cost_ns, which nothing reads unless a tier engages.
+	 */
+	target->weave_start_ns = os_monotonic_get_ns();
+
+	bool have_fb_pacing = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+	/*
+	 * #2068 FEEDBACK PACING (opt-in): before weaving frame N, wait — bounded
+	 * at 1.5 periods — until the wp_presentation feedback for commit
+	 * N-latency has arrived, i.e. that frame is on glass (or was discarded).
+	 * The present_wait latency-1 behaviour for apps whose device has no
+	 * present_wait (enable1): nothing queues in FIFO, so a commit is shown at
+	 * the compositor's next cycle instead of behind the queue. Same blocking
+	 * point as the present_wait tier (acquire, inside xrEndFrame's commit).
+	 * Where present_wait exists it stays the pacer; the grid gate stands down
+	 * for either.
+	 */
+	if (dxr_late_weave_enabled() && dxr_late_weave_linux_pace() && target_present_wait_fn(target) == nullptr) {
+		if (!comp_vk_native_present_feedback_can_pace(target->present_fb)) {
+			if (!target->fb_pace_unavailable_logged) {
+				target->fb_pace_unavailable_logged = true;
+				U_LOG_W("#902: DXR_LATE_WEAVE_LINUX_PACE=1 but this surface has no wp_presentation feedback "
+				        "(X11, or the compositor lacks it) — feedback pacing not available");
+			}
+		} else {
+			if (!target->fb_pace_inited) {
+				target->fb_pace_inited = true;
+				comp_fb_pace_init(&target->fb_pace, dxr_late_weave_linux_pace_latency(),
+				                  dxr_late_weave_autobackoff());
+			}
+			const uint64_t wait_seq = comp_fb_pace_wait_target(&target->fb_pace, target->pf_seq);
+			have_fb_pacing = !target->fb_pace.off;
+			if (wait_seq != 0) {
+				const uint64_t t0 = os_monotonic_get_ns();
+				const bool ok = comp_vk_native_present_feedback_wait(
+				    target->present_fb, wait_seq, comp_fb_pace_timeout_ns(target->vblank_grid.period_ns));
+				const uint64_t t1 = os_monotonic_get_ns();
+				const int from = target->fb_pace.depth;
+				const enum comp_fb_pace_event e = comp_fb_pace_on_wait(&target->fb_pace, ok, t1 - t0, t1);
+				if (ok && !target->fb_pace_logged) {
+					target->fb_pace_logged = true;
+					U_LOG_W("#902: pacing enable1 weaves on wp_presentation feedback (latency %d)",
+					        target->fb_pace.depth);
+				}
+				if (e == COMP_FB_PACE_DEEPER || e == COMP_FB_PACE_SHALLOWER) {
+					U_LOG_W("#902: feedback pacing latency %d -> %d (%s)", from, target->fb_pace.depth,
+					        e == COMP_FB_PACE_DEEPER ? "slip-rate escalation" : "return probe");
+				} else if (e == COMP_FB_PACE_OFF) {
+					U_LOG_W("#902: feedback pacing OFF for this session — no wp_presentation feedback "
+					        "arrived within 1.5 periods, 3 times in a row, before any did");
+					have_fb_pacing = false;
+				}
+				// The weave starts now, after the pacing wait.
+				target->weave_start_ns = os_monotonic_get_ns();
+			}
+		}
+	}
+#endif
+
+	bool grid_tier_allowed = true;
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2068: opt-in on desktop Linux, and off for the session once the learned
+	// compositor lead leaves no slack (see dxr_late_weave_linux_grid_optin).
+	grid_tier_allowed = dxr_late_weave_linux_grid_optin() && !target->lw_lead.off;
+	if (!dxr_late_weave_linux_grid_optin() && !have_present_wait && dxr_late_weave_enabled() &&
+	    !target->lw_grid_optin_logged &&
+	    comp_vblank_grid_trusted(&target->vblank_grid, os_monotonic_get_ns())) {
+		target->lw_grid_optin_logged = true;
+		U_LOG_W(
+		    "#902: grid late weave NOT engaged — opt-in on desktop Linux (DXR_LATE_WEAVE_LINUX_GRID=1): "
+		    "on a composited desktop it cost presents (#2068). The grid is still fed.");
+	}
+#endif
+	if (dxr_late_weave_enabled() && !have_present_wait && !have_fb_pacing && grid_tier_allowed) {
 		const uint64_t now_ns = os_monotonic_get_ns();
 		const uint64_t next_vblank =
 		    comp_vblank_grid_next_vblank_after(&target->vblank_grid, now_ns);
@@ -3013,8 +3767,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			// millisecond early costs a millisecond of staleness, being a
 			// millisecond late costs a whole refresh.
 			const uint64_t margin_ns = 1500ULL * 1000;
-			const uint64_t budget_ns = target->weave_cost_ns + margin_ns;
-			if (next_vblank > now_ns + budget_ns) {
+			uint64_t budget_ns = target->weave_cost_ns + margin_ns;
+			bool may_aim = true;
+#ifdef XRT_OS_LINUX_DESKTOP
+			// #2068: plus the lead the desktop compositor's latch needs. It
+			// starts from what the desktop has SHOWN — the smallest
+			// commit-to-vblank gap of an un-aimed frame that still made the
+			// pipeline's floor — so nothing is aimed until that is known.
+			if (!target->lw_lead.initialised && comp_lw_lead_primed(&target->lw_lead)) {
+				comp_lw_lead_init(&target->lw_lead, margin_ns);
+				U_LOG_W(
+				    "#902: grid late weave aiming — the desktop shows a commit %u vblank(s) later at "
+				    "best; starting lead %.2f ms (smallest commit-to-vblank gap that made it, %u "
+				    "frames watched)",
+				    target->lw_lead.base_vblanks, target->lw_lead.lead_ns / 1e6,
+				    target->lw_lead.observed);
+			}
+			may_aim = target->lw_lead.initialised;
+			budget_ns += target->lw_lead.lead_ns;
+#endif
+			if (may_aim && next_vblank > now_ns + budget_ns) {
 				uint64_t sleep_ns = next_vblank - budget_ns - now_ns;
 				// Never sleep past one period, whatever the grid says. A
 				// wrong anchor must cost at most a frame, not a stall — the
@@ -3023,12 +3795,23 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 					sleep_ns = period_ns;
 				}
 				os_nanosleep((int64_t)sleep_ns);
+#ifdef XRT_OS_LINUX_DESKTOP
+				// Aimed: the feedback for this weave says whether it made it.
+				target->lw_aimed_vblank_ns = next_vblank;
+#endif
 			}
 			if (!target->late_weave_grid_logged) {
 				target->late_weave_grid_logged = true;
-				U_LOG_W("#902: late weave on the measured grid — period %.3f ms, "
-				        "weave budget %.3f ms (no present_wait on this device)",
-				        period_ns / 1e6, budget_ns / 1e6);
+				const char *grid_source = "VK_GOOGLE_display_timing";
+#ifdef XRT_OS_LINUX_DESKTOP
+				if (target->present_fb != NULL) {
+					grid_source = comp_vk_native_present_feedback_kind(target->present_fb);
+				}
+#endif
+				U_LOG_W(
+				    "#902: late weave on the measured grid — period %.3f ms, "
+				    "weave budget %.3f ms (no present_wait on this device; grid source: %s)",
+				    period_ns / 1e6, budget_ns / 1e6, grid_source);
 			}
 		}
 		target->weave_start_ns = os_monotonic_get_ns();
@@ -3274,11 +4057,231 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	}
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2060: the same pacing on desktop Linux — block until the previous
+	// present hit glass, so record + weave + present run inside one refresh.
+	if (target->last_present_id != 0) {
+		PFN_vkWaitForPresentKHR wait_fn = target_present_wait_fn(target);
+		if (wait_fn != nullptr) {
+			// #2119: the depth comes from the governor — max(commit-to-glass
+			// lag floor, slip level), base 1 — unless DXR_LATE_WEAVE_MAX_LATENCY
+			// pins it or DXR_LATE_WEAVE_AUTOBACKOFF=0 holds it at the base.
+			const bool lat_explicit = vk_late_weave_max_latency_explicit();
+			if (!target->pw_pace_inited) {
+				target->pw_pace_inited = true;
+				target->pw_governing = !lat_explicit && dxr_late_weave_autobackoff();
+				comp_fb_pace_init(&target->pw_pace, vk_late_weave_max_latency(), target->pw_governing);
+				// The slip machine's "never resolved -> off" rule is for
+				// feedback pacing; this tier has its own latch (below), and a
+				// composited window's first depth-1 frames are all slips.
+				target->pw_pace.ever_ok = true;
+				// No banked level above the measured floor on this tier: on a
+				// 58 fps app slipping from GPU jitter it bought no frames and
+				// cost a full period of residual (#2119, second CI build).
+				target->pw_pace.banked = 0;
+				comp_lw_lag_init(&target->pw_lag);
+			}
+			const int depth = target_pw_depth(target);
+			const uint64_t relax = (uint64_t)(depth - 1);
+			const uint64_t wait_id = comp_fb_pace_wait_target(&target->pw_pace, target->last_present_id);
+			if (wait_id != 0) {
+				const uint64_t wait_t0 = os_monotonic_get_ns();
+				const VkResult wres =
+				    wait_fn(vk->device, target->swapchain, wait_id, 100ull * 1000 * 1000);
+				const uint64_t now_ns = os_monotonic_get_ns();
+				if (wres != VK_SUCCESS) {
+					// Occluded / not reaching glass: not saturation.
+					target->pw_last_frame_ns = 0;
+				} else if (target->pw_governing) {
+					// (a) lag floor where the feeder cannot correlate per
+					// present (X11, no wp_presentation): a wait that blocked
+					// returned at glass (+ wake-up), so now − commit is the lag.
+					// A wait that did not block says only "already on glass".
+					const uint64_t commit = (target->present_weave_ring_id[wait_id % 8] == wait_id)
+					                            ? target->present_commit_ring_ns[wait_id % 8]
+					                            : 0;
+					if (!target->pw_lag_from_feedback && commit != 0 && now_ns > commit &&
+					    now_ns - wait_t0 > 200ULL * 1000) {
+						target_pw_note_lag(target, now_ns - commit,
+						                   target->present_commit_queued[wait_id % 8], now_ns);
+					}
+					// (b) slip level: a paced frame interval over 1.55
+					// periods is a vsync-doubled frame (Windows slip test).
+					const uint64_t period_ns = comp_vk_native_target_vblank_period_ns(target);
+					const uint64_t dt =
+					    target->pw_last_frame_ns != 0 ? now_ns - target->pw_last_frame_ns : 0;
+					{
+						// Floor: raised by starvation (the wait is the frame),
+						// lowered by slack (the waited-on present was already on
+						// glass for a whole dwell). Both are free to measure.
+						const int from = target_pw_depth(target);
+						const uint32_t reverted = target->pw_lag.lowers_reverted;
+						const enum comp_lw_lag_event le = comp_lw_lag_on_frame(
+						    &target->pw_lag, dt, now_ns - wait_t0, period_ns, now_ns);
+						if (le != COMP_LW_LAG_NONE) {
+							comp_fb_pace_set_floor(&target->pw_pace, target->pw_lag.depth,
+							                       now_ns);
+							char why[160];
+							if (le == COMP_LW_LAG_LOWERED_SLACK) {
+								snprintf(why, sizeof(why),
+								         "slack: %.0f%% of present waits < 0.1 period "
+								         "over the dwell",
+								         target->pw_lag.last_slack_share * 100.0);
+							} else {
+								snprintf(why, sizeof(why),
+								         "starvation: the pacer's wait was the frame%s",
+								         target->pw_lag.lowers_reverted != reverted
+								             ? " — the last lowering was wrong, dwell "
+								               "doubled"
+								             : "");
+							}
+							target_pw_log_change(target, from, why, now_ns);
+						}
+					}
+					if (period_ns != 0 && dt != 0 && dt < 250ULL * 1000 * 1000) {
+						const int from = target_pw_depth(target);
+						const enum comp_fb_pace_event e = comp_fb_pace_on_wait(
+						    &target->pw_pace, !comp_lw_lag_is_slip(dt, period_ns),
+						    now_ns - wait_t0, now_ns);
+						if (target_pw_depth(target) != from) {
+							target_pw_log_change(target, from,
+							                     e == COMP_FB_PACE_DEEPER
+							                         ? "saturation: slip-rate escalation"
+							                         : "slip-level return probe",
+							                     now_ns);
+						} else if (e == COMP_FB_PACE_AT_CAP) {
+							target->pw_cap_windows++;
+							if (target->pw_cap_log_ns == 0 ||
+							    now_ns - target->pw_cap_log_ns >
+							        30ULL * 1000 * 1000 * 1000) {
+								U_LOG_W(
+								    "#2119: slip window at the depth cap (depth %d = "
+								    "measured floor): "
+								    "not escalating, a level above the floor buys no "
+								    "frames here "
+								    "(%u such windows so far)",
+								    from, target->pw_cap_windows);
+								target->pw_cap_log_ns = now_ns;
+							}
+						}
+					}
+					// Drain: never admit a frame with more of ours outstanding
+					// than the depth allows — after a raise the frames admitted
+					// at the lower depth would otherwise stay queued for good
+					// (round 4: residual 2.97 periods for ~50 s after a revert).
+					// Wayland only: X11 Present carries no tag of ours.
+					if (target->pw_lag_from_feedback && target->present_fb != NULL) {
+						const int d = target_pw_depth(target);
+						uint64_t tag =
+						    comp_lw_lag_drain_tag(target->pf_seq, target->pf_answered_seq, d);
+						if (tag != 0) {
+							target_feed_present_feedback(target); // count may be stale
+							tag = comp_lw_lag_drain_tag(target->pf_seq,
+							                            target->pf_answered_seq, d);
+						}
+						if (tag != 0) {
+							const uint64_t ahead = target->pf_seq - target->pf_answered_seq;
+							(void)comp_vk_native_present_feedback_wait(
+							    target->present_fb, tag,
+							    comp_fb_pace_timeout_ns(period_ns));
+							target_feed_present_feedback(target);
+							if (target->pw_drains++ == 0) {
+								U_LOG_W(
+								    "#2119: drained the present queue to depth %d "
+								    "before admitting a "
+								    "frame (%llu of ours were outstanding); further "
+								    "drains are counted "
+								    "on the #206 line",
+								    d, (unsigned long long)ahead);
+							}
+						}
+					}
+					target->pw_last_frame_ns = now_ns;
+				}
+				if (wres == VK_SUCCESS) {
+					target->present_wait_timeouts = 0;
+					target->present_wait_ever_ok = true;
+					if (!target->present_wait_logged) {
+						target->present_wait_logged = true;
+						U_LOG_W(
+						    "#902: late weave on VK_KHR_present_wait — pacing on present id "
+						    "N-%llu hitting glass (%s)",
+						    (unsigned long long)relax,
+						    lat_explicit
+						        ? "depth pinned by DXR_LATE_WEAVE_MAX_LATENCY, governor off"
+						    : target->pw_governing
+						        ? "depth governed (#2119): max(commit-to-glass lag floor, slip "
+						          "level), "
+						          "base 1, changes logged as '#2119: late-weave depth'"
+						        : "governor off (DXR_LATE_WEAVE_AUTOBACKOFF=0), depth 1");
+					}
+					// #206 residual, only where no window-system feedback
+					// measures it more exactly (wait return = glass + wake-up).
+					const uint64_t started = (target->present_weave_ring_id[wait_id % 8] == wait_id)
+					                             ? target->present_weave_ring_ns[wait_id % 8]
+					                             : 0;
+					if (target->present_fb == NULL && started != 0 && now_ns > started &&
+					    now_ns - started < 200ULL * 1000 * 1000) {
+						target->residual_ns = now_ns - started;
+						target->residual_samples++;
+						comp_residual_window_add(&target->residual_win, now_ns - started);
+						// No feeder to call the trace (it logs from its pump).
+						target_log_residual(target);
+					}
+				} else if (wres == VK_TIMEOUT && !target->present_wait_ever_ok &&
+				           ++target->present_wait_timeouts >= 3) {
+					// Never resolved once: the entry point exists but the
+					// features were not enabled (an enable1 app), or the
+					// WSI cannot report. Occlusion is not this case — that
+					// only times out AFTER waits have succeeded.
+					target->present_wait_latched_off = true;
+					U_LOG_W(
+					    "#902: VK_KHR_present_wait never resolved (3 timeouts, 0 successes) — "
+					    "present_wait tier OFF for this session, the measured vblank grid takes "
+					    "over");
+				}
+				// The weave starts now, after the pacing wait: the budget
+				// and the residual measure from here.
+				target->weave_start_ns = os_monotonic_get_ns();
+				// #2119/#867: xrWaitFrame -> weave start, for the lookahead.
+				if (target->pw_wait_frame_ns != 0 &&
+				    target->weave_start_ns > target->pw_wait_frame_ns) {
+					const double phi = (double)(target->weave_start_ns - target->pw_wait_frame_ns);
+					if (phi < 250e6) {
+						target->pw_wait_to_weave_ema_ns =
+						    target->pw_wait_to_weave_ema_ns == 0.0
+						        ? phi
+						        : target->pw_wait_to_weave_ema_ns * 0.9 + phi * 0.1;
+					}
+					target->pw_wait_frame_ns = 0;
+				}
+			}
+		}
+	}
+#endif
+
+	/*
+	 * An image a dropped fill acquired but never presented (see
+	 * comp_vk_native_target_hold_unpresented) is still OURS: hand it out
+	 * again instead of asking the presentation engine for another. Its
+	 * acquire semaphore was already waited on (the dummy submit below ran
+	 * for it), so nothing is waited here. Only for the image set it came
+	 * from — a recreate bumps the generation and the old image is gone.
+	 */
+	if (target->held_valid) {
+		target->held_valid = false;
+		if (target->held_generation == target->generation && target->swapchain != VK_NULL_HANDLE &&
+		    target->held_index < target->image_count) {
+			target->current_index = target->held_index;
+			*out_index = target->current_index;
+			return XRT_SUCCESS;
+		}
+	}
+
 	// Use the semaphore for acquire, then do a dummy submit that waits on it
 	// to ensure the image is actually available before the compositor renders.
-	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-	                                          dxr_acquire_timeout_ns(), target->image_available,
-	                                          VK_NULL_HANDLE, &target->current_index);
+	VkResult res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
+	                                         VK_NULL_HANDLE, &target->current_index);
 	target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE);
 	if (res == VK_ERROR_OUT_OF_DATE_KHR || res == VK_SUBOPTIMAL_KHR) {
 		// Swapchain invalidated (window resize, minimize, etc.) — recreate and retry
@@ -3300,6 +4303,12 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		// refresh_cycle_probed clears too: a recreate can follow a mode change.
 		comp_vblank_grid_reset_phase(&target->vblank_grid);
 		target->refresh_cycle_probed = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+		comp_present_feedback_reset_phase(&target->pf_state);
+		target->present_id_counter = 0; // present ids are per-swapchain (#2060)
+		target->last_present_id = 0;
+		target->pw_last_frame_ns = 0; // #2119: no interval across a recreate
+#endif
 
 		{
 			// Same lifetime guard as comp_vk_native_target_resize. This
@@ -3340,12 +4349,26 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 			}
 		}
 
-		// Retry acquire with new swapchain
-		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain,
-		                                 dxr_acquire_timeout_ns(), target->image_available,
-		                                 VK_NULL_HANDLE, &target->current_index);
+		// #2095: a VK_SUBOPTIMAL_KHR first acquire DID acquire an image and
+		// signalled acq_sem; the recreate above idled the device, so that
+		// signal is now stale with nothing pending on it, and the retry
+		// below may not re-signal a signalled binary semaphore
+		// (VUID-vkAcquireNextImageKHR-semaphore-01286). Consume it the way
+		// the host-wait path always did. Caller-owned semaphore only: the
+		// target's own keeps its pre-existing behaviour byte for byte.
+		if (res == VK_SUBOPTIMAL_KHR && acquire_sem != VK_NULL_HANDLE) {
+			comp_vk_native_target_consume_acquire_signal(target, queue, acq_sem);
+		}
+
+		// Retry acquire with new swapchain. VK_SUBOPTIMAL_KHR IS a success
+		// here: an image was acquired and acq_sem signalled, so treating it
+		// as a failure would strand that signal (#2095 review) — the next
+		// frame presents it and the swapchain is recreated on the following
+		// acquire if it is still suboptimal.
+		res = vk->vkAcquireNextImageKHR(vk->device, target->swapchain, dxr_acquire_timeout_ns(), acq_sem,
+		                                VK_NULL_HANDLE, &target->current_index);
 		target_note_swap_result(target, res, TARGET_SWAP_ACQUIRE_RETRY);
-		if (res != VK_SUCCESS) {
+		if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
 			U_LOG_E("Failed to acquire after swapchain recreation: %d", res);
 #ifdef XRT_OS_ANDROID
 			// #1236: same reasoning as the primary acquire path — a surface that
@@ -3407,6 +4430,18 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 		return XRT_ERROR_VULKAN;
 	}
 
+	if (acquire_sem != VK_NULL_HANDLE) {
+		// #2095 / ADR-055: the caller's semaphore now carries one pending
+		// signal, which the caller's first batch on the image waits on the
+		// GPU. No dummy submit, no vkQueueWaitIdle — that pair is exactly
+		// the acquire-side host drain the chain exists to remove.
+		if (out_acquire_sem_signalled != NULL) {
+			*out_acquire_sem_signalled = true;
+		}
+		*out_index = target->current_index;
+		return XRT_SUCCESS;
+	}
+
 	// Wait for the acquired image to be available by doing a dummy submit
 	// that waits on the image_available semaphore.
 	VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
@@ -3419,15 +4454,63 @@ comp_vk_native_target_acquire(struct comp_vk_native_target *target, uint32_t *ou
 	// #868: whichever queue the CALLER owns — the app frame uses the app's,
 	// a repaint uses the runtime-owned one. Never mix: a VkQueue is externally
 	// synchronised and the runtime cannot serialise the app's own submits.
+#ifdef XRT_OS_ANDROID
+	// #1905: retried once on -3 — a lost wait leaves image_available signalled
+	// and unwaited, which poisons the next acquire on this semaphore.
+	comp_vk_native_queue_submit_retry(vk, queue, &wait_submit, VK_NULL_HANDLE, "acquire-wait");
+#else
 	vk->vkQueueSubmit(queue, 1, &wait_submit, VK_NULL_HANDLE);
+#endif
 	vk->vkQueueWaitIdle(queue);
 
 	*out_index = target->current_index;
 	return XRT_SUCCESS;
 }
 
+uint32_t
+comp_vk_native_target_get_image_count(struct comp_vk_native_target *target)
+{
+	return target != NULL ? target->image_count : 0;
+}
+
+#ifdef XRT_OS_ANDROID
+VkResult
+comp_vk_native_queue_submit_retry(
+    struct vk_bundle *vk, VkQueue queue, const VkSubmitInfo *submit, VkFence fence, const char *site)
+{
+	VkResult res = vk->vkQueueSubmit(queue, 1, submit, fence);
+	if (res != VK_ERROR_INITIALIZATION_FAILED) {
+		return res;
+	}
+	os_nanosleep(1000 * 1000);
+	res = vk->vkQueueSubmit(queue, 1, submit, fence);
+
+	static std::atomic<uint64_t> s_retries{0};
+	static std::atomic<uint64_t> s_recovered{0};
+	const uint64_t n = ++s_retries;
+	const uint64_t ok = (res == VK_SUCCESS) ? ++s_recovered : s_recovered.load();
+	if (n == 1 || n % 100 == 0) {
+		U_LOG_W(
+		    "#1905: vkQueueSubmit returned VK_ERROR_INITIALIZATION_FAILED at %s — retried after 1 ms: "
+		    "%d (%llu retries so far, %llu recovered). Mitigation for the shared-GSL-context submit "
+		    "race; logged first + every 100th.",
+		    site, (int)res, (unsigned long long)n, (unsigned long long)ok);
+	}
+	return res;
+}
+#endif
+
 xrt_result_t
 comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queue, bool counted)
+{
+	return comp_vk_native_target_present_ex(target, queue, counted, VK_NULL_HANDLE);
+}
+
+xrt_result_t
+comp_vk_native_target_present_ex(struct comp_vk_native_target *target,
+                                 VkQueue queue,
+                                 bool counted,
+                                 VkSemaphore wait_sem)
 {
 	struct vk_bundle *vk = target->vk;
 
@@ -3448,12 +4531,14 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 	}
 #endif
 
-	// No semaphore wait needed — the compositor calls vkQueueWaitIdle
-	// after all rendering commands before presenting.
+	// Host-wait callers pass VK_NULL_HANDLE: they drained (vkQueueWaitIdle /
+	// a fence) before presenting, so there is nothing to wait. #2095 / ADR-055
+	// chained callers pass the semaphore their final batch signals, and have
+	// waited nothing on the host.
 	VkPresentInfoKHR present_info = {
 	    .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-	    .waitSemaphoreCount = 0,
-	    .pWaitSemaphores = NULL,
+	    .waitSemaphoreCount = wait_sem != VK_NULL_HANDLE ? 1u : 0u,
+	    .pWaitSemaphores = wait_sem != VK_NULL_HANDLE ? &wait_sem : NULL,
 	    .swapchainCount = 1,
 	    .pSwapchains = &target->swapchain,
 	    .pImageIndices = &target->current_index,
@@ -3475,6 +4560,22 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 		present_id.swapchainCount = 1;
 		present_id.pPresentIds = &wl_id;
 		present_info.pNext = &present_id;
+	}
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2060: tag the present with a VkPresentIdKHR for the present_wait tier
+	// (Linux twin of the Windows block above). Never for an uncounted present.
+	uint64_t pw_id = 0;
+	// Captured now: the counted-present block below consumes weave_start_ns.
+	const uint64_t pw_weave_start = target->weave_start_ns;
+	VkPresentIdKHR pw_present_id = {};
+	if (counted && present_info.pNext == NULL && target_present_wait_fn(target) != nullptr) {
+		pw_id = ++target->present_id_counter;
+		pw_present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+		pw_present_id.swapchainCount = 1;
+		pw_present_id.pPresentIds = &pw_id;
+		present_info.pNext = &pw_present_id;
 	}
 #endif
 
@@ -3515,8 +4616,42 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 		target->residual_ring[slot].weave_start_ns = target->weave_start_ns;
 	}
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #902: ask the window system to report THIS present (Wayland: a
+	// wp_presentation.feedback on the commit the WSI makes inside
+	// vkQueuePresentKHR below; X11 reports every present without asking).
+	// Uncounted presents are not tagged, for the same reason as above.
+	uint64_t pf_req_seq = 0;
+	if (counted && target->present_fb != NULL) {
+		pf_req_seq = ++target->pf_seq;
+		target->pf_ring[pf_req_seq % 16].seq = pf_req_seq;
+		target->pf_ring[pf_req_seq % 16].weave_start_ns = target->weave_start_ns;
+		target->pf_ring[pf_req_seq % 16].aimed_vblank_ns = target->lw_aimed_vblank_ns;
+		target->pf_ring[pf_req_seq % 16].commit_ns = 0;
+		// #2119: the ACTUAL number of our presents still outstanding at this
+		// commit (not depth - 1: the swapchain lets the app run further
+		// ahead). Drain the feedback first so the count is current.
+		if (target->pw_governing) {
+			target_feed_present_feedback(target);
+		}
+		const uint64_t prev = pf_req_seq - 1;
+		const uint32_t outstanding =
+		    prev > target->pf_answered_seq ? (uint32_t)(prev - target->pf_answered_seq) : 0;
+		target->pf_ring[pf_req_seq % 16].queued_ahead = outstanding;
+		target->pw_last_outstanding = outstanding;
+		comp_vk_native_present_feedback_request(target->present_fb, pf_req_seq);
+	}
+	target->lw_aimed_vblank_ns = 0;
+#endif
+
 	VkResult res = vk->vkQueuePresentKHR(queue, &present_info);
 	target_note_swap_result(target, res, TARGET_SWAP_PRESENT);
+#ifdef XRT_OS_LINUX_DESKTOP
+	const uint64_t present_ret_ns = os_monotonic_get_ns();
+	if (pf_req_seq != 0) {
+		target->pf_ring[pf_req_seq % 16].commit_ns = present_ret_ns;
+	}
+#endif
 
 	// #868/#902: anchor the vblank grid on what actually reached the panel.
 	// After the present, so the driver has the record; best-effort, so a
@@ -3552,6 +4687,22 @@ comp_vk_native_target_present(struct comp_vk_native_target *target, VkQueue queu
 			target->weave_start_ns = 0;
 		}
 	}
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	if (pw_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
+		target->last_present_id = pw_id;
+		target->present_weave_ring_id[pw_id % 8] = pw_id;
+		target->present_weave_ring_ns[pw_id % 8] = pw_weave_start;
+		target->present_commit_ring_ns[pw_id % 8] = present_ret_ns; // #2119 lag
+		// X11 / uncorrelated feedback: present_wait only proves glass for the
+		// id the pacer waited on, so depth - 1 is the bound it guarantees
+		// (the Wayland path above counts the real outstanding presents).
+		target->present_commit_queued[pw_id % 8] = (uint32_t)(target_pw_depth(target) - 1);
+		if (!target->pw_lag_from_feedback) {
+			target->pw_last_outstanding = target->present_commit_queued[pw_id % 8];
+		}
+	}
+#endif
 
 #ifdef XRT_OS_WINDOWS
 	if (wl_id != 0 && (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR)) {
@@ -3617,6 +4768,12 @@ VkFormat
 comp_vk_native_target_get_format(struct comp_vk_native_target *target)
 {
 	return target->format;
+}
+
+bool
+comp_vk_native_target_images_sampled(struct comp_vk_native_target *target)
+{
+	return target != NULL && target->images_sampled;
 }
 
 xrt_result_t
@@ -3763,6 +4920,12 @@ comp_vk_native_target_resize(struct comp_vk_native_target *target,
 	// refresh_cycle_probed clears too: a recreate can follow a mode change.
 	comp_vblank_grid_reset_phase(&target->vblank_grid);
 	target->refresh_cycle_probed = false;
+#ifdef XRT_OS_LINUX_DESKTOP
+	comp_present_feedback_reset_phase(&target->pf_state);
+	target->present_id_counter = 0; // present ids are per-swapchain (#2060)
+	target->last_present_id = 0;
+	target->pw_last_frame_ns = 0; // #2119: no interval across a recreate
+#endif
 
 	// The crash this exists to stop: below, target->swapchain is set to
 	// VK_NULL_HANDLE before create_swapchain repopulates it, and the repaint
@@ -3791,4 +4954,28 @@ uint32_t
 comp_vk_native_target_get_generation(struct comp_vk_native_target *target)
 {
 	return target->generation;
+}
+
+void
+comp_vk_native_target_hold_unpresented(struct comp_vk_native_target *target, uint32_t index)
+{
+#ifdef XRT_OS_WINDOWS
+	if (target->dcomp_active) {
+		return; // a bridge ring slot, not a WSI image: nothing to hand back
+	}
+#endif
+	if (index >= target->image_count) {
+		return;
+	}
+	target->held_valid = true;
+	target->held_index = index;
+	target->held_generation = target->generation;
+}
+
+void
+comp_vk_native_target_set_current_index(struct comp_vk_native_target *target, uint32_t index)
+{
+	if (index < target->image_count) {
+		target->current_index = index;
+	}
 }

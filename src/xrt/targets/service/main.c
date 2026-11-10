@@ -24,13 +24,44 @@
 #include "service_orchestrator.h"
 #include "service_tray_win.h"
 #include <stdlib.h> // __argc, __argv
+#include <wchar.h>  // _snwprintf_s
 #endif
 
 #include "server/ipc_server_interface.h"
 #include "server/ipc_server.h"
+#include "server/ipc_server_stereo_camera.h" // the shared-camera host slot (in-process consumers)
 #include "service_client_class.h" // #960
 
+#ifdef XRT_OS_WINDOWS
+#include "shared/ipc_protocol.h" // enum ipc_workspace_launch_status
+
+// Display dashboard phase 8: the orchestrator's launch result, mapped onto the
+// system_workspace_launch wire status (registered as the provider below).
+static uint32_t
+workspace_launch_provider(const char *controller_id)
+{
+	switch (service_orchestrator_request_launch(controller_id)) {
+	case SERVICE_LAUNCH_STARTED: return IPC_WORKSPACE_LAUNCH_STARTED;
+	case SERVICE_LAUNCH_NOT_ACTIVE: return IPC_WORKSPACE_LAUNCH_NOT_ACTIVE;
+	case SERVICE_LAUNCH_DISABLED: return IPC_WORKSPACE_LAUNCH_DISABLED;
+	case SERVICE_LAUNCH_ALREADY_RUNNING: return IPC_WORKSPACE_LAUNCH_ALREADY_RUNNING;
+	case SERVICE_LAUNCH_NO_CONTROLLER: return IPC_WORKSPACE_LAUNCH_NO_CONTROLLER;
+	default: return IPC_WORKSPACE_LAUNCH_UNSUPPORTED;
+	}
+}
+#endif
+
 #include "target_lists.h"
+#include "target_status_snapshot.h"     // ADR-051 D3: the status provider
+#include "target_display_hotplug.h"     // ADR-051 D6: the display-identity follow-up sink
+#include "target_plugin_loader.h"       // #2250: screen-key re-key permission
+#include "target_component_loader.h"    // ADR-054: the component class ids
+#include "target_input_plugin_loader.h" // ADR-054 N3d: input policy re-read -> arbiter re-rank
+#include "target_viewer_tracking.h"     // ADR-054 N6 Part 2: the service hosts the viewer-tracking provider
+#include "target_viewer_host.h"         // §4a: the out-of-process host binary name
+#include "service_spawn.h"              // its sibling path
+#include "service_conversion.h"         // ADR-053: the conversion core
+#include "service_component_watch.h"    // ADR-054 N3d (#2051): the policy-store watch
 
 // #950: run ipc_server_main under the structured-exception guard so an
 // exception escaping the main thread is recorded ([TERMINATE]) before it
@@ -51,7 +82,252 @@ service_main_body(void *p)
 	return NULL;
 }
 
+#include <stdlib.h> // getenv (DXR_TRACKING_HOST_EXE)
 #include <string.h> // strcmp for --workspace flag
+
+/*!
+ * ADR-051 D3: the rows of the display status snapshot only this target can
+ * fill (the loader + screen registry live in targets/common, above the IPC
+ * server). Read lazily on DIAG status RPCs; never per frame.
+ */
+static void
+register_status_provider(void)
+{
+	static const struct ipc_server_status_provider provider = {
+	    .build = target_status_snapshot_build_service,
+	    .change_key = target_status_snapshot_change_key,
+	};
+	ipc_server_set_status_provider(&provider);
+}
+
+/*!
+ * ADR-051 D6: a re-enumeration that kept a monitor's identity across an
+ * unreadable EDID (mid-reseat) asks for one more; the service runs no
+ * in-process hotplug monitor, so it goes to the display re-probe worker.
+ */
+static void
+display_followup_to_reprobe(const char *reason)
+{
+	// Debounced by the worker; a no-op until ipc_server_main started it.
+	ipc_server_request_display_reprobe(reason);
+}
+
+/*
+ * The input host iface's shared-camera slots (tracking-provider-discovery.md
+ * §10 item 2): an input provider in this process reads the display's shared
+ * stereo camera IN-PROCESS from the camera manager (never an IPC
+ * self-connection). The loader (targets/common, also in the in-process
+ * runtime) cannot link the IPC server, so the service registers the
+ * implementation here; the manager is created later inside ipc_server_main
+ * and these calls resolve it at call time ("unavailable" until then).
+ *
+ * The provenance -> consent mapping lives here, between the two layers: a
+ * binary the N4b gate classified signed / allowlisted / platform-trusted is a
+ * trusted component (consent step 4a, no prompt); unverified (reachable only
+ * with Trust Enforce = 0) and dev-override are prompted like an app — unless
+ * the camera's own developer override is set, which allows everyone.
+ */
+static xrt_result_t
+shcam_open(void *ctx,
+           const char *provider_id,
+           const char *display_name,
+           uint32_t provenance,
+           struct xrt_input_host_camera_open *inout,
+           void **out_impl)
+{
+	(void)ctx;
+	const bool trusted = provenance == TARGET_COMPONENT_PROVENANCE_SIGNED ||
+	                     provenance == TARGET_COMPONENT_PROVENANCE_ALLOWLISTED ||
+	                     provenance == TARGET_COMPONENT_PROVENANCE_PLATFORM_TRUSTED;
+	const struct ipc_server_stereo_camera_internal_request req = {
+	    .provider_id = provider_id,
+	    .display_name = display_name,
+	    .component_trusted = trusted,
+	    .camera_id = inout->camera_id,
+	    .output = inout->output,
+	    .max_frame_rate = inout->max_frame_rate,
+	};
+	struct ipc_server_stereo_camera_internal_info info;
+	struct ipc_server_stereo_camera_internal *c = NULL;
+	xrt_result_t xret = ipc_server_stereo_camera_internal_open(&req, &info, &c);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	if (!trusted) {
+		U_LOG_W(
+		    "shared camera: provider '%s' provenance %s — consented like an app, not as a trusted component",
+		    provider_id, target_component_provenance_str(provenance));
+	}
+	inout->props = info.props;
+	inout->calib = info.calib;
+	inout->layout = info.layout;
+	inout->wake = info.wake;
+	*out_impl = c;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+shcam_acquire(void *ctx, void *impl, uint32_t timeout_ms, struct xrt_input_host_camera_frame *out, uint32_t *out_state)
+{
+	(void)ctx;
+	struct ipc_server_stereo_camera_internal_frame f;
+	xrt_result_t xret = ipc_server_stereo_camera_internal_acquire((struct ipc_server_stereo_camera_internal *)impl,
+	                                                              timeout_ms, &f, out_state);
+	if (xret != XRT_SUCCESS) {
+		return xret;
+	}
+	out->frame_index = f.info.frame_index;
+	out->timestamp_ns = f.info.capture_time_ns;
+	out->time_is_exposure = f.info.time_is_exposure != 0;
+	out->width = f.info.width;
+	out->height = f.info.height;
+	out->format = f.info.format;
+	out->calibration_generation = f.info.calibration_generation;
+	out->plane[0] = f.plane[0];
+	out->plane[1] = f.plane[1];
+	out->row_pitch[0] = f.info.row_pitch[0];
+	out->row_pitch[1] = f.info.row_pitch[1];
+	return XRT_SUCCESS;
+}
+
+static void
+shcam_release(void *ctx, void *impl, uint64_t frame_index)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_internal_release((struct ipc_server_stereo_camera_internal *)impl, frame_index);
+}
+
+static void
+shcam_close(void *ctx, void *impl)
+{
+	(void)ctx;
+	ipc_server_stereo_camera_internal_close((struct ipc_server_stereo_camera_internal *)impl);
+}
+
+static void
+register_shared_camera(void)
+{
+	static const struct target_input_shared_camera_ops ops = {
+	    .open = shcam_open,
+	    .acquire = shcam_acquire,
+	    .release = shcam_release,
+	    .close = shcam_close,
+	};
+	target_input_plugin_loader_set_shared_camera_ops(&ops, NULL);
+}
+
+static void
+register_display_followup(void)
+{
+	target_display_hotplug_set_followup_sink(display_followup_to_reprobe);
+#if defined(XRT_OS_WINDOWS) || defined(XRT_OS_LINUX_DESKTOP)
+	// #2305: the in-process hotplug sweep is on by default on Windows and
+	// desktop Linux now, but this process already re-probes on its own OS
+	// events (the tray's WM_DISPLAYCHANGE / WM_DEVICECHANGE; DRM uevents +
+	// Mutter MonitorsChanged) through reprobe_run, which also refreshes the
+	// segment screens and the weave engines. One feeder, not two. (macOS
+	// keeps the sweep: the service has no other display-change source there.)
+	target_display_hotplug_set_host_feed(true);
+#endif
+}
+
+/*
+ * ADR-054 N3d (#2051): live re-select on an `Enabled` / `Preferred` change.
+ * One watch thread over every class's policy store (service_component_watch)
+ * dispatches per class; the conversion core subscribes itself in
+ * service_conversion_start. What each class does, by its lifetime rules:
+ *  - display: the same debounced re-probe as `system_request_display_reprobe`
+ *    (a secondary screen's segment DP follows; the primary at the next
+ *    session — plugin-discovery.md §4.2, no live swap);
+ *  - input: re-read PreferredPlugin + Enabled and re-rank the arbiter (devices
+ *    stay resident; a disabled provider is withdrawn like presence loss).
+ * The DIAG call `system_request_component_reselect` pokes the same callbacks.
+ */
+static void
+on_display_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	ipc_server_request_display_reprobe(reason == SERVICE_COMPONENT_WATCH_POKED
+	                                       ? "display-processor preference changed"
+	                                       : "plug-in registration or policy changed");
+	if (reason != SERVICE_COMPONENT_WATCH_POKED) {
+		// #2029: a vendor installer (its conversion module with it) touches
+		// only DisplayProcessors: the dp-lift rows retry on it too.
+		service_conversion_display_plugins_changed();
+	}
+}
+
+static void
+on_input_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	(void)reason;
+	(void)target_input_plugin_reread_policy();
+}
+
+/*
+ * ADR-054 N6 Part 2: the service hosts the viewer-tracking provider for every
+ * IPC client, chosen once per service instance (the tracking scan is one-shot
+ * per process, and the composed XR_DXR_display_info advertisement every client
+ * reads is static per instance). A policy change is therefore honoured at the
+ * next service start; say so once instead of pretending to re-select.
+ */
+static void
+on_tracking_policy_watch(void *ud, uint32_t class_id, uint32_t reason)
+{
+	(void)ud;
+	(void)class_id;
+	(void)reason;
+	static bool warned = false;
+	if (!warned) {
+		warned = true;
+		U_LOG_W(
+		    "viewer tracking: a tracking-provider registration / preference changed — the service picks its "
+		    "provider once per run; it applies at the next service start.");
+	}
+}
+
+static xrt_result_t
+component_reselect_provider(uint32_t class_id)
+{
+	if (class_id == TARGET_COMPONENT_CLASS_NONE || class_id >= TARGET_COMPONENT_CLASS_COUNT) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	return service_component_watch_poke(class_id, SERVICE_COMPONENT_WATCH_POKED) ? XRT_SUCCESS
+	                                                                             : XRT_ERROR_NOT_IMPLEMENTED;
+}
+
+static void
+register_component_watch(void)
+{
+	// ADR-054 N6 Part 2: this process composes IPC clients' views itself, so
+	// it HOSTS the viewer-tracking provider (once, shared by every client)
+	// and composes the tracking advertisement the clients read.
+	target_viewer_tracking_set_service_process(true);
+	// Tracking-provider-discovery §4a: the provider runs in its own supervised
+	// host process when the binary ships beside the service; else in here.
+	// DXR_TRACKING_HOST_EXE (dev / test only) names another binary, or `none`
+	// to keep the provider in the service.
+	{
+		const char *env = getenv("DXR_TRACKING_HOST_EXE");
+		char host_exe[1024];
+		if (env != NULL && env[0] != '\0') {
+			if (strcmp(env, "none") != 0 && service_spawn_file_exists(env)) {
+				target_viewer_tracking_set_host_exe(env);
+			}
+		} else if (service_spawn_sibling_path(TARGET_VIEWER_HOST_EXE, host_exe, sizeof(host_exe)) &&
+		           service_spawn_file_exists(host_exe)) {
+			target_viewer_tracking_set_host_exe(host_exe);
+		}
+	}
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_DISPLAY, on_display_policy_watch, NULL);
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_INPUT, on_input_policy_watch, NULL);
+	service_component_watch_subscribe(TARGET_COMPONENT_CLASS_TRACKING, on_tracking_policy_watch, NULL);
+	ipc_server_set_component_reselect_provider(component_reselect_provider);
+	(void)service_component_watch_start();
+}
 
 
 // Insert the on load constructor to init trace marker.
@@ -96,6 +372,160 @@ setup_dpi_awareness(void)
 	u_win_make_process_dpi_aware(NULL);
 }
 
+/*
+ * Restart Manager support. A third-party installer that must replace a DLL this
+ * process holds (a vendor plug-in's dependency, loaded for the process lifetime)
+ * finds us with RmGetList, closes us with RmShutdown (the session-end window in
+ * service_tray_win.c) and brings us back with RmRestart, which relaunches the
+ * command line registered here. See docs/architecture/service-architecture.md
+ * § Restart Manager.
+ */
+#define SERVICE_RM_RESTART_ARG "--rm-restart"
+
+//! Mandatory integrity RID of this process (0x2000 medium, 0x3000 high), 0 if unknown.
+static DWORD
+process_integrity_rid(void)
+{
+	DWORD rid = 0;
+	HANDLE tok = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return 0;
+	}
+	union {
+		TOKEN_MANDATORY_LABEL tml;
+		BYTE buf[64];
+	} u;
+	DWORD len = 0;
+	if (GetTokenInformation(tok, TokenIntegrityLevel, &u, sizeof(u), &len)) {
+		PSID sid = u.tml.Label.Sid;
+		rid = *GetSidSubAuthority(sid, *GetSidSubAuthorityCount(sid) - 1);
+	}
+	CloseHandle(tok);
+	return rid;
+}
+
+static bool
+process_is_elevated(void)
+{
+	TOKEN_ELEVATION e = {0};
+	DWORD len = 0;
+	HANDLE tok = NULL;
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+		return false;
+	}
+	BOOL ok = GetTokenInformation(tok, TokenElevation, &e, sizeof(e), &len);
+	CloseHandle(tok);
+	return ok && e.TokenIsElevated != 0;
+}
+
+/*!
+ * A Restart-Manager restart is driven by an installer that is usually elevated.
+ * The service must run at the user's normal integrity (clients at medium/low
+ * integrity connect to it), so if the restarted instance came up elevated, hand
+ * the launch to the desktop shell (`explorer.exe <exe>` starts it in the
+ * shell's own, non-elevated context — the same recipe as the documented manual
+ * restart) and bow out. Returns true when the hand-off was started.
+ */
+static bool
+relaunch_unelevated_via_shell(void)
+{
+	wchar_t exe[MAX_PATH];
+	wchar_t windir[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+	UINT w = GetWindowsDirectoryW(windir, ARRAYSIZE(windir));
+	if (n == 0 || n >= ARRAYSIZE(exe) || w == 0 || w >= ARRAYSIZE(windir)) {
+		return false;
+	}
+	wchar_t cmd[2 * MAX_PATH + 32];
+	if (_snwprintf_s(cmd, ARRAYSIZE(cmd), _TRUNCATE, L"\"%ls\\explorer.exe\" \"%ls\"", windir, exe) < 0) {
+		return false;
+	}
+	STARTUPINFOW si = {0};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {0};
+	if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+//! Register the command line Restart Manager relaunches us with after an
+//! installer closed us. Not for crash/hang (WER behaviour is unchanged) and not
+//! across a reboot (the HKLM Run key already starts us at logon).
+static void
+register_for_restart(bool workspace_mode)
+{
+	// No --autostart: a restart restores a service that was running, so the
+	// start-on-login preference (which gates only logon auto-starts) must not
+	// turn it into an exit. The marker lets the restarted instance recognise
+	// itself (integrity check above).
+	const wchar_t *args = workspace_mode ? L"" SERVICE_RM_RESTART_ARG L" --workspace" : L"" SERVICE_RM_RESTART_ARG;
+	HRESULT hr = RegisterApplicationRestart(args, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
+	if (SUCCEEDED(hr)) {
+		U_LOG_W("Registered for Restart Manager restart (args \"%ls\").", args);
+	} else {
+		U_LOG_W(
+		    "RegisterApplicationRestart failed (hr=0x%08lx); installers can close but not restart the "
+		    "service.",
+		    (unsigned long)hr);
+	}
+}
+
+/*
+ * ADR-045 complete adoption. When a re-probe adopts a better display plug-in
+ * under a head device the fallback created, the IPC server ends its main loop
+ * once no client is connected (ipc_server_restart_requested) and this host
+ * starts a successor that waits for this process to exit, then builds its
+ * whole system on the new plug-in. A successor never restarts itself again
+ * for the same reason (no restart loop if a plug-in flaps between probes).
+ */
+#define SERVICE_ADOPTION_RESTART_ARG "--adoption-restart-after-pid"
+
+//! Start the successor instance (same exe, same integrity: this process's own
+//! token, so a medium-integrity service stays medium). Returns true on success.
+static bool
+start_adoption_successor(bool workspace_mode)
+{
+	wchar_t exe[MAX_PATH];
+	DWORD n = GetModuleFileNameW(NULL, exe, ARRAYSIZE(exe));
+	if (n == 0 || n >= ARRAYSIZE(exe)) {
+		return false;
+	}
+	wchar_t cmd[MAX_PATH + 96];
+	if (_snwprintf_s(cmd, ARRAYSIZE(cmd), _TRUNCATE,
+	                 L"\"%ls\" "
+	                 L"" SERVICE_ADOPTION_RESTART_ARG L" %lu%ls",
+	                 exe, (unsigned long)GetCurrentProcessId(), workspace_mode ? L" --workspace" : L"") < 0) {
+		return false;
+	}
+	STARTUPINFOW si = {0};
+	si.cb = sizeof(si);
+	PROCESS_INFORMATION pi = {0};
+	if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		return false;
+	}
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+}
+
+//! Successor side: wait (bounded) for the predecessor to exit so the
+//! singleton mutex and the IPC pipe are free.
+static void
+wait_for_predecessor(unsigned long pid)
+{
+	HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, (DWORD)pid);
+	if (h == NULL) {
+		return; // already gone
+	}
+	DWORD w = WaitForSingleObject(h, 30000);
+	CloseHandle(h);
+	U_LOG_W("Adoption restart: predecessor pid %lu %s.", pid,
+	        w == WAIT_OBJECT_0 ? "exited" : "did not exit within 30 s; continuing");
+}
+
 // GUI subsystem entry point (no console window).
 int WINAPI
 WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
@@ -129,11 +559,40 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// registration so we can tell a logon auto-start from a manual launch.
 	bool workspace_mode = false;
 	bool autostart = false;
+	bool rm_restart = false;
+	unsigned long adoption_predecessor_pid = 0;
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--workspace") == 0) {
 			workspace_mode = true;
 		} else if (strcmp(argv[i], "--autostart") == 0) {
 			autostart = true;
+		} else if (strcmp(argv[i], SERVICE_RM_RESTART_ARG) == 0) {
+			rm_restart = true;
+		} else if (strcmp(argv[i], SERVICE_ADOPTION_RESTART_ARG) == 0 && i + 1 < argc) {
+			adoption_predecessor_pid = strtoul(argv[++i], NULL, 10);
+		}
+	}
+
+	// ADR-045: started by our own predecessor to complete a plug-in adoption.
+	if (adoption_predecessor_pid != 0) {
+		U_LOG_W("Started to complete a display plug-in adoption (predecessor pid %lu).",
+		        adoption_predecessor_pid);
+		wait_for_predecessor(adoption_predecessor_pid);
+	}
+
+	// Restarted by Restart Manager after an installer closed us: record the
+	// context it gave us, and never stay elevated (see relaunch_unelevated_via_shell).
+	if (rm_restart) {
+		bool elevated = process_is_elevated();
+		U_LOG_W("Started by a Restart Manager restart (integrity RID 0x%lx, elevated=%d).",
+		        (unsigned long)process_integrity_rid(), elevated ? 1 : 0);
+		if (elevated) {
+			bool handed_off = relaunch_unelevated_via_shell();
+			U_LOG_W("Restart Manager restart came up elevated; %s.",
+			        handed_off ? "relaunched non-elevated via the shell, exiting"
+			                   : "could NOT relaunch non-elevated, exiting (start the service normally)");
+			u_crash_guard_mark_orderly_exit();
+			ExitProcess(0);
 		}
 	}
 
@@ -148,7 +607,7 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		ExitProcess(0);
 	}
 
-	// #975: become the singleton BEFORE touching the tray, the Ctrl+Space hook,
+	// #975: become the singleton BEFORE touching the tray, the launch-hotkey hook,
 	// or any child process. The pipe's FILE_FLAG_FIRST_PIPE_INSTANCE inside
 	// ipc_server_main stays the authoritative gate; this earlier check keeps a
 	// second instance (client auto-launch racing a dev restart, a logon race)
@@ -167,7 +626,12 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 		}
 	}
 
-	// Start the system tray icon with orchestrator menu
+	// Only the singleton owner registers: Restart Manager relaunches the
+	// instance it closed, never one that bowed out above.
+	register_for_restart(workspace_mode);
+
+	// Start the system tray icon with orchestrator menu (also creates the
+	// hidden session-end window Restart Manager closes us through).
 	service_tray_init(tray_shutdown_callback, tray_config_change_callback, &cfg);
 
 	// Initialize orchestrator (registers hotkeys, spawns children per config)
@@ -180,12 +644,28 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	// #960: verify CONTROLLER (registered controller binary) / DIAG (runtime dir)
 	// class claims — facts only the service target can check.
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
+	register_status_provider();
+	register_display_followup();
+	register_shared_camera();
+	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
+	target_plugin_set_screen_key_rekey(true);
+	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
+	service_conversion_start();
+	// ADR-054 N3d (#2051): after the conversion core subscribed.
+	register_component_watch();
 
 	// Same plumbing for the file-dialog capability bit so the IPC server can
 	// short-circuit `session_request_file_picker` when the active controller
 	// did not opt in to Tier 1 — apps then fall back to a flat OS dialog.
 	ipc_server_set_workspace_supports_file_dialog_provider(
 	    service_orchestrator_get_workspace_supports_file_dialog);
+
+	// Display dashboard phase 8: `displayxr-cli workspace set|launch` (DIAG)
+	// re-apply service.json live and launch the controller through the
+	// hotkey's own spawn path.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(workspace_launch_provider);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
 
 	u_trace_marker_init();
 	u_metrics_init();
@@ -197,6 +677,9 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	            .open = U_DEBUG_GUI_OPEN_AUTO,
 	        },
 	    .workspace_mode = workspace_mode,
+	    // ADR-045: restart once to complete an adoption — but never from an
+	    // instance that is itself such a restart (bounded, no loop).
+	    .allow_adoption_restart = adoption_predecessor_pid == 0,
 	};
 
 	// MCP server moved out of the runtime in 2026-05 — workspace
@@ -207,6 +690,19 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 	struct service_main_args sma = {argc, argv, &ismi, 0};
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
+
+	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
+	service_component_watch_stop();
+	// ADR-053: torn down last, after the IPC server (no client can reach it now).
+	service_conversion_stop();
+
+	// ADR-045: the IPC server ended its loop to complete a plug-in adoption.
+	// The successor waits for this process to exit before it starts.
+	if (ipc_server_restart_requested()) {
+		bool started = start_adoption_successor(workspace_mode);
+		U_LOG_W("Adoption restart: %s.", started ? "successor started; this instance exits"
+		                                         : "could NOT start a successor (start the service manually)");
+	}
 
 	u_metrics_close();
 
@@ -227,9 +723,46 @@ WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdS
 #include "service_orchestrator.h"
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+// Linux workspace orchestrator: the macOS posix_spawn orchestrator plus the
+// launch hotkey (service_hotkey_linux.c). Kept apart from the macOS blocks.
+#include "service_config.h"
+#include "service_orchestrator.h"
+#include "util/u_debug.h"
+#include "util/u_sd_notify.h" // #2515: systemd notify protocol, no libsystemd
+#include <stdio.h>            // fflush
+#include <unistd.h>           // _exit
+
+/*!
+ * #2515: leave with _exit() after the orderly teardown, so no atexit handler or
+ * shared-object destructor (a vendor plug-in's ELF destructor, run from
+ * _dl_fini after the SDK's own statics are gone) can crash or deadlock the
+ * process on its way out and leave systemd holding the activated socket for a
+ * dead service. DXR_SERVICE_EXIT_FAST=0 restores the plain return from main().
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(service_exit_fast, "DXR_SERVICE_EXIT_FAST", true)
+// ADR-051 D6: DRM connector hotplug -> the display re-probe worker.
+#include "service_drm_hotplug_linux.h"
+// #2251: Mutter MonitorsChanged (a live display-scale change) -> the same worker.
+#include "service_display_layout_linux.h"
+
+static void
+drm_hotplug_to_reprobe(const char *reason)
+{
+	// Debounced by the worker; a no-op until ipc_server_main started it.
+	ipc_server_request_display_reprobe(reason);
+}
+#endif
+
 int
 main(int argc, char *argv[])
 {
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: cache + unset NOTIFY_SOCKET / WATCHDOG_* before any thread or
+	// child process starts (the watchdog is fed from the IPC main loop).
+	u_sd_notify_init();
+#endif
+
 	// #950 exit tripwire (see the Windows entry point for the ordering rule).
 	u_file_logging_init();
 	u_crash_guard_install_exit_tripwire();
@@ -261,14 +794,57 @@ main(int argc, char *argv[])
 	ipc_server_set_workspace_supports_file_dialog_provider(
 	    service_orchestrator_get_workspace_supports_file_dialog);
 
-	// Let the macOS menu-bar status item / Ctrl+Space hotkey summon the
+	// Let the macOS menu-bar status item / launch hotkey summon the
 	// controller through the orchestrator's registry-discovery + respawn path.
 	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
+
+	// Display dashboard phase 8: live re-apply of service.json + launch-now.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(service_orchestrator_request_launch);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
+#endif
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Linux orchestrator: discover the registered workspace controller (POSIX
+	// manifests), spawn it per its launch mode / on the launch hotkey, respawn
+	// it in ENABLE mode. The PID provider makes workspace_activate accept only
+	// the controller we spawned (0 → manual mode, first-claim wins, as before).
+	struct service_config linux_cfg;
+	service_config_load(&linux_cfg);
+	service_orchestrator_init(&linux_cfg);
+
+	ipc_server_set_workspace_pid_provider(service_orchestrator_get_workspace_pid);
+	ipc_server_set_workspace_supports_file_dialog_provider(service_orchestrator_get_workspace_supports_file_dialog);
+	ipc_server_set_workspace_summon_provider(service_orchestrator_summon_workspace);
+
+	// Display dashboard phase 8: live re-apply of service.json, launch-now and
+	// the hotkey-capture suspend.
+	ipc_server_set_service_config_reload_provider(service_orchestrator_request_config_reload);
+	ipc_server_set_workspace_launch_provider(service_orchestrator_request_launch);
+	ipc_server_set_workspace_hotkey_suspend_provider(service_orchestrator_request_hotkey_suspend);
+
+	// ADR-051 D6 / ADR-045 R-c: the Linux twin of the Windows tray's
+	// WM_DISPLAYCHANGE feed — a monitor plugged or unplugged re-probes the
+	// screen registry and bumps the status topology generation.
+	(void)service_drm_hotplug_start(drm_hotplug_to_reprobe);
+	// #2251: a display-scale / arrangement change touches no connector (no
+	// uevent) — Mutter's MonitorsChanged re-probes, so the panel's desktop
+	// geometry and the weave present origin follow without a restart.
+	(void)service_display_layout_start(drm_hotplug_to_reprobe);
 #endif
 
 	// #960: class verification (controller manifests are cross-platform; the
-	// orchestrator entry only exists on macOS).
+	// orchestrator entry exists on macOS and desktop Linux).
 	ipc_server_set_client_class_verify_provider(service_client_class_verify);
+	register_status_provider();
+	register_display_followup();
+	register_shared_camera();
+	// #2250: the service may re-key a per-user screen preference stored under a legacy key.
+	target_plugin_set_screen_key_rekey(true);
+	// ADR-053 (#2005): the conversion core + the v3 lift handlers' route to it.
+	service_conversion_start();
+	// ADR-054 N3d (#2051): after the conversion core subscribed.
+	register_component_watch();
 
 	struct ipc_server_main_info ismi = {
 	    .udgci =
@@ -288,6 +864,11 @@ main(int argc, char *argv[])
 	u_crash_guard_run("service-main", service_main_body, &sma);
 	int ret = sma.ret;
 
+	// ADR-054 N3d: no more policy callbacks into the cores being torn down.
+	service_component_watch_stop();
+	// ADR-053: torn down last, after the IPC server (no client can reach it now).
+	service_conversion_stop();
+
 	u_metrics_close();
 
 #ifdef XRT_OS_MACOS
@@ -295,7 +876,37 @@ main(int argc, char *argv[])
 	service_orchestrator_shutdown();
 #endif
 
+#ifdef XRT_OS_LINUX_DESKTOP
+	// Stop the DRM hotplug feeder (it only posts to the re-probe worker,
+	// which ipc_server_main has already stopped).
+	service_drm_hotplug_stop();
+	service_display_layout_stop();
+	// Release the hotkey, terminate the managed controller, join the watcher.
+	service_orchestrator_shutdown();
+#endif
+
 	u_crash_guard_mark_orderly_exit();
+
+#ifdef XRT_OS_LINUX_DESKTOP
+	// #2515: everything the service owns is torn down explicitly above — the
+	// IPC server (clients joined, system devices + xrt_instance destroyed, which
+	// destroys the plug-in instances; listening socket closed, and unlinked when
+	// this process bound it), the conversion + component-watch cores, metrics,
+	// the hotplug feeders and the orchestrator. Satellites (conversion host,
+	// viewer-tracking host) die with their parent (kill_on_parent_exit). What
+	// atexit would still do is the #950 tripwire (a no-op once the exit is
+	// marked orderly) and the platform file logger (a stub here: logs go to
+	// stderr / the journal). So flush stdio and leave without running any
+	// atexit handler or shared-object destructor.
+	if (debug_get_bool_option_service_exit_fast()) {
+		U_LOG_W(
+		    "Service exit: leaving with _exit(%d), skipping atexit + shared-object destructors (#2515; "
+		    "DXR_SERVICE_EXIT_FAST=0 to return normally).",
+		    ret);
+		fflush(NULL);
+		_exit(ret);
+	}
+#endif
 	return ret;
 }
 

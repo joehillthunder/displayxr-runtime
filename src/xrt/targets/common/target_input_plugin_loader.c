@@ -4,17 +4,17 @@
  * @file
  * @brief  Registry / manifest-driven loader for input-provider plug-ins.
  *
- * Mirrors `target_plugin_loader.c` (the display-processor loader) for the
- * second plug-in type (ADR-034): enumerate the discovery root, sort by
- * ProbeOrder, load → negotiate → ABI-gate → probe until one provider
- * claims the system. Shares the DP loader's plumbing where it is shaped
- * for sharing (POSIX discovery roots, the Windows runtime-core-DLL
- * preload, the #434 preload sanitizer); the enumeration itself is
- * per-type because the roots and value schemas differ.
+ * The input-provider class loader (ADR-034), written as ADR-054 N2 intends:
+ * discovery, the #952 / #328 / #434 load path and the ADR-020 ABI gate are the
+ * shared component loader's (`target_component_loader.h`), driven by this
+ * class's table row below. What is left here is what only this class knows:
+ * the host iface a provider retains (#1380), what `probe()` means, the
+ * keep-every-claimer rule (ADR-034 Amendment 3), the scan tally the self-test
+ * reads, and the two class gates — `ForceQwerty` (skip the providers) and
+ * `EmulatedControllers` (withhold the qwerty pair, ADR-054 N7).
  *
- * v1 hosts at most one active provider per process and has no refresh
- * path: provider devices are created exactly once at system build, so
- * the DP loader's #342 mid-install refresh problem (factory pointers
+ * v1 has no refresh path: provider devices are created exactly once at system
+ * build, so the DP loader's #342 mid-install refresh problem (factory pointers
  * baked into long-lived compositor state) does not arise here.
  *
  * Issue #823.
@@ -23,23 +23,79 @@
  */
 
 #include "target_input_plugin_loader.h"
-#include "target_plugin_loader.h"
-#include "target_plugin_preload_sanitize.h"
-#include "target_plugin_path_guard.h"
+#include "target_camera_pose.h"
+#include "target_input_arbiter.h"
+#include "target_component_loader.h"
 
 #include "xrt/xrt_input_plugin.h"
 #include "xrt/xrt_results.h"
 #include "xrt/xrt_config_os.h"
+#include "xrt/xrt_input_selection.h"
 
 #include "util/u_logging.h"
+#include "util/u_exe_basename.h"
+#include "util/u_pointer_sink.h"
 
 #include "os/os_threading.h"
 
-#include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+
+/*
+ *
+ * The class row (ADR-054 §2).
+ *
+ */
+
+/*!
+ * `Policy` holds root policy (`Policy\Lock`, honoured by the shared
+ * per-user overlay), never a provider row. Case-insensitive, like the
+ * conversion class's reserved names.
+ */
+static bool
+input_name_ieq(const char *name, const char *lower)
+{
+	for (size_t i = 0;; i++) {
+		const char a = (char)((name[i] >= 'A' && name[i] <= 'Z') ? name[i] + ('a' - 'A') : name[i]);
+		if (a != lower[i]) {
+			return false;
+		}
+		if (a == '\0') {
+			return true;
+		}
+	}
+}
+
+/*!
+ * `PerApp` holds the per-app pins (ADR-034 Amendment 5) — reserved too, so a
+ * machine-side `PerApp` key can never be read as a provider row.
+ */
+static bool
+input_is_reserved_subkey(const char *name)
+{
+	return input_name_ieq(name, "policy") || input_name_ieq(name, "perapp");
+}
+
+static const struct target_component_class g_input_class = {
+    .name = "input provider",
+    .log_tag = "input plugin loader",
+    .entrypoint = XRT_INPUT_PLUGIN_ENTRYPOINT_NAME,
+    .abi_current = XRT_INPUT_PLUGIN_API_VERSION_CURRENT,
+    .registry_root = "Software\\DisplayXR\\InputProviders",
+    .manifest_kind = TARGET_PLUGIN_MANIFEST_INPUT,
+    // Android: `libdxri<NNN>_<id>.so` in the runtime APK's lib dir, the same
+    // convention as the DP (`libdxrp`) and conversion (`libdxrc`) classes.
+    // The first one is the touch provider (`libdxri100_touch_input.so`,
+    // #132); a vendor's tracking provider ships at a lower ProbeOrder.
+    .android_prefix = TARGET_PLUGIN_ANDROID_PREFIX_INPUT,
+    .is_reserved_subkey = input_is_reserved_subkey,
+    .read_extra = NULL,
+    .env_class = "INPUT", // DXR_INPUT_<ID>_<KEY> (N3c)
+};
 
 
 /*
@@ -62,20 +118,10 @@ static int g_input_load_attempted = 0;
  */
 static int g_input_scan_declined = 0;
 static int g_input_scan_failed = 0;
-
-/*!
- * Set by `input_try_load_one` when it returned NULL because the provider
- * declined cleanly (`XRT_ERROR_PROBER_NOT_SUPPORTED` from `negotiate` or
- * `probe`) rather than because it could not be dispatched. Read once per
- * entry by `input_discover_all`; the loader scan is single-threaded.
- */
-static bool g_input_last_declined = false;
-
-/*!
- * Maximum number of providers we enumerate. Matches the DP loader's
- * bound — a handful in practice.
- */
-#define MAX_INPUT_PLUGIN_ENTRIES 16
+//! ADR-054 N4b: providers the provenance gate REFUSED (unsigned, not allowlisted) — counted apart from
+//! load failures so the verdict can say so; set by input_try_load_one for the row it just tried.
+static int g_input_scan_untrusted = 0;
+static bool g_input_last_untrusted = false;
 
 /*!
  * Every provider that loaded, ABI-passed and probed successfully, in
@@ -98,24 +144,36 @@ static struct input_provider_slot
 	const struct xrt_input_plugin_iface *iface;
 	struct xrt_input_plugin_instance *inst;
 	uint32_t probe_order;
-} g_input_providers[MAX_INPUT_PLUGIN_ENTRIES];
+	char row_id[64]; //!< the registration id (row), not iface->id (N3b)
+	//! What the shared-camera slot passes on: the row's display name and the
+	//! binary's ADR-054 N4b verdict (enum target_component_provenance) at load.
+	char display_name[128];
+	uint32_t provenance;
+} g_input_providers[TARGET_COMPONENT_MAX_ENTRIES];
 
 static int g_input_provider_count = 0;
 
 /*!
- * Record a provider that loaded, ABI-passed and probed. Called by each
- * platform's discovery pass in ProbeOrder, so the array ends up sorted.
+ * Record a provider that loaded, ABI-passed and probed. Called by the
+ * discovery pass in ProbeOrder, so the array ends up sorted.
  */
 static void
-input_note_provider(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst, uint32_t order)
+input_note_provider(const struct xrt_input_plugin_iface *iface,
+                    struct xrt_input_plugin_instance *inst,
+                    uint32_t order,
+                    const struct target_component_entry *e)
 {
-	if (iface == NULL || g_input_provider_count >= MAX_INPUT_PLUGIN_ENTRIES) {
+	if (iface == NULL || g_input_provider_count >= TARGET_COMPONENT_MAX_ENTRIES) {
 		return;
 	}
 	struct input_provider_slot *slot = &g_input_providers[g_input_provider_count++];
 	slot->iface = iface;
 	slot->inst = inst;
 	slot->probe_order = order;
+	snprintf(slot->row_id, sizeof(slot->row_id), "%s", e->id);
+	snprintf(slot->display_name, sizeof(slot->display_name), "%s",
+	         iface->display_name != NULL && iface->display_name[0] != '\0' ? iface->display_name : e->display_name);
+	slot->provenance = e->provenance;
 }
 
 
@@ -213,8 +271,219 @@ input_host_get_display_geometry(struct xrt_input_host_display_geometry *inout)
 }
 
 /*!
- * Fill @ref g_input_host once and hand it out. Called from each
- * platform's `input_try_load_one` immediately before `negotiate`.
+ * The one options contract's read slot (N3c): a provider's per-component
+ * settings through the shared store — `DXR_INPUT_<ID>_<KEY>` in this
+ * process's environment, the per-user overlay, the row's `Settings\*` /
+ * manifest `settings`. Never the provider's own getenv.
+ */
+static const char *
+input_settings_fallback_row(const char *id);
+
+static bool
+input_host_get_setting(const char *id, const char *key, char *buf, uint32_t buf_size)
+{
+	if (target_component_get_setting(&g_input_class, id, key, buf, buf_size, NULL)) {
+		return true;
+	}
+	// Nothing under the provider's own id: its registration row, when that
+	// is named differently (see input_settings_fallback_row).
+	const char *row = input_settings_fallback_row(id);
+	return row != NULL && target_component_get_setting(&g_input_class, row, key, buf, buf_size, NULL);
+}
+
+/*
+ *
+ * Shared stereo camera slots: forwarded to what the service registered
+ * (target_input_plugin_loader_set_shared_camera_ops); nothing registered —
+ * the in-process runtime — means "no camera manager in this process".
+ *
+ */
+
+static const struct target_input_shared_camera_ops *volatile g_shcam_ops = NULL;
+static void *volatile g_shcam_ctx = NULL;
+
+//! The host's per-stream record behind the opaque handle a provider holds.
+struct xrt_input_host_camera
+{
+	const struct target_input_shared_camera_ops *ops;
+	void *ctx;
+	void *impl;
+};
+
+void
+target_input_plugin_loader_set_shared_camera_ops(const struct target_input_shared_camera_ops *ops, void *ctx)
+{
+	g_shcam_ctx = ctx;
+	g_shcam_ops = ops;
+}
+
+//! The resident provider calling with @p id (its iface id, else its row id), or NULL.
+static const struct input_provider_slot *
+input_provider_by_id(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return NULL;
+	}
+	for (int p = 0; p < g_input_provider_count; p++) {
+		const struct input_provider_slot *slot = &g_input_providers[p];
+		if (slot->iface != NULL && slot->iface->id != NULL && strcmp(slot->iface->id, id) == 0) {
+			return slot;
+		}
+	}
+	for (int p = 0; p < g_input_provider_count; p++) {
+		if (strcmp(g_input_providers[p].row_id, id) == 0) {
+			return &g_input_providers[p];
+		}
+	}
+	return NULL;
+}
+
+/*!
+ * The row being loaded by @ref input_try_load_one (negotiate + probe), whose
+ * slot is not noted yet. Discovery is one pass on one thread.
+ */
+static const char *g_input_loading_row = NULL;
+
+/*!
+ * A provider asks for its settings with its OWN id (iface->id), but
+ * `displayxr-cli input set <id>` only accepts — and writes under — a
+ * REGISTRATION row id, as `Enabled` / `PreferredPlugin` do. Every
+ * installer-written row is named after the provider's id, so the two agree;
+ * a dev row named after the DLL (`register_dev_plugin.bat input
+ * …\DisplayXR-Ultraleap.dll` before it learnt the declared id) did not, and
+ * `input set DisplayXR-Ultraleap …` landed where the provider never looked.
+ *
+ * So when nothing is stored under @p id, the row is read too — but only when
+ * that row is unambiguous: exactly one resident row carries this iface id
+ * (two rows of one DLL share it, N3b, and must not read each other's
+ * settings), or, during negotiate / probe, the row being loaded. NULL = no
+ * distinct row to fall back to.
+ */
+static const char *
+input_settings_fallback_row(const char *id)
+{
+	if (id == NULL || id[0] == '\0') {
+		return NULL;
+	}
+	const char *row = NULL;
+	int matches = 0;
+	for (int p = 0; p < g_input_provider_count; p++) {
+		const struct input_provider_slot *slot = &g_input_providers[p];
+		if (slot->iface != NULL && slot->iface->id != NULL && strcmp(slot->iface->id, id) == 0) {
+			row = slot->row_id;
+			matches++;
+		}
+	}
+	if (matches == 0 && g_input_loading_row != NULL) {
+		row = g_input_loading_row;
+		matches = 1;
+	}
+	if (matches != 1 || row == NULL || strcmp(row, id) == 0) {
+		return NULL;
+	}
+	return row;
+}
+
+static xrt_result_t
+input_host_open_shared_camera(const char *provider_id,
+                              struct xrt_input_host_camera_open *inout,
+                              struct xrt_input_host_camera **out_cam)
+{
+	if (out_cam == NULL) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	*out_cam = NULL;
+	// The in fields must be covered; out fields the provider's size does not
+	// cover are simply not written back.
+	if (inout == NULL || inout->struct_size < offsetof(struct xrt_input_host_camera_open, props)) {
+		return XRT_ERROR_INPUT_UNSUPPORTED;
+	}
+	const struct input_provider_slot *slot = input_provider_by_id(provider_id);
+	if (slot == NULL) {
+		U_LOG_W("input plugin loader: open_shared_camera from unknown provider id '%s' — refused.",
+		        provider_id != NULL ? provider_id : "(null)");
+		return XRT_ERROR_NOT_AUTHORIZED;
+	}
+	const struct target_input_shared_camera_ops *ops = g_shcam_ops;
+	void *ctx = g_shcam_ctx;
+	if (ops == NULL || ops->open == NULL) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED; // no camera manager in this process
+	}
+
+	struct xrt_input_host_camera_open full;
+	memset(&full, 0, sizeof(full));
+	const uint32_t caller_size = inout->struct_size;
+	const size_t copy = caller_size < sizeof(full) ? caller_size : sizeof(full);
+	memcpy(&full, inout, copy);
+	full.struct_size = (uint32_t)sizeof(full);
+
+	struct xrt_input_host_camera *cam = (struct xrt_input_host_camera *)calloc(1, sizeof(*cam));
+	if (cam == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	void *impl = NULL;
+	xrt_result_t xret = ops->open(ctx, provider_id, slot->display_name, slot->provenance, &full, &impl);
+	if (xret != XRT_SUCCESS) {
+		free(cam);
+		return xret;
+	}
+	cam->ops = ops;
+	cam->ctx = ctx;
+	cam->impl = impl;
+	memcpy(inout, &full, copy);
+	inout->struct_size = caller_size;
+	*out_cam = cam;
+	return XRT_SUCCESS;
+}
+
+static xrt_result_t
+input_host_camera_acquire(struct xrt_input_host_camera *cam,
+                          uint32_t timeout_ms,
+                          struct xrt_input_host_camera_frame *out,
+                          uint32_t *out_state)
+{
+	if (out_state != NULL) {
+		*out_state = XRT_STEREO_CAMERA_STATE_UNAVAILABLE;
+	}
+	if (cam == NULL || cam->ops->acquire == NULL) {
+		return XRT_ERROR_STEREO_CAMERA_STREAM_ENDED;
+	}
+	struct xrt_input_host_camera_frame full;
+	memset(&full, 0, sizeof(full));
+	full.struct_size = (uint32_t)sizeof(full);
+	xrt_result_t xret = cam->ops->acquire(cam->ctx, cam->impl, timeout_ms, &full, out_state);
+	if (out != NULL && out->struct_size >= sizeof(uint32_t)) {
+		const uint32_t caller_size = out->struct_size;
+		const size_t copy = caller_size < sizeof(full) ? caller_size : sizeof(full);
+		memcpy(out, &full, copy);
+		out->struct_size = caller_size;
+	}
+	return xret;
+}
+
+static void
+input_host_camera_release(struct xrt_input_host_camera *cam, uint64_t frame_index)
+{
+	if (cam != NULL && cam->ops->release != NULL) {
+		cam->ops->release(cam->ctx, cam->impl, frame_index);
+	}
+}
+
+static void
+input_host_close_shared_camera(struct xrt_input_host_camera *cam)
+{
+	if (cam == NULL) {
+		return;
+	}
+	if (cam->ops->close != NULL) {
+		cam->ops->close(cam->ctx, cam->impl);
+	}
+	free(cam);
+}
+
+/*!
+ * Fill @ref g_input_host once and hand it out. Called from
+ * `input_try_load_one` immediately before `negotiate`.
  */
 static struct xrt_input_plugin_host_iface *
 input_host_iface(void)
@@ -225,9 +494,77 @@ input_host_iface(void)
 		g_input_host.struct_size = (uint32_t)sizeof(struct xrt_input_plugin_host_iface);
 		g_input_host.host_api_version = XRT_INPUT_PLUGIN_API_VERSION_CURRENT;
 		g_input_host.get_display_geometry = input_host_get_display_geometry;
+		g_input_host.get_setting = input_host_get_setting;
+		// The pointer-event queue every runtime-owned surface pushes into
+		// (hosted SurfaceView, xrSubmitAndroidInputEventDXR, later the
+		// workspace controller's forwarded events — #1996). The slot IS
+		// the queue's poll; nothing provider-specific lives in between.
+		g_input_host.poll_pointer_events = u_pointer_sink_poll;
+		// The SAME implementation the viewer-tracking host iface carries, so a
+		// hand-tracking provider reading a webcam gets the pose head tracking
+		// calibrated (tracking-provider-discovery.md §6).
+		g_input_host.get_camera_pose = target_camera_pose_host_get;
+		// The display's shared stereo camera as a hands source: forwarded to the
+		// service's camera manager when it registered one, else "unavailable".
+		g_input_host.open_shared_camera = input_host_open_shared_camera;
+		g_input_host.camera_acquire = input_host_camera_acquire;
+		g_input_host.camera_release = input_host_camera_release;
+		g_input_host.close_shared_camera = input_host_close_shared_camera;
 		g_input_host_filled = true;
 	}
 	return &g_input_host;
+}
+
+const struct target_component_class *
+target_input_plugin_component_class(void)
+{
+	return &g_input_class;
+}
+
+int
+target_input_plugin_describe_settings(const char *id, struct target_component_setting_desc *out, int max)
+{
+	if (id == NULL || id[0] == '\0' || out == NULL || max <= 0) {
+		return 0;
+	}
+	// The manifest's schema first (POSIX), then whatever the binary declares.
+	int n = target_component_manifest_settings_schema(&g_input_class, id, out, max);
+
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return n;
+	}
+	const int count = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	for (int i = 0; i < count; i++) {
+		struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || strcmp(e->id, id) != 0) {
+			continue;
+		}
+		// Negotiate only (no probe): a disabled or declining provider still
+		// declares its settings — that is how one finds the key to enable it.
+		void *module = NULL;
+		void *fn = NULL;
+		if (target_component_load_binary_ex(&g_input_class, e, TARGET_COMPONENT_LOAD_FLAG_QUIET, &module, &fn,
+		                                    NULL, NULL, 0) != TARGET_COMPONENT_LOAD_OK) {
+			break;
+		}
+		struct xrt_input_plugin_iface *iface = NULL;
+		uint32_t plugin_version = 0;
+		const xrt_result_t xret = ((xrt_input_plugin_negotiate_fn_t)fn)(
+		    XRT_INPUT_PLUGIN_API_VERSION_CURRENT, input_host_iface(), &iface, &plugin_version);
+		if (target_component_abi_gate(&g_input_class, e->id, xret, iface, plugin_version, NULL, 0) ==
+		        TARGET_COMPONENT_ABI_OK &&
+		    XRT_INPUT_PLUGIN_IFACE_HAS(iface, describe_settings)) {
+			const struct xrt_component_setting_desc *descs = NULL;
+			const uint32_t nd = iface->describe_settings(&descs);
+			n = target_component_merge_setting_descs(out, n, max, descs, nd);
+		}
+		target_component_unload(module);
+		break;
+	}
+	free(entries);
+	return n;
 }
 
 void
@@ -248,6 +585,7 @@ target_input_plugin_set_display_geometry(const struct xrt_input_host_display_geo
 	if (g_input_geometry_mutex_ready) {
 		os_mutex_unlock(&g_input_geometry_mutex);
 	}
+	target_camera_pose_set_home_display(geometry->display_width_m, geometry->display_height_m, NULL);
 
 	// One-off init fact, once per process: a bug report needs to show
 	// whether providers ever got geometry at all.
@@ -269,225 +607,38 @@ target_input_plugin_get_host_iface(void)
 
 /*
  *
- * Platform-specific discovery.
+ * Discovery (every platform — the shared loader does the platform part).
  *
  */
 
-#ifdef XRT_OS_WINDOWS
-
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#include <stdio.h>
-#include <wchar.h>
-
 /*!
- * Registry-derived per-provider metadata, filled by the enumeration
- * pass under `HKLM\Software\DisplayXR\InputProviders\*`.
- */
-struct input_plugin_entry
-{
-	wchar_t binary_path[MAX_PATH];
-	char id[64]; /* subkey name (UTF-8) */
-	char display_name[128];
-	char vendor[64];
-	char version[64];
-	uint32_t probe_order; /* defaults to 100 when REG value is missing */
-	bool enabled;         /* `Enabled` DWORD; absent = enabled */
-};
-
-static bool
-input_wide_to_utf8(const wchar_t *src, char *dst, int dst_size)
-{
-	int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dst_size, NULL, NULL);
-	if (n <= 0) {
-		if (dst_size > 0) {
-			dst[0] = '\0';
-		}
-		return false;
-	}
-	return true;
-}
-
-static void
-input_read_optional_string(HKEY key, const wchar_t *name, char *dst, int dst_size)
-{
-	wchar_t wbuf[256];
-	DWORD wbuf_bytes = sizeof(wbuf);
-	if (RegGetValueW(key, NULL, name, RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes) == ERROR_SUCCESS) {
-		input_wide_to_utf8(wbuf, dst, dst_size);
-	} else {
-		if (dst_size > 0) {
-			dst[0] = '\0';
-		}
-	}
-}
-
-/*!
- * Enumerate provider subkeys under HKLM\Software\DisplayXR\InputProviders.
- * Returns the number of entries populated (0 if the root key is absent).
- * Entries missing the required `Binary` value are skipped.
- */
-static int
-input_enumerate_registry(struct input_plugin_entry *entries, int max)
-{
-	HKEY root;
-	LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\InputProviders", 0, KEY_READ, &root);
-	if (rc != ERROR_SUCCESS) {
-		U_LOG_I(
-		    "input plugin loader: registry root HKLM\\Software\\DisplayXR\\InputProviders absent "
-		    "(rc=%ld) — no providers to try.",
-		    rc);
-		return 0;
-	}
-
-	int count = 0;
-	DWORD index = 0;
-	for (;;) {
-		if (count >= max) {
-			U_LOG_W("input plugin loader: more than %d registered providers — truncating.", max);
-			break;
-		}
-
-		wchar_t subkey_name[256];
-		DWORD subkey_name_len = (DWORD)(sizeof(subkey_name) / sizeof(wchar_t));
-		LSTATUS er = RegEnumKeyExW(root, index, subkey_name, &subkey_name_len, NULL, NULL, NULL, NULL);
-		index++;
-		if (er == ERROR_NO_MORE_ITEMS) {
-			break;
-		}
-		if (er != ERROR_SUCCESS) {
-			U_LOG_W("input plugin loader: RegEnumKeyEx failed (rc=%ld) at index %lu — stopping.", er,
-			        (unsigned long)index);
-			break;
-		}
-
-		HKEY sub;
-		if (RegOpenKeyExW(root, subkey_name, 0, KEY_READ, &sub) != ERROR_SUCCESS) {
-			continue;
-		}
-
-		struct input_plugin_entry *e = &entries[count];
-		memset(e, 0, sizeof(*e));
-
-		DWORD binary_bytes = (DWORD)sizeof(e->binary_path);
-		if (RegGetValueW(sub, NULL, L"Binary", RRF_RT_REG_SZ, NULL, e->binary_path, &binary_bytes) !=
-		    ERROR_SUCCESS) {
-			U_LOG_W("input plugin loader: subkey '%ls' missing required 'Binary' value — skipping.",
-			        subkey_name);
-			RegCloseKey(sub);
-			continue;
-		}
-
-		input_wide_to_utf8(subkey_name, e->id, (int)sizeof(e->id));
-		input_read_optional_string(sub, L"DisplayName", e->display_name, (int)sizeof(e->display_name));
-		input_read_optional_string(sub, L"Vendor", e->vendor, (int)sizeof(e->vendor));
-		input_read_optional_string(sub, L"Version", e->version, (int)sizeof(e->version));
-
-		DWORD order = 100;
-		DWORD order_bytes = sizeof(order);
-		e->probe_order = 100;
-		if (RegGetValueW(sub, NULL, L"ProbeOrder", RRF_RT_REG_DWORD, NULL, &order, &order_bytes) ==
-		    ERROR_SUCCESS) {
-			e->probe_order = (uint32_t)order;
-		}
-
-		DWORD enabled = 1;
-		DWORD enabled_bytes = sizeof(enabled);
-		e->enabled = true;
-		if (RegGetValueW(sub, NULL, L"Enabled", RRF_RT_REG_DWORD, NULL, &enabled, &enabled_bytes) ==
-		    ERROR_SUCCESS) {
-			e->enabled = enabled != 0;
-		}
-
-		count++;
-		RegCloseKey(sub);
-	}
-
-	RegCloseKey(root);
-	return count;
-}
-
-/*!
- * ProbeOrder ascending, ties broken by id (#1466).
+ * Load + negotiate + ABI-check + probe one registered provider. Returns the
+ * iface (writing the instance to *out_inst) on success, NULL on any failure
+ * (the binary is unloaded again). Successful loads intentionally leak the
+ * module for the process lifetime: the devices' vtables live in it.
  *
- * qsort is not stable, so equal ProbeOrder values used to leave the relative
- * priority of two providers up to the sort implementation — and that order is
- * what the arbiter ranks its candidates by, i.e. which provider wins a hand
- * when both are present. strcmp on the registry id makes it the same on every
- * run and every box; `input_warn_probe_order_ties` then tells the vendor a
- * tiebreak happened at all.
- */
-static int
-input_compare_by_probe_order(const void *a, const void *b)
-{
-	const struct input_plugin_entry *ea = (const struct input_plugin_entry *)a;
-	const struct input_plugin_entry *eb = (const struct input_plugin_entry *)b;
-	if (ea->probe_order < eb->probe_order) {
-		return -1;
-	}
-	if (ea->probe_order > eb->probe_order) {
-		return 1;
-	}
-	return strcmp(ea->id, eb->id);
-}
-
-/*!
- * One WARN per adjacent pair sharing a ProbeOrder, after the sort (#1466).
- * Which provider outranks the other is then an alphabetical accident rather
- * than a decision, and the vendor whose provider lost is the only person who
- * can fix it — so say so, once, with both ids.
- */
-static void
-input_warn_probe_order_ties(const struct input_plugin_entry *entries, int n)
-{
-	for (int i = 1; i < n; i++) {
-		if (entries[i - 1].probe_order != entries[i].probe_order) {
-			continue;
-		}
-		U_LOG_W(
-		    "input plugin loader: '%s' and '%s' share ProbeOrder %u — tie broken by id; "
-		    "give coexisting providers distinct values.",
-		    entries[i - 1].id, entries[i].id, entries[i].probe_order);
-	}
-}
-
-/*!
- * Load + negotiate + ABI-check + probe one registered provider. Returns
- * the iface (writing the instance to *out_inst) on success, NULL (and
- * closes the DLL) on any failure. Successful loads intentionally leak
- * the HMODULE for the process lifetime.
+ * @p out_declined is true when the provider was dispatched correctly and
+ * said "not my hardware" — negotiate or probe returned
+ * XRT_ERROR_PROBER_NOT_SUPPORTED — as opposed to a load / ABI fault.
  */
 static const struct xrt_input_plugin_iface *
-input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_instance **out_inst)
+input_try_load_one_inner(struct target_component_entry *e,
+                         struct xrt_input_plugin_instance **out_inst,
+                         bool *out_declined)
 {
 	*out_inst = NULL;
-	g_input_last_declined = false;
+	*out_declined = false;
 
-	// Same host-crash breadcrumb + #434 sanitizer as the DP loader —
-	// #952: same dev-path guard as the DP loader.
-	if (target_plugin_path_check(e->binary_path, e->id, "input plugin") == TARGET_PLUGIN_PATH_REFUSED) {
+	void *module = NULL;
+	void *fn = NULL;
+	g_input_last_untrusted = false;
+	const enum target_component_load_result lr =
+	    target_component_load_binary(&g_input_class, e, &module, &fn, NULL, NULL, 0);
+	if (lr != TARGET_COMPONENT_LOAD_OK) {
+		g_input_last_untrusted = lr == TARGET_COMPONENT_LOAD_UNTRUSTED;
 		return NULL;
 	}
-
-	// LoadLibrary of a provider runs host DLL-notification code too.
-	target_plugin_sanitized_preload(e->binary_path);
-	U_LOG_W("input plugin loader:   %s: loading provider binary %ls", e->id, e->binary_path);
-
-	HMODULE dll = LoadLibraryExW(e->binary_path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
-	if (dll == NULL) {
-		U_LOG_W("input plugin loader:   %s: LoadLibrary(%ls) failed (err=%lu).", e->id, e->binary_path,
-		        GetLastError());
-		return NULL;
-	}
-
-	xrt_input_plugin_negotiate_fn_t negotiate =
-	    (xrt_input_plugin_negotiate_fn_t)(void *)GetProcAddress(dll, XRT_INPUT_PLUGIN_ENTRYPOINT_NAME);
-	if (negotiate == NULL) {
-		U_LOG_W("input plugin loader:   %s: missing entry point '%s' — skipping.", e->id,
-		        XRT_INPUT_PLUGIN_ENTRYPOINT_NAME);
-		FreeLibrary(dll);
-		return NULL;
-	}
+	xrt_input_plugin_negotiate_fn_t negotiate = (xrt_input_plugin_negotiate_fn_t)fn;
 
 	// Process-lifetime host storage: providers may retain this pointer
 	// (#1380). Never a stack local.
@@ -496,21 +647,11 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 	struct xrt_input_plugin_iface *iface = NULL;
 	uint32_t plugin_version = 0;
 	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, host, &iface, &plugin_version);
-	if (xret != XRT_SUCCESS || iface == NULL) {
-		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
-		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
-		        (void *)iface);
-		FreeLibrary(dll);
-		return NULL;
-	}
-
-	/* ADR-020 rule 3: never dispatch through a mismatched-vtable. */
-	if (plugin_version != XRT_INPUT_PLUGIN_API_VERSION_CURRENT) {
-		U_LOG_E(
-		    "input plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
-		    "the provider must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
-		    e->id, plugin_version, (unsigned)XRT_INPUT_PLUGIN_API_VERSION_CURRENT);
-		FreeLibrary(dll);
+	const enum target_component_abi_verdict verdict =
+	    target_component_abi_gate(&g_input_class, e->id, xret, iface, plugin_version, NULL, 0);
+	if (verdict != TARGET_COMPONENT_ABI_OK) {
+		*out_declined = verdict == TARGET_COMPONENT_ABI_DECLINED;
+		target_component_unload(module);
 		return NULL;
 	}
 
@@ -518,69 +659,177 @@ input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_i
 		xret = iface->probe(out_inst);
 		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
 			U_LOG_I("input plugin loader:   %s: probe declined (no matching hardware).", e->id);
-			g_input_last_declined = true;
-			FreeLibrary(dll);
+			*out_declined = true;
+			target_component_unload(module);
 			return NULL;
 		}
 		if (xret != XRT_SUCCESS) {
 			U_LOG_W("input plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
-			FreeLibrary(dll);
+			target_component_unload(module);
 			return NULL;
 		}
 	}
 
 	U_LOG_W(
 	    "input plugin loader: active input provider: id=%s name='%s' vendor='%s' version='%s' "
-	    "plugin_api=%u probe_order=%u path=%ls",
+	    "plugin_api=%u probe_order=%u path=%s",
 	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
 	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
+	if (iface->id != NULL && strcmp(iface->id, e->id) != 0) {
+		U_LOG_W(
+		    "input plugin loader:   row '%s' holds provider id '%s': `displayxr-cli input set/enable/prefer` "
+		    "take the ROW id ('%s'); its settings are read under '%s' first, then '%s'. Register the row under "
+		    "'%s' to make the two agree.",
+		    e->id, iface->id, e->id, iface->id, e->id, iface->id);
+	}
+
+	/* Module handle intentionally leaked, same lifetime rule as the DP
+	 * loader — the devices' vtables live in the provider binary. */
 	return iface;
+}
+
+//! @ref input_try_load_one_inner with the row published to the settings slot for negotiate + probe.
+static const struct xrt_input_plugin_iface *
+input_try_load_one(struct target_component_entry *e, struct xrt_input_plugin_instance **out_inst, bool *out_declined)
+{
+	g_input_loading_row = e->id;
+	const struct xrt_input_plugin_iface *iface = input_try_load_one_inner(e, out_inst, out_declined);
+	g_input_loading_row = NULL;
+	return iface;
+}
+
+/*!
+ * Where a row's `enabled` came from, for `displayxr-cli input list` (N3a):
+ * "user" when the shared per-user overlay applied, "machine" / "manifest"
+ * when the platform's own store disabled it, else "default". The shared row
+ * reader records the value, not its presence, so an explicit enable in
+ * HKLM / the manifest reads as "default".
+ */
+static const char *
+input_enabled_source(const struct target_component_entry *e)
+{
+	if ((e->flags & TARGET_COMPONENT_FLAG_USER_OVERLAY) != 0) {
+		return "user";
+	}
+	if (!e->enabled) {
+#ifdef XRT_OS_WINDOWS
+		return "machine";
+#else
+		return "manifest";
+#endif
+	}
+	return "default";
+}
+
+/*!
+ * N3a (ADR-054 verb `prefer`) — class selection policy, which the shared
+ * loader deliberately never does: move the row whose id is @p preferred to
+ * the front of the sorted @p entries, keeping the rest in order, so the scan
+ * tries it first and notes it at arbitration priority 0 (the arbiter ranks
+ * by that value, ties in insertion order). Returns true when a row matched.
+ */
+static bool
+input_hoist_preferred(struct target_component_entry *entries, int n, const char *preferred)
+{
+	if (preferred == NULL || preferred[0] == '\0') {
+		return false;
+	}
+	for (int i = 0; i < n; i++) {
+		if (strcmp(entries[i].id, preferred) != 0) {
+			continue;
+		}
+		if (i > 0) {
+			struct target_component_entry *tmp = (struct target_component_entry *)malloc(sizeof(*tmp));
+			if (tmp == NULL) {
+				return true; // matched; leave the order alone rather than fail
+			}
+			*tmp = entries[i];
+			memmove(&entries[1], &entries[0], (size_t)i * sizeof(entries[0]));
+			entries[0] = *tmp;
+			free(tmp);
+		}
+		return true;
+	}
+	return false;
 }
 
 static void
 input_discover_all(void)
 {
-	// Providers import DisplayXRClient.dll like DP plug-ins do (#328).
-	target_plugin_preload_runtime_core_dll();
-
-	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
-	int n = input_enumerate_registry(entries, MAX_INPUT_PLUGIN_ENTRIES);
-	if (n == 0) {
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
 		return;
 	}
+	int n = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	if (n == 0) {
+		U_LOG_I("input plugin loader: no registered input providers.");
+		free(entries);
+		return;
+	}
+	// N3a: per-user Enabled (HKCU over HKLM; Windows only) — `input enable|disable`.
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n);
 
-	qsort(entries, (size_t)n, sizeof(entries[0]), input_compare_by_probe_order);
-	input_warn_probe_order_ties(entries, n);
+	// #1466: which provider outranks the other on a tie is an alphabetical
+	// accident, and the vendor whose provider lost is the only person who
+	// can fix it — so say so, once, with both ids.
+	for (int i = 1; i < n; i++) {
+		if (entries[i - 1].probe_order == entries[i].probe_order &&
+		    (entries[i].flags & TARGET_COMPONENT_FLAG_PROBE_ORDER_TIE) != 0) {
+			U_LOG_W(
+			    "input plugin loader: '%s' and '%s' share ProbeOrder %u — tie broken by id; "
+			    "give coexisting providers distinct values.",
+			    entries[i - 1].id, entries[i].id, entries[i].probe_order);
+		}
+	}
+
+	// N3a: the PreferredPlugin override (`input use <id>`) is tried first and
+	// ranked at priority 0; unregistered → ignored, disabled → skipped below.
+	char preferred[64] = {0};
+	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
+	if (have_pref && !input_hoist_preferred(entries, n, preferred)) {
+		U_LOG_W("input plugin loader: PreferredPlugin '%s' is not a registered provider — ignored.", preferred);
+	}
 
 	U_LOG_I("input plugin loader: %d registered provider(s); attempting in ProbeOrder ascending.", n);
 	for (int i = 0; i < n; i++) {
-		if (!entries[i].enabled) {
-			U_LOG_I("input plugin loader:   [%d/%d] %s disabled (Enabled=0) — skipping.", i + 1, n,
-			        entries[i].id);
+		struct target_component_entry *e = &entries[i];
+		const bool is_pref = have_pref && strcmp(e->id, preferred) == 0;
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
+			U_LOG_W("input plugin loader:   [%d/%d] %s: %s — skipping.", i + 1, n, e->source, e->reason);
 			continue;
 		}
-		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u, %ls)", i + 1, n, entries[i].id,
-		        entries[i].probe_order, entries[i].binary_path);
+		if (!e->enabled) {
+			U_LOG_I("input plugin loader:   [%d/%d] %s disabled (Enabled=0, %s)%s — skipping.", i + 1, n,
+			        e->id, input_enabled_source(e), is_pref ? " [preferred]" : "");
+			continue;
+		}
+		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u%s, %s)", i + 1, n, e->id, e->probe_order,
+		        is_pref ? ", preferred" : "", e->binary_path);
 		struct xrt_input_plugin_instance *inst = NULL;
-		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], &inst);
+		bool declined = false;
+		const struct xrt_input_plugin_iface *iface = input_try_load_one(e, &inst, &declined);
 		if (iface != NULL) {
 			// Keep going: every claiming provider is a live
 			// candidate the arbiter can fall back to.
-			input_note_provider(iface, inst, entries[i].probe_order);
+			input_note_provider(iface, inst, is_pref ? 0 : e->probe_order, e);
 			continue;
 		}
-		if (g_input_last_declined) {
+		if (declined) {
 			g_input_scan_declined++;
+		} else if (g_input_last_untrusted) {
+			g_input_scan_untrusted++;
 		} else {
 			g_input_scan_failed++;
 		}
 	}
+	free(entries);
 
 	if (g_input_provider_count == 0) {
 		U_LOG_I(
-		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) "
-		    "— qwerty keeps the hand roles.",
-		    g_input_scan_declined, g_input_scan_failed);
+		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load, %d "
+		    "refused by the provenance gate) — qwerty keeps the hand roles.",
+		    g_input_scan_declined, g_input_scan_failed, g_input_scan_untrusted);
 	}
 }
 
@@ -591,26 +840,78 @@ target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
 		return 0;
 	}
 
-	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
-	int n = input_enumerate_registry(entries, MAX_INPUT_PLUGIN_ENTRIES);
-	if (n > max) {
-		n = max;
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return 0;
 	}
+	int n = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n); // N3a: what the scan sees
 
-	for (int i = 0; i < n; i++) {
-		struct target_input_plugin_desc *d = &out[i];
+	int count = 0;
+	for (int i = 0; i < n && count < max; i++) {
+		const struct target_component_entry *e = &entries[i];
+		if ((e->flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0) {
+			// A row the loader could never try is not a choice to list.
+			continue;
+		}
+		struct target_input_plugin_desc *d = &out[count++];
 		memset(d, 0, sizeof(*d));
-		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
-		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
-		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
-		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
-		input_wide_to_utf8(entries[i].binary_path, d->binary_path, (int)sizeof(d->binary_path));
-		d->probe_order = entries[i].probe_order;
-		d->enabled = entries[i].enabled;
+		snprintf(d->id, sizeof(d->id), "%s", e->id);
+		snprintf(d->display_name, sizeof(d->display_name), "%s", e->display_name);
+		snprintf(d->vendor, sizeof(d->vendor), "%s", e->vendor);
+		snprintf(d->version, sizeof(d->version), "%s", e->version);
+		snprintf(d->binary_path, sizeof(d->binary_path), "%s", e->binary_path);
+		d->probe_order = e->probe_order;
+		d->enabled = e->enabled;
+		snprintf(d->enabled_source, sizeof(d->enabled_source), "%s", input_enabled_source(e));
+		// ADR-054 N4b: the load path classifies what it loads; a lister
+		// asks explicitly (signature check cached per file identity + digest).
+		(void)target_component_check_provenance(&g_input_class, entries + i);
+		d->provenance = e->provenance;
+		snprintf(d->provenance_reason, sizeof(d->provenance_reason), "%s", e->provenance_reason);
+		snprintf(d->signer, sizeof(d->signer), "%s", e->signer);
 	}
-
-	return n;
+	free(entries);
+	return count;
 }
+
+const char *
+target_input_plugin_get_row_id(int index)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	if (index < 0 || index >= g_input_provider_count) {
+		return "";
+	}
+	return g_input_providers[index].row_id;
+}
+
+
+/*
+ *
+ * Per-client selection policy (ADR-034 Amendment 5, #2181) — the pure part.
+ *
+ */
+
+//! A provider id a pin may name: the CLI's rule (non-empty, fits, no separators / control chars).
+static bool
+input_pin_id_valid(const char *id)
+{
+	return u_exe_basename_valid(id, XRT_INPUT_PROVIDER_ID_SIZE);
+}
+
+
+/*
+ *
+ * The ForceQwerty + EmulatedControllers gates (class-specific; the one
+ * platform split left here).
+ *
+ */
+
+#ifdef XRT_OS_WINDOWS
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 bool
 target_input_plugin_get_force_qwerty(void)
@@ -622,416 +923,256 @@ target_input_plugin_get_force_qwerty(void)
 	return rc == ERROR_SUCCESS && value != 0;
 }
 
-#elif defined(XRT_OS_ANDROID)
+/*
+ * N7: `InputProviders\Policy\EmulatedControllers`, HKCU over HKLM under the
+ * class's `Policy\Lock` — the shared loader's root-policy read, so this is
+ * one call and the N3 rules apply unchanged.
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	uint32_t value = 1;
+	const uint32_t tier = target_component_read_policy_dword(&g_input_class, "EmulatedControllers", &value);
+	const char *source = "default";
+	if (tier == TARGET_COMPONENT_SETTING_USER) {
+		source = "user";
+	} else if (tier == TARGET_COMPONENT_SETTING_MACHINE) {
+		source = "machine";
+	} else {
+		value = 1; // absent = on
+	}
+	if (out_source != NULL) {
+		*out_source = source;
+	}
+	return value != 0;
+}
 
 /*
- * Android ships no input providers in v1 — the convention-driven
- * `libdxrp*` discovery is DP-only for now. Stubs keep the builder
- * wiring platform-uniform; the qwerty fallback (where built) or the
- * shell-side input path is unaffected.
+ * N3a: `PreferredPlugin` — HKCU first (per user, `input use <id>`), then the
+ * HKLM 64-bit view (`--machine`). Same root value name as the DP loader's
+ * §2.1 override, under the InputProviders root. Class selection policy, so
+ * class code — the shared loader never selects.
  */
-
-static void
-input_discover_all(void)
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
 {
-	// No providers on Android in v1 — g_input_provider_count stays 0.
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	wchar_t wbuf[64];
+	DWORD wbuf_bytes = sizeof(wbuf);
+	// ADR-034 Am.5 precedence: `Policy\Lock` sits above every per-user value of
+	// the class, the user default included — under it only HKLM is read.
+	LSTATUS rc = ERROR_FILE_NOT_FOUND;
+	if (!target_component_policy_lock(&g_input_class)) {
+		rc = RegGetValueW(HKEY_CURRENT_USER, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ, NULL, wbuf, &wbuf_bytes);
+	}
+	if (rc != ERROR_SUCCESS || wbuf[0] == L'\0') {
+		wbuf_bytes = sizeof(wbuf);
+		rc = RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\DisplayXR\\InputProviders", L"PreferredPlugin",
+		                  RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, NULL, wbuf, &wbuf_bytes);
+	}
+	if (rc != ERROR_SUCCESS) {
+		return false;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
+		out[0] = '\0';
+	}
+	return out[0] != '\0';
+}
+
+/*
+ * ADR-034 Am.5: the per-app pin — HKCU `InputProviders\PerApp\<exe>\PreferredPlugin`,
+ * hidden under `Policy\Lock` (HKCU is invisible to every rule of this class then).
+ */
+#define INPUT_PERAPP_ROOT_W L"Software\\DisplayXR\\InputProviders\\PerApp"
+
+static bool
+input_perapp_key_path(const char *exe_basename, wchar_t *out, size_t cap_chars)
+{
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return false;
+	}
+	wchar_t wexe[XRT_INPUT_EXE_BASENAME_SIZE];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, exe_basename, -1, wexe,
+	                        (int)(sizeof(wexe) / sizeof(wexe[0]))) <= 0) {
+		return false;
+	}
+	return _snwprintf(out, cap_chars, L"%ls\\%ls", INPUT_PERAPP_ROOT_W, wexe) > 0;
+}
+
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	if (target_component_policy_lock(&g_input_class)) {
+		return false;
+	}
+	wchar_t path[256];
+	if (!input_perapp_key_path(exe_basename, path, sizeof(path) / sizeof(path[0]))) {
+		return false;
+	}
+	wchar_t wbuf[64];
+	DWORD bytes = sizeof(wbuf);
+	if (RegGetValueW(HKEY_CURRENT_USER, path, L"PreferredPlugin", RRF_RT_REG_SZ, NULL, wbuf, &bytes) !=
+	        ERROR_SUCCESS ||
+	    wbuf[0] == L'\0') {
+		return false;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, (int)cap, NULL, NULL) <= 0) {
+		out[0] = '\0';
+	}
+	return out[0] != '\0';
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	const bool clear = provider_id == NULL || provider_id[0] == '\0';
+	if (!clear && !input_pin_id_valid(provider_id)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	wchar_t path[256];
+	if (!input_perapp_key_path(exe_basename, path, sizeof(path) / sizeof(path[0]))) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	if (clear) {
+		// Remove the app's whole key: it holds nothing but the pin.
+		const LSTATUS rc = RegDeleteTreeW(HKEY_CURRENT_USER, path);
+		if (rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND) {
+			return TARGET_INPUT_PIN_WRITE_OK;
+		}
+		return rc == ERROR_ACCESS_DENIED ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+	}
+	wchar_t wid[64];
+	if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, provider_id, -1, wid,
+	                        (int)(sizeof(wid) / sizeof(wid[0]))) <= 0) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	HKEY key = NULL;
+	LSTATUS rc = RegCreateKeyExW(HKEY_CURRENT_USER, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
+	if (rc == ERROR_SUCCESS) {
+		rc = RegSetValueExW(key, L"PreferredPlugin", 0, REG_SZ, (const BYTE *)wid,
+		                    (DWORD)((wcslen(wid) + 1) * sizeof(wchar_t)));
+		RegCloseKey(key);
+	}
+	if (rc == ERROR_SUCCESS) {
+		return TARGET_INPUT_PIN_WRITE_OK;
+	}
+	return rc == ERROR_ACCESS_DENIED ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
 }
 
 int
-target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	HKEY root = NULL;
+	if (RegOpenKeyExW(HKEY_CURRENT_USER, INPUT_PERAPP_ROOT_W, 0, KEY_READ, &root) != ERROR_SUCCESS) {
+		return 0;
+	}
+	int n = 0;
+	for (DWORD i = 0; n < max; i++) {
+		wchar_t name[256];
+		DWORD name_len = (DWORD)(sizeof(name) / sizeof(name[0]));
+		const LSTATUS rc = RegEnumKeyExW(root, i, name, &name_len, NULL, NULL, NULL, NULL);
+		if (rc == ERROR_NO_MORE_ITEMS) {
+			break;
+		}
+		if (rc != ERROR_SUCCESS) {
+			continue;
+		}
+		wchar_t wbuf[64];
+		DWORD bytes = sizeof(wbuf);
+		if (RegGetValueW(root, name, L"PreferredPlugin", RRF_RT_REG_SZ, NULL, wbuf, &bytes) != ERROR_SUCCESS ||
+		    wbuf[0] == L'\0') {
+			continue;
+		}
+		struct target_input_app_pin *pin = &out[n];
+		memset(pin, 0, sizeof(*pin));
+		if (WideCharToMultiByte(CP_UTF8, 0, name, -1, pin->exe_basename, (int)sizeof(pin->exe_basename), NULL,
+		                        NULL) <= 0 ||
+		    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, pin->provider_id, (int)sizeof(pin->provider_id), NULL,
+		                        NULL) <= 0) {
+			continue;
+		}
+		n++;
+	}
+	RegCloseKey(root);
+	return n;
+}
+
+#elif defined(XRT_OS_ANDROID)
+
+bool
+target_input_plugin_get_force_qwerty(void)
+{
+	return false;
+}
+
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	return true; // no per-user store on Android; the pair is always published
+}
+
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	return false; // no per-user store on Android: ProbeOrder (the file name) is the only ranking
+}
+
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	(void)exe_basename;
+	if (out != NULL && cap > 0) {
+		out[0] = '\0';
+	}
+	return false; // no per-user store on Android
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	(void)exe_basename;
+	(void)provider_id;
+	return TARGET_INPUT_PIN_WRITE_UNSUPPORTED;
+}
+
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
 {
 	(void)out;
 	(void)max;
 	return 0;
 }
 
-bool
-target_input_plugin_get_force_qwerty(void)
-{
-	return false;
-}
-
 #else /* POSIX: macOS / desktop Linux */
 
-#include "util/u_json.h"
-
 #include <dirent.h>
-#include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
-#include <stdio.h>
 #include <sys/stat.h>
-
-/*
- * Discovery: `NNN-<name>-input-provider.json` manifests in the SAME
- * roots the DP loader scans (target_plugin_build_discovery_roots) —
- * input-provider-discovery.md §3. The three-digit ProbeOrder filename
- * prefix gives lexicographic ordering for free; the DP loader skips
- * the `-input-provider.json` suffix, this loader requires it.
- */
-
-struct input_plugin_entry
-{
-	char manifest_path[PATH_MAX];
-	char manifest_file[PATH_MAX]; /* basename, used for stable sort */
-	char binary_path[PATH_MAX];
-	char id[64];
-	char display_name[128];
-	char vendor[64];
-	char version[64];
-	uint32_t probe_order;
-	bool enabled;
-};
-
-static int
-input_compare_by_filename(const void *a, const void *b)
-{
-	return strcmp(((const struct input_plugin_entry *)a)->manifest_file,
-	              ((const struct input_plugin_entry *)b)->manifest_file);
-}
-
-static void
-input_copy_optional_str(const cJSON *root, const char *field, char *dst, size_t dst_size)
-{
-	if (dst_size == 0) {
-		return;
-	}
-	dst[0] = '\0';
-	const cJSON *node = u_json_get(root, field);
-	if (node == NULL) {
-		return;
-	}
-	(void)u_json_get_string_into_array(node, dst, dst_size);
-}
-
-static bool
-input_parse_manifest(const char *path, struct input_plugin_entry *e)
-{
-	FILE *f = fopen(path, "rb");
-	if (f == NULL) {
-		U_LOG_W("input plugin loader: %s: fopen failed (errno=%d).", path, errno);
-		return false;
-	}
-	if (fseek(f, 0, SEEK_END) != 0) {
-		fclose(f);
-		return false;
-	}
-	long len = ftell(f);
-	if (len <= 0 || len > 64 * 1024) {
-		U_LOG_W("input plugin loader: %s: implausible manifest size %ld.", path, len);
-		fclose(f);
-		return false;
-	}
-	if (fseek(f, 0, SEEK_SET) != 0) {
-		fclose(f);
-		return false;
-	}
-	char *buf = (char *)malloc((size_t)len + 1);
-	if (buf == NULL) {
-		fclose(f);
-		return false;
-	}
-	size_t got = fread(buf, 1, (size_t)len, f);
-	fclose(f);
-	if (got != (size_t)len) {
-		free(buf);
-		return false;
-	}
-	buf[len] = '\0';
-
-	cJSON *root = cJSON_Parse(buf);
-	free(buf);
-	if (root == NULL) {
-		U_LOG_W("input plugin loader: %s: JSON parse failed.", path);
-		return false;
-	}
-
-	char fmt[16] = {0};
-	const cJSON *fmt_node = u_json_get(root, "file_format_version");
-	if (fmt_node != NULL) {
-		(void)u_json_get_string_into_array(fmt_node, fmt, sizeof(fmt));
-	}
-	if (strcmp(fmt, "1.0") != 0) {
-		U_LOG_W("input plugin loader: %s: unsupported file_format_version='%s'.", path, fmt);
-		cJSON_Delete(root);
-		return false;
-	}
-
-	const cJSON *plugin = u_json_get(root, "plugin");
-	if (plugin == NULL) {
-		U_LOG_W("input plugin loader: %s: missing 'plugin' object.", path);
-		cJSON_Delete(root);
-		return false;
-	}
-
-	input_copy_optional_str(plugin, "id", e->id, sizeof(e->id));
-	input_copy_optional_str(plugin, "display_name", e->display_name, sizeof(e->display_name));
-	input_copy_optional_str(plugin, "vendor", e->vendor, sizeof(e->vendor));
-	input_copy_optional_str(plugin, "version", e->version, sizeof(e->version));
-	input_copy_optional_str(plugin, "binary_path", e->binary_path, sizeof(e->binary_path));
-
-	int probe_order = 100;
-	const cJSON *po = u_json_get(plugin, "probe_order");
-	if (po != NULL) {
-		(void)u_json_get_int(po, &probe_order);
-	}
-	e->probe_order = (uint32_t)probe_order;
-	e->enabled = true;
-
-	cJSON_Delete(root);
-
-	if (e->id[0] == '\0' || e->binary_path[0] == '\0') {
-		U_LOG_W("input plugin loader: %s: required fields 'plugin.id' or 'plugin.binary_path' missing.", path);
-		return false;
-	}
-	return true;
-}
-
-static bool
-input_already_have_id(const struct input_plugin_entry *entries, int n, const char *id)
-{
-	for (int i = 0; i < n; i++) {
-		if (strcmp(entries[i].id, id) == 0) {
-			return true;
-		}
-	}
-	return false;
-}
-
-static int
-input_enumerate_dir(const char *root, struct input_plugin_entry *entries, int start, int max)
-{
-	DIR *d = opendir(root);
-	if (d == NULL) {
-		return start;
-	}
-
-	static const char ip_suffix[] = "-input-provider.json";
-	const size_t ip_len = sizeof(ip_suffix) - 1;
-
-	int count = start;
-	struct dirent *de;
-	while ((de = readdir(d)) != NULL) {
-		if (count >= max) {
-			U_LOG_W("input plugin loader: more than %d entries — truncating.", max);
-			break;
-		}
-		const char *name = de->d_name;
-		size_t n = strlen(name);
-		if (n <= ip_len || strcmp(name + n - ip_len, ip_suffix) != 0) {
-			continue;
-		}
-
-		struct input_plugin_entry e;
-		memset(&e, 0, sizeof(e));
-		snprintf(e.manifest_path, sizeof(e.manifest_path), "%s/%s", root, name);
-		snprintf(e.manifest_file, sizeof(e.manifest_file), "%s", name);
-
-		if (!input_parse_manifest(e.manifest_path, &e)) {
-			continue;
-		}
-		/* Per-user shadows system: roots are walked in priority order,
-		 * so the first occurrence of an `<id>` wins. */
-		if (input_already_have_id(entries, count, e.id)) {
-			U_LOG_I("input plugin loader:   %s: shadowed by earlier manifest for id='%s'.", e.manifest_path,
-			        e.id);
-			continue;
-		}
-		entries[count++] = e;
-	}
-	closedir(d);
-	return count;
-}
-
-static int
-input_enumerate_all(struct input_plugin_entry *entries, int max)
-{
-	char roots[8][PATH_MAX];
-	int n_roots = target_plugin_build_discovery_roots(roots, (int)(sizeof(roots) / sizeof(roots[0])));
-
-	int n = 0;
-	for (int r = 0; r < n_roots; r++) {
-		n = input_enumerate_dir(roots[r], entries, n, max);
-	}
-	if (n > 1) {
-		qsort(entries, (size_t)n, sizeof(entries[0]), input_compare_by_filename);
-	}
-	return n;
-}
-
-static const struct xrt_input_plugin_iface *
-input_try_load_one(const struct input_plugin_entry *e, struct xrt_input_plugin_instance **out_inst)
-{
-	*out_inst = NULL;
-	g_input_last_declined = false;
-
-	/* RTLD_LOCAL keeps the provider's symbols private; aux symbols
-	 * resolve via the runtime dylib/.so already in the process. */
-	void *handle = dlopen(e->binary_path, RTLD_NOW | RTLD_LOCAL);
-	if (handle == NULL) {
-		U_LOG_W("input plugin loader:   %s: dlopen(%s) failed: %s.", e->id, e->binary_path, dlerror());
-		return NULL;
-	}
-
-	dlerror();
-	xrt_input_plugin_negotiate_fn_t negotiate =
-	    (xrt_input_plugin_negotiate_fn_t)dlsym(handle, XRT_INPUT_PLUGIN_ENTRYPOINT_NAME);
-	const char *err = dlerror();
-	if (negotiate == NULL || err != NULL) {
-		U_LOG_W("input plugin loader:   %s: missing entry point '%s' (%s) — skipping.", e->id,
-		        XRT_INPUT_PLUGIN_ENTRYPOINT_NAME, err ? err : "null");
-		dlclose(handle);
-		return NULL;
-	}
-
-	// Process-lifetime host storage: providers may retain this pointer
-	// (#1380). Never a stack local.
-	struct xrt_input_plugin_host_iface *host = input_host_iface();
-
-	struct xrt_input_plugin_iface *iface = NULL;
-	uint32_t plugin_version = 0;
-	xrt_result_t xret = negotiate(XRT_INPUT_PLUGIN_API_VERSION_CURRENT, host, &iface, &plugin_version);
-	if (xret != XRT_SUCCESS || iface == NULL) {
-		g_input_last_declined = xret == XRT_ERROR_PROBER_NOT_SUPPORTED;
-		U_LOG_W("input plugin loader:   %s: negotiate returned %d (iface=%p) — skipping.", e->id, (int)xret,
-		        (void *)iface);
-		dlclose(handle);
-		return NULL;
-	}
-
-	/* ADR-020 rule 3: never dispatch through a mismatched vtable. */
-	if (plugin_version != XRT_INPUT_PLUGIN_API_VERSION_CURRENT) {
-		U_LOG_E(
-		    "input plugin loader:   %s: ABI major mismatch — plugin_api=%u, runtime expects %u; "
-		    "the provider must be rebuilt against this runtime's headers — skipping (ADR-020 rule 3).",
-		    e->id, plugin_version, (unsigned)XRT_INPUT_PLUGIN_API_VERSION_CURRENT);
-		dlclose(handle);
-		return NULL;
-	}
-
-	if (iface->probe != NULL) {
-		xret = iface->probe(out_inst);
-		if (xret == XRT_ERROR_PROBER_NOT_SUPPORTED) {
-			U_LOG_I("input plugin loader:   %s: probe declined (no matching hardware).", e->id);
-			g_input_last_declined = true;
-			dlclose(handle);
-			return NULL;
-		}
-		if (xret != XRT_SUCCESS) {
-			U_LOG_W("input plugin loader:   %s: probe returned %d — skipping.", e->id, (int)xret);
-			dlclose(handle);
-			return NULL;
-		}
-	}
-
-	U_LOG_W(
-	    "input plugin loader: active input provider: id=%s name='%s' vendor='%s' version='%s' "
-	    "plugin_api=%u probe_order=%u path=%s",
-	    iface->id ? iface->id : e->id, iface->display_name ? iface->display_name : e->display_name,
-	    iface->vendor ? iface->vendor : e->vendor, e->version, plugin_version, e->probe_order, e->binary_path);
-
-	/* dlopen handle intentionally leaked, same lifetime rule as the DP
-	 * loader — the devices' vtables live in the provider binary. */
-	return iface;
-}
-
-static void
-input_discover_all(void)
-{
-	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
-	int n = input_enumerate_all(entries, MAX_INPUT_PLUGIN_ENTRIES);
-	if (n == 0) {
-		U_LOG_I("input plugin loader: no input-provider manifests found.");
-		return;
-	}
-
-	U_LOG_I("input plugin loader: %d registered provider(s); attempting in filename order.", n);
-	for (int i = 0; i < n; i++) {
-		U_LOG_I("input plugin loader:   [%d/%d] %s (ProbeOrder=%u, %s)", i + 1, n, entries[i].id,
-		        entries[i].probe_order, entries[i].binary_path);
-		struct xrt_input_plugin_instance *inst = NULL;
-		const struct xrt_input_plugin_iface *iface = input_try_load_one(&entries[i], &inst);
-		if (iface != NULL) {
-			// Keep going: every claiming provider is a live
-			// candidate the arbiter can fall back to.
-			input_note_provider(iface, inst, entries[i].probe_order);
-			continue;
-		}
-		if (g_input_last_declined) {
-			g_input_scan_declined++;
-		} else {
-			g_input_scan_failed++;
-		}
-	}
-
-	if (g_input_provider_count == 0) {
-		U_LOG_I(
-		    "input plugin loader: no registered provider claimed the system (%d declined, %d failed to load) "
-		    "— qwerty keeps the hand roles.",
-		    g_input_scan_declined, g_input_scan_failed);
-	}
-}
-
-int
-target_input_plugin_enumerate(struct target_input_plugin_desc *out, int max)
-{
-	if (out == NULL || max <= 0) {
-		return 0;
-	}
-
-	struct input_plugin_entry entries[MAX_INPUT_PLUGIN_ENTRIES];
-	int n = input_enumerate_all(entries, MAX_INPUT_PLUGIN_ENTRIES);
-	if (n > max) {
-		n = max;
-	}
-
-	for (int i = 0; i < n; i++) {
-		struct target_input_plugin_desc *d = &out[i];
-		memset(d, 0, sizeof(*d));
-		snprintf(d->id, sizeof(d->id), "%s", entries[i].id);
-		snprintf(d->display_name, sizeof(d->display_name), "%s", entries[i].display_name);
-		snprintf(d->vendor, sizeof(d->vendor), "%s", entries[i].vendor);
-		snprintf(d->version, sizeof(d->version), "%s", entries[i].version);
-		snprintf(d->binary_path, sizeof(d->binary_path), "%s", entries[i].binary_path);
-		d->probe_order = entries[i].probe_order;
-		d->enabled = entries[i].enabled;
-	}
-
-	return n;
-}
-
-/*!
- * POSIX per-user manifest dir — mirrors the DP loader's `preferred` file
- * location; the `force_qwerty` gate file lives next to it.
- */
-static bool
-input_user_manifest_dir(char *out, size_t cap)
-{
-	const char *home = getenv("HOME");
-#ifdef __APPLE__
-	if (home == NULL || *home == '\0') {
-		return false;
-	}
-	snprintf(out, cap, "%s/Library/Application Support/DisplayXR/DisplayProcessors", home);
-	return true;
-#else
-	const char *xdg = getenv("XDG_DATA_HOME");
-	if (xdg != NULL && *xdg != '\0') {
-		snprintf(out, cap, "%s/DisplayXR/DisplayProcessors", xdg);
-		return true;
-	}
-	if (home != NULL && *home != '\0') {
-		snprintf(out, cap, "%s/.local/share/DisplayXR/DisplayProcessors", home);
-		return true;
-	}
-	return false;
-#endif
-}
 
 bool
 target_input_plugin_get_force_qwerty(void)
 {
 	char dir[PATH_MAX];
-	if (!input_user_manifest_dir(dir, sizeof(dir))) {
+	if (!target_component_user_dir(dir, sizeof(dir))) {
 		return false;
 	}
 	char path[PATH_MAX];
@@ -1048,7 +1189,214 @@ target_input_plugin_get_force_qwerty(void)
 	return c != '0';
 }
 
-#endif /* platform-specific discovery */
+/*
+ * N7: the `emulated_controllers` file next to `force_qwerty`, same byte
+ * convention (first byte '0' = off, anything else = on); absent = on. What
+ * `displayxr-cli input emulated on|off` writes. No machine tier on POSIX.
+ */
+bool
+target_input_plugin_get_emulated_controllers(const char **out_source)
+{
+	if (out_source != NULL) {
+		*out_source = "default";
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return true;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/emulated_controllers", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return true;
+	}
+	int c = fgetc(f);
+	fclose(f);
+	if (out_source != NULL) {
+		*out_source = "file";
+	}
+	return c != '0';
+}
+
+/*
+ * N3a: the preferred provider — the DP loader's §3.3 pattern: an env var
+ * for dev/CI (no writable filesystem needed), else a one-line file next to
+ * `force_qwerty`, which is what `displayxr-cli input use <id>` / `input
+ * reset` write.
+ */
+bool
+target_input_plugin_get_preferred(char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+
+	const char *env = getenv("XRT_PREFERRED_INPUT_PLUGIN_ID");
+	if (env != NULL && *env != '\0') {
+		snprintf(out, cap, "%s", env);
+		return out[0] != '\0';
+	}
+
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), "%s/input-preferred", dir);
+
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[64] = {0};
+	size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[got] = '\0';
+	size_t len = strlen(buf);
+	while (len > 0 &&
+	       (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+		buf[--len] = '\0';
+	}
+	snprintf(out, cap, "%s", buf);
+	return out[0] != '\0';
+}
+
+/*
+ * ADR-034 Am.5: the per-app pin — a one-line `input-preferred-<exe-basename>`
+ * file next to `input-preferred` (same trim rule). No lock tier on POSIX.
+ */
+#define INPUT_PERAPP_PREFIX "input-preferred-"
+
+static bool
+input_perapp_file(const char *exe_basename, char *out, size_t cap, bool create_dir)
+{
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return false;
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return false;
+	}
+	if (create_dir) {
+		// Best-effort mkdir -p: a fresh box has no per-user dir yet.
+		char tmp[PATH_MAX];
+		snprintf(tmp, sizeof(tmp), "%s", dir);
+		for (char *p = tmp + 1; *p != '\0'; p++) {
+			if (*p == '/') {
+				*p = '\0';
+				(void)mkdir(tmp, 0755);
+				*p = '/';
+			}
+		}
+		(void)mkdir(tmp, 0755);
+	}
+	const int n = snprintf(out, cap, "%s/" INPUT_PERAPP_PREFIX "%s", dir, exe_basename);
+	return n > 0 && (size_t)n < cap;
+}
+
+//! Read a one-line id file, trimmed; "" when absent / empty.
+static bool
+input_read_id_file(const char *path, char *out, size_t cap)
+{
+	out[0] = '\0';
+	FILE *f = fopen(path, "rb");
+	if (f == NULL) {
+		return false;
+	}
+	char buf[64] = {0};
+	size_t got = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[got] = '\0';
+	size_t len = strlen(buf);
+	while (len > 0 &&
+	       (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ' || buf[len - 1] == '\t')) {
+		buf[--len] = '\0';
+	}
+	snprintf(out, cap, "%s", buf);
+	return out[0] != '\0';
+}
+
+bool
+target_input_plugin_get_app_pin(const char *exe_basename, char *out, size_t cap)
+{
+	if (out == NULL || cap == 0) {
+		return false;
+	}
+	out[0] = '\0';
+	char path[PATH_MAX];
+	if (!input_perapp_file(exe_basename, path, sizeof(path), false)) {
+		return false;
+	}
+	return input_read_id_file(path, out, cap);
+}
+
+enum target_input_pin_write
+target_input_plugin_set_app_pin(const char *exe_basename, const char *provider_id)
+{
+	const bool clear = provider_id == NULL || provider_id[0] == '\0';
+	if (!clear && !input_pin_id_valid(provider_id)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	if (!u_exe_basename_valid(exe_basename, XRT_INPUT_EXE_BASENAME_SIZE)) {
+		return TARGET_INPUT_PIN_WRITE_INVALID;
+	}
+	char path[PATH_MAX];
+	if (!input_perapp_file(exe_basename, path, sizeof(path), !clear)) {
+		return clear ? TARGET_INPUT_PIN_WRITE_OK : TARGET_INPUT_PIN_WRITE_UNSUPPORTED;
+	}
+	if (clear) {
+		if (remove(path) != 0 && errno != ENOENT) {
+			return errno == EACCES ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+		}
+		return TARGET_INPUT_PIN_WRITE_OK;
+	}
+	FILE *f = fopen(path, "wb");
+	if (f == NULL) {
+		return errno == EACCES ? TARGET_INPUT_PIN_WRITE_DENIED : TARGET_INPUT_PIN_WRITE_FAILED;
+	}
+	fprintf(f, "%s\n", provider_id);
+	fclose(f);
+	return TARGET_INPUT_PIN_WRITE_OK;
+}
+
+int
+target_input_plugin_list_app_pins(struct target_input_app_pin *out, int max)
+{
+	if (out == NULL || max <= 0) {
+		return 0;
+	}
+	char dir[PATH_MAX];
+	if (!target_component_user_dir(dir, sizeof(dir))) {
+		return 0;
+	}
+	DIR *d = opendir(dir);
+	if (d == NULL) {
+		return 0;
+	}
+	int n = 0;
+	const size_t plen = strlen(INPUT_PERAPP_PREFIX);
+	struct dirent *ent;
+	while (n < max && (ent = readdir(d)) != NULL) {
+		if (strncmp(ent->d_name, INPUT_PERAPP_PREFIX, plen) != 0) {
+			continue;
+		}
+		const char *exe = ent->d_name + plen;
+		struct target_input_app_pin *pin = &out[n];
+		memset(pin, 0, sizeof(*pin));
+		if (!u_exe_basename_valid(exe, sizeof(pin->exe_basename)) ||
+		    !target_input_plugin_get_app_pin(exe, pin->provider_id, sizeof(pin->provider_id))) {
+			continue;
+		}
+		snprintf(pin->exe_basename, sizeof(pin->exe_basename), "%s", exe);
+		n++;
+	}
+	closedir(d);
+	return n;
+}
+
+#endif /* platform-specific gate */
 
 
 /*
@@ -1085,11 +1433,54 @@ input_providers_disabled_by_env(void)
 	return env != NULL && env[0] == '0' && env[1] == '\0';
 }
 
+/*
+ * ADR-034 Am.5: the store reads the arbiter's per-client walk needs, installed
+ * once at discovery. Kept here (not in the arbiter) so the arbiter stays
+ * store-free and its tests can fake every read.
+ */
+static int
+input_policy_set_app_pin(const char *exe, const char *id)
+{
+	return target_input_plugin_set_app_pin(exe, id) == TARGET_INPUT_PIN_WRITE_OK ? 0 : 1;
+}
+
+static bool
+input_policy_lock(void)
+{
+	return target_component_policy_lock(&g_input_class);
+}
+
+static const char *
+input_policy_row_id_for(const struct xrt_input_plugin_iface *iface, struct xrt_input_plugin_instance *inst)
+{
+	for (int p = 0; p < g_input_provider_count; p++) {
+		if (g_input_providers[p].iface == iface && g_input_providers[p].inst == inst) {
+			return g_input_providers[p].row_id;
+		}
+	}
+	return NULL;
+}
+
+static void
+input_install_arbiter_policy(void)
+{
+	const struct t_input_arbiter_policy policy = {
+	    .get_app_pin = target_input_plugin_get_app_pin,
+	    .set_app_pin = input_policy_set_app_pin,
+	    .get_policy_lock = input_policy_lock,
+	    .get_user_default = target_input_plugin_get_preferred,
+	    .row_id_for = input_policy_row_id_for,
+	    .self_exe_basename = u_exe_basename_self,
+	};
+	t_input_arbiter_set_policy(&policy);
+}
+
 const struct xrt_input_plugin_iface *
 target_input_plugin_get_iface(int index)
 {
 	if (!g_input_load_attempted) {
 		g_input_load_attempted = 1;
+		input_install_arbiter_policy();
 		if (input_providers_disabled_by_env()) {
 			/* One WARN, once per process: the scan is one-shot, so
 			 * this cannot bloat a log even across the hundreds of
@@ -1150,4 +1541,182 @@ target_input_plugin_get_scan_result(int *out_declined, int *out_failed)
 	if (out_failed != NULL) {
 		*out_failed = g_input_scan_failed;
 	}
+}
+
+/*!
+ * N7: the live half of the `EmulatedControllers` gate — withdraw / re-admit
+ * the qwerty floor candidate. The two cases that cannot be applied live are
+ * each said once per process at WARN (the policy is re-read on every store
+ * write of any class), INFO after.
+ */
+static int
+input_reread_emulated_gate(void)
+{
+	const char *source = "default";
+	const bool emulated = target_input_plugin_get_emulated_controllers(&source);
+	bool installed = false;
+	t_input_arbiter_get_status(&installed, NULL);
+	const bool have_floor = t_input_arbiter_has_floor();
+
+	static bool warned_not_installed = false;
+	static bool warned_no_pair = false;
+	if (!installed) {
+		if (!emulated) {
+			// No provider resident -> nothing arbitrates -> the pair created
+			// at build keeps the roles until the next start (the restart rule
+			// `Enabled` has for a provider that was not loaded).
+			if (!warned_not_installed) {
+				warned_not_installed = true;
+				U_LOG_W(
+				    "input plugin loader: EmulatedControllers=0 (%s) but no input provider is "
+				    "resident, "
+				    "so nothing arbitrates the hand roles — the qwerty pair keeps them until the next "
+				    "service start (in-process apps: their next launch).",
+				    source);
+			} else {
+				U_LOG_I("input plugin loader: EmulatedControllers=0 (%s) — applies at the next start.",
+				        source);
+			}
+		}
+		return 0;
+	}
+	if (emulated && !have_floor) {
+		// The process started with the gate off: the pair was never created,
+		// and the candidate set (qwerty's included) is fixed per process.
+		if (!warned_no_pair) {
+			warned_no_pair = true;
+			U_LOG_W(
+			    "input plugin loader: EmulatedControllers=1 (%s) but the qwerty pair was not created at "
+			    "system build (the gate was 0 then) — it joins at the next service start.",
+			    source);
+		} else {
+			U_LOG_I("input plugin loader: EmulatedControllers=1 (%s) — the pair joins at the next start.",
+			        source);
+		}
+		return 0;
+	}
+	const int changed = t_input_arbiter_set_floor_withdrawn(!emulated);
+	if (changed > 0) {
+		U_LOG_W("input plugin loader: policy re-read — EmulatedControllers=%d (%s): the qwerty pair is %s.",
+		        emulated ? 1 : 0, source,
+		        emulated ? "re-admitted as the hand-role floor"
+		                 : "WITHDRAWN (devices stay resident; no floor)");
+	}
+	return changed;
+}
+
+int
+target_input_plugin_reread_policy(void)
+{
+	(void)target_input_plugin_get_iface(0); // Force discovery.
+	// N7 first: the floor is a candidate of its own, so the gate applies
+	// whether or not a provider is resident — and says so when it cannot.
+	const int floor_changed = input_reread_emulated_gate();
+	if (g_input_provider_count == 0) {
+		U_LOG_I(
+		    "input plugin loader: policy re-read — no resident provider; a newly enabled one loads at "
+		    "the next service start.");
+		return floor_changed;
+	}
+	struct target_component_entry *entries =
+	    (struct target_component_entry *)calloc(TARGET_COMPONENT_MAX_ENTRIES, sizeof(*entries));
+	if (entries == NULL) {
+		return 0;
+	}
+	const int n = target_component_enumerate(&g_input_class, entries, TARGET_COMPONENT_MAX_ENTRIES);
+	(void)target_component_apply_user_overlay(&g_input_class, entries, (size_t)n);
+	char preferred[64] = {0};
+	const bool have_pref = target_input_plugin_get_preferred(preferred, sizeof(preferred));
+
+	struct t_input_arbiter_rank ranks[TARGET_COMPONENT_MAX_ENTRIES];
+	int rank_count = 0;
+	for (int p = 0; p < g_input_provider_count; p++) {
+		struct input_provider_slot *slot = &g_input_providers[p];
+		const char *id = slot->iface != NULL ? slot->iface->id : NULL;
+		if (id == NULL) {
+			continue;
+		}
+		// A row gone from the store is treated as disabled: still resident
+		// (never unloaded), no longer a candidate.
+		bool enabled = false;
+		uint32_t priority = slot->probe_order;
+		for (int i = 0; i < n; i++) {
+			if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 ||
+			    strcmp(entries[i].id, id) != 0) {
+				continue;
+			}
+			enabled = entries[i].enabled;
+			priority = entries[i].probe_order;
+			break;
+		}
+		if (have_pref && strcmp(id, preferred) == 0) {
+			priority = 0;
+		}
+		slot->probe_order = priority;
+		ranks[rank_count].id = id;
+		ranks[rank_count].priority = priority;
+		ranks[rank_count].enabled = enabled;
+		rank_count++;
+	}
+	// Say so when the preferred / re-enabled provider is not resident: the
+	// user's write is honoured only by a restart, and nothing else would tell.
+	for (int i = 0; i < n; i++) {
+		if ((entries[i].flags & TARGET_COMPONENT_FLAG_MALFORMED) != 0 || !entries[i].enabled) {
+			continue;
+		}
+		bool resident = false;
+		for (int p = 0; p < g_input_provider_count && !resident; p++) {
+			resident = g_input_providers[p].iface != NULL && g_input_providers[p].iface->id != NULL &&
+			           strcmp(g_input_providers[p].iface->id, entries[i].id) == 0;
+		}
+		if (!resident) {
+			// Once per process per id at WARN; INFO after — the policy is
+			// re-read on every store write of any class, and a provider
+			// that declined at scan would otherwise WARN on each of them.
+			static char logged[TARGET_COMPONENT_MAX_ENTRIES][64];
+			static int logged_count = 0;
+			bool first = true;
+			for (int k = 0; k < logged_count; k++) {
+				if (strcmp(logged[k], entries[i].id) == 0) {
+					first = false;
+					break;
+				}
+			}
+			if (first && logged_count < TARGET_COMPONENT_MAX_ENTRIES) {
+				snprintf(logged[logged_count], sizeof(logged[0]), "%s", entries[i].id);
+				logged_count++;
+			}
+			const char *pref = have_pref && strcmp(entries[i].id, preferred) == 0 ? " and preferred" : "";
+			if (first) {
+				U_LOG_W(
+				    "input plugin loader: '%s' is enabled%s but was not loaded by this process "
+				    "(disabled, unregistered or declined at scan) — it joins at the next service "
+				    "start.",
+				    entries[i].id, pref);
+			} else {
+				U_LOG_I(
+				    "input plugin loader: '%s' is enabled%s but not resident — joins at the next "
+				    "service start.",
+				    entries[i].id, pref);
+			}
+		}
+	}
+	free(entries);
+	const int changed = t_input_arbiter_rerank(ranks, rank_count);
+	// ADR-034 Am.5: per-app pins (and the lock / default they resolve under).
+	const int pins_changed = t_input_arbiter_policy_changed();
+	if (pins_changed > 0) {
+		U_LOG_W("input plugin loader: policy re-read — %d client(s) picked up a changed per-app pin.",
+		        pins_changed);
+	}
+	U_LOG_W("input plugin loader: policy re-read — PreferredPlugin=%s, %d resident provider(s), %d re-ranked.",
+	        have_pref ? preferred : "<unset>", rank_count, changed);
+	return changed + floor_changed;
+}
+
+int
+target_input_plugin_get_scan_untrusted(void)
+{
+	(void)target_input_plugin_get_active();
+	return g_input_scan_untrusted;
 }

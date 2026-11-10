@@ -29,6 +29,7 @@ endforeach()
 
 set(IPC_COMMON_SOURCES
     ${CMAKE_CURRENT_BINARY_DIR}/ipc_protocol_generated.h
+    shared/ipc_lift_caps.h
     shared/ipc_message_channel.h
     shared/ipc_shmem.c
     shared/ipc_shmem.h
@@ -49,6 +50,11 @@ endif()
 
 target_link_libraries(ipc_shared PRIVATE aux_util)
 
+if(NOT WIN32)
+	# XR_DXR_lift's CPU image kind over the graphics-buffer transport (POSIX).
+	target_sources(ipc_shared PRIVATE shared/ipc_cpu_buffer.c shared/ipc_cpu_buffer.h)
+endif()
+
 if(APPLE)
 	target_sources(ipc_shared PRIVATE shared/ipc_metal_utils.m)
 	target_link_libraries(ipc_shared PRIVATE "-framework Metal" "-framework IOSurface" "-framework CoreFoundation")
@@ -68,6 +74,12 @@ add_library(
 	client/ipc_client.h
 	client/ipc_client_compositor.c
 	client/ipc_client_connection.c
+	client/ipc_client_lift.c
+	client/ipc_client_lift.h
+	client/ipc_client_service_link.c
+	client/ipc_client_service_link.h
+	client/ipc_client_stereo_camera.c
+	client/ipc_client_stereo_camera.h
 	client/ipc_client_device.c
 	client/ipc_client_hmd.c
 	client/ipc_client_instance.c
@@ -109,6 +121,18 @@ endif()
 ###
 # Server
 
+# ADR-053 (#2005): the XR_DXR_lift v3 handlers' adapter onto the conversion
+# core. Its own target (no generated headers, no compositor) so it is
+# host-testable with a CPU fake provider (tests_ipc_lift_core).
+add_library(ipc_server_conv STATIC server/ipc_server_conv.c server/ipc_server_conv.h)
+target_include_directories(ipc_server_conv PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(ipc_server_conv PUBLIC conv_runtime xrt-interfaces PRIVATE aux_util aux_os)
+if(NOT WIN32)
+	# The POSIX CPU I/O glue (no D3D11 device): spec-4 CPU kinds.
+	target_sources(ipc_server_conv PRIVATE server/ipc_server_conv_cpu.c server/ipc_server_conv_cpu.h)
+	target_link_libraries(ipc_server_conv PRIVATE ipc_shared)
+endif()
+
 add_library(
 	ipc_server STATIC
 	${CMAKE_CURRENT_BINARY_DIR}/ipc_server_generated.c
@@ -119,6 +143,9 @@ add_library(
 	server/ipc_server_peer_creds.c
 	server/ipc_server_peer_creds.h
 	server/ipc_server_process.c
+	server/ipc_server_status.c
+	server/ipc_server_stereo_camera.c
+	server/ipc_server_stereo_camera.h
 	)
 target_include_directories(
 	ipc_server
@@ -127,6 +154,10 @@ target_include_directories(
 	PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../compositor  # For d3d11_service headers
 	)
 target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debug_gui ipc_shared aux_math)
+# ADR-053 (#2005): the v3 lift handlers route to the conversion core through it.
+target_link_libraries(ipc_server PUBLIC ipc_server_conv)
+# ADR-043 Amendment 4: the UVC side-by-side stereo camera source's capture backend.
+target_link_libraries(ipc_server PRIVATE aux_os_uvc)
 
 # Link the D3D11 service compositor — the IPC handlers call its
 # vendor-agnostic helpers for predicted eye positions, per-client window
@@ -135,7 +166,20 @@ target_link_libraries(ipc_server PRIVATE aux_util aux_util_process aux_util_debu
 # static dependency on any specific vendor driver (issue #256 / ADR-019).
 if(WIN32 AND XRT_FEATURE_HYBRID_MODE)
 	target_link_libraries(ipc_server PRIVATE comp_d3d11_service)
+	target_sources(ipc_server PRIVATE server/ipc_server_share_tap_d3d11.c)
 	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_D3D11_SERVICE_COMPOSITOR)
+	# ADR-053 P1a (#2003): the compositor's GPU glue + the dp-lift backend,
+	# attached to the conversion core once the device exists.
+	target_sources(ipc_server PRIVATE server/ipc_server_conv_d3d11.c)
+endif()
+
+# ADR-053 P5: the POSIX counterpart -- the conversion core's Vulkan glue
+# (vk_conv: image allocation, S5 view synthesis, S6 readback) attached to the
+# system compositor's Vulkan device on macOS and desktop Linux.
+if(TARGET comp_vk_conv AND (APPLE OR (XRT_HAVE_LINUX AND NOT ANDROID)))
+	target_link_libraries(ipc_server PRIVATE comp_vk_conv)
+	target_compile_definitions(ipc_server PRIVATE XRT_HAVE_VK_CONV_SERVICE)
+	target_sources(ipc_server PRIVATE server/ipc_server_conv_vk.c)
 endif()
 
 # Qwerty driver stereo state access for camera-centric controls
@@ -145,10 +189,11 @@ if(XRT_BUILD_DRIVER_QWERTY)
 	target_compile_definitions(ipc_server PRIVATE XRT_BUILD_DRIVER_QWERTY)
 endif()
 
-if(XRT_HAVE_SYSTEMD)
-	target_include_directories(ipc_server PRIVATE ${SYSTEMD_INCLUDE_DIRS})
-	target_link_libraries(ipc_server PRIVATE ${SYSTEMD_LIBRARIES})
-endif()
+# No libsystemd link (#1744): the Linux mainloop reads the socket-activation
+# hand-off (LISTEN_PID/LISTEN_FDS, sd_listen_fds(3)'s whole protocol) itself.
+# Linking it only on hosts that happen to have libsystemd-dev made the shipped
+# service's DT_NEEDED depend on the build box, and the .deb's STABLE_SONAMES
+# gate refuses libsystemd.so.0.
 
 if(ANDROID)
 	add_library(
@@ -164,6 +209,14 @@ if(ANDROID)
 		)
 	target_sources(
 		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_mainloop_android.c
+		)
+	# Android compiles the comp_multi shared surface since the workspace overlay
+	# mode (#1006, ADR-036 D4), so the workspace handler arms — and their generic
+	# per-target input queues, shared with macOS / desktop Linux — are linked here
+	# too. Nothing feeds them pointer input on Android yet; the queues stay empty.
+	target_sources(
+		ipc_server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
+				   ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
 		)
 	target_link_libraries(
 		ipc_shared
@@ -182,6 +235,25 @@ elseif(XRT_HAVE_LINUX)
 	if(XRT_HAVE_VULKAN)
 		target_link_libraries(ipc_server PRIVATE aux_vk)
 	endif()
+	# Desktop-Linux shared spatial surface (#710, #967): the workspace handler
+	# arms use the generic per-target input queues (shared with macOS), fed by
+	# the service window's input capture (comp_window_linux -> sink installed
+	# by ipc_server_linux_input.c).
+	if(NOT ANDROID)
+		target_sources(
+			ipc_server
+			PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
+				${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
+			)
+	endif()
+	if(TARGET comp_linux_window)
+		target_sources(
+			ipc_server
+			PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_linux_input.c
+				${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_linux_input.h
+			)
+		target_link_libraries(ipc_server PRIVATE comp_linux_window)
+	endif()
 elseif(APPLE)
 	target_sources(
 		ipc_server
@@ -195,7 +267,7 @@ elseif(APPLE)
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.c
 			${CMAKE_CURRENT_SOURCE_DIR}/server/ipc_server_input_queue.h
 		)
-	# Carbon: RegisterEventHotKey for the system-wide Ctrl+Space workspace toggle
+	# Carbon: RegisterEventHotKey for the system-wide Control+Shift+Space workspace toggle
 	# (the service has no window before a controller connects, so the toggle can't
 	# be an NSEvent — it must be a global hotkey, #61).
 	target_link_libraries(ipc_server PRIVATE "-framework CoreFoundation" "-framework Cocoa" "-framework Carbon")

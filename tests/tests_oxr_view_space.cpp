@@ -94,6 +94,35 @@
 namespace {
 
 constexpr float kPosTolM = 0.001f;    // 1 mm
+
+/*!
+ * Multi-screen M3: PRIMARY_MULTIVIEW_DXR reports one view set per window
+ * segment the system can ever weave — the device max on a box that cannot split
+ * a window (one DP-backed screen, a service session, non-Linux), the device max
+ * x 2 on desktop Linux with two DP-backed screens.
+ *
+ * EXACT everywhere: this binary runs with DXR_SEGMENTS=0 (set below, before any
+ * instance exists), which keeps the pre-M3 count on every platform. Deriving
+ * the Linux x2 from the box instead is not exact — a screen counts only when its
+ * plug-in's VK factory passed the vk_bundle ABI check (#1243), which an
+ * installed plug-in next to a dev runtime does not, and xrEnumerateDisplaysDXR
+ * cannot see that. The x2 arithmetic itself is pinned by tests_oxr_segment_views.
+ */
+bool
+is_multiview_count(size_t n, uint32_t device_max)
+{
+	return n == device_max;
+}
+
+[[maybe_unused]] const bool kSegmentsOff = [] {
+// Before main(): the runtime reads it at every system fill-in.
+#ifdef _WIN32
+	_putenv_s("DXR_SEGMENTS", "0");
+#else
+	setenv("DXR_SEGMENTS", "0", 1);
+#endif
+	return true;
+}();
 constexpr float kAngTolDeg = 0.1f;    // 0.1 degree
 
 /*!
@@ -255,6 +284,9 @@ struct Runtime
 	XrSpace view = XR_NULL_HANDLE;
 	bool have_view_rig = false;
 	bool have_display_info = false;
+	bool have_hand_tracking = false; //!< #2189: XR_EXT_hand_tracking enabled
+	//! XrViewActivityStateDXR::activeViewCount of the last views() call (0 = not reported).
+	uint32_t last_active = 0;
 
 	//! #1486: the view configuration this session was begun with. Every locate
 	//! below names it, because a session locates in exactly one configuration.
@@ -321,6 +353,11 @@ struct Runtime
 			*raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 			vs.next = raw;
 		}
+		XrViewActivityStateDXR act = {XR_TYPE_VIEW_ACTIVITY_STATE_DXR};
+		if (have_display_info) {
+			act.next = const_cast<void *>(vs.next);
+			vs.next = &act;
+		}
 
 		uint32_t count = 0;
 		REQUIRE(XR_SUCCEEDED(pfnLocateViews(session, &li, &vs, 0, &count, nullptr)));
@@ -329,6 +366,7 @@ struct Runtime
 		REQUIRE(XR_SUCCEEDED(pfnLocateViews(session, &li, &vs, count, &count, out.data())));
 		const XrViewStateFlags need = XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT;
 		REQUIRE((vs.viewStateFlags & need) == need);
+		last_active = have_display_info ? act.activeViewCount : 0;
 		return out;
 	}
 
@@ -552,6 +590,8 @@ struct BringUp
 	bool display_info = false;
 	//! The primaryViewConfigurationType handed to xrBeginSession.
 	XrViewConfigurationType begin = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	//! #2189: enable XR_EXT_hand_tracking when the runtime advertises it.
+	bool hand_tracking = false;
 };
 
 //! Returns false (after SKIP-ing the test) when the runtime cannot come up
@@ -594,6 +634,10 @@ bring_up(Runtime &rt, const BringUp &opt = BringUp{})
 	}
 	if (rt.have_display_info) {
 		exts.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+	}
+	rt.have_hand_tracking = opt.hand_tracking && has(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
+	if (rt.have_hand_tracking) {
+		exts.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 	}
 
 	XrInstanceCreateInfo ici = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -902,13 +946,14 @@ TEST_CASE("VIEW is the centroid of the located views (#1502)", "[oxr][view_space
 }
 
 /*
- * #1502 + #1486: the centroid is over the REPORTED array, not the eye set.
+ * #1502 + #1486 + multi-screen M3: the centroid is over the ACTIVE views.
  *
- * Under PRIMARY_MULTIVIEW_DXR the session reports the device max (4 on
- * sim_display) while the active rendering mode may be narrower; xrLocateViews
- * fills the surplus slots by duplicating view 0. An app - and the CTS, which
- * loops over every enumerated view configuration - averages what it was handed,
- * so VIEW must be the mean of THAT array, duplicates included.
+ * Under PRIMARY_MULTIVIEW_DXR the session reports the device max (times the
+ * view-set capacity, M3) while the active rendering mode may be narrower;
+ * xrLocateViews fills the surplus slots by duplicating view 0. Those aliases
+ * carry no content and would drag the centroid toward view 0 (more so now that
+ * the tail can be 3x the active set), so VIEW is the mean of the ACTIVE views
+ * — (L+R)/2 for a stereo mode, exactly as a PRIMARY_STEREO session gets.
  *
  * This arm only has teeth where the device max exceeds the active mode's view
  * count; on a box whose sim-display tops out at 2 (Quad not enabled) it is the
@@ -943,12 +988,15 @@ TEST_CASE("VIEW tracks the reported view array under MULTIVIEW (#1502)", "[oxr][
 	const uint32_t device_max = rt.device_max_view_count();
 	INFO("reported views = " << v.size() << ", device max = " << device_max);
 	if (device_max != 0) {
-		CHECK(v.size() == device_max);
+		CHECK(is_multiview_count(v.size(), device_max));
 	}
 
 	const XrPosef T_local_view = rt.locate(rt.view, rt.local, t);
-	const XrVector3f c = rt.centroid(v);
-	INFO("VIEW in LOCAL: " << pstr(T_local_view));
+	REQUIRE(rt.last_active > 0);
+	REQUIRE(rt.last_active <= v.size());
+	const std::vector<XrView> active(v.begin(), v.begin() + rt.last_active);
+	const XrVector3f c = rt.centroid(active);
+	INFO("VIEW in LOCAL: " << pstr(T_local_view) << ", active views " << rt.last_active);
 	INFO("centroid = (" << c.x << "," << c.y << "," << c.z << ")");
 	CHECK(vdist(c, T_local_view.position) < kPosTolM);
 
@@ -992,7 +1040,8 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 	{
 		// PRIMARY_STEREO means exactly 2, whatever the device can drive.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) == 2);
-		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR) == device_max);
+		CHECK(is_multiview_count(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR),
+		                         device_max));
 		// A valid core type the system does NOT advertise is still refused.
 		CHECK(rt.config_view_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MONO) == 0);
 	}
@@ -1003,7 +1052,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		uint32_t n = 0;
 		CHECK(rt.locate_count(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR, t, &n) == XR_SUCCESS);
-		CHECK(n == device_max);
+		CHECK(is_multiview_count(n, device_max));
 
 		// Same session, the OTHER advertised configuration: valid enum, wrong
 		// session - UNSUPPORTED, not VALIDATION_FAILURE.
@@ -1012,7 +1061,7 @@ TEST_CASE("XR_DXR_display_info advertises PRIMARY_MULTIVIEW_DXR (#1486)", "[oxr]
 
 		// And the full locate really writes that many views.
 		std::vector<XrView> v = rt.views(rt.local, t, nullptr, nullptr);
-		CHECK(v.size() == device_max);
+		CHECK(is_multiview_count(v.size(), device_max));
 	}
 
 	tear_down(rt);
@@ -1614,6 +1663,830 @@ TEST_CASE("the CTS configuration (no input providers) still reports tracking (#1
 	WARN("built without the qwerty driver - no tracked role device, so FALSE is correct here");
 	SUCCEED("no role devices in this build; the rule itself is pinned on the host");
 #endif
+
+	tear_down(rt);
+}
+
+TEST_CASE("rig-scoped hand joints: a locate BEFORE the first view locate equals one after it (#2189)",
+          "[oxr][view_space][rig_hands]")
+{
+	// XR_DXR_view_rig spec 4: joints chained with a rig come back in the rig
+	// frame. Before the session's first xrLocateViews there is no recorded
+	// canvas, so the in-process runtime resolves the session's own canvas
+	// through the same helper the views use — the result must be what the
+	// joints read once a view locate has recorded it. Needs a hand-tracking
+	// provider: the sim-input plug-in, in its own process
+	// (tests_oxr_view_space_rig_hands: a generated manifest +
+	// DXR_INPUT_SIM_INPUT_ENABLE=1; the provider scan is one-shot).
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		// SUCCEED, not SKIP: build-windows.yml reads any "SKIPPED:" from this
+		// binary as "the headless runtime did not come up" (#1370).
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+	XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+	hci.hand = XR_HAND_LEFT_EXT;
+	hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+	XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+	REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+	// A scaled, posed display rig: a missed rig shows up as base-space metres.
+	XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+	rig.pose = {{0, 0, 0, 1}, {0.5f, 1.0f, -2.0f}};
+	rig.virtualDisplayHeight = 3.0f;
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	const XrTime t = rt.now();
+	auto joints = [&](const void *chain, XrHandJointLocationEXT *out, XrBool32 *active) {
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.next = chain;
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT locs = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		locs.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		locs.jointLocations = out;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &locs)));
+		*active = locs.isActive;
+	};
+
+	XrHandJointLocationEXT base[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrHandJointLocationEXT before[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrHandJointLocationEXT after[XR_HAND_JOINT_COUNT_EXT] = {};
+	XrBool32 a0 = XR_FALSE, a1 = XR_FALSE, a2 = XR_FALSE;
+	joints(nullptr, base, &a0);
+	joints(&rig, before, &a1); // no view locate yet on this session
+	if (!a0 || !a1) {
+		WARN("the hand is not active (provider present but not tracking) - nothing to compare");
+		SUCCEED("inactive hand");
+		tear_down(rt);
+		return;
+	}
+	(void)rt.views(rt.local, t, &rig, nullptr); // records the canvas
+	joints(&rig, after, &a2);
+	REQUIRE(a2);
+
+	const XrVector3f &pb = base[XR_HAND_JOINT_PALM_EXT].pose.position;
+	const XrVector3f &p1 = before[XR_HAND_JOINT_PALM_EXT].pose.position;
+	INFO("base (" << pb.x << "," << pb.y << "," << pb.z << ") before-views (" << p1.x << "," << p1.y << "," << p1.z
+	              << ")");
+	// The rig applied before any view locate (the review's case): not base-space metres.
+	CHECK(std::fabs(p1.z - pb.z) > 0.1f);
+	for (uint32_t i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++) {
+		CAPTURE(i);
+		CHECK(before[i].pose.position.x == Catch::Approx(after[i].pose.position.x).margin(1e-4));
+		CHECK(before[i].pose.position.y == Catch::Approx(after[i].pose.position.y).margin(1e-4));
+		CHECK(before[i].pose.position.z == Catch::Approx(after[i].pose.position.z).margin(1e-4));
+		CHECK(before[i].radius == Catch::Approx(after[i].radius).margin(1e-6));
+	}
+
+	tear_down(rt);
+}
+
+namespace {
+
+//! Rotate @p v by the inverse of unit quaternion @p q.
+XrVector3f
+quat_inv_rotate(const XrQuaternionf &q, const XrVector3f &v)
+{
+	// v' = v + 2w(u x v) + 2 u x (u x v), with u = the conjugate's vector part.
+	const float ux = -q.x, uy = -q.y, uz = -q.z, w = q.w;
+	const float cx = uy * v.z - uz * v.y, cy = uz * v.x - ux * v.z, cz = ux * v.y - uy * v.x;
+	const float ccx = uy * cz - uz * cy, ccy = uz * cx - ux * cz, ccz = ux * cy - uy * cx;
+	return {v.x + 2.0f * (w * cx + ccx), v.y + 2.0f * (w * cy + ccy), v.z + 2.0f * (w * cz + ccz)};
+}
+
+} // namespace
+
+TEST_CASE("sim-input hands sit in front of the physical display plane (#2191)", "[oxr][view_space][rig_hands]")
+{
+	// #2191: the scripted hands must land where a default display rig shows
+	// them — about HAND_DISTANCE_M (0.25) in front of the glass, ±12 cm either
+	// side — measured END TO END: wrists located in LOCAL through
+	// xrLocateHandJointsEXT, re-expressed in the frame of the physical display
+	// plane xrLocateViews reports in LOCAL (XrViewDisplayRawDXR::
+	// displayPlanePose, nothing chained). Same process as the arm above.
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	const XrTime t = rt.now();
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, nullptr, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	std::printf("#2191 display plane in LOCAL: (%.3f, %.3f, %.3f) q(%.3f, %.3f, %.3f, %.3f)\n", plane.position.x,
+	            plane.position.y, plane.position.z, plane.orientation.x, plane.orientation.y, plane.orientation.z,
+	            plane.orientation.w);
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	const XrHandEXT hands[2] = {XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT};
+	for (XrHandEXT hand : hands) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = hand;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		XrHandJointLocationEXT locs[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT out = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		out.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		out.jointLocations = locs;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &out)));
+		REQUIRE(out.isActive);
+
+		const XrVector3f w = locs[XR_HAND_JOINT_WRIST_EXT].pose.position;
+		const XrVector3f d = quat_inv_rotate(
+		    plane.orientation, {w.x - plane.position.x, w.y - plane.position.y, w.z - plane.position.z});
+		const bool left = hand == XR_HAND_LEFT_EXT;
+		std::printf("#2191 %s wrist LOCAL (%.3f, %.3f, %.3f) -> display-plane (%.3f, %.3f, %.3f)\n",
+		            left ? "left " : "right", w.x, w.y, w.z, d.x, d.y, d.z);
+		CAPTURE(left, w.x, w.y, w.z, d.x, d.y, d.z);
+		// In front of the glass, about HAND_DISTANCE_M out (the circle and the
+		// wrist-to-root offset of the simulated hand both fit in ±10 cm).
+		CHECK(d.z > 0.15f);
+		CHECK(d.z < 0.35f);
+		// Left hand left of centre, right hand right of it, within the panel.
+		CHECK((left ? -d.x : d.x) > 0.02f);
+		CHECK(std::fabs(d.x) < 0.25f);
+		// Near panel-centre height, not a stage height away.
+		CHECK(std::fabs(d.y) < 0.15f);
+
+		destroyTracker(tracker);
+	}
+
+	tear_down(rt);
+}
+
+namespace {
+
+/*!
+ * One instant on the host's monotonic clock, re-expressible as an XrTime in
+ * ANY instance (each instance has its own XrTime offset). The sim-input script
+ * is a pure function of the monotonic timestamp, so two instances asked about
+ * the same Instant see the same scripted hands — which is what lets the
+ * session classes below be compared to the millimetre.
+ */
+struct Instant
+{
+#if defined(_WIN32)
+	LARGE_INTEGER qpc;
+#else
+	struct timespec ts;
+#endif
+};
+
+/*!
+ * An Instant 10 s in the FUTURE. Each instance's XrTime is offset from the
+ * moment it was created, so an instant taken before a later instance exists
+ * would map to a negative (invalid) XrTime there. The hand script is a pure
+ * function of the timestamp, so a predicted time is as good as a present one.
+ */
+Instant
+instant_ahead()
+{
+	Instant i{};
+#if defined(_WIN32)
+	LARGE_INTEGER f;
+	QueryPerformanceFrequency(&f);
+	QueryPerformanceCounter(&i.qpc);
+	i.qpc.QuadPart += f.QuadPart * 10;
+#else
+	clock_gettime(CLOCK_MONOTONIC, &i.ts);
+	i.ts.tv_sec += 10;
+#endif
+	return i;
+}
+
+XrTime
+instant_to_xr(Runtime &rt, const Instant &i)
+{
+	XrTime t = 0;
+#if defined(_WIN32)
+	auto convert =
+	    rt.fn<PFN_xrConvertWin32PerformanceCounterToTimeKHR>("xrConvertWin32PerformanceCounterToTimeKHR");
+	REQUIRE(XR_SUCCEEDED(convert(rt.instance, &i.qpc, &t)));
+#else
+	auto convert = rt.fn<PFN_xrConvertTimespecTimeToTimeKHR>("xrConvertTimespecTimeToTimeKHR");
+	REQUIRE(XR_SUCCEEDED(convert(rt.instance, &i.ts, &t)));
+#endif
+	return t;
+}
+
+//! Wrist + palm of both hands, in the display-plane frame.
+struct PlaneHands
+{
+	XrVector3f wrist[2];
+	XrVector3f palm[2];
+	//! The palm joint's radius: the RIG_LOCAL canvas scale (ADR-034
+	//! Amendment 7) scales it with the canvas; 1:1 for a session with no
+	//! canvas of its own.
+	float palm_radius[2];
+};
+
+/*!
+ * Locate both hands' wrist + palm in @p base and re-express them in the frame
+ * of the display plane xrLocateViews reports in that same base
+ * (XrViewDisplayRawDXR::displayPlanePose, nothing chained). Returns false when
+ * a hand is not active.
+ */
+bool
+measure_plane_hands(Runtime &rt, XrSpace base, XrTime t, PlaneHands *out, XrPosef *out_plane)
+{
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(base, t, nullptr, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	const XrPosef inv_plane = pinv(plane);
+	if (out_plane != nullptr) {
+		*out_plane = plane;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	bool all_active = true;
+	for (int h = 0; h < 2; h++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = h == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		XrHandJointLocationEXT locs[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = base;
+		li.time = t;
+		XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		jl.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		jl.jointLocations = locs;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &jl)));
+		all_active = all_active && jl.isActive;
+
+		out->wrist[h] = pmul(inv_plane, locs[XR_HAND_JOINT_WRIST_EXT].pose).position;
+		out->palm[h] = pmul(inv_plane, locs[XR_HAND_JOINT_PALM_EXT].pose).position;
+		out->palm_radius[h] = locs[XR_HAND_JOINT_PALM_EXT].radius;
+		destroyTracker(tracker);
+	}
+	return all_active;
+}
+
+//! One session class's measurement of the same Instant, in LOCAL and STAGE.
+struct ClassResult
+{
+	bool ran = false;
+	PlaneHands local{};
+	PlaneHands stage{};
+};
+
+ClassResult
+measure_session_class(const char *name, bool display_info, const Instant &at)
+{
+	ClassResult r;
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	opt.display_info = display_info;
+	if (!bring_up(rt, opt)) {
+		return r;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking || (display_info && !rt.have_display_info)) {
+		WARN(name << ": XR_DXR_view_rig / XR_EXT_hand_tracking / XR_DXR_display_info not advertised");
+		tear_down(rt);
+		return r;
+	}
+	const XrTime t = instant_to_xr(rt, at);
+	XrPosef plane_local{}, plane_stage{};
+	const bool a0 = measure_plane_hands(rt, rt.local, t, &r.local, &plane_local);
+	const bool a1 = measure_plane_hands(rt, rt.stage, t, &r.stage, &plane_stage);
+	REQUIRE(a0);
+	REQUIRE(a1);
+	for (int h = 0; h < 2; h++) {
+		std::printf(
+		    "RIG_LOCAL %-12s %s wrist plane-frame (%.3f, %.3f, %.3f) palm (%.3f, %.3f, %.3f) | plane in "
+		    "LOCAL %s\n",
+		    name, h == 0 ? "L" : "R", r.local.wrist[h].x, r.local.wrist[h].y, r.local.wrist[h].z,
+		    r.local.palm[h].x, r.local.palm[h].y, r.local.palm[h].z, pstr(plane_local).c_str());
+	}
+	r.ran = true;
+	tear_down(rt);
+	return r;
+}
+
+void
+check_in_front_of_plane(const char *name, const PlaneHands &p)
+{
+	for (int h = 0; h < 2; h++) {
+		const bool left = h == 0;
+		const XrVector3f d = p.wrist[h];
+		CAPTURE(name, left, d.x, d.y, d.z);
+		// In front of the glass, about HAND_DISTANCE_M (0.25) out.
+		CHECK(d.z > 0.15f);
+		CHECK(d.z < 0.35f);
+		// Left hand left of centre, right hand right of it, on the panel.
+		CHECK((left ? -d.x : d.x) > 0.01f);
+		CHECK(std::fabs(d.x) < 0.25f);
+		// Near panel-centre height — not a standing height, not a viewer offset.
+		CHECK(std::fabs(d.y) < 0.15f);
+	}
+}
+
+void
+check_same_hands(const char *what, const PlaneHands &a, const PlaneHands &b, float tol_m)
+{
+	for (int h = 0; h < 2; h++) {
+		CAPTURE(what, h);
+		CHECK(vdist(a.wrist[h], b.wrist[h]) < tol_m);
+		CHECK(vdist(a.palm[h], b.palm[h]) < tol_m);
+		CHECK(a.palm_radius[h] == Catch::Approx(b.palm_radius[h]).margin(1e-6));
+	}
+}
+
+} // namespace
+
+TEST_CASE("RIG_LOCAL hands sit on the display plane the SESSION sees, in every session class",
+          "[oxr][view_space][rig_hands]")
+{
+	// RIG_LOCAL contract (input-provider-discovery.md §4b.4): a joint the
+	// provider publishes at display-plane point L is located at
+	// displayPlanePose o L — in whatever base the app locates in, and for every
+	// session class. Field evidence (2026-10-18): an external-window session
+	// (modelviewer, `_handle`) on a no-qwerty Linux build had the palms 1.47 m
+	// below and 0.54 m in front of where they belong, because the builder
+	// anchored RIG_LOCAL at the head DEVICE pose — the display plane only for
+	// runtime-window sessions.
+	//
+	// Headless classes reachable in-process:
+	//   - runtime-window (no XR_DXR_display_info): plane = head device pose;
+	//   - bridge relay (XR_DXR_display_info + headless): plane = identity at the
+	//     head's tracking origin — the SAME plane rule an external-window
+	//     (`_handle` / `_texture`) session gets (oxr_session.c, the
+	//     `!has_external_window && !is_bridge_relay` gate).
+	// Both measure the same monotonic Instant, so their plane-frame hands must
+	// agree to the millimetre, not just be "roughly in front".
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	const Instant at = instant_ahead();
+	const ClassResult hosted = measure_session_class("runtime-win", false, at);
+	const ClassResult relay = measure_session_class("bridge-relay", true, at);
+	if (!hosted.ran || !relay.ran) {
+		SUCCEED("a session class could not come up headlessly - nothing to compare");
+		return;
+	}
+
+	// Each class: the hands are in front of ITS display plane.
+	check_in_front_of_plane("runtime-win", hosted.local);
+	check_in_front_of_plane("bridge-relay", relay.local);
+	// Each class: the plane-frame hands do not depend on the base space.
+	check_same_hands("runtime-win LOCAL vs STAGE", hosted.local, hosted.stage, kPosTolM);
+	check_same_hands("bridge-relay LOCAL vs STAGE", relay.local, relay.stage, kPosTolM);
+	// The classes agree: RIG_LOCAL is the display plane, not the head device pose.
+	check_same_hands("runtime-win vs bridge-relay", hosted.local, relay.local, 0.002f);
+	// Neither class owns a canvas, so the canvas-relative rule (ADR-034
+	// Amendment 7) leaves both at the physical display's scale: the palm
+	// radius is the provider's, unscaled, in both (compared above) and
+	// non-zero. The canvas-owning (external-window) class cannot come up
+	// headlessly; its placement — L at the canvas centre + s L, radii and
+	// velocities times s — is pinned in tests_view_rig_point
+	// ("RIG_LOCAL is canvas-relative: placement").
+	for (int h = 0; h < 2; h++) {
+		CAPTURE(h);
+		CHECK(hosted.local.palm_radius[h] > 0.0f);
+	}
+}
+
+TEST_CASE("RIG_LOCAL hands follow the display plane a chained XR_DXR_view_rig puts in LOCAL",
+          "[oxr][view_space][rig_hands]")
+{
+	// Field report (cube_handle_metal_macos --hands --actions, 2026-10-25): an
+	// external-window app that chains a display rig at the LOCAL origin — the
+	// shape every engine plug-in and cube app has — located its sim-input
+	// wrists and grips at (+-0.03, -1.56, 0.25) in LOCAL: on the PHYSICAL plane
+	// (the head's tracking origin, LOCAL's 1.6 m stage height below), not on
+	// the plane its views and displayPlanePose are in. Once a view locate
+	// chains a rig, the display plane the session sees is where the rig puts
+	// it, and RIG_LOCAL must land there (input-provider-discovery.md §4b.4).
+	//
+	// The external-window class cannot come up headlessly; the runtime-window
+	// class carries the same rule, and a rig posed AWAY from the physical
+	// plane makes a miss unmistakable (before the fix the hands stayed at the
+	// physical plane, ~0.6 m from where the rig shows them). A canvas-owning
+	// session puts the plane at its CANVAS centre through the rig and scales
+	// L by the canvas (ADR-034 Amendment 7) — the same plane for a
+	// full-display canvas; the windowed case is pinned in tests_view_rig_point.
+	const char *enable = std::getenv("DXR_INPUT_SIM_INPUT_ENABLE");
+	if (enable == nullptr || std::strcmp(enable, "1") != 0) {
+		WARN(
+		    "this arm needs the sim-input provider - see tests_oxr_view_space_rig_hands in "
+		    "tests/CMakeLists.txt");
+		SUCCEED("not the rig-hands process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_view_rig || !rt.have_hand_tracking) {
+		WARN("XR_DXR_view_rig / XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	const XrTime t = rt.now();
+
+	// Unscaled (virtualDisplayHeight = the canvas height), posed and yawed.
+	XrViewDisplayRawDXR raw0 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, nullptr, &raw0);
+	const float canvas_h = raw0.canvasSizeMeters.height;
+	REQUIRE(canvas_h > 0.0f);
+	XrDisplayRigDXR rig = {XR_TYPE_DISPLAY_RIG_DXR};
+	rig.pose = {qyaw(0.4f), {0.4f, 0.3f, -0.35f}};
+	rig.virtualDisplayHeight = canvas_h;
+	rig.ipdFactor = 1.0f;
+	rig.parallaxFactor = 1.0f;
+	rig.perspectiveFactor = 1.0f;
+
+	// Hands with no rig: the physical plane's frame (the #2191 contract).
+	PlaneHands phys{};
+	XrPosef phys_plane{};
+	REQUIRE(measure_plane_hands(rt, rt.local, t, &phys, &phys_plane));
+
+	// A view locate chaining the rig: displayPlanePose is the rig pose.
+	XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	(void)rt.views(rt.local, t, &rig, &raw);
+	const XrPosef plane = raw.displayPlanePose;
+	INFO("rig plane in LOCAL: " << pstr(plane) << "  physical plane in LOCAL: " << pstr(phys_plane));
+	CHECK(vdist(plane.position, rig.pose.position) < kPosTolM);
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+	for (int h = 0; h < 2; h++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = h == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		XrHandTrackerEXT tracker = XR_NULL_HANDLE;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &tracker)));
+
+		auto locate = [&](const void *chain, XrHandJointLocationEXT *out) {
+			XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+			li.next = chain;
+			li.baseSpace = rt.local;
+			li.time = t;
+			XrHandJointLocationsEXT jl = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+			jl.jointCount = XR_HAND_JOINT_COUNT_EXT;
+			jl.jointLocations = out;
+			REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &jl)));
+			REQUIRE(jl.isActive);
+		};
+		XrHandJointLocationEXT base[XR_HAND_JOINT_COUNT_EXT] = {};
+		XrHandJointLocationEXT scoped[XR_HAND_JOINT_COUNT_EXT] = {};
+		locate(nullptr, base);
+		locate(&rig, scoped);
+
+		const XrPosef w = base[XR_HAND_JOINT_WRIST_EXT].pose;
+		const XrVector3f in_rig = pmul(pinv(plane), w).position;
+		CAPTURE(h, w.position.x, w.position.y, w.position.z, in_rig.x, in_rig.y, in_rig.z);
+		// The same display-plane point as with no rig, now in the rig's frame.
+		CHECK(vdist(in_rig, phys.wrist[h]) < kPosTolM);
+		// An unscaled rig: base-space joints ARE the spec-4 rig-frame joints,
+		// which must not move either (they undo the plane RIG_LOCAL landed on).
+		for (uint32_t j = 0; j < XR_HAND_JOINT_COUNT_EXT; j++) {
+			CAPTURE(j);
+			CHECK(vdist(base[j].pose.position, scoped[j].pose.position) < kPosTolM);
+			CHECK(qangle_deg(base[j].pose.orientation, scoped[j].pose.orientation) < kAngTolDeg);
+		}
+		destroyTracker(tracker);
+	}
+
+	// A view locate that chains nothing again: back on the physical plane.
+	PlaneHands again{};
+	XrPosef again_plane{};
+	REQUIRE(measure_plane_hands(rt, rt.local, t, &again, &again_plane));
+	CHECK(vdist(again_plane.position, phys_plane.position) < kPosTolM);
+	check_same_hands("no rig, after a rigged locate", again, phys, kPosTolM);
+
+	tear_down(rt);
+}
+
+TEST_CASE("sim-input HANDS=right PINCH=hold: one hand, one sustained pinch (#2191)",
+          "[oxr][view_space][rig_hands_hold]")
+{
+	// The one-hand drag a gesture consumer could never exercise under the curl
+	// wave: tests_oxr_view_space_rig_hands_hold runs this process with
+	// DXR_INPUT_SIM_INPUT_HANDS=right + DXR_INPUT_SIM_INPUT_PINCH=hold.
+	const char *hands = std::getenv("DXR_INPUT_SIM_INPUT_HANDS");
+	const char *pinch = std::getenv("DXR_INPUT_SIM_INPUT_PINCH");
+	if (hands == nullptr || std::strcmp(hands, "right") != 0 || pinch == nullptr ||
+	    std::strcmp(pinch, "hold") != 0) {
+		WARN("this arm needs HANDS=right PINCH=hold - see tests_oxr_view_space_rig_hands_hold");
+		SUCCEED("not the rig-hands-hold process");
+		return;
+	}
+
+	Runtime rt;
+	BringUp opt;
+	opt.hand_tracking = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_hand_tracking) {
+		WARN("XR_EXT_hand_tracking not advertised (no hand-tracking provider resident)");
+		SUCCEED("nothing to locate");
+		tear_down(rt);
+		return;
+	}
+
+	auto createTracker = rt.fn<PFN_xrCreateHandTrackerEXT>("xrCreateHandTrackerEXT");
+	auto destroyTracker = rt.fn<PFN_xrDestroyHandTrackerEXT>("xrDestroyHandTrackerEXT");
+	auto locateJoints = rt.fn<PFN_xrLocateHandJointsEXT>("xrLocateHandJointsEXT");
+
+	auto locate = [&](XrHandTrackerEXT tracker, XrTime t, XrHandJointLocationEXT *out) {
+		XrHandJointsLocateInfoEXT li = {XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT};
+		li.baseSpace = rt.local;
+		li.time = t;
+		XrHandJointLocationsEXT locs = {XR_TYPE_HAND_JOINT_LOCATIONS_EXT};
+		locs.jointCount = XR_HAND_JOINT_COUNT_EXT;
+		locs.jointLocations = out;
+		REQUIRE(XR_SUCCEEDED(locateJoints(tracker, &li, &locs)));
+		return locs.isActive;
+	};
+
+	XrHandTrackerEXT trackers[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+	for (int i = 0; i < 2; i++) {
+		XrHandTrackerCreateInfoEXT hci = {XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT};
+		hci.hand = i == 0 ? XR_HAND_LEFT_EXT : XR_HAND_RIGHT_EXT;
+		hci.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+		REQUIRE(XR_SUCCEEDED(createTracker(rt.session, &hci, &trackers[i])));
+	}
+
+	const XrTime t0 = rt.now();
+	float max_gap = 0.0f, min_x = 1.0f, max_x = -1.0f;
+	for (int k = 0; k < 40; k++) {
+		const XrTime t = t0 + (XrTime)k * 100000000; // 100 ms steps across one 4 s revolution
+		XrHandJointLocationEXT j[XR_HAND_JOINT_COUNT_EXT] = {};
+		CHECK_FALSE(locate(trackers[0], t, j)); // HANDS=right: the left hand never tracks
+		REQUIRE(locate(trackers[1], t, j));
+		const XrVector3f a = j[XR_HAND_JOINT_THUMB_TIP_EXT].pose.position;
+		const XrVector3f b = j[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position;
+		const float gap =
+		    std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+		max_gap = std::fmax(max_gap, gap);
+		min_x = std::fmin(min_x, j[XR_HAND_JOINT_WRIST_EXT].pose.position.x);
+		max_x = std::fmax(max_x, j[XR_HAND_JOINT_WRIST_EXT].pose.position.x);
+	}
+	std::printf("#2191 HANDS=right PINCH=hold: max thumb-index gap %.4f m, wrist x sweep %.3f..%.3f m\n", max_gap,
+	            min_x, max_x);
+	CHECK(max_gap < 0.015f);      // pinched the whole revolution
+	// ...while the root moves: a drag. The circle's PROJECTED diameter is 0.20 x
+	// the display height (capped at 8 cm); the real one shrinks by the
+	// perspective factor (0.35/0.60 at 25 cm in front of a 0.6 m viewer,
+	// sim_input_hand_radius), so > 1 cm on any panel taller than 0.10 m.
+	CHECK(max_x - min_x > 0.01f);
+	CHECK(min_x > 0.0f);          // on the right of the display centre
+
+	destroyTracker(trackers[0]);
+	destroyTracker(trackers[1]);
+	tear_down(rt);
+}
+
+namespace {
+
+//! The viewer-tracking arms run only in their own process (the tracking scan is one-shot).
+bool
+viewer_tracking_process()
+{
+	const char *enable = std::getenv("DXR_TRACKING_SIM_TRACKING_ENABLE");
+	return enable != nullptr && std::strcmp(enable, "1") == 0;
+}
+
+void
+sleep_ms(int ms)
+{
+#if defined(_WIN32)
+	Sleep((DWORD)ms);
+#else
+	struct timespec ts = {ms / 1000, (long)(ms % 1000) * 1000000L};
+	nanosleep(&ts, nullptr);
+#endif
+}
+
+} // namespace
+
+TEST_CASE("sim_tracking's scripted sweep drives xrLocateViews through sim_display (ADR-054 N6 Part 2)",
+          "[oxr][view_space][viewer_tracking]")
+{
+	// sim_display does not track and declares EXTERNAL_OK, so the trunk serves
+	// its screen from the best enabled viewer-tracking provider: sim_tracking
+	// (generated manifest + DXR_TRACKING_SIM_TRACKING_ENABLE=1, SCRIPT=sweep,
+	// PERIOD_MS=2000, AMPLITUDE_M=0.1 — tests_oxr_view_space_viewer_tracking).
+	// The head starts at the nominal viewer and is +AMPLITUDE to the right a
+	// quarter period later; the raw display-space eyes and the views follow.
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	if (!bring_up(rt)) {
+		return;
+	}
+	if (!rt.have_view_rig) {
+		WARN("XR_DXR_view_rig not advertised: no raw eye channel to read");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+
+	auto raw_centroid_x = [&](XrViewDisplayRawDXR &raw, std::vector<XrView> &views) {
+		views = rt.views(rt.view, rt.now(), nullptr, &raw);
+		REQUIRE(raw.eyeCountOutput >= 2);
+		float cx = 0.0f;
+		for (uint32_t i = 0; i < raw.eyeCountOutput; i++) {
+			cx += raw.rawEyes[i].x;
+		}
+		return cx / (float)raw.eyeCountOutput;
+	};
+
+	XrViewDisplayRawDXR raw0 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	std::vector<XrView> v0;
+	const float x0 = raw_centroid_x(raw0, v0); // starts the provider (on demand) at phase 0
+	sleep_ms(500);                             // a quarter of PERIOD_MS=2000
+	XrViewDisplayRawDXR raw1 = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	std::vector<XrView> v1;
+	const float x1 = raw_centroid_x(raw1, v1);
+
+	const float vx0 = rt.centroid(v0).x;
+	const float vx1 = rt.centroid(v1).x;
+	std::printf(
+	    "N6 viewer tracking: raw eye centroid x %.4f -> %.4f m (tracking %d/%d), view centroid x %.4f -> "
+	    "%.4f\n",
+	    x0, x1, (int)raw0.isTracking, (int)raw1.isTracking, vx0, vx1);
+	CHECK(raw1.isTracking == XR_TRUE);
+	CHECK(std::fabs(x0) < 0.03f); // phase 0: at the nominal viewer (sim's nominal x is 0)
+	CHECK(x1 - x0 > 0.06f);       // a quarter period later: ~+0.1 m to the right
+	CHECK(x1 - x0 < 0.12f);
+	CHECK(raw1.rawEyes[1].x - raw1.rawEyes[0].x == Catch::Approx(0.063f).margin(0.002f)); // IPD_MM default
+	CHECK(vx1 > vx0); // the views follow the same way
+
+	tear_down(rt);
+}
+
+TEST_CASE("the composed advertisement: sim_display + a usable provider advertises MANAGED|MANUAL (ADR-054 N6 Part 2)",
+          "[oxr][view_space][viewer_tracking]")
+{
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info) {
+		WARN("XR_DXR_display_info not advertised");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+	XrEyeTrackingModeCapabilitiesDXR caps = {XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_DXR};
+	XrSystemProperties props = {XR_TYPE_SYSTEM_PROPERTIES};
+	props.next = &caps;
+	auto getProps = rt.fn<PFN_xrGetSystemProperties>("xrGetSystemProperties");
+	REQUIRE(XR_SUCCEEDED(getProps(rt.instance, rt.system, &props)));
+	std::printf("N6 composed advertisement: supportedModes=0x%x defaultMode=%d\n", (unsigned)caps.supportedModes,
+	            (int)caps.defaultMode);
+	// sim_display alone advertises 0 (honest); the trunk composes MANAGED|MANUAL.
+	CHECK(caps.supportedModes == (XrEyeTrackingModeCapabilityFlagsDXR)3);
+	CHECK((int)caps.defaultMode == 0); // MANAGED
+	tear_down(rt);
+}
+
+TEST_CASE("a fixed-viewer locate asks for no viewer: the provider is not started (XR_DXR_display_info v25)",
+          "[oxr][view_space][viewer_tracking][fixed_viewer]")
+{
+	// XrViewLocateFixedViewerDXR: a locate that chains it is framed for the
+	// nominal viewer and posts no viewer-tracking demand. sim_tracking's sweep
+	// (PERIOD_MS=2000, AMPLITUDE_M=0.1) starts at phase 0 when the provider
+	// starts, so the time the provider started is readable off the eyes: had
+	// any fixed locate below started it, the first normal locate a quarter
+	// period later would already see the head ~+AMPLITUDE to the right.
+	if (!viewer_tracking_process()) {
+		WARN("this arm needs the sim-tracking provider - see tests_oxr_view_space_viewer_tracking");
+		SUCCEED("not the viewer-tracking process");
+		return;
+	}
+	Runtime rt;
+	BringUp opt;
+	opt.display_info = true;
+	if (!bring_up(rt, opt)) {
+		return;
+	}
+	if (!rt.have_display_info || !rt.have_view_rig) {
+		WARN("XR_DXR_display_info or XR_DXR_view_rig not advertised: nothing to read");
+		SUCCEED("nothing to read");
+		tear_down(rt);
+		return;
+	}
+
+	XrViewLocateFixedViewerDXR fixed = {XR_TYPE_VIEW_LOCATE_FIXED_VIEWER_DXR};
+	fixed.fixedViewer = XR_TRUE;
+
+	auto raw_centroid_x = [&](const void *next, XrViewDisplayRawDXR &raw) {
+		(void)rt.views(rt.view, rt.now(), next, &raw);
+		REQUIRE(raw.eyeCountOutput >= 2);
+		float cx = 0.0f;
+		for (uint32_t i = 0; i < raw.eyeCountOutput; i++) {
+			cx += raw.rawEyes[i].x;
+		}
+		return cx / (float)raw.eyeCountOutput;
+	};
+
+	// A quarter period of fixed-viewer locates: the nominal viewer every time.
+	for (int i = 0; i < 10; i++) {
+		XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+		const float x = raw_centroid_x(&fixed, raw);
+		CHECK(raw.isTracking == XR_FALSE);
+		CHECK(std::fabs(x) < 1e-4f); // sim's nominal x is 0
+		sleep_ms(50);
+	}
+
+	// The first locate that asks for a viewer starts the provider: phase 0.
+	XrViewDisplayRawDXR first = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_first = raw_centroid_x(nullptr, first);
+	sleep_ms(500); // a quarter of PERIOD_MS=2000
+	XrViewDisplayRawDXR quarter = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_quarter = raw_centroid_x(nullptr, quarter);
+	std::printf("fixed viewer: first normal locate x %.4f, a quarter period later %.4f (tracking %d)\n", x_first,
+	            x_quarter, (int)quarter.isTracking);
+	CHECK(std::fabs(x_first) < 0.03f); // not already a quarter period in: no fixed locate started it
+	CHECK(quarter.isTracking == XR_TRUE);
+	CHECK(x_quarter - x_first > 0.06f);
+
+	// With the provider running for other locates, a fixed one still gets the
+	// nominal viewer, untracked.
+	XrViewDisplayRawDXR again = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+	const float x_again = raw_centroid_x(&fixed, again);
+	CHECK(again.isTracking == XR_FALSE);
+	CHECK(std::fabs(x_again) < 1e-4f);
 
 	tear_down(rt);
 }

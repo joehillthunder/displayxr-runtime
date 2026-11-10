@@ -93,6 +93,10 @@ if(WIN32)
 	# absent. The D3D11 native compositor path never calls into Vulkan
 	# weaver functions, so the delay-loaded DLL is never triggered.
 	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
+	# #2461: the system graphics DLLs are delay-loaded so target_dll_init.c
+	# resolves them from System32. A host that ships its own d3d11.dll /
+	# dxgi.dll (DXVK) would otherwise bind the runtime to those.
+	target_link_options(${RUNTIME_TARGET} PRIVATE "/DELAYLOAD:d3d11.dll" "/DELAYLOAD:dxgi.dll" "/DELAYLOAD:d3d12.dll")
 	target_link_libraries(${RUNTIME_TARGET} PRIVATE delayimp)
 	# Vendor-SDK delay-loads (SR Vulkan beta, etc.) live in the vendor
 	# plug-in DLL's link line — see DisplayXR/displayxr-leia-plugin.
@@ -128,6 +132,13 @@ if(XRT_FEATURE_HYBRID_MODE)
 	endif()
 elseif(XRT_FEATURE_IPC_CLIENT)
 	target_link_libraries(${RUNTIME_TARGET} PUBLIC st_oxr ipc_client comp_client comp_multi)
+	# st_oxr, comp_multi and comp_vk_native call into qwerty behind
+	# XRT_BUILD_DRIVER_QWERTY but link only drv_qwerty_includes: the symbols
+	# normally arrive through target_lists, which an IPC-only runtime does not
+	# link. Link the driver itself so a qwerty build of --service links (#2355).
+	if(XRT_BUILD_DRIVER_QWERTY AND TARGET drv_qwerty)
+		target_link_libraries(${RUNTIME_TARGET} PUBLIC drv_qwerty)
+	endif()
 else()
 	target_link_libraries(
 		${RUNTIME_TARGET}
@@ -229,9 +240,20 @@ endif()
 # Prepare the installable manifest: will be generated completely at install time,
 # by a script we generate now.
 if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
-	# Windows: install manifest to top level with DisplayXR naming
-	# The installer copies everything to a flat directory, so use "." for the
-	# relative path (manifest and DLL will be in the same directory)
+	# Windows: install the manifest NEXT TO the DLL (_package/bin/), with a
+	# manifest-relative library_path ".\DisplayXRClient.dll". That relation
+	# (manifest and DLL in one directory) holds both in the staging tree and
+	# in the installer's flat layout, so ONE file serves both: the NSIS
+	# installer packs ${BIN_DIR}\DisplayXR_win64.json, and dev runs point
+	# XR_RUNTIME_JSON / `displayxr-cli runtime activate` at
+	# _package/bin/DisplayXR_win64.json (#852).
+	#
+	# There is deliberately NO top-level _package/DisplayXR_win64.json any
+	# more: it carried the installer's ".\DisplayXRClient.dll" while sitting
+	# one directory above the DLL, so inside the staging tree it pointed at
+	# nothing — `runtime activate` refused it, and the OpenXR loader given it
+	# via XR_RUNTIME_JSON silently fell back to the registry ActiveRuntime
+	# (apps run, look healthy, and measure the WRONG runtime).
 	set(_extra_args RUNTIME_DIR_RELATIVE_TO_MANIFEST .)
 	if(XRT_OPENXR_INSTALL_ABSOLUTE_RUNTIME_PATH)
 		set(_extra_args ABSOLUTE_RUNTIME_PATH)
@@ -239,24 +261,14 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
 	generate_openxr_runtime_manifest_at_install(
 		${_extra_args}
 		RUNTIME_TARGET ${RUNTIME_TARGET}
-		DESTINATION .
+		DESTINATION ${CMAKE_INSTALL_BINDIR}
 		RELATIVE_RUNTIME_DIR ${CMAKE_INSTALL_BINDIR}
 		OUT_FILENAME "DisplayXR_win64.json"
 		)
-	# #852 — also stage the manifest NEXT TO the DLL (_package/bin/). The
-	# top-level copy above is written for the installer's flat layout
-	# (library_path ".\DisplayXRClient.dll"), so inside the staging tree it
-	# points at a DLL that isn't there and the OpenXR loader silently falls
-	# back to the registry ActiveRuntime — apps run, look healthy, and
-	# measure the WRONG runtime. Copy the manifest beside the DLL, where the
-	# same relative (or absolute) library_path is valid in-tree; point
-	# XR_RUNTIME_JSON at _package/bin/DisplayXR_win64.json for dev runs
-	# (and always verify the per-app log's "loaded from:" line). A plain
-	# copy, not a second generate_openxr_runtime_manifest_at_install(): the
-	# helper keys its install script and intermediate file on the target
-	# name only, so two calls for one target overwrite each other.
+	# Sweep the broken top-level copy an older build left in an existing
+	# _package/ (install never deletes, so it would otherwise linger).
 	install(
-		CODE "file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}\" TYPE FILE FILES \"\${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json\")"
+		CODE "file(REMOVE \"\${CMAKE_INSTALL_PREFIX}/DisplayXR_win64.json\")"
 		COMPONENT Runtime
 		)
 	install(

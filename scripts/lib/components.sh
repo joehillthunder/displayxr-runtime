@@ -50,12 +50,20 @@ COMPONENT_INSTALL_MARKER_WINDOWS_runtime="HKLM\\Software\\DisplayXR\\Runtime"
 COMPONENT_INSTALL_MARKER_LINUX_runtime="/usr/lib/displayxr/plugins/200-sim-display.json"
 
 # --- shell ---
-# macOS shell port deferred per CLAUDE.md M6. Empty macOS glob → warn+skip.
+# The DisplayXR Shell (workspace controller). macOS: DisplayXRShell-<v>.pkg
+# (displayxr-shell-pvt installer/macos/build_installer.sh), whose postinstall
+# writes the system-wide controller manifest checked below; publish-shell-
+# releases.yml attaches it when the macOS leg built (soft requirement). Linux:
+# the displayxr-shell_*_amd64.deb (Linux shell port, in progress) drops its
+# manifest into /usr/share/displayxr/WorkspaceControllers — the POSIX discovery
+# root the service orchestrator scans (workspace-controller-registration.md).
 COMPONENT_REPO_shell="DisplayXR/displayxr-shell-releases"
-COMPONENT_PKG_MACOS_shell=""
+COMPONENT_PKG_MACOS_shell="DisplayXRShell-*.pkg"
 COMPONENT_EXE_WINDOWS_shell="DisplayXRShellSetup-*.exe"
-COMPONENT_INSTALL_MARKER_MACOS_shell=""
+COMPONENT_DEB_LINUX_shell="displayxr-shell_*_amd64.deb"
+COMPONENT_INSTALL_MARKER_MACOS_shell="/Library/Application Support/DisplayXR/WorkspaceControllers/shell.json"
 COMPONENT_INSTALL_MARKER_WINDOWS_shell="HKLM\\Software\\DisplayXR\\WorkspaceControllers\\shell"
+COMPONENT_INSTALL_MARKER_LINUX_shell="/usr/share/displayxr/WorkspaceControllers/shell.json"
 
 # --- leia_plugin ---
 # Leia SR display processor. Windows: DisplayXRLeiaSRSetup-*.exe. Linux: the
@@ -70,6 +78,18 @@ COMPONENT_DEB_LINUX_leia_plugin="displayxr-leia-sr_*_amd64.deb"
 COMPONENT_INSTALL_MARKER_MACOS_leia_plugin=""
 COMPONENT_INSTALL_MARKER_WINDOWS_leia_plugin="HKLM\\Software\\DisplayXR\\DisplayProcessors\\leia-sr"
 COMPONENT_INSTALL_MARKER_LINUX_leia_plugin="/usr/lib/displayxr/plugins/050-leia-sr.json"
+
+# --- conversion_open ---
+# Open-model conversion provider (ADR-053 P4). Windows: DisplayXROpenConversionSetup-*.exe
+# (registers ConversionProviders\open-conversion). Linux: a per-user tarball with its own
+# install.sh, not a .deb, so the .deb glob is empty here (warn-and-skip). No macOS build yet.
+COMPONENT_REPO_conversion_open="DisplayXR/displayxr-conversion-open"
+COMPONENT_PKG_MACOS_conversion_open=""
+COMPONENT_EXE_WINDOWS_conversion_open="DisplayXROpenConversionSetup-*.exe"
+COMPONENT_DEB_LINUX_conversion_open=""
+COMPONENT_INSTALL_MARKER_MACOS_conversion_open=""
+COMPONENT_INSTALL_MARKER_WINDOWS_conversion_open="HKLM\Software\DisplayXR\ConversionProviders\open-conversion"
+COMPONENT_INSTALL_MARKER_LINUX_conversion_open=""
 
 # --- mcp_tools ---
 # displayxr-mcp ships a Windows installer (NSIS) and a macOS .pkg

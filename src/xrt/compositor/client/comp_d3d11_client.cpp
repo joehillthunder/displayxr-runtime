@@ -22,6 +22,7 @@
 #include "xrt/xrt_vulkan_includes.h"
 #include "d3d/d3d_dxgi_formats.h"
 #include "d3d/d3d_d3d11_helpers.hpp"
+#include "d3d/d3d_dxgi_helpers.hpp"
 #include "d3d/d3d_d3d11_allocator.hpp"
 #include "d3d/d3d_d3d11_fence.hpp"
 #include "util/u_misc.h"
@@ -1018,6 +1019,7 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 	// layer_sync RPC ships it to the service. The service per-view loop
 	// will queue an `ID3D11DeviceContext4::Wait` on this value and skip
 	// the legacy KeyedMutex acquire entirely for fence-capable clients.
+	bool signals_flushed = false; // #2320
 	if (c->workspace_sync_fence) {
 		c->workspace_sync_fence_value++;
 		HRESULT hr_wsf =
@@ -1053,12 +1055,21 @@ client_d3d11_compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_syn
 			// signal can never complete, so the wait would just burn its
 			// budget every frame. Keep both.
 			c->fence_context->Flush();
+			signals_flushed = true;
 			comp_ipc_client_compositor_set_workspace_sync_fence_value(
 			    &c->xcn->base, c->workspace_sync_fence_value);
 		}
 	}
 
 	if (c->timeline_semaphore) {
+		// #2320: the service now queues a GPU-side Wait on this value when this
+		// client is not on the workspace_sync_fence path. The Signal above only
+		// QUEUED into the immediate context; submit it, or the service's Wait
+		// would hold its shared context until our next flush (and for ever if
+		// we died first -- the #922 shape). The fence path flushed already.
+		if (!signals_flushed) {
+			c->fence_context->Flush();
+		}
 		// We got this from the native compositor, so we can pass it back
 		OutputDebugStringA("[DisplayXR] xrEndFrame: Using timeline semaphore commit\n");
 		int64_t profile_t1 = os_monotonic_get_ns();
@@ -1279,10 +1290,27 @@ try {
 	}
 
 	{
-		// Now, try to get an equivalent device of our own
+		// Now, try to get an equivalent device of our own.
+		//
+		// Find the adapter by LUID in our own DXGI rather than passing the app device's adapter on: this
+		// DLL resolves d3d11.dll from System32 (#2461), and when the host ships its own graphics DLLs the
+		// app device's adapter is that DLL's object, which the system D3D11CreateDevice cannot read (it
+		// faults inside it). In a normal process both lookups return the same adapter.
+		wil::com_ptr<IDXGIAdapter> our_adapter = adapter;
+		DXGI_ADAPTER_DESC our_adapter_desc = {};
+		if (SUCCEEDED(adapter->GetDesc(&our_adapter_desc))) {
+			xrt_luid_t luid = {};
+			memcpy(&luid, &our_adapter_desc.AdapterLuid, sizeof(luid));
+			wil::com_ptr<IDXGIAdapter> by_luid = xrt::auxiliary::d3d::getAdapterByLUID(luid, c->log_level);
+			if (by_luid) {
+				our_adapter = by_luid;
+			} else {
+				U_LOG_W("No DXGI adapter for the app device's LUID, using the app device's adapter");
+			}
+		}
 		wil::com_ptr<ID3D11Device> our_dev;
 		wil::com_ptr<ID3D11DeviceContext> our_context;
-		std::tie(our_dev, our_context) = xrt::auxiliary::d3d::d3d11::createDevice(adapter, c->log_level);
+		std::tie(our_dev, our_context) = xrt::auxiliary::d3d::d3d11::createDevice(our_adapter, c->log_level);
 		our_dev.query_to(c->comp_device.put());
 		our_context.query_to(c->comp_context.put());
 	}

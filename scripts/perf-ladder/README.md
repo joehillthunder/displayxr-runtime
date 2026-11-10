@@ -53,3 +53,107 @@ Dev switches (`run_ladder.ps1`): `-Smoke` (1 rep, 8 s windows),
 Results are only comparable **within one kit version** and within one session's
 own anchors (dwm is bistable across sessions — never compare raw columns across
 boxes; compare the derived deltas).
+
+## Native-vs-hub A/B (`run_hub_ab.ps1`, #2317 P1d)
+
+A second harness in this kit, for the single-hub decision: it measures each
+per-API in-process compositor (`native`) against the D3D11 weave/present hub
+(`hub`) on `cube_handle_{d3d11,d3d12,vk,gl}_win`. An arm is a **name + an env
+map** (`hub-ab.json`), plus the path its own log must prove.
+
+Arms are per app **and per topology** (`topologies` on an arm; `native` = the
+path `main` takes by default on that topology - VK's only non-hub path is the
+kill switch):
+
+| app | topology | `native` (expected path) | hub arm(s) (expected line) |
+|---|---|---|---|
+| d3d11 | default | `DXR_HUB=0` (own #918 split; the kill switch since #2317 step 2) | `hub`: default env (`hub placement: hub=1 ... ingress=xbridge`) |
+| d3d11 | same-adapter | `DXR_HUB=0` (own same-adapter engage) | `hub-direct`: `DXR_HUB=1` (`ingress=direct`); `hub-xbridge`: + `DXR_HUB_INGRESS=xbridge`; optional `default-same`: default env, expected NATIVE (`reason=same_adapter_opt_in` - the default-on scope is cross-adapter until the desktop run) |
+| d3d12 | default | `DXR_SPLIT_D3D12_HYBRID_REROUTE=0` (own-legs split, the kill switch since #2375: `hub placement: hub=0 reason=hybrid_reroute_disabled_by_env`) | `hub`: default env at full frame rate (#2375; expects `heavy-d3d12 reroute ACTIVE` + `hub placement: hub=1 ... ingress=xbridge ingress_reason=cross_adapter reason=hybrid_reroute_default_on`); `hub-divisor2`: + `DXR_APP_FRAME_DIVISOR=2`, the pre-#2317 gate shape (#1309) as the control |
+| d3d12 | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env, the #1264 reroute (`hub placement: hub=1 ... ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a, `ingress=direct`) |
+| vk | default | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=cross_adapter`) |
+| vk | same-adapter | `DXR_WEAVE_ON_SCANOUT=0` | `hub`: default env (`ingress=xbridge ingress_reason=default_xbridge`); `hub-direct`: + `DXR_HUB_INGRESS=direct` (P2a) |
+| gl | both | default env | - (reference row) |
+
+```powershell
+.\run_hub_ab.ps1 -AppDir <repo>\test_apps\build\bin                      # all apps, n=3 x 20 s
+.\run_hub_ab.ps1 -AppDir ... -Apps d3d12,vk -Topology same-adapter     # hybrid box: render on the scanout GPU
+.\run_hub_ab.ps1 -AppDir ... -Windows 10 -Reps 1                        # validation pass
+.\run_hub_ab.ps1 ... -RuntimeJson <dev json> -RuntimePath <_package\bin> # a from-source runtime
+.\run_hub_ab.ps1 ... -PresentMon <PresentMon.exe>                       # optional present-mode columns
+.\run_hub_ab.ps1 ... -ThreadSample                                      # + per-thread CPU attribution (#2371)
+.\run_hub_ab.ps1 ... -DryRun                                            # print the plan + each arm's env, launch nothing
+```
+
+- **Topology matters on a hybrid laptop.** The d3d12 reroute onto the fill arm
+  is accepted **same-adapter only**: with the app on the dGPU and the panel on
+  the iGPU, default d3d12 engages its *own-legs* split (path `own-split`), and
+  the `hub` arm is then REFUSED, correctly. `-Topology same-adapter` adds
+  `DXR_D3D_FORCE_GPU=scanout` / `DXR_VK_FORCE_GPU=scanout` so render, weave and
+  present share the scanout adapter (what a single-GPU desktop sees by default).
+  `-Arms own-split` runs d3d12's own split as a third arm.
+- **The d3d12 hybrid reroute (#2317).** Before #2317 the hybrid reroute needed
+  `DXR_APP_FRAME_DIVISOR>=2` as well as `DXR_SPLIT_D3D12_HYBRID_REROUTE=1`
+  (#1309: a cost/benefit scope from the partition campaign, not a correctness
+  gate), so it could not be compared with the own split at full rate. The
+  opt-in alone engages it, and since #2375 it is the hybrid default
+  (`DXR_SPLIT_D3D12_HYBRID_REROUTE=0` is the kill switch, so the `native` arm
+  sets it; kit 0.6.0 results are not comparable with 0.5.0 runs, whose d3d12
+  arms had the opposite env); `DXR_SPLIT_D3D12_HYBRID_REROUTE_REQUIRE_DIVISOR=1`
+  restores the old gate. Run it with
+  `.\run_hub_ab.ps1 -Apps d3d12 -Topology default -Arms native,hub,hub-divisor2`.
+  An arm with `expectLines` (an array) must match every regex in it; `rejectLines`
+  must match none (the full-rate arms reject the `#1257 partition` line, and pin
+  `DXR_APP_FRAME_DIVISOR=0` so a stray user-level value cannot leak in).
+  `hub-divisor2` must show the partition line; the optional `needs-divisor` arm
+  checks the `hybrid_reroute_needs_divisor` token.
+- **Verification, not assumption.** Each run's path is classified from the app
+  log (`weave placement:` / `hub placement:` verbatim + the split/reroute ACTIVE
+  lines) and cross-checked against the `[WITNESS]` site (`d3d11` for the fill
+  arm/hub, the API's own site for native). A mismatch, a lost foreground, a
+  missing witness, a missing `expectLine`, a peer XR app mid-window, or a runtime/DP different from the pinned one
+  (`-ExpectRuntime`, default = the first run's) marks the run REFUSED: kept in
+  `runs.csv`, never counted. Environmental refusals (focus, peer app, app exit) are retried up to
+  `maxRetries` so the interleaved pair survives; a path mismatch is not.
+- **R / D.** `DXR_WEAVE_LATENCY_CSV=<run dir>\wl` writes `wl.<site>.csv`; R is
+  joined F->S exactly as `weave_latency.py` does (app frames only, window
+  limited by QPC). D rows exist only where the site is handed
+  `predicted_display_time_ns`: the native `d3d11`/`d3d12` sites and, since P1c,
+  the hub's `d3d11` site do; `vknative` does not. Since #2327 the hub pairs
+  each weave with the promise of the frame it actually weaves (by seq), and the
+  d3d12/vk callers predict from the hub target's measured #867 lookahead.
+  `vknative` needs `VK_KHR_present_wait` - absent there, no CSV at all.
+- **Hygiene.** Apps launch de-elevated via `explorer.exe` -> `.bat` (env is
+  process-level, so the runtime's `getenv` sees it), centred, forced to the
+  foreground and polled every 500 ms (losing focus moved R p50 from 16.6 to
+  66-133 ms in validation). Before every launch the harness waits up to
+  `-WaitForPanelMin` while any other XR client runs; it only ever stops the pid
+  it started and never touches `displayxr-service`.
+- **Per-thread CPU (#2371).** The #2371 single-GPU run measured ~50 % app
+  CPU (of one core) on the hub's DIRECT ingress against ~10 % native. A
+  process total cannot say which thread burns it, so `-ThreadSample` (or
+  `DXR_HUB_AB_THREAD_SAMPLE=1` in the harness's environment) starts
+  `thread_sampler.ps1` beside every run: once a second it records each app
+  thread's user and kernel time and its Win32 start address, resolved to
+  `module+offset` against the process's module list. The harness cuts the
+  same window it measures `app_cpu` over and adds `thr_cpu`, `thr_user`,
+  `thr_kernel` and `thr_top3` (the three busiest threads, `module+offset
+  tid: % (user/kernel)`, `[main]` = the app main thread) to `runs.csv`,
+  `run.json` and a *Per-thread CPU* section in `summary.md`; the raw
+  samples stay in `<run>\threads\`. Reading it: a thread that started in a
+  GPU driver's user-mode module is a driver worker; the `[main]` thread is
+  where the in-process compositor (and the hub) weave and present; every
+  CRT-created runtime thread starts in `ucrtbase`. Mostly-kernel time points
+  at a loop around a syscall (present, frame statistics, short sleeps),
+  mostly-user time at a busy-wait. Sampling also sets
+  `DXR_WEAVE_REPAINT_TRACE=1` on every arm, so each app log carries the hub
+  target's frame-latency wait peaks and instant/timeout counts. The sampler
+  is read-only and also runs on its own against anything already running:
+  `.\thread_sampler.ps1 -ProcessName displayxr-service -Seconds 10 -Report`.
+  For #2371, run the single-GPU harness command with `-ThreadSample` added
+  and attach `summary.md`, `runs.csv` and the per-run `threads\` folders.
+- Output: `results\hub-ab-<stamp>[-label]\` - `runs.csv`, `summary.md`
+  (arm x app medians, verdict per app from the interleaved pairs, placement
+  evidence, every run), `environment.json`, `capabilities.json`,
+  `displayxr-cli-info.txt`, and per run `launch.bat`, `app.log`, `wl.*.csv`,
+  `presentmon.csv`, `run.json` (and `threads\` with `-ThreadSample`).

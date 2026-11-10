@@ -32,6 +32,9 @@ a runtime-side consumer.
 consumes is DEVICE pixels. The conversion is ours to perform, and it happens
 exactly once, where the geometry crosses into the runtime** — in
 `comp_vk_native_wl_geom.c`, through `auxiliary/util/u_wayland_geom.h` (#1596).
+The one exception is a publisher that sends `buffer_device` (§2, #1991): it has
+already done the conversion with the compositor's own rounding, so the runtime
+takes that rect as it is and converts nothing.
 
 That is not a style preference. The vendor ships the same guarantee from its
 side: every geometry its SDK reports or accepts is device pixels,
@@ -105,6 +108,50 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
   v1; before #1596 the consumer simply never read four of them. Mutter omits
   the `monitor` object only for a window on no monitor.
 
+  **`scale` is the factor only in Mutter's LOGICAL layout mode** (extension
+  version 11, §4.1). "Logical" above means Mutter's *stage* coordinates, and
+  in Mutter's PHYSICAL layout mode the stage is device px: a 3840x2160
+  monitor at 200 % is published as `{w: 3840, h: 2160, scale: 2}`. Version 11
+  therefore adds a top-level `layout_mode` (`"logical"` / `"physical"`) and
+  `monitor.device_scale`, the device-px-per-stage-px factor (the scale of the
+  stage view painting the monitor). The consumer converts by `device_scale`,
+  then by `layout_mode`, then, for an older publisher, by asking Mutter
+  (`org.gnome.Mutter.DisplayConfig.GetCurrentState` → `layout-mode`: 1
+  logical, 2 physical). It falls back to `scale` only when none of those
+  answers (`u_wl_stage_to_device_scale`).
+
+  **`buffer_device` `[x,y,w,h]` — where the compositor paints the surface**
+  (#1991, additive, schema `version: 1` unchanged). Integer device px,
+  relative to the top-left of the entry's `monitor`, naming the rect at which
+  the compositor paints the window's main surface (the bound surface). A
+  consumer that finds it uses it directly, for the present origin, the Kooima
+  canvas and the 1:1 check (`u_wl_window_device_rect`). A consumer that does
+  not keeps converting `buffer` with `round((buffer − monitor) × device_scale)`,
+  and `buffer` stays as it is, so older consumers are unaffected.
+  - *Why.* The conversion guesses the compositor's rounding. A compositor
+    that keeps window positions fractional (KWin does, after any pointer
+    drag) can paint a surface on a device row no whole logical value names:
+    at 166.67 % a buffer published at y 191 converts to row 318 and is painted
+    on row 319 (#1928). Measured on Stereo KWin 6.7.4 at five scales,
+    `buffer_device` equalled the painted rect 90 times out of 90, and the
+    conversion was one pixel off in 45.
+  - *The 1:1 test.* `w`/`h` against the buffer's own size in pixels. Equal
+    means the buffer reaches the output unscaled at an integer origin, so the
+    published size is the destination the 1:1 gate compares (#1595).
+  - *Under move sync* (§9), `buffer_device` is where the publisher will paint
+    the frame woven for this snapshot. On KWin that is the conversion of
+    `buffer`, so a runtime that weaves for either value gets every frame
+    painted where it wove it.
+  - *When the publisher cannot vouch for the rect* (an effect transforms the
+    window, or the window spans outputs of different scale), it leaves
+    `buffer_device` out, and the consumer falls back to the conversion.
+  - *Malformed is absent.* A non-integer value or a non-positive size is
+    ignored, never rounded.
+  - *Publishers.* The KWin publisher sends it. Mutter paints a surface at
+    `roundf((content − monitor) × scale)` (§7.2), so the GNOME extension's
+    `buffer_device` would equal today's conversion; it may send it, and need
+    not.
+
 - **Consumer** — `comp_vk_native_wl_geom` (`src/xrt/compositor/vk_native/`,
   built when `XRT_HAVE_WAYLAND && XRT_HAVE_DBUS`, libdbus-1). Private
   session-bus connection; one blocking `GetWindows` at create (200 ms cap),
@@ -124,10 +171,11 @@ GNOME Shell (Mutter)                        DisplayXR runtime process
 | Extension not installed/enabled | Snapshot empty; bounded retry every 5 s; display-scoped until it appears |
 | No window matches our PID | `get_window_metrics` invalid; display-scoped |
 | Monitor scale ≠ 1.0 | **Converted**, not refused (#1596): the rect is multiplied to device pixels using `monitor` + its fractional `scale`, one INFO naming both spaces. Weaving proceeds with a real phase |
+| Mutter in its PHYSICAL layout mode (stage = device px; Ubuntu 24.04 / GNOME 46 at an integer scale) | Factor 1, not the monitor scale (§4.1). One WARN naming the source (`device_scale`, `layout_mode`, or Mutter's own `layout-mode` for a publisher older than version 11). Before this, a 3840x2160 panel at 200 % read as 7680x4320, so the window was "not on the panel" and presented flat 2D |
 | Payload carries no `monitor` object | Rect **refused**, one WARN; display-scoped. Without it there is no scale to apply and no way to name the space the rect is in. Mutter omits it only for a window on no monitor |
 | The window's monitor is not the 3D panel | Rect **refused**, one WARN; display-scoped — *and* the weave itself degrades to flat 2D (#1595), because a surface on another output cannot be 1:1 with this panel by any phase |
 | The presented buffer ≠ the window's device extent | Geometry is still valid and still served; the **weave** degrades to flat 2D (#1595), one `NOT_1TO1:` WARN, and the present-origin feed is suppressed so no stale phase stays latched |
-| Publisher goes away / comes back (screen lock) | Cache **dropped** on `NameOwnerChanged`, so display-scoped while it is gone; on its return the consumer re-takes `GetWindows` immediately rather than waiting for the next change. One WARN per transition |
+| Publisher goes away / comes back (shell restart, re-enable; screen lock before extension version 14) | Cache **dropped** on `NameOwnerChanged`, so display-scoped while it is gone; on its return the consumer re-takes `GetWindows` immediately rather than waiting for the next change, and the compositor **re-syncs** everything it derived from the old publisher (§3.1, #2071). One WARN per transition |
 
 The scale row has been rewritten twice, and the history is the argument. It
 originally returned the rect with a warning, so the outcome was not pre-#817
@@ -163,10 +211,14 @@ the session is in — so with no publisher there is no destination extent, and
 the session behaves exactly as it did before the gate existed. Degrading on
 ignorance would be its own kind of wrong answer.
 
-The lock-screen row exists because the publisher is **intermittent by design**:
-GNOME disables user extensions whenever the screen shield is up and re-enables
-them on unlock, so the bus name really does disappear and reappear during a
-normal session. Absence was always handled (bounded retry, display-scoped), but
+The lock-screen row exists because the publisher was **intermittent by design**:
+GNOME disables an extension whose `metadata.json` names no `session-modes`
+whenever the screen shield is up and re-enables it on unlock, so up to extension
+version 13 the bus name really did disappear and reappear during a normal
+session — on a laptop at every suspend. Version 14 declares
+`["user", "unlock-dialog"]` and stays up across the lock (§3.1), but a shell
+restart or a re-enable still takes the name away, and an older extension is
+still in the field, so the consumer keeps handling both edges. Absence was always handled (bounded retry, display-scoped), but
 two things about the *edges* were not. On the way out, the last snapshot stayed
 cached and kept anchoring the phase — and a window moved or resized behind the
 shield made that cached origin quietly wrong. On the way back, the publisher
@@ -177,6 +229,58 @@ survived until the user happened to move the window again. Tracking
 gaining one invalidates it *and* re-takes the same bounded `GetWindows` the
 retry path already makes. These are rare lifecycle events, so each transition
 logs exactly one WARN; the per-frame pump still never blocks for anything else.
+
+### 3.1 The lock screen and the publisher re-sync (extension version 14, #2071)
+
+**Observed:** a weaving native-Wayland app kept up across s2idle suspend/resume
+cycles on an SR panel (GNOME 50.1) came back once with exactly inverted 3D — depth
+swapped, tracking fine — while a freshly started app was correct. Its log showed
+the publisher going away at the suspend (the lock screen) and the window having
+no publisher entry until the unlock: the placement / phase anchor, which on
+Wayland only the extension can supply, was lost for the length of the lock and
+re-acquired inconsistently.
+
+**Extension side.** `metadata.json` declares
+`"session-modes": ["user", "unlock-dialog"]` (supported since GNOME 42, the
+extension's floor), so GNOME keeps it enabled on the lock screen instead of
+calling `disable()`. What keeps running there: the geometry snapshot and
+`WindowsChanged`, `CaptureExclusion1` (tearing it down at lock would make every
+excluded window capturable for the length of the lock), `WindowPlacement1` and
+move sync (a client moving its own window; the version 15 keep-above / activate /
+minimize requests are refused while locked, §11.2, and the version 16 GetPointer /
+GetWindowAt answer only `{"locked": true}`, §12.2), and the `WorkspaceHotkey1`
+object.
+What does not: the workspace hotkey's **grab** — the extension follows
+`Main.sessionMode` (`isLocked`, via its `updated` signal; not `currentMode`,
+which is `ubuntu` on Ubuntu), releases the accelerator on lock, never acts on a
+press while locked, defers the manifest bootstrap to the unlock, and re-grabs
+on unlock. The extension draws no UI, so it adds none to the lock screen. No
+D-Bus member or capability bit changed; `WorkspaceHotkey1.GetState` gains a
+`locked` field.
+
+**Runtime side.** The provider already dropped its cache on the vanish edge and
+re-took `GetWindows` (and renewed move sync) on the appear edge. Each appear
+edge now also bumps a publisher generation
+(`comp_vk_native_wl_geom_publisher_generation`), and the in-process Vulkan
+compositor, before the 1:1 gate each frame, re-syncs everything it derived from
+the previous publisher when the generation moves: the present-origin baseline is
+forgotten (the DP's `set_present_origin` is re-fed from the fresh snapshot and
+logged), the 1:1 gate re-runs on the fresh snapshot with its one-shot lines
+re-armed, a drop-snap verification in flight is abandoned and the gap is
+treated as a move from the last position seen before it — so the drop path
+re-asks the DP (`snap_window_rect`) and moves the window onto the lattice if
+the gap left it off — and the move-sync frame tag is re-sent with the next
+presented frame. One WARN per event:
+
+```
+wl_geom: publisher reappeared — re-syncing geometry (#2071): present origin re-fed, 1:1 gate re-run, weave phase … , move-sync tag … (publisher generation N)
+```
+
+so a session that lives across a lock never keeps a stale phase, even on an
+extension older than version 14. With version 14 that line should not appear
+across a lock at all; seeing it on lock/unlock means the session still runs an
+older copy (`gnome-extensions info window-geometry@displayxr.org`; a running
+shell keeps the code it loaded until the next login).
 
 ## 4. Packaging contract — the publisher is a shared asset
 
@@ -196,22 +300,33 @@ schema*, not who ships the bits — the `org.freedesktop.*` / `org.gnome.*`
 convention. A vendor package shipping the publisher keeps these identifiers
 unchanged; renaming forks the ecosystem and strands consumers.
 
-**Exactly one installed owner.** A D-Bus well-known name is singly owned: a
-second publisher binds nothing, queues silently, and leaves consumers on
-whichever copy won the race — possibly an older schema. So multiple packages
-may *be able* to ship it, but only one may be installed at a time. The Debian
-idiom for that is a virtual package — every package that ships the extension
-declares all three of:
+**Exactly one installed owner per compositor.** A D-Bus well-known name is
+singly owned: a second publisher binds nothing, queues silently, and leaves
+consumers on whichever copy won the race — possibly an older schema. So
+multiple packages may *be able* to ship a publisher for one compositor, but
+only one may be installed at a time. Publishers for *different* compositors
+never meet: GNOME Shell and KWin never run in the same session, so the bus
+name never has two owners, and a system with both desktops installed must be
+able to carry both publishers (#1928). The Debian idiom for that is two
+virtual packages — a generic one that consumers depend on, and a
+per-compositor one that carries the exclusion. A package shipping the GNOME
+Shell extension declares:
 
 ```
-Provides:  displayxr-window-geometry-publisher
-Conflicts: displayxr-window-geometry-publisher
-Replaces:  displayxr-window-geometry-publisher
+Provides:  displayxr-window-geometry-publisher, displayxr-window-geometry-publisher-gnome
+Conflicts: displayxr-window-geometry-publisher-gnome
+Replaces:  displayxr-window-geometry-publisher-gnome
 ```
 
-so a vendor runtime .deb and a DisplayXR .deb can each satisfy the dependency,
-dpkg refuses to install both, and consumers depend on the virtual name rather
-than on any particular vendor. Files install system-wide to
+and a KWin publisher the same with `-kwin` (any further compositor: its own
+suffix). So a vendor runtime .deb and a DisplayXR .deb can each satisfy the
+dependency, dpkg refuses to install two publishers for the same compositor,
+a GNOME publisher and a KWin publisher install side by side, and consumers
+depend on the generic name rather than on any particular vendor or desktop.
+Never put `Conflicts:` on the generic name: it would make every publisher
+exclude every other, across compositors. A package built before this split
+(it conflicts on the generic name) still excludes all publishers until it is
+upgraded. Files install system-wide to
 `/usr/share/gnome-shell/extensions/window-geometry@displayxr.org/` (not the
 per-user `~/.local/share/...` path used for manual dev installs).
 
@@ -262,9 +377,110 @@ Consumers refuse a payload whose `version` exceeds what they understand
 (`WLG_SCHEMA_VERSION_MAX`) and fall back to display-scoped rather than weave at
 a silently wrong phase; a payload with no `version` is treated as v1.
 
+### 4.1 Worked example: Mutter's layout mode (extension version 11)
+
+The clause above says the wire is LOGICAL. That was true only on the desktops
+it had been measured on. The wire is Mutter's **stage** coordinates, and Mutter
+has two layout modes:
+
+| `layout-mode` | when | stage space | 3840x2160 monitor at 200 % |
+|---|---|---|---|
+| 1 LOGICAL | fractional scaling enabled; mutter 50's default | logical px | rect 1920x1080, scale 2, stage view scale 2 |
+| 2 PHYSICAL | Ubuntu 24.04 / GNOME 46 at an integer scale, out of the box | device px | rect 3840x2160, scale 2, stage view scale 1 |
+
+(Measured on a headless mutter 50.1, switching only `gdctl set --layout-mode`.)
+In PHYSICAL the monitor scale says how big clients draw. It is not a
+coordinate factor, so a consumer that multiplied by it read the panel as a
+7680x4320 output. The window was then never "on the panel": `NOT_1TO1`, flat
+2D, lens off.
+
+Version 11 fixes this **additively**. No field changes meaning: `frame`,
+`buffer` and `monitor.{x,y,w,h}` remain stage coordinates, and `scale` remains
+`get_monitor_scale()`. What is new is two fields that name the stage's space:
+
+- top-level `layout_mode`: `"logical"` / `"physical"`, left out when it
+  cannot be told. With every monitor at scale 1 the two modes agree.
+- `monitor.device_scale`: device px per stage px. This is the scale of the
+  stage view painting the monitor (`Clutter.StageView.get_scale()`), so it is
+  the factor in either mode.
+
+Mutter does not introspect its layout mode. The view scales give it away:
+any view scale other than 1 means LOGICAL, and every view at 1 while some
+monitor is scaled means PHYSICAL (`StageScale` in `lib.js`, pinned by
+`scripts/test_gnome_extension_stage_scale.js`). The schema stays `version: 1`.
+Bumping it would make every shipped consumer refuse a payload that is still
+correct for it on every LOGICAL desktop. A consumer without the new fields
+asks Mutter for `layout-mode` instead, as the runtime does for a publisher
+older than version 11 (`wlg_query_mutter_layout_mode`). That case is not
+hypothetical: after a package upgrade, the running shell keeps the old
+extension until the user logs out.
+
+Everything else in the extension already worked in stage coordinates, so it
+follows the mode with no change: `MoveWindow`, the pointer drag, and the
+move-sync history. The move-sync tag is read from subsurface actor positions,
+and those are in *surface* units in both modes. Measured in PHYSICAL at
+200 %: the tag actor sits at `(x mod 256, y mod 256)` of the buffer's stage
+position, exactly as the runtime set it. The drag-lattice choice and the stamp
+audit weigh device px, and now use `device_scale`.
+
 **No reverse dependency.** The extension must remain pure GNOME Shell JS with
 no import from, or runtime dependency on, DisplayXR or any vendor stack — that
 is what lets any package ship it and any runtime consume it.
+
+### 4.2 The monitor's work area (extension version 19)
+
+`monitor` is the whole monitor. An app that places its own window needs the
+part of the monitor that is left to windows: the Unity plug-in's side-step
+(DisplayXR/displayxr-unity#399) moves the app's window into a corner of its
+monitor when another app's window covers it, and with only the monitor rect a
+top corner put the window under GNOME's top bar, a left or bottom one under a
+dock that stays visible. Version 19 adds that part to every window entry:
+
+```json
+"monitor": { "x": 0, "y": 0, "w": 1920, "h": 1080, "scale": 1.0, "device_scale": 1.0,
+             "work_area": [0, 32, 1920, 1048] }
+```
+
+- `work_area`: `[x, y, w, h]` in stage coordinates, the space of
+  `monitor.x/y/w/h` (§4.1). It is mutter's work area of that monitor
+  (`Meta.Workspace.get_work_area_for_monitor`), the area mutter keeps a
+  maximized window in: the monitor minus every strut (GNOME Shell's top bar,
+  a dock that stays visible, such as Ubuntu's by default; an auto-hiding dock
+  reserves none).
+- Struts can differ between workspaces, so it is asked of the window's own
+  workspace (`Meta.Window.get_workspace()`, which is the active one for a
+  window on all workspaces), else of the active workspace.
+- Absent when it cannot be told (no workspace answers, an empty rect). A
+  consumer treats a missing `work_area` as the whole monitor, which is what it
+  had before version 19.
+- A change of the work area alone (the dock switched to auto-hide or back, a
+  monitor change) emits `WindowsChanged` (mutter's `workareas-changed`).
+- GNOME 42–44 hand back a `Meta.Rectangle`, 45+ an `Mtk.Rectangle`; both
+  have `x`, `y`, `width`, `height`. The pure part is `WorkArea` in `lib.js`,
+  unit-tested by `scripts/test_gnome_extension_work_area.js`.
+
+Additive: no field changed meaning, so the schema stays `version: 1`, and an
+older consumer ignores the new key.
+
+**Verified (private headless GNOME Shell 50.1).** Two monitors, 3840x2160 at
+200 % (primary, 1920x1080 logical) and 1920x1200 at 133 %, logical layout:
+
+- Top bar only: the primary's `work_area` was `[0, 32, 1920, 1048]`. The top
+  bar is 32 px there (the actor picked at y 0-31 is the panel, at y 32 it is
+  not), and a window maximized on that monitor got exactly that frame. The
+  secondary, which has no top bar, had `[1920, 0, 1440, 900]`, its whole
+  monitor, again the maximized frame.
+- Ubuntu's session (its dock on the left, fixed): `[67, 32, 1853, 1048]`. The
+  dock ends at x 67, and a window maximized there got exactly that frame.
+- Switching the dock to auto-hide and back emitted `WindowsChanged` with
+  `[0, 32, 1920, 1048]`, then `[67, 32, 1853, 1048]`, within 0.3 s, while no
+  window moved.
+- The Unity plug-in's side-step (DisplayXR/displayxr-unity#399) with the
+  work area stepped into the top-left corner of the work area: (24, 56) under
+  the 32 px bar, (91, 56) with the dock. Without it, the window landed at
+  (24, 24), partly under the top bar, or at (0, 304), partly under the dock.
+- Version 18 has no `work_area`, and the plug-in then behaves as before.
+- No JS errors in any run.
 
 ## 5. Known limitations / follow-ups (#817)
 
@@ -307,6 +523,40 @@ is what lets any package ship it and any runtime consume it.
 - Mutter emits geometry transactionally with its own redraw, so tracking
   during interactive drags is expected to be at least as good as the X11
   per-frame poll; validate visually (phase lock while dragging).
+- **Multi-screen segments need every monitor, not just the window's own
+  (multi-screen M2 follow-up, ADR-047 D2).** M2 weaves a window that spans
+  screens per segment — `canvas ∩ screen`, each by that screen's display
+  processor with its own present origin — on X11/XWayland, where root
+  coordinates are desktop-absolute and RandR gives every monitor's rect in the
+  same space (`docs/architecture/comp-segments.md`). Native Wayland stays on
+  the primary-segment-only behaviour (#1654 bands), because this payload cannot
+  place the second segment:
+  - `monitor` describes only the window's OWN monitor. The rect of the part of
+    the window that lands on another monitor, in THAT monitor's device px,
+    needs that monitor's stage rect and its own `device_scale` — a
+    mixed-scale layout (this box: 1.6667 laptop + 2.0 DS1) makes a single
+    factor wrong for one of the two.
+  - The runtime's screen registry is keyed by connector / RandR output name,
+    and the payload names no connector, so even the window's own monitor is
+    matched only by its device size today (`wr.monitor_width_px ==
+    panel_px_w`), which is ambiguous for two identical panels.
+
+  **Required extension change** (not installed on any dev box; the runtime
+  keeps refusing until a publisher announces it): add a top-level
+  `monitors: [{connector, x, y, w, h, scale, device_scale}]` array — every
+  monitor in stage coordinates, `connector` = the DRM connector / Mutter
+  monitor connector (`Meta.MonitorManager` → `get_monitor_for_connector`,
+  e.g. `"HDMI-1"`, which is what the registry's `device_name` holds) — plus
+  `monitor.connector` on each window. Additive, so the schema stays
+  `version: 1` and an older consumer ignores it; bump the extension version
+  so `org.displayxr.WindowGeometry1` capability probing can tell. The consumer
+  then intersects the window's `buffer` rect with each monitor in stage
+  coordinates, converts each piece to that monitor's device px with that
+  monitor's `device_scale`, and hands `comp_segments` a segment table in
+  which every rect is already per screen. Note that Mutter paints a straddling
+  surface at ONE buffer scale (the window's main monitor's), so the part on
+  the other monitor is resampled: the per-segment 1:1 policy applies (a
+  resample-tolerant DP weaves it, a lenticular weave gets flat 2D).
 
 ## 6. Capture exclusion — `org.displayxr.CaptureExclusion1` (extension version 2)
 
@@ -392,11 +642,13 @@ so a dead app can never leave a window invisible to capture. There is no timer
 and no heartbeat.
 
 **Disable removes everything.** `disable()` removes every effect the extension
-added, whether or not its owner is still registered. GNOME disables user
-extensions whenever the screen shield is up, so this happens routinely: the bus
-name disappears, every window becomes capturable again, and on unlock the name
-returns with **no** registrations. Consumers must watch `NameOwnerChanged` and
-re-register (§6.5).
+added, whether or not its owner is still registered. Up to extension version 13
+GNOME disabled it whenever the screen shield was up, so this happened routinely;
+since version 14 the lock screen no longer disables it (§3.1) and exclusions
+survive a lock, but a shell restart or a re-enable still does: the bus name
+disappears, every window becomes capturable again, and the name returns with
+**no** registrations. Consumers must watch `NameOwnerChanged` and re-register
+(§6.5).
 
 ### 6.4 Detecting it
 
@@ -490,6 +742,21 @@ Object  /org/displayxr/WindowPlacement      Interface  org.displayxr.WindowPlace
 the argument (which must match, or be 0 for "me"): a client may only move its
 own windows. The extension refuses while an interactive grab is running on the
 window — the user is still dragging it — and for fullscreen windows.
+
+**What a move promises is where the CONTENT lands** (#1928). `x`/`y` still
+name the frame, but the consumer asked for a content position: the move is
+`(x, y) − frame` logical px applied to the window, and the runtime judges the
+landing by the content's device position (§7.2, `vk_wayland_phase_snap`), not
+the frame's. On a compositor that places a client-decorated window's frame at
+whole logical px while its buffer sits a fraction below (KWin at 125 % and
+166.67 %: a 58 px title bar is 72.5 device px, painted at 73), a whole-pixel
+frame can leave the buffer one device row off, which reads as a missed snap.
+So a publisher **may adjust the frame** by less than one logical px so the
+buffer lands on `round((buffer + move − monitor) × device_scale)`, the same
+rule its drag table entries follow (§8.6). Mutter places frame and buffer on
+the same whole-px grid, so the GNOME extension never needs to. A publisher
+that sends `buffer_device` (§2) reports that landing directly, and the runtime
+judges the snap against it.
 
 Additive schema field for the same reason: every window now carries
 `"moving"`, true while an interactive grab (move or resize) is in progress on
@@ -657,3 +924,963 @@ pixel"). At 150 % the panel dragged unconstrained, and stuttered. Now:
 
 An app against a v7 extension keeps the integer-scale-only behaviour.
 
+### 8.7 Drag smoothness — the dense table (#1748)
+
+A slow drag on the panel moved in visible sideways steps. That was measured in
+a private headless GNOME Shell 50.1 running the v8 extension. The drag was a
+real `xdg_toplevel.move` grab, driven by pointer injection through
+`org.gnome.Mutter.RemoteDesktop`. The table came from the helper's own probe,
+over a best-phase snap of the vendor weaver's shape. Distances are in device px.
+
+- **Correct-after-apply is not the cause.** Of ~1,000 audited frames across
+  200 % and 150 %, 0 were painted off the table. `position-changed` runs
+  synchronously inside `move_resize`, so the correction lands before the next
+  paint, as §8.2 relies on.
+- **The table was coarser than the lens.** A 3 px probe keeps one entry per
+  cell and leaves out 18 % (200 %) to 31 % (150 %) of the reachable
+  phase-correct positions. So the nearest entry was up to 6.3 px away where
+  4.5 would do. Along a straight drag, the choice of entry flips between
+  neighbours on either side of the drag line, which shows as a wiggle across
+  the drag direction.
+- **Fix (displayxr-common, dense table):** on the grid-snap path the helper
+  probes every logical px and keeps every reachable answer. The display
+  processor does no extra work at a non-unit scale: the grid calls already
+  cover every logical px. At 100 % the one call grows from 129×129 to 385×385
+  points. The table stays ~13k entries, and the wire `cell` (the extension's
+  bucket size) stays 3, so the extension is unchanged.
+
+| scale | table | correction rms / max | across-track max |
+|---|---|---|---|
+| 200 % | 3 px | 3.8 / 6.3 | 6.0 |
+| 200 % | dense | 3.1 / 4.5 | 4.0 |
+| 150 % | 3 px | 3.1 / 5.4 | 4.7 |
+| 150 % | dense | 2.5 / 4.5 | 4.5 |
+| Windows, app-owned (reference) | — | 1.9 / 2.8 | 2.0 |
+
+**What remains is reachability.** Mutter places a window at whole logical px,
+so at 200 % only every other device px in each axis can be reached. Any table
+at the same phase precision therefore sits about 1.6× coarser than the Windows
+drag. Closing that gap would mean accepting a looser phase, which is the
+display processor's decision, not the table's.
+
+### 8.8 Version 9 — which entry a move lands on (#1748)
+
+Every table entry is equally phase-correct, so the only freedom left during a
+drag is which entry each move lands on. Up to version 8 that was the plain
+nearest one. Along a straight drag, nearest picks entries on either side of
+the drag line in turn, and the window wiggles sideways. A denser table
+(displayxr-common's probe at every logical px, §8.7) removes the entries it
+used to miss, but it cannot close the gap to Windows: mutter places windows at
+whole logical px, so above 100 % only some device px are reachable.
+
+Version 9 spends the remaining error where it shows least (`LatticeChoice` in
+`lib.js`):
+
+- **The drag direction** is estimated from the raw positions mutter proposes,
+  in device px, with a memory of about 8 px of travel. It is an axis, so a drag
+  that reverses along the same line keeps it, and a turn moves it.
+- **The cost** of an entry is `along² + 9 · across²`, both measured from the
+  raw position: a sideways error counts three times a lead or lag along the
+  drag.
+- **The lead or lag is capped at 6 device px.** Entries past it are not
+  eligible. If none is eligible, or until the drag has travelled 4 device px,
+  the choice is plain nearest.
+- Everything is in device px (logical × the window's monitor scale), so the
+  rule is the same at any output scale.
+- `DISPLAYXR_LATTICE_NEAREST=1` in the shell's environment restores plain
+  nearest, for A/B comparison on a panel.
+
+Nothing on the wire changes, and every landing is still a table entry.
+`scripts/test_gnome_extension_lattice.js` (gjs, in `lint.yml`) checks the
+rule directly.
+
+**Measured** in a private headless GNOME Shell 50.1, over the dense table
+(displayxr-common#65), with a real `xdg_toplevel.move` grab driven through
+`org.gnome.Mutter.RemoteDesktop` and a best-phase snap of the vendor weaver's
+shape. Distances are in device px; sideways travel is the total sideways
+motion of the window per 100 px dragged.
+
+| scale | drag | sideways rms | sideways max | sideways travel /100 px | largest sideways jump | lead/lag max |
+|---|---|---|---|---|---|---|
+| 200 % | horizontal | 2.56 → 1.64 | 4.0 → 4.0 | 73 → 31 | 8.0 → 4.0 | 4.0 → 6.0 |
+| 200 % | vertical | 2.02 → 1.46 | 4.0 → 2.0 | 45 → 22 | 6.0 → 4.0 | 4.0 → 6.0 |
+| 200 % | 20° | 2.07 → 1.50 | 4.4 → 3.8 | 52 → 31 | 6.2 → 6.2 | 4.4 → 5.6 |
+| 200 % | 45° | 1.94 → 1.77 | 4.4 → 3.8 | 34 → 35 | 5.9 → 5.9 | 4.4 → 5.6 |
+| 200 % | reversing | 2.56 → 1.62 | 4.0 → 4.0 | 73 → 32 | 8.0 → 4.0 | 4.0 → 6.0 |
+| 150 % | horizontal | 1.87 → 0.99 | 4.5 → 1.5 | 58 → 22 | 7.5 → 3.0 | 3.0 → 6.0 |
+| 150 % | vertical | 1.84 → 1.21 | 4.5 → 3.0 | 46 → 24 | 6.0 → 4.5 | 3.0 → 6.0 |
+| 150 % | 20° | 1.76 → 0.88 | 4.2 → 1.9 | 72 → 26 | 8.1 → 3.5 | 3.8 → 5.3 |
+| 150 % | 45° | 1.64 → 1.33 | 3.2 → 2.1 | 51 → 34 | 5.3 → 4.2 | 3.2 → 5.3 |
+| 150 % | reversing | 1.87 → 1.00 | 4.5 → 1.5 | 62 → 26 | 7.5 → 3.0 | 3.0 → 6.0 |
+| Windows, app-owned (model, same snap) | all four | 1.31–1.41 | 2.0–2.8 | 45–81 | 4.0–4.8 | 2.0–2.8 |
+
+Sideways rms and travel drop by a third to a half, and the largest sideways
+jump halves on straight drags. The worst single sideways offset still reaches
+4 device px at 200 % where the table has no closer entry within the cap. The
+price is the lead or lag along the drag (≤ 6 px, from ≤ 4.5) and a larger
+correction (rms 3.1 → 3.6 at 200 %, 2.5 → 3.3 at 150 %). Edge tiling (left half),
+the top-edge maximize and a drag starting from rest behave as before, and no
+frame inside the table's coverage was painted off it.
+
+
+
+### 8.9 Version 9 — the pointer drag (a content drag on a secondary button)
+
+DisplayXR apps drag their window from anywhere in the content with the RIGHT
+button (the left one belongs to the scene), the same gesture as on X11 and
+Windows. Handed to mutter with `xdg_toplevel.move`, that drag never ended on
+the release: mutter accepts the request with any pressed button's serial
+(`meta_wayland_pointer_get_grab_info` only asks for `button_count > 0`), but
+its move grab ends only on the release of button 1 or of the resize button
+(mutter 50.1, `src/compositor/meta-window-drag.c`, `process_pointer_event`,
+`CLUTTER_BUTTON_RELEASE`: `button == 1 || button ==
+meta_prefs_get_mouse_button_resize ()` — 2 by default). The window kept
+following the pointer until the next click, and the client never saw the
+release. Reproduced in a private headless GNOME Shell 50.1 with pointer
+injection through `org.gnome.Mutter.RemoteDesktop`: after the right button
+went up, a further 300 px of pointer motion moved the window 300 px, in 3 of 3
+drags. Nothing outside mutter can end its grab (no introspected
+`end_grab_op`; its grab is an input-only `ClutterGrab` with its own handler),
+so the app no longer starts one for such a button.
+
+Instead the extension follows the pointer itself — capability bit 2 (value 4),
+`BeginPointerDrag(u pid, u button) -> (b started)` and `EndPointerDrag(u pid)`:
+
+- **No grab.** The client keeps its implicit pointer grab, so it sees the
+  motion and the release. Every move goes through `move_frame`, and so
+  through the drag table's correction exactly as a compositor drag's does.
+  While it runs, the window is reported `moving` and a table sent for it is
+  active; it ends with `DragLatticeDone` like a grab.
+- **It ends on the button mask.** The pointer is read every 4 ms
+  (`global.get_pointer()`), and the drag is over on the first read whose
+  modifier mask lacks the button — however the release happened, wherever
+  the pointer is. Not an event filter: one added by an extension runs after
+  mutter's own, which consumes every event it delivers to a Wayland client.
+- **mutter files the middle and right buttons under each other's mask.** Its
+  table (`src/backends/native/meta-seat-impl.c`, `maskmap`) is indexed by the
+  Clutter button number but written in evdev order, so a held right button
+  reads as `BUTTON2_MASK` (measured: mods `0x200`). For buttons 2 and 3
+  either bit is accepted at the start, and the one actually set is watched.
+- **Refused** when the button is already up at the call (a quick click),
+  when a grab or another pointer drag is running, or for a fullscreen or
+  unmovable window. A compositor grab that starts during it ends it.
+- `EndPointerDrag` is the app's belt and braces (it saw the release); the
+  mask ends the drag either way.
+
+The app (displayxr-common `dxr_drag.h`) keeps `xdg_toplevel.move` for button 1,
+and for any button on a compositor that is not mutter. On mutter without this
+capability a secondary-button content drag does not move the window at all,
+with one WARN, rather than start a drag nothing can end. Same measurement with
+this version: the window followed the pointer while the button was held
+(+300,+120 for a +300,+120 drag) and stayed put after the release, in 3 of 3
+drags including a release far outside the window after a fast flick.
+
+`scripts/test_gnome_extension_pointer_drag.js` (gjs, in `lint.yml`) checks the
+pure part (`PointerDrag` in `lib.js`).
+
+## 9. Move-synchronised re-weave (extension version 9, #1748; tag-gated in version 10)
+
+**On by default** on native Wayland whenever the extension offers it
+(`EnableMoveSync`, placement capability bit 3 = value 8; GNOME 45+). The drag
+lattice (§8) is the fallback, unchanged, wherever move sync is not available:
+an extension older than version 9, the GNOME 40–44 entry point (which answers
+`false`), X11/XWayland, no extension at all, or `DXR_WL_MOVE_SYNC=0` in the
+app's environment.
+
+### 9.1 Idea
+
+The lattice keeps a stale weave correct by allowing only the positions where
+it stays phase-correct. Move sync inverts that: the window may sit on any
+logical pixel, and the stage never paints a frame anywhere but where it was
+woven for. mutter keeps its grab (or the extension its pointer drag, §8.9)
+and moves the `MetaWindow` as usual, so the published geometry, edge tiling
+and workspaces all see the real position. Only the window's **actor** is held
+back: on every stage frame, in `before-update` (after that frame's input and
+commits, before layout and paint), the extension places it at the position
+the buffer it is about to paint was woven for.
+
+Because every painted frame is woven for exactly where it is painted, the
+result is exact for any lens, not only where a stale weave happens to be
+phase-equivalent. It needs no table probe, and every logical position is
+reachable at any scale.
+
+### 9.2 Binding a buffer to its woven position
+
+GJS has no per-commit identifier. `MetaWindowActor::damaged` fires inside the
+commit's apply, before the subsurface state is synced, and
+`meta_window_actor_freeze()` cannot hold a Wayland window: freezing also stops
+mutter syncing the surface actors (the new texture and the subsurface
+positions) until the thaw.
+
+So the runtime tags the commit itself (`comp_vk_native_wl_move_sync`):
+- A 1x1 clear **synchronised** subsurface of the bound surface, placed below
+  it, with an empty input region.
+- It sits at `(x mod 256, y mod 256)` of the logical content position the
+  frame was woven for — the snapshot `vk_get_window_metrics` used for that
+  frame's present origin (`comp_vk_native_wl_geom_last_rect`), captured per
+  weave and set **immediately before that weave's present, under the
+  compositor lock**. A fill's fence-park releases the lock between its weave
+  and its present (§9.6), so the position is carried in the weave's own
+  storage, never read back from shared state.
+- A synchronised subsurface's position is parent state: it lands atomically
+  with the buffer the WSI commits in `vkQueuePresentKHR`.
+- While the window covers its whole monitor (fullscreen) the tag's pixel is
+  detached, so the window stays a single surface for direct scanout; a
+  fullscreen window is never dragged.
+
+The encoding is `comp_vk_native_wl_move_sync_encode` (pinned by
+`tests/tests_comp_wl_move_sync_tag.cpp`); the extension's decode is
+`MoveSyncChoice.decode` (pinned by `scripts/test_gnome_extension_move_sync.js`
+against a transcription of the same function).
+
+The extension reads the tag off the window's surface actors (`_readTag`): the
+1x1 actor is the tag, and the **main surface** is the actor whose content is
+the window's texture — `MetaWindowActor.get_texture()` is the main surface's
+`MetaShapedTexture`, and mutter sets that same object as the surface actor's
+content, so the pairing is structural: the toplevel's own surface, the one the
+tag is a subsurface of (runtime and present-owner alike, §9.8). The tag is
+decoded as its position minus the main surface's, both relative to the window
+actor (`MoveSyncChoice.pick`, extension version 12, pinned by the same test).
+Versions 9–11 took the **largest** surface actor instead. Under libdecor-gtk —
+GLFW 3.4's and SDL2/SDL3's stock decorations on GNOME — the shadow subsurface
+is larger than the content, so every tag decoded against the shadow's origin,
+no frame ever resolved against the window's history, and the hold timed out on
+every title-bar drag: stale frames and visible 3D stutter, found on the LeiaSR
+OpenGL example (the same drag was smooth with libdecor disabled). An app that
+draws its own chrome in a smaller subsurface, as the test apps and the browser
+do, was never affected. Without a texture match (none handed out, or no actor
+carrying it — not seen on mutter 45–50) the largest actor still stands in.
+
+### 9.3 Placement rules (`MoveSyncChoice` in `lib.js`)
+
+The extension resolves the tag against the positions the window had in the
+last second, **newest first**, and shows the frame there:
+- **By position.** Every tagged frame is shown where its tag says. A tag names
+  a position, and which moment of the history it came from is ambiguous only
+  when the window revisits a position (a reversal) — where either answer is
+  the same pixel. Commits reach mutter in present order, each woven for a
+  position the window had at or after the previous one's. (The prototype
+  instead ignored a tag that resolved OLDER than the one shown; at a reversal
+  that painted frames woven on the way to the turn off their origin — 1.1 %
+  of a reversal's frames.)
+- **Stall fallback.** After 100 ms *and* 6 stage frames behind the window with
+  no newer woven frame, the actor follows the window, showing stale frames
+  (counted as a timeout). It re-syncs on the first frame woven for a position
+  the window had within the last 60 ms.
+- **Tick at a stop.** While the actor is behind a window that has stopped, a
+  redraw is queued each frame; otherwise nothing schedules a stage update and
+  the frame woven for the final position waited ~300 ms.
+- **Both movers.** mutter's move grab (title bar, Super+drag) and the pointer
+  drag (§8.9, a right-button content drag) start and end the same hold.
+- **Geometry every frame.** A move of a window in a hold is published
+  (`WindowsChanged`) at once. The coalescing `BEFORE_REDRAW` later, added from
+  `position-changed`, only runs in the NEXT frame — so the runtime saw a new
+  position every other frame and the window advanced on at most half the
+  paints. That, not the runtime's weave rate, was the prototype's 30 Hz
+  cadence.
+
+### 9.4 Registration and fallback
+
+- The runtime creates the tag first, then calls `EnableMoveSync(0)`.
+  `UnknownMethod` (an older extension) or `false` → the tag is destroyed and
+  the lattice path runs. No answer (no extension yet) → the request is
+  remembered.
+- The registration lives with the caller's bus connection. The service name
+  can disappear (a shell restart, a re-enable, and — before extension version
+  14 — every lock screen), so the runtime registers again whenever it
+  reappears, and re-sends its frame tag (§3.1).
+- Per frame, the runtime trusts the snapshot's `move_sync` for its window: only
+  when it is set does it skip the drop-time snap (#1609). Until the extension has
+  (re)accepted, the window is a lattice window.
+- The extension refuses drag tables for a registered process, and
+  displayxr-common (the app side) reads `move_sync` from the same snapshot it
+  already fetches at the press and derives no table for that drag: each table
+  costs the frame loop ~90 ms of snap probing.
+
+### 9.5 Cadence: a weave per refresh
+
+The window advances only when a frame woven for its new position is painted.
+The runtime therefore re-weaves during a move-sync drag whenever no weave has
+chosen an origin for 7/8 of a refresh period (`vk_wl_move_fill_due`,
+`DXR_WL_MOVE_SYNC_FILL=0` to disable): the repaint loop bypasses its quiet gate
+and phase hold for that, but never `app_frame_in_progress` or the submit
+window, and adds at most one weave per period. An app that is FIFO-bound
+already weaves every slot the queue drains, so the fill rarely fires; with a
+30 Hz app the difference it made stayed within run-to-run noise in the
+harness, because the ordinary repaint gate already refills most of the gaps.
+
+### 9.6 Found on the way: the fill fence-park leaked swapchain images
+
+`DXR_WEAVE_REPAINT_FORCE=1` hung the prototype's app within seconds: the app
+thread sat in `vkAcquireNextImageKHR` (waiting on the explicit-sync release
+point) holding the compositor lock, and the repaint thread waited for that
+lock. Cause: a fill whose fence-park lost the race to an app frame returned
+without presenting the image it had acquired, and Vulkan hands an acquired
+image back only through a present, so each lost race leaked one image for the
+life of the swapchain. The target now holds such an image and hands it to the
+next acquire (`comp_vk_native_target_hold_unpresented`; a recreate drops the
+hold). With the fix, `DXR_WEAVE_REPAINT_FORCE=1` runs a full drag suite with
+no hang and 0 frames off their woven origin. The default gate hit the same
+race rarely, so long sessions were exposed too.
+
+### 9.7 Measured (private headless GNOME Shell 50.1)
+
+**Setup.** A private headless GNOME Shell 50.1 (own display and session bus),
+real drags through that instance's `org.gnome.Mutter.RemoteDesktop`:
+left-button title-bar drags (mutter's grab) and right-button content drags
+(the pointer drag). `cube_handle_vk_linux` on sim_display only
+(`DXR_PLUGIN_EXCLUSIVE=sim-display`), windowed 1600x1000 device px, its
+content drag on the right button (`DXR_CUBE_DRAG_BUTTON=3`, as the demos). The
+harness is `scripts/linux/move_sync/` (`run.sh default|lattice|reweave SCALE
+OUT DRAG...`).
+
+**Stamp audit.** With `DXR_WL_ORIGIN_STAMP=1` the runtime writes a barcode of
+each frame's present origin into its top-left 352x8 px (a measurement hook: it
+overwrites content). With `DISPLAYXR_STAMP_AUDIT=1` in the shell's environment
+the extension reads it back after every stage paint and compares it with
+where the stage painted the window. "Off-origin" = painted at a device origin
+other than the one it was woven for. Lag = pointer to painted content. "Still"
+= paints on which a moving window did not advance. Slow = 1 logical px per
+8 ms, fast = 10 logical px per 8 ms. Device px.
+
+| scale | build | off-origin | lag slow p50 | lag fast p50 | still (slow LMB / RMB) |
+|---|---|---|---|---|---|
+| 200 % | prototype (#1752) | 0 % (reversal 1.1 %) | 14 | 160 | 51 % / — |
+| 200 % | **this** | **0 %** (1,313 frames, reversal included) | 12 | 140 | 22 % / 18 % |
+| 150 % | prototype (#1752) | 0 % | 9 | 90 | 51 % / — |
+| 150 % | **this** | **0 %** (1,526 frames) | 10.5 | 90 | 22 % / 26 % |
+| 200 % | lattice (§8, `DXR_WL_MOVE_SYNC=0`) | 92 % (phase-correct by table) | 2 | — | 68 % |
+
+Every drag type at both scales reads 0 frames off their woven origin: straight
+(horizontal and a 20° diagonal), fast, reversal, start from rest, release in
+motion, and the same set as right-button pointer drags. No timeout fires.
+- **Reversal:** 0 % off-origin (the prototype: 1.1 %).
+- **Edge tiling:** a drag to the left edge tiles to the left half, to the top
+  edge maximises, at both scales; the hold ends as the window is resized.
+- **App frozen (SIGSTOP 670 ms mid-drag), both buttons:** one timeout per
+  drag; the window follows the pointer with stale frames (27–28 % of that
+  drag's frames), then re-syncs with one backward hop of ≤ 120 device px
+  (200 %) / ≤ 67 (150 %).
+- **Extension version 8** (the published one before this): `EnableMoveSync`
+  answers `UnknownMethod`, the runtime logs it once and runs the lattice path;
+  the app derives and sends tables, 0 frames painted off-table. A right-button
+  content drag does not move the window (displayxr-common's one WARN), since
+  that extension has no pointer drag either.
+
+**Lag.** About 2.9 frames at 200 % (3.4 in the prototype) and unchanged at
+150 %. It is the pipeline depth: publish → the app's next weave → a FIFO queue
+that, with a FIFO-bound app, holds up to three frames → paint. Measured levers
+(not shipped): a minimum-size swapchain (3 images instead of 4) cut it to ~2
+frames; `MAILBOX` to ~1 frame, but then nothing paces the app (it wove ~700
+frames/s). Either changes every Wayland app's presentation, not only drags, and
+needs a panel run first.
+
+### 9.8 Present-owners tag their own commit (XR_DXR_weave v12, browser-pvt#180)
+
+Everything above keys off a window-bound `vk_native` session: the runtime owns
+the surface, so it creates the tag subsurface and sets it before its own
+present. A **present-owner** (an `XR_DXR_weave` caller on the service path —
+the DisplayXR browser) presents the woven buffer itself, through its own
+surface, so the runtime cannot tag that commit. Present-owners tag their own
+commit from the v12 origin: every `xrWeaveSubmitDXR` returns, in a chained
+`XrWeaveOutputOriginDXR`, the origin that submit's output was woven for — the
+geometry the weave fed the display processor, captured per weave under the
+engine lock, the service-side twin of `comp_vk_native_wl_geom_last_rect` in
+§9.2 — plus a per-output serial. The runtime never converts device px back to
+logical (the service knows no output scale, and a fresh rounding is how a
+150 % output lands one pixel off, #1609): the present-owner binds its logical
+content origin and scale beside its device geometry
+(`XrWeaveWindowLogicalOriginDXR`) and gets them echoed verbatim per output.
+It then places its own 1×1 synchronised subsurface at
+`(wovenOriginLogical mod 256)` — the same encoding as
+`comp_vk_native_wl_move_sync_encode`, `COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD` =
+the extension's `MOVE_SYNC_TAG_MOD` — and commits it with the buffer that
+carries that output. Registration (`EnableMoveSync`) and the §9.4 fallback are
+the present-owner's too; the extension authorises by caller pid, which for a
+multi-process browser is a question for its side. API and wire:
+`docs/specs/extensions/XR_DXR_weave.md` §5e.
+
+### 9.9 Tag-gated hold (extension version 10)
+
+`EnableMoveSync` is per **process**, but a present-owner (§9.8) often shows
+nothing woven — a browser on a 2D page tags no commit. Under version 9 every
+drag of such a window was held with no tagged frame to resolve, so the actor
+stood still until the stall fallback (§9.3, 100 ms and 6 frames) let it
+follow: a hitch at the start of every 2D drag. Version 10 holds a synced
+window **only while a tag subsurface is mapped** (`MoveSyncChoice.gate` in
+`lib.js`, checked on every stage frame before `onFrame`):
+
+- **Move start** (mutter's grab or the pointer drag, §8.9): the hold starts
+  only if the buffer on screen carries a tag. Otherwise the window drags as a
+  plain window — the actor is wherever mutter puts it. The move is tracked
+  either way: its position history is kept and a move is published every
+  frame, as for a held one.
+- **A tag appears mid-move** (a 3D element scrolls into view): the hold
+  starts on that frame, from the window's current position. The kept history
+  resolves that very frame's tag, so it is shown where it was woven for — one
+  step back by the pipeline lag (measured below).
+- **The tag goes away mid-hold** (unmapped, or its actor hidden): the hold ends
+  on that frame — the actor is put at the window's real position, with no
+  timeout and no hop back — counted per drag as a *tag-lost release*
+  (`… N hold(s), M tag-lost release(s)` in the `DISPLAYXR_DEBUG` summary). The
+  hold starts again if a tag reappears before the move ends.
+- **Stall fallback unchanged:** a mapped tag whose frames stop coming (the app
+  is stalled) still takes the §9.3 timeout.
+- **Unchanged for an app that keeps its tag mapped** — every in-process
+  `vk_native` window does, except fullscreen, which is never dragged (§9.2).
+
+**Capability:** placement capability bit 4 (value 16),
+`PLACEMENT_CAP_MOVE_SYNC_TAG_GATED`, only ever set together with bit 3. A
+present-owner that leaves its tag unmapped while it shows nothing woven checks
+it to know that such a drag does not hitch; with bit 4 clear (a version-9
+extension) it should keep the tag mapped, or accept the hitch.
+
+**Test hook** (off by default, never in a real session):
+`DXR_WL_TEST_TAG=off` never maps the runtime's tag (a synced process that
+tags nothing); `DXR_WL_TEST_TAG=toggle:ON_MS:OFF_MS` maps it for `ON_MS`, then
+unmaps it for `OFF_MS`, repeating. The registration is unchanged.
+
+**Decoding against the parent surface: not possible from GJS on GNOME 50 —
+the main surface is found by its texture instead (version 12).** The parent
+surface would be the exact reference, but mutter 50 flattens a window's
+surface actors into siblings under one `MetaSurfaceContainerActorWayland` (the
+tag's Clutter parent is the container, not its parent surface),
+`MetaSurfaceActorWayland` exposes no surface accessor or property to GObject
+introspection, and `Meta.WaylandSurface` exposes only `get_window()`. Only the
+sibling order hints at the parent (a `place_below` tag sits just before it),
+which a client may reorder. What *is* reachable is the toplevel's own surface:
+`MetaWindowActor.get_texture()` returns its `MetaShapedTexture`, which is that
+surface actor's content (§9.2). So a present-owner keeps its tag a subsurface
+of the toplevel's (root) surface — the browser's root surface already is — and
+that surface no longer has to be the largest; versions 9–11 decoded against
+the largest surface, which a client-side shadow bigger than the content broke.
+
+**Measured** (the §9.7 harness, private headless GNOME Shell 50.1,
+`cube_handle_vk_linux` on sim_display only, stamp audit after every paint;
+LMB = mutter's grab, RMB = the pointer drag):
+
+| run | scale | frames | held frames off their woven origin | plain frames with the actor not at the window | holds / tag-lost / timeouts |
+|---|---|---|---|---|---|
+| always tagged (in-process, 17 drags LMB + RMB, reversals) | 200 % | 1,645 | **0** | — | 17 / 0 / 0 |
+| always tagged | 150 % | 1,698 | **0** | — | 17 / 0 / 0 |
+| never tagged (`DXR_WL_TEST_TAG=off`, 11 drags) | 200 % | 1,034 | — | **0** | 0 / 0 / 0 |
+| never tagged | 150 % | 1,058 | — | **0** | 0 / 0 / 0 |
+| never tagged, **version 9** (6 drags) | 200 % | 673 | 594 (held, then following stale) | — | 6 timeouts: every drag hitched, up to 110 logical px behind |
+| toggled 300/300 ms (8 drags) | 200 % | 992 | **0** of 495 | **0** of 497 | 37 / 34 / 0 |
+| toggled 300/300 ms | 150 % | 988 | **0** of 487 | **0** of 501 | 35 / 34 / 0 |
+
+- Always tagged, lag p50 slow / fast: 12 / 120 device px at 200 %, 9 / 90 at
+  150 %; paints where a moving window stood still: 22 % / 25 % — within the
+  §9.7 run-to-run spread.
+- Never tagged: the actor is on the window on every paint (lag 0 — a plain
+  mutter drag).
+- Toggled: a hold starting mid-move steps back by up to 60 device px at
+  200 % (45 at 150 %), and a tag-lost release steps forward to the window by
+  up to 120 (81) — each the pipeline lag at that moment, on the fastest
+  toggled drag (6 logical px per 8 ms). That is the cost of a tag toggling
+  during a drag; it never takes the timeout.
+- App frozen mid-drag with the tag mapped: one timeout per drag, as in §9.7.
+
+## 10. Workspace hotkey — `org.displayxr.WorkspaceHotkey1` (extension version 13)
+
+A Wayland client cannot grab a global chord, and the DisplayXR service that owns
+the workspace-controller launch chord is socket-activated and exits 30 s after its
+last client — so it is usually not running when the chord is pressed. The extension
+is the one long-lived process in the session that can hold a keybinding, so it
+holds it **for** a client:
+
+| member | meaning |
+|---|---|
+| `Configure(s accelerator, s unit) -> (b pending)` | grab `accelerator` (GTK syntax, `<Control>space`; `""` releases and forgets) for the caller, and remember it with `unit` (a systemd **user** unit, `""` = none) across the caller's exit and shell restarts (`$XDG_STATE_HOME/displayxr/workspace-hotkey.json`). `pending`: a press happened while no caller was registered, within the last 30 s |
+| `Suspend(b suspend, u timeoutMs)` | release the grab until `Suspend(false)` or the timeout (capped at 60 s) — a hotkey-capture box must see the chord |
+| `GetState() -> (s)` | JSON diagnostics: `version`, `accelerator`, `unit`, `registered`, `grabbed`, `suspended` |
+| signal `Activated(u timestamp)` | the accelerator was pressed |
+
+The caller is registered exactly as long as its bus connection. A press while it is
+registered only emits `Activated`; a press while it is gone also calls
+`org.freedesktop.systemd1.Manager.StartUnit(unit, "replace")` and is reported back
+by that client's next `Configure`. The grab is `Meta.Display.grab_accelerator`
+(mutter's own path, Wayland and X11 GNOME alike), allowed in the NORMAL and
+OVERVIEW action modes. Nothing is grabbed until a client configures.
+
+**Bootstrap.** So a freshly installed workspace controller gets its chord without the
+client having run since, the extension also watches the DisplayXR workspace-controller
+manifest roots (`$XRT_WORKSPACE_CONTROLLER_PATH`, `$XDG_DATA_HOME/DisplayXR/WorkspaceControllers`,
+`/usr/local/share/displayxr/WorkspaceControllers`, `/usr/share/displayxr/WorkspaceControllers`
+— the runtime registry's order): 5 s after enable and 2 s after a change in a watched
+root, if the `*.json` set differs from the one recorded at the last `Configure` (the cache
+records it, including for a `Configure("")`), it starts the last configured unit — else
+`displayxr.service` — once per set per shell session. The bookkeeping
+is the pure `WorkspaceHotkey` object in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_workspace_hotkey.js`; the consumer is
+`src/xrt/targets/service/service_hotkey_linux.c`. Contract and lifecycle:
+`workspace-controller-registration.md` § Linux.
+
+Shared-asset note (§4): the interface itself knows nothing about DisplayXR — it holds one
+accelerator for one client and starts the unit that client named. The unit name comes
+from the client, the systemd manager is the user's own, and only a `*.service` name is
+accepted. The bootstrap is the one DisplayXR-specific piece (the manifest roots and the
+default unit name); it does nothing on a box without workspace-controller manifests.
+
+## 11. The caller's own window — keep-above, activate, minimize (extension version 15)
+
+### 11.1 Why
+
+What an app does to its own window with EWMH on X11 — keep it above other windows,
+bring it to the front, minimize and restore it — has no Wayland protocol:
+
+- no keep-above request at all (only the user, through the window menu);
+- `xdg-activation-v1` from an app in the background, without a fresh input serial,
+  only marks the window as demanding attention ("… is ready");
+- `xdg_toplevel.set_minimized` exists, nothing undoes it.
+
+An always-on-top 3D companion (a transparent avatar), or a hotkey that summons one,
+therefore cannot be ported to a native-Wayland player as written. On Windows the
+DisplayXR Unity plugin keeps such a window `WS_EX_TOPMOST`; on X11 the plugin's
+transparent mode keeps Unity's window `_NET_WM_STATE_ABOVE`. The extension closes
+the gap for the caller's **own** window.
+
+### 11.2 D-Bus surface
+
+On `org.displayxr.WindowPlacement1`, each with its own placement capability bit:
+
+| member | bit (value) | mutter call |
+|---|---|---|
+| `SetKeepAbove(u pid, b above) -> (b ok)` | 5 (32) | `make_above()` / `unmake_above()` |
+| `ActivateWindow(u pid) -> (b ok)` | 6 (64) | `activate(get_current_time_roundtrip())` |
+| `SetMinimized(u pid, b minimized) -> (b ok)` | 7 (128) | `minimize()` / `unminimize()` |
+
+- **Whose window:** MoveWindow's gate and choice — the caller's PID comes from the bus
+  daemon, `pid` must be 0 or that PID, and the window is that process's focused
+  normal window, else its largest. No member can reach another process's window, so
+  the call must come from inside the app process: a helper process (`gdbus`) or a
+  sandbox proxy (Flatpak) is refused.
+- **Refused** (false, nothing changed) while a grab runs on that window or any
+  extension pointer drag runs (never fight the user), and on the lock screen.
+- **`ok`:** keep-above / minimized now reads as asked; activate: the window has focus.
+- **Reading the state back:** every window in the geometry snapshot gains
+  `minimized` and `above` (additive; the schema stays `version: 1`), and
+  `WindowsChanged` follows changes of both. A caller learns from it what the user
+  did meanwhile (restored it from the dock, cleared "Always on Top" from the window
+  menu); a request's `ok` alone cannot tell it that.
+- **Keep-above lifetime:** what the extension set is undone when the caller's bus
+  connection goes away (an app that exits or crashes leaves no window stuck on top)
+  and when the extension is disabled. Only what it set: a user's own "Always on Top"
+  on the same window is never undone behind their back — including one the user
+  cleared and set again after the app's request (any clear ends the extension's
+  claim); an explicit `SetKeepAbove(false)` does clear it, as the window menu would.
+  A request still waiting for its sender's PID when the extension is disabled does
+  nothing. A consumer that
+  wants keep-above to persist re-applies it when the extension reappears and when
+  its window is recreated (the DisplayXR plugin does).
+- **No maximize.** An app that places its own window (the DisplayXR plugin moves a
+  resized window back and re-applies its size) fights a maximize, and mutter keeps a
+  maximized window in the normal layer whatever its "above" flag says.
+  `SetKeepAbove(true)` on a maximized window is refused, as GNOME's window menu greys
+  "Always on Top" out for it.
+- **`ActivateWindow` timestamp.** `activate(0)` skips mutter's focus-stealing check
+  but, for a window on another workspace, only marks it as demanding attention.
+  `Main.activateWindow()` would also close the Overview and the calendar. A
+  server-roundtrip timestamp brings the window to the front with focus, restores it
+  from minimized and switches to its workspace. It is newer than any user input, so
+  focus-stealing prevention does not hold it back: in version 15 an app took
+  keyboard focus even while the user was typing in another app (measured, §11.5).
+  Version 17 decides first whether the app may take focus at all (§11.6).
+
+The pure part (gate, keep-above bookkeeping, maximized on both sides of mutter 49's
+API change, minimize) is the `OwnWindow` object in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_own_window.js`. The consumer is the DisplayXR Unity
+plugin (`displayxr_linux_set_keep_above` / `_activate_window` / `_set_minimized`).
+
+### 11.3 Mutter policy a consumer should know
+
+- **Keep-above changes focus for new windows** (mutter's rule, the same for a user's
+  own "Always on Top"). While some window has focus, a new window that mutter finds
+  covered by a kept-above window does not get focus; it is stacked under the focused
+  window (and flagged as demanding attention if it overlaps that one). Coverage is
+  measured on the kept-above window's frame rectangle, not its visible pixels — a
+  transparent avatar window counts as its whole rectangle. Which rectangle of the
+  new window is tested depends on the version (measured, below):
+  - **mutter 47+** (GNOME 47+, Ubuntu 26.04): the window where it opens, denied
+    when about 60 % or more of it is covered
+    (`window_would_mostly_be_covered_by_always_above_window`, visible area ≤ 40 %).
+  - **mutter 42–46** (Ubuntu 22.04, 24.04): `window_would_be_covered()` runs before
+    the window is placed, on the rectangle `(work-area x, work-area y, W, H)` — the
+    top-left corner of the primary monitor's work area with the new window's size.
+    Any overlap of that rectangle with a kept-above window denies focus, wherever
+    the window then opens; coverage of its final position does not matter (100 %
+    covered still gets focus). In practice: a kept-above avatar on a secondary
+    monitor (the 3D panel, typically) never takes focus from new windows; one on
+    the primary monitor takes it from every new window large enough to reach the
+    avatar from the top-left corner. Measured on mutter 42.9 and 46.2 with 1-px
+    probes (edges at exactly `x + W` and `y + H`), Wayland and Xwayland clients
+    alike, two monitors (the rectangle stays on the primary / (0,0) monitor; a
+    layout where those differ was not tested).
+- **Keep-above and maximize:** a window made above and maximized afterwards stays in
+  the top layer only until the next relayer (any window opening), then drops to the
+  normal layer while `is_above()` still reads true.
+
+### 11.4 Verified (private headless GNOME Shell 50.1)
+
+GTK4 test windows and the real Unity player (a Lenovo Avatar build on sim_display,
+`DXR_PLUGIN_EXCLUSIVE=sim-display`, native Wayland), each calling from its own
+process:
+
+- capabilities 255; all three members refused for another process naming the app's
+  PID, the window unchanged;
+- keep-above holds the stack while another app's larger window has focus; cleared on
+  request;
+- activate from the background (another app focused), from minimized, and on another
+  workspace (switches to it): focus each time; `SetMinimized(false)` restores without
+  focus;
+- minimize with the player's Vulkan weave running: the player keeps running and is
+  restored by its own later request;
+- maximized window: `SetKeepAbove(true)` refused and the window untouched; accepted
+  after unmaximize;
+- bus disconnect and extension disable each undo the keep-above the extension set; a
+  user's own "Always on Top" survives both; a closed window leaves no record;
+- extension disabled and enabled again: the plugin re-applies keep-above.
+
+- a user who clears "Always on Top" and sets it again keeps it after the app
+  disconnects; without the user's toggle it is undone.
+
+### 11.5 Verified (real GNOME 50.1 session, Ubuntu 26.04, Leia SR panel)
+
+The same Unity player, native Wayland, weaving on the panel, with the DisplayXR
+Unity plugin as the caller:
+
+- keep-above: the window stays above a file manager window dragged over it while
+  another app has focus;
+- activate while the user holds a key in a text editor: keyboard focus moves to the
+  app (the editor's key repeat stops) — focus-stealing prevention does not apply;
+- screen locked: all three refused; after unlock the plugin re-sends keep-above
+  (done), activate and minimize are not replayed;
+- right-button drag of the window (extension pointer drag): all three refused;
+  keep-above re-sent after the drop (done);
+- minimize, then restore from the Ubuntu dock: the weave shows correctly again.
+
+GNOME 42.9 and 46.2 (Ubuntu 22.04 / 24.04 in rootless containers, headless, software
+rendering, GTK4 test windows; extension versions 16 and 17, installed as the
+packages do — on 42 the legacy entry point): the extension loads with no JS errors
+(capabilities 231 on 42, without the move-sync bits as designed; 255 on 46); keep-above
+on and off holds the stack while another window has focus; activate (same
+workspace, from minimized, across workspaces), minimize and restore, MoveWindow; a
+maximized window's keep-above is refused; the undo on disconnect leaves a user's own
+"Always on Top" alone; all four members refused for another process naming the pid
+(version 16; version 17 the same, except that activation from the background is
+refused and flagged by its focus policy, §11.6). The keep-above focus rule was
+measured there too (§11.3). Not verified: GNOME 47–49
+at run time, and anything on real hardware before 50.
+
+### 11.6 ActivateWindow's focus policy (extension version 17)
+
+Version 15 let an app take keyboard focus at any time, also while the user was typing
+in another app (§11.5). From version 17, `ActivateWindow` takes focus only from the
+app itself:
+
+- **Focus** when the user's latest key press or click went to one of the app's
+  windows, and the user has not moved focus away from it since. Then it behaves as
+  before: to the front, restored from minimized, its workspace switched to.
+- **Otherwise no focus:** nothing changes except that mutter flags the window as
+  demanding attention (GNOME shows "… is ready"; a window in full view is not
+  flagged, mutter's rule). A minimized window stays minimized. `ok` is `false`.
+  This is what GNOME does for any app that asks from the background.
+
+"Input" is mutter's per-window user time: mutter stamps it on every key press,
+button press and touch on a window, before shortcuts are handled (`core/events.c`),
+and on every activation.
+
+- For the **app**, only those stamps count (`notify::user-time`, which only
+  `meta_window_set_user_time` emits). A new window's starting value — its creation
+  time, not a stamp — does not: recreating a window or opening a new one earns no
+  focus.
+- For **every other app** the starting value counts too (another app's window that
+  just came up wins; a dialog starts at its parent's time), and so does mutter's own
+  newest input (`Meta.Display.get_last_user_time()`), which a window that closes
+  cannot take back. A time 2^31 ms (24.8 days) or more from now is ignored: the
+  32-bit order does not hold across that distance.
+
+So:
+
+| what the user did last | ActivateWindow |
+|---|---|
+| typed or clicked in another app | no focus |
+| another app's window came up (no input) | no focus |
+| clicked the app, then Alt+Tab / Super+H / minimized it from the dock / clicked elsewhere | no focus ("left it") |
+| clicked or typed in the app, and the app minimized **itself** through `SetMinimized` (also while its dialog had focus) | focus (the app stepped aside; the user did not leave) |
+| clicked or typed in the app, nothing since | focus |
+| no window has focus (and the user has not left the app) | focus (nothing to take it from) |
+| came back to the app (new input in it) after leaving | focus |
+
+It is mutter's own focus-stealing rule, applied with the time of the app's last
+input instead of "now". It also limits the rate by itself: once the user is
+elsewhere, nothing the app does takes focus until the user comes back to it, so no
+separate rate limit is needed. Input injected through the RemoteDesktop portal
+counts like the user's own. An app that wants its window back on screen anyway
+restores it with `SetMinimized(false)`, which never takes focus. A minimize the app
+does any other way (`xdg_toplevel.set_minimized`, a minimize button in its own
+title bar) counts as the user leaving.
+
+**Not covered: a global shortcut that summons the app.** mutter stamps the press on
+the window that has focus (another app's), before the shortcut runs, so an app that
+calls `ActivateWindow` in response is refused and flagged. No current caller does
+this; letting the extension's own `WorkspaceHotkey1` client through for its press
+(the extension knows both) would be the natural follow-up if one does.
+
+Consumers:
+
+- The DisplayXR Unity plugin (`displayxr_linux_activate_window`) logs
+  "window activate: refused" for a `false`; nothing is retried (as before).
+- `XR_DXR_desktop_control` (ADR-056), the app's own window: when `ActivateWindow`
+  refuses, the agent does what the user would, a Super+click on the window through
+  the app's portal session, as it already does for any other window: restored first
+  if minimized, and kept above for the click if it is not already (put back
+  afterwards), so a window covered by another one is reachable. A window on another
+  workspace is not (no visible part to click). `RESTORE` succeeds once the window is
+  restored; focus is best effort. The agent has the user's consent, and its safety
+  layer (idle wait, kill switch, lock) applies to the gesture.
+
+The pure part is `OwnWindow.mayTakeFocus` / `focusMoved` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_own_window.js` (section 6).
+
+Verified (private headless GNOME Shell 50.1, GTK4 test windows, input through that
+instance's `org.gnome.Mutter.RemoteDesktop`): the user types in B, A asks → `false`,
+B keeps focus; the user clicks A, A minimizes itself, A asks → `true`, restored with
+focus; the same but the user types in B after the minimize → `false`, A stays
+minimized and flagged; the user clicks A and presses Super+H → `false`; the user
+clicks A, then minimizes it without a key on it (the dock) → `false`; the user
+clicks A and stays → `true`; the user clicks A, then B opens → `false`; the user
+clicks A, then B, then A again, A minimizes itself and asks → `true`; the user
+clicks A, then Alt+Tab to B → `false`. The version 15 suite passes except its two
+"activate from the background" cases, which now answer `false` and flag the window
+— the change itself. No JS errors.
+
+## 12. The pointer — `WindowGeometry1.GetPointer` (extension version 16)
+
+### 12.1 Why
+
+A Wayland client learns where the pointer is only while it is over the client's own
+surface. An assistant app that reads or acts on what the user points at ("which
+window is under my mouse?", "what text is under my mouse?") therefore cannot answer
+on GNOME Wayland: there is no protocol for a global position. GNOME 50's
+`org.freedesktop.a11y.PointerLocator` only answers the Orca screen reader, and a
+ScreenCast stream with cursor metadata costs a consent dialog and keeps the
+screen-sharing indicator on for as long as the app listens. The compositor knows the
+position, and this extension already publishes every window's geometry.
+
+### 12.2 D-Bus surface
+
+`GetPointer() -> (s json)` on `org.displayxr.WindowGeometry1`:
+
+```json
+{ "version": 1, "x": 1180, "y": 640, "layout_mode": "logical",
+  "over": "window", "window": { …a GetWindows entry… }, "window_type": 0 }
+```
+
+- `x`, `y`: stage coordinates, the same space as the snapshot (`layout_mode` says
+  which; absent when it cannot be told).
+- `over`:
+  - `window`: an app window is what a click there would meet;
+  - `desktop`: the desktop background, or a window that is the desktop (type
+    DESKTOP, or Ubuntu's desktop-icons window "ding", a NORMAL window before
+    mutter 49 because only 49+ lets it set its type);
+  - `shell`: shell UI is on top (the panel, a shell popup, the overview);
+  - `outside` (GetWindowAt only): the point is on no monitor (negative, beyond
+    the stage, or in the gap beside a smaller monitor) — no click can reach it.
+- `window`: the snapshot entry of the window hit (also for a desktop window), else
+  `null`. `window_type` is mutter's `Meta.WindowType` number: 0 NORMAL, 1 DESKTOP,
+  2 DOCK, 3 DIALOG, 4 MODAL_DIALOG, 5 TOOLBAR, 6 MENU, 7 UTILITY, 8 SPLASHSCREEN,
+  9 DROPDOWN_MENU, 10 POPUP_MENU, 11 TOOLTIP, 12 NOTIFICATION, 13 COMBO, 14 DND,
+  15 OVERRIDE_OTHER. A popup menu (an xdg_popup) has no app_id or title of its own;
+  its entry carries `parent_id`, the owning window's `id`.
+- While the screen is locked: `{"version": 1, "locked": true}` and nothing else.
+
+`GetWindowAt(i x, i y) -> (s json)` gives the same reply for a given stage point
+instead of the pointer: what a click at that point would meet (a caller checks a
+target before acting on it, or resolves "the window at x, y").
+
+`GetAllWindows() -> (s json)` is `GetWindows`' snapshot with the app's dialogs and
+utility windows too (types NORMAL, DIALOG, MODAL_DIALOG, UTILITY; not menus,
+popups, tooltips, docks or the desktop), each entry with its `window_type`. A
+"Save changes?" dialog that takes the focus after a close request is in it, so a
+caller can see where the keyboard went. `GetWindows` keeps to normal windows: its
+consumers (the runtime, the Unity plugin) look up an app's main window in it.
+
+Every window entry (in `GetWindows`, `GetAllWindows`, `WindowsChanged` and here) also gains `id`:
+mutter's window id (`Meta.Window.get_id()`), unique and stable for the window's
+lifetime (a client that recreates its toplevel gets a new one). It is an
+**unsigned 64-bit** number and is above INT32_MAX in about half of all sessions:
+read it as int64 or double, never as a 32-bit int. A transient window (a popup, a
+dialog) also has `parent_id`. Every entry also says `maximized` (both ways; a
+half-tiled window is not) and `fullscreen`, so a client that sends the user's
+maximize toggle (mutter's `toggle-maximized`) knows which way it will go. Additive;
+the schema stays `version: 1`.
+
+The hit is found the way a click is: `global.stage.get_actor_at_pos(REACTIVE)` —
+the same reactive pick mutter uses for Wayland pointer focus — then the first
+ancestor that is a window actor. Stacking order, input regions (a click-through
+window, e.g. the transparent part of a DisplayXR overlay app, is passed over to the
+window behind) and shell UI on top all count as they would for a click. One
+exception: while a grab is open (a shell menu, Alt+Tab, a modal dialog, a Wayland
+popup grab) a click only ends the grab, although the pick still names the window.
+The pure part is `PointerPick` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_pointer.js`.
+
+**Trust.** Read-only and open to any session-bus client, like `GetWindows`, which
+already lists every window. The addition is where the pointer is — what X11 gives
+every client; GNOME's own `org.gnome.Shell.Introspect` is narrower (allow-listed
+callers only). A same-user process could poll it to follow the pointer. This is a
+deliberate choice for assistant apps; gating it (for example answering only callers
+that own the focused window) would defeat "what is under my mouse" while the app is
+in the background. Nothing is reported on the lock screen. From version 18 the
+window entry has no `title` unless the caller was authorised for titles (§12.5).
+
+### 12.3 Verified (private headless GNOME Shell 50.1)
+
+Pointer driven through that instance's `org.gnome.Mutter.RemoteDesktop`:
+
+- two overlapping windows: the one on top is reported;
+- the desktop background: `over: desktop` (a shell without the desktop-icons
+  extension; with it, the "ding" window is reported as `desktop` by the rule above,
+  unit-tested); the top bar: `over: shell`; a point on no monitor: `outside`;
+- a click-through window (empty input region) on top: the window behind it is
+  reported, and a real click at the same point is received by that window behind.
+
+### 12.4 The rule: read-only for other apps' windows
+
+The extension reads other apps' windows and never changes them. This is a rule for
+every future version, not only a description of this one.
+
+- **Reading** other apps' windows: `GetWindows`, `WindowsChanged`, `GetAllWindows`,
+  `GetPointer`, `GetWindowAt`. They report; nothing else. Their window titles go
+  only to a caller authorised for them (version 18, §12.5).
+- **Changing** a window: `MoveWindow` and the drag members (§7–§9),
+  `CaptureExclusion1` (§6), `SetKeepAbove` / `ActivateWindow` / `SetMinimized` (§11).
+  Each acts only on the caller's own window, found by the caller's PID from the bus
+  daemon; an argument can name only the caller.
+- **Never added:** a member that moves, resizes, raises, focuses, minimizes,
+  maximizes, closes, hides or restacks another process's window, excludes it from
+  capture, or sends it input — not behind a flag, an allow-list or a setting either.
+  A reviewer's test: a new member that takes another window's id, a point or a title
+  and changes something there is out of scope.
+
+**Why.** The extension ships enabled with every DisplayXR install and answers every
+process of the user on the session bus. A member that controlled other windows would
+let any program the user runs drive any window, and GNOME would never ask the user:
+the question the RemoteDesktop portal asks ("may this app control your computer?")
+would be skipped for every app at once. ADR-056 ("Why DisplayXR must not just 'do
+it' in a shared component", D5) has the full argument.
+
+**Where it goes instead.** An app that must act on other apps' windows uses
+`XR_DXR_desktop_control` (ADR-056). The runtime, inside the app's own process, gets
+the user's consent through the RemoteDesktop portal, sends input through libei, and
+moves other windows the way the user would (Super gestures, the user's shortcuts),
+with the kill switch, the lock-screen pause and the audit log. It reads the results
+back through the read-only members above.
+
+**Changing the rule takes an ADR first.** The one open candidate is ADR-056 open
+question 1: a primitive gated on proof that the caller holds an approved
+RemoteDesktop session, which mutter cannot give today.
+
+### 12.5 Window titles go only to an authorised caller (extension version 18)
+
+This follows the maintainer's direction on the Unity plug-in's read-only
+desktop-info PR (DisplayXR/displayxr-unity#389): the GNOME extension stops handing
+window titles to callers that have not been authorised.
+
+**Why.** Everything else in a window entry is geometry and state. A title is
+content: a document name, a mail subject, who a chat is with. ADR-056 lists titles
+under *observe*, behind the user's desktop-control grant (on macOS reading them
+needs Screen Recording). Up to version 17 the extension gave every window's title to
+any session-bus client, in every reply and in every `WindowsChanged`.
+
+**D-Bus surface.** `SetTitleAccess(u pid, b allow) -> (b titles)` on
+`org.displayxr.WindowGeometry1`.
+
+- `pid` names the caller: 0 or its own PID, which the extension reads from the bus
+  daemon (`GetConnectionUnixProcessID`), as for every member of §11. Any other value,
+  or a caller whose PID the bus daemon cannot give, is refused.
+- The access is for the calling **bus connection** (its unique name), not for the
+  whole process. Other connections of the same process do not get titles.
+- `allow = true` is refused on the lock screen. `titles` is true when the
+  connection gets titles from now on.
+- It ends with `SetTitleAccess(…, false)`, when the connection closes (exit, crash,
+  a closed private connection) or when the extension is disabled. The extension
+  keeps nothing across a restart.
+- Both answers go through the PID lookup in the order they arrive, so a revoke never
+  overtakes the grant it follows.
+
+**What a reply carries.**
+
+| Member | Version 17 | Version 18 |
+|---|---|---|
+| `GetWindows`, `GetAllWindows`, `GetPointer`, `GetWindowAt` | `title` for every caller | `title` only for an authorised connection; for any other caller the key is absent |
+| `WindowsChanged` | `title` | never `title`: a signal reaches every listener |
+| `CaptureExclusion1.GetState` (`windows[]`) | `title` | as the getters |
+| Any of them while the screen is locked | `title` | no `title` for anyone |
+
+A withheld title is a missing key, never `""`. An authorised caller still reads `""`
+for a window that has no title. The schema stays `version: 1`: `title` keeps its
+meaning when present. The pure part is `TitleAccess` in `lib.js`, unit-tested by
+`scripts/test_gnome_extension_title_access.js`, which also checks that `lib.js`
+reads a window title in one place only.
+
+**Who calls it.** The runtime's GNOME desktop-control backend
+(`u_desktop_gnome.c`), on its private observation connection, the one that every
+window list, pick and pointer read goes through. The common layer
+(`u_desktop_control.c`) calls the backend's `grant_changed` when the CONTROL scope
+becomes GRANTED and when it stops being GRANTED: denied, revoked by the OS, the kill
+switch, the store's per-app switch, the lock screen, a new prompt, and before the
+session's backend is destroyed. It notices those changes on the next call into the
+object (the app's, or the worker's input guard), which is also when the app's state
+event fires. Until then the authorised connection is still the runtime's private
+one, and the runtime reads nothing through it while the state is not GRANTED. If a
+reply comes back without titles while the grant holds (the extension was disabled
+and enabled again), the backend asks once more, at most once a second.
+
+**Trust.** The extension cannot verify a desktop-control grant: mutter does not say
+which client holds a RemoteDesktop session (ADR-056 open question 1).
+`SetTitleAccess` is the runtime saying that the user granted it, and the runtime
+says so only while the grant lasts. A same-user process can call it for itself and
+get titles, just as it can read them from the accessibility bus. What version 18
+changes is that no client gets other apps' titles by default, including every
+`WindowsChanged` listener. A client has to ask for them explicitly, by name, on its
+own connection. Gating on proof of an approved portal session is still the open
+question.
+
+**Compatibility.**
+
+| Runtime \ extension | 17 or older | 18 |
+|---|---|---|
+| Without `SetTitleAccess` (v2.50.0 and older) | titles for everyone, as before | titles are withheld from the runtime too: `XR_DXR_desktop_control`'s window list, pick and pointer report empty titles, and the AT-SPI reads that find a window's frame by its title (text at a point, the paste check) come back empty or unverified. Update the runtime. |
+| With it | the call fails with `UnknownMethod`: logged once, nothing else changes (titles for everyone, as before) | titles only while the app holds the grant |
+
+No other consumer in this repository reads titles (the geometry provider
+`comp_vk_native_wl_geom` matches windows by PID), and the Unity plug-in's read-only
+desktop info (#389) leaves them out by design. A consumer that needs other apps'
+titles holds the user's desktop-control grant and reads them through
+`XR_DXR_desktop_control`.
+
+**Verified (private headless GNOME Shell 50.1, sim_display only).** Two test
+windows, one with capture exclusion. Each check is a fresh bus connection or the
+probe (`desktop_control_probe`, the runtime in its process):
+
+- With no grant, every member and every `WindowsChanged` emitted while a window
+  opened and closed had entries and no `title` key.
+- `SetTitleAccess` with another process's PID was refused; with 0 or the caller's
+  own PID it was granted. Only that one connection got titles (GetWindowAt and
+  GetState included); two other connections of the same process got none. A revoke
+  took effect at once, and closing the connection removed it.
+- On the lock screen the granted connection got entries without titles and a new
+  grant was refused. After unlock its titles were back without asking again.
+- The granted runtime listed the real titles and read the text at a point, while a
+  client in another process saw no title at any step. The extension listed exactly
+  one connection, the probe's, only while GRANTED: not after `desktop stop`, again
+  after `resume`, not after `desktop deny`, again after `forget`, and nobody after
+  the probe exited.
+- The extension was disabled and enabled while granted. The new instance had no
+  record of the grant; the runtime's next list asked again ("granted again") and
+  had the titles.
+- A v2.50 runtime against version 18 was GRANTED, listed every title empty and read
+  `""` at the point that this runtime read. This runtime against version 17 listed
+  the titles, logged the older extension once and logged no warning.

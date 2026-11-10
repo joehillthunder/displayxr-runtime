@@ -19,6 +19,7 @@
 #include "os/os_threading.h"
 
 #include "util/u_logging.h"
+#include "util/u_tracking_any.h"
 
 #include "shared/ipc_protocol.h"
 #include "shared/ipc_message_channel.h"
@@ -60,6 +61,7 @@ extern "C" {
 #define IPC_MAX_CLIENT_SPACES 128
 
 struct xrt_instance;
+struct ipc_server_stereo_camera;
 struct xrt_compositor;
 struct xrt_compositor_native;
 
@@ -97,6 +99,13 @@ struct ipc_client_state
 
 	//! Is the inputs and outputs active.
 	bool io_active;
+
+	//! XR_DXR_display_info v25: this client's locates are fixed-viewer
+	//! (XrViewLocateFixedViewerDXR) — its views are framed for the nominal
+	//! viewer and it asks the viewer tracking for nothing, so no viewer-
+	//! tracking provider is started for it. Set by compositor_set_fixed_viewer
+	//! on change; cleared with the session.
+	bool fixed_viewer;
 
 	//! Number of swapchains in use by client
 	uint32_t swapchain_count;
@@ -158,6 +167,10 @@ struct ipc_client_state
 
 	int server_thread_index;
 
+	//! Set as the client thread's last act (after common_shutdown), so
+	//! the server can wait for it without blocking its main thread (#1815).
+	bool thread_done;
+
 	xrt_shmem_handle_t ism_handle;
 
 	//! #954: OS-derived peer identity, set once at accept. peer_pid is the
@@ -175,21 +188,56 @@ struct ipc_client_state
 	//! connection. Equal to peer_pid until a peer declaration is accepted, after
 	//! which peer_pid becomes the DECLARED target and this stays the authoriser.
 	long opener_pid;
+	//! The opener's uid (SO_PEERCRED on Linux / Android; -1 = unknown or
+	//! not available). Android's stereo camera consent keys on it (the
+	//! package + signing certificate of that uid) and on which connections
+	//! of the same uid present (stereo-camera-android §4).
+	long peer_uid;
+	//! os_monotonic_get_ns() of this connection's last successful weave
+	//! submit (XR_DXR_weave), 0 = never. Written by its own IPC thread, read
+	//! racily by the stereo camera's front-camera gate.
+	int64_t last_weave_ns;
+	//! Input focus follows the APPLICATION (ipc_app_group.h): the peer's
+	//! executable and parent pid, read once at describe_client (best-effort,
+	//! "" / 0 = unknown), so a sibling connection of the focused client can be
+	//! recognised without a syscall on the per-frame path.
+	char peer_exe_path[512];
+	long peer_parent_pid;
+	//! This connection is NOT the focused one but belongs to the focused
+	//! client's application, so its device reads are live (client_input_allowed).
+	//! Written under global_state.lock on flush, read racily per frame.
+	bool input_focus_shared;
+	//! #2262: the session-state event the server itself pushed for a shared
+	//! sibling (FOCUSED, so the app's xrSyncActions runs) — what it last said,
+	//! so a repeat flush pushes nothing and a change pushes once.
+	bool shared_focus_event_sent;
+	bool shared_focus_event_visible;
 
 	//! browser#103 RC-1: a peer declaration has been settled on this connection.
 	//! Settled ONCE — a second declaration is refused, so no client can move its
 	//! identity after gates have run against it.
 	bool peer_declared;
 
+	/*!
+	 * ADR-034 Amendment 5 (#2181): the per-app key of this connection — the
+	 * executable BASENAME of the peer process (`SampleGame.exe`), resolved by
+	 * the server from the OS-derived pid at accept and again when a peer
+	 * declaration moves @ref peer_pid. Never taken from anything the client
+	 * sends (`XrInstanceCreateInfo::applicationName` included). "" when the OS
+	 * would not tell us (a restricted-token peer): such a client has no
+	 * per-app pin and cannot persist one.
+	 */
+	char input_exe_basename[XRT_INPUT_EXE_BASENAME_SIZE];
+
 	//! browser#103 RC-1: a handle has already been duplicated to this client
 	//! (instance_get_shm_fd ran). A declaration arriving after this point is too
 	//! late to be honoured and is refused.
 	bool handles_sent;
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX // desktop Linux (v10 dma-buf) + Android (v20 sync_file)
 	/*!
-	 * XR_DXR_weave v10 (#1699): fds this process handed to a weave reply and
-	 * must close AFTER that reply is on the wire.
+	 * XR_DXR_weave v10 (#1699) / v20 (Android): fds this process handed to a
+	 * weave reply and must close AFTER that reply is on the wire.
 	 *
 	 * The generated server dispatch sends a handler's out handles with
 	 * ipc_send_fds, which (SCM_RIGHTS) installs a copy in the client and does
@@ -204,7 +252,60 @@ struct ipc_client_state
 	 */
 	int weave_deferred_close_fds[4];
 	uint32_t weave_deferred_close_count;
+
+	/*!
+	 * XR_DXR_weave v20 (Android): the acquire sync_file of the NEXT
+	 * weave_submit_sync, delivered by weave_set_acquire_fence just before it
+	 * (a call carries one handle type, and the submit's in_handles are
+	 * AHardwareBuffers). Owned by this client state until a submit consumes
+	 * it; teardown closes a leftover. Flag-gated, so a zeroed state is empty.
+	 */
+	int weave_pending_acquire_fd;
+	bool weave_have_pending_acquire;
 #endif
+
+	/*!
+	 * XR_DXR_lift (ADR-042): this connection's lift-stream owner token, taken
+	 * from a process-wide counter on first lift use (0 = never used lift). A
+	 * token, not the ics pointer: the thread slot is reused by later
+	 * connections, and a stale stream must never resolve for them. Released —
+	 * every stream it owns destroyed — at client teardown.
+	 */
+	uint64_t lift_owner;
+
+	/*!
+	 * XR_DXR_lift v3: EXPLICIT viewpoints of lifted weave rects, staged by
+	 * lift_weave_rect_viewpoints and consumed (cleared) by the next
+	 * lift_weave_rects on this connection — they do not fit that message.
+	 */
+	struct ipc_arg_lift_rect_viewpoints lift_staged_vps[IPC_LIFT_WEAVE_RECTS_MAX];
+	uint32_t lift_staged_vps_count;
+
+	/*!
+	 * XR_DXR_stereo_camera (ADR-043): this connection's stream-owner token,
+	 * taken from the camera manager on first stream create (0 = never used a
+	 * camera). A token, not the ics pointer: the thread slot is reused by later
+	 * connections. Every stream it owns is destroyed at client teardown.
+	 */
+	uint64_t stereo_camera_owner;
+
+	/*!
+	 * ADR-061: the session opted out of app share (XrSessionShareabilityDXR
+	 * shareable = XR_FALSE, xrt_session_info::app_share_not_shareable). Set at
+	 * session create; the camera manager never lists such a session.
+	 */
+	bool app_share_opt_out;
+
+	/*!
+	 * ADR-047 Amendment 7: this connection's session-level tracking state —
+	 * the OR over every DP presenting for it, debounced on a screen
+	 * hand-over (util/u_tracking_any.h). One for the eye query its
+	 * xrLocateViews makes, one for the XR_DXR_weave submit's eyesTracking.
+	 * Touched only by this client's own IPC thread; zeroed with the rest of
+	 * the state at connect.
+	 */
+	struct u_tracking_any tracking_any_locate;
+	struct u_tracking_any tracking_any_weave;
 };
 
 enum ipc_thread_state
@@ -330,6 +431,12 @@ struct ipc_server_mainloop
 	//! The socket filename we bound to, if any.
 	char *socket_filename;
 
+	//! Self-pipe the SIGTERM/SIGINT handler writes to; read end is in epoll (#1744).
+	int signal_pipe[2];
+
+	//! Is @ref signal_pipe open? (The struct starts zeroed, and 0 is a valid fd.)
+	bool signal_pipe_valid;
+
 	/*! @} */
 
 #define XRT_IPC_GOT_IMPL
@@ -349,6 +456,12 @@ struct ipc_server_mainloop
 
 	//! The socket filename we bound to, if any.
 	char *socket_filename;
+
+	//! Self-pipe the SIGTERM/SIGINT handler writes to; read end is in epoll (#1744).
+	int signal_pipe[2];
+
+	//! Is @ref signal_pipe open? (The struct starts zeroed, and 0 is a valid fd.)
+	bool signal_pipe_valid;
 
 	/*! @} */
 
@@ -462,6 +575,11 @@ struct ipc_server
 	//! controller is active.
 	unsigned long workspace_controller_pid;
 
+	//! #1006 Android: UID of that controller (SO_PEERCRED at activate), -1
+	//! when none / unknown. The runtime's Java side keys its surface gate and
+	//! slot broker on it (the workspace overlay mode, ADR-036 D4).
+	long workspace_controller_uid;
+
 	struct ipc_thread threads[IPC_MAX_CLIENTS];
 
 	//! #959: runtime-admitted client cap, <= IPC_MAX_CLIENTS. Set at start from
@@ -484,6 +602,14 @@ struct ipc_server
 
 		struct os_mutex lock;
 	} global_state;
+
+	//! XR_DXR_stereo_camera (ADR-043): the camera manager (never NULL once
+	//! the server is initialised; it may expose zero cameras).
+	struct ipc_server_stereo_camera *stereo_camera;
+
+	//! ADR-051 D3: the display status snapshot + generation counters
+	//! (`ipc_server_status.c`); NULL only if its allocation failed.
+	struct ipc_server_status *status;
 };
 
 
@@ -568,15 +694,39 @@ ipc_server_client_thread(void *_ics);
 void
 ipc_server_client_destroy_session_and_compositor(volatile struct ipc_client_state *ics);
 
-#ifdef XRT_OS_LINUX_DESKTOP
+#ifdef XRT_OS_LINUX
 /*!
  * Close every fd parked in ics->weave_deferred_close_fds (XR_DXR_weave v10,
- * #1699). Called at the top of the weave dma-buf handlers and at client
+ * #1699; v20 on Android). Called at the top of the weave dma-buf handlers and at client
  * teardown. Only safe once the reply that carried those fds has been sent.
  */
 void
 ipc_server_client_weave_flush_deferred_fds(volatile struct ipc_client_state *ics);
 #endif
+
+/*!
+ * XR_DXR_lift (ADR-042): destroy every lift stream this client created. Called
+ * once at client teardown; a no-op for a client that never used lift.
+ */
+void
+ipc_server_client_lift_release(volatile struct ipc_client_state *ics);
+
+/*!
+ * ADR-034 Amendment 5 (#2181): resolve @p pid's executable basename into
+ * @p ics->input_exe_basename (the connection's per-app key). Best effort —
+ * "" when the OS will not say. Called at accept and on an accepted peer
+ * declaration; never under the server's global lock (it opens the process).
+ */
+void
+ipc_server_client_resolve_input_identity(volatile struct ipc_client_state *ics, long pid);
+
+/*!
+ * ADR-034 Amendment 5: drop this connection's session requests and cached
+ * per-client roles in the system's input selection. Called once at client
+ * teardown; the user's per-app pin is not touched.
+ */
+void
+ipc_server_client_input_release(volatile struct ipc_client_state *ics);
 
 /*!
  * @defgroup ipc_server_internals Server Internals
@@ -667,6 +817,42 @@ typedef bool (*ipc_server_client_class_verify_fn)(long peer_pid, const char *pee
 void
 ipc_server_set_client_class_verify_provider(ipc_server_client_class_verify_fn fn);
 
+#ifdef XRT_OS_ANDROID
+/*!
+ * #1006 (ADR-036 D4): Android workspace-controller verification. Android has no
+ * orchestrator pid and no controller binary path; a controller is an APP
+ * identified by its UID. The provider (registered by the runtime service) must
+ * return true iff that UID's package declares
+ * `<meta-data android:name="com.displayxr.workspace_controller" android:value="true"/>`
+ * AND is signed with the runtime's own certificate. The
+ * `DXR_ALLOW_UNVERIFIED_CONTROLLER` dev override (`debug.xrt.DXR_ALLOW_UNVERIFIED_CONTROLLER`
+ * on Android) still applies after it. Called from the client's IPC thread.
+ */
+typedef bool (*ipc_server_android_controller_verify_fn)(long peer_uid);
+
+void
+ipc_server_set_android_controller_verify_provider(ipc_server_android_controller_verify_fn fn);
+
+/*!
+ * #1006: told whenever the workspace overlay mode turns on (a verified
+ * controller activated it) or off (deactivate, or the controller went away),
+ * with the controller's UID (-1 when off). The runtime's Java side uses it to
+ * accept app surfaces only from the controller while the overlay is on and to
+ * route new IPC clients to the main-process service. Called from an IPC thread
+ * with no server lock held.
+ */
+typedef void (*ipc_server_android_overlay_fn)(bool active, long controller_uid);
+
+void
+ipc_server_set_android_overlay_hook(ipc_server_android_overlay_fn fn);
+
+/*!
+ * Internal: invoke the overlay hook (no-op without one).
+ */
+void
+ipc_server_android_notify_overlay(bool active, long controller_uid);
+#endif
+
 /*!
  * #960: short upper-case name of an enum xrt_client_class value ("APP",
  * "CONTROLLER", ...) for logs and telemetry.
@@ -675,12 +861,223 @@ const char *
 ipc_server_client_class_str(uint32_t client_class);
 
 /*!
+ * One connected slot's IPC-layer health facts — what one `[HEALTH] slot=…` log
+ * line prints (#951), kept as data so the log and the status snapshot
+ * (ADR-051 D3, phase 2) read the same struct and cannot drift.
+ */
+struct ipc_service_health_slot
+{
+	uint32_t slot;                            //!< Server thread slot index.
+	uint32_t id;                              //!< Client id.
+	int64_t pid;                              //!< Client process id.
+	uint32_t client_class;                    //!< Verified `enum xrt_client_class`.
+	bool class_verified;                      //!< false = "unverified" (describe_client not run yet).
+	char name[XRT_MAX_APPLICATION_NAME_SIZE]; //!< Application name ("" = unknown).
+	bool session_active;                      //!< Session flags.
+	bool session_visible;                     //!< See @ref session_active.
+	bool session_focused;                     //!< See @ref session_active.
+	bool input_focus_shared;                  //!< Input focus shared from the focused sibling (ipc_app_group.h).
+	bool io_active;                           //!< Input routed to this client.
+	bool primary_application;                 //!< Primary application.
+	uint32_t swapchain_count;                 //!< Live swapchains.
+	uint32_t space_count;                     //!< Live spaces.
+};
+
+//! Who holds the panel lease (#961).
+enum ipc_service_lease_kind
+{
+	IPC_SERVICE_LEASE_NONE = 0,       //!< Nobody.
+	IPC_SERVICE_LEASE_CONTROLLER = 1, //!< The connected workspace controller.
+	IPC_SERVICE_LEASE_SLOT = 2,       //!< The focused client's slot (default policy).
+};
+
+/*!
+ * The service's health summary — the `[HEALTH]` log lines as data (#951,
+ * #961, #1002). Filled under `global_state.lock`.
+ */
+struct ipc_service_health
+{
+	uint32_t slot_count;                                   //!< Valid entries in @ref slots.
+	struct ipc_service_health_slot slots[IPC_MAX_CLIENTS]; //!< Connected slots, in slot order.
+	uint32_t max_clients;                                  //!< Runtime-admitted client cap.
+	int32_t active_idx;                                    //!< Active client slot (-1 = none).
+	enum ipc_service_lease_kind lease;                     //!< Panel lease holder kind.
+	int32_t lease_slot;                                    //!< Slot holding the lease (LEASE_SLOT only).
+	bool device_removed;                                   //!< The service's D3D11 device is REMOVED.
+	bool dp_state_known;                                   //!< A service compositor reports DP backend state.
+	uint32_t dp_backend_state;                             //!< `XRT_DP_BACKEND_STATE_*` (iff @ref dp_state_known).
+};
+
+/*!
+ * ADR-051: copy the current health summary into @p out, under
+ * `global_state.lock` (the lock the `[HEALTH]` emitter holds). For the
+ * phase-2 status RPCs; safe from any thread.
+ */
+void
+ipc_server_get_health(struct ipc_server *s, struct ipc_service_health *out);
+
+/*!
+ * ADR-051 D3: what only the service TARGET can fill into a status snapshot
+ * (runtime identity, plug-ins, the screen rows — the loader lives in
+ * targets/common, above this library). Registered by the service's main;
+ * same lifetime model as the other `ipc_server_set_*_provider` hooks.
+ */
+struct ipc_server_status_provider
+{
+	//! `target_status_snapshot_build_service`: the whole snapshot from the
+	//! service's instance + DP registry + the live facts gathered here.
+	void (*build)(struct xrt_instance *xi,
+	              const struct xrt_dp_factory_registry *reg,
+	              const struct xrt_status_live *live,
+	              struct xrt_status_snapshot *out);
+	//! `target_status_snapshot_change_key`: moves with the plug-ins' load /
+	//! platform state and vendor change counters (folded into `topology`).
+	uint64_t (*change_key)(const struct xrt_dp_factory_registry *reg);
+};
+
+//! Register (or, with NULL, clear) the status provider.
+void
+ipc_server_set_status_provider(const struct ipc_server_status_provider *provider);
+
+/*!
+ * ADR-053 (#2006): where the service's conversion rows come from. The
+ * conversion core's service object registers it (HOOK for #2003, which lands
+ * the `conv_core` service object + the dp-lift adapter); until then nothing is
+ * registered and the service reports zero conversion rows, which every reader
+ * treats as "no providers" (the headless CLI path still describes them).
+ *
+ * Both callbacks run on the DIAG consumer's IPC thread under the status lock,
+ * at most at the status poll rate; they must answer from memory.
+ */
+struct ipc_server_conv_status_source
+{
+	//! Copy the current rows (provider rows <= XRT_STATUS_MAX_CONV_PROVIDERS,
+	//! task rows <= XRT_STATUS_MAX_CONV_TASKS) into @p live's conv_* fields.
+	void (*fill)(void *userdata, struct xrt_status_live *live);
+	//! The core's conversion generation: moves on every readiness transition
+	//! and provider-table change. Folded into `xrt_status_generation::conversion`.
+	uint64_t (*generation)(void *userdata);
+	void *userdata;
+};
+
+//! Register (or, with NULL, clear) the conversion status source.
+void
+ipc_server_set_conv_status_source(const struct ipc_server_conv_status_source *source);
+
+/*!
+ * ADR-053 P1a (#2003): attach the D3D11 service compositor's GPU side (image
+ * allocation, S5 / S6, the v3 route's I/O, the `dp-lift` backend, the weave
+ * bridge, the eyes sink) to the registered conversion core. Called from
+ * init_all once the system compositor exists; a no-op without a core or on
+ * another compositor. Detach before the system compositor is destroyed.
+ */
+void
+ipc_server_conv_attach_d3d11(struct xrt_system_compositor *xsysc);
+
+void
+ipc_server_conv_detach_d3d11(void);
+
+/*!
+ * ADR-053 P5: attach the conversion core's Vulkan glue (image allocation, the
+ * S5 reference view synthesis, S6 readback) to the system compositor's Vulkan
+ * device (macOS and desktop Linux: the multi system compositor's target
+ * service bundle). Called from init_all once the system compositor exists; a
+ * no-op without a core or without a Vulkan device. Detach before the system
+ * compositor is destroyed.
+ */
+void
+ipc_server_conv_attach_vk(struct xrt_system_compositor *xsysc);
+
+void
+ipc_server_conv_detach_vk(void);
+
+struct conv_core;
+
+/*!
+ * ADR-053 (#2005): the service's conversion core, or NULL when none is
+ * registered (`ipc_server_set_conv`, server/ipc_server_conv.h). One per
+ * service process; @p server is accepted for symmetry with the other
+ * accessors.
+ */
+struct conv_core *
+ipc_server_conv_core(struct ipc_server *server);
+
+/*!
+ * @name Display status snapshot (ADR-051 D3; `ipc_server_status.c`)
+ *
+ * The service-side snapshot behind the three session-free DIAG RPCs. The
+ * `topology` / `status` counters move on events (bump sites below, plus what a
+ * status read finds changed), with a 2 s floor; the snapshot is rebuilt lazily
+ * on the first piece read after a counter moved. Nothing here runs unless a
+ * DIAG consumer reads, and nothing logs.
+ * @{
+ */
+//! Allocate the status state (init_all).
+void
+ipc_server_status_init(struct ipc_server *s);
+//! Free it (teardown_all).
+void
+ipc_server_status_fini(struct ipc_server *s);
+/*!
+ * Bump a counter from an event site (client connect / disconnect, display
+ * re-probe). Takes only a leaf lock: callable while holding anything.
+ */
+void
+ipc_server_status_bump(struct ipc_server *s, bool topology);
+//! `system_get_status_generation`.
+xrt_result_t
+ipc_server_status_get_generation(struct ipc_server *s, struct xrt_status_generation *out);
+//! `system_get_status_snapshot(screen_index)`: the head + one screen row (zeroed past the count).
+xrt_result_t
+ipc_server_status_get_snapshot_piece(struct ipc_server *s,
+                                     uint32_t screen_index,
+                                     struct xrt_status_head *out_head,
+                                     struct xrt_status_screen *out_screen);
+//! `system_get_client_segments(client_id)`: that client's row + raw segment table, at the snapshot's generation.
+xrt_result_t
+ipc_server_status_get_client(struct ipc_server *s,
+                             uint32_t client_id,
+                             struct xrt_status_client *out_client,
+                             struct xrt_segment_metrics *out_metrics,
+                             struct xrt_status_generation *out_generation);
+/*!
+ * ADR-053 `system_get_conv_provider_row(index)` / `system_get_conv_task_row(index)`:
+ * one conversion row of the cached snapshot, at its generation (zeroed past the
+ * count; XRT_ERROR_IPC_FAILURE when @p index is out of range).
+ */
+xrt_result_t
+ipc_server_status_get_conv_provider(struct ipc_server *s,
+                                    uint32_t index,
+                                    struct xrt_status_conv_provider *out_row,
+                                    struct xrt_status_generation *out_generation);
+xrt_result_t
+ipc_server_status_get_conv_task(struct ipc_server *s,
+                                uint32_t index,
+                                struct xrt_status_conv_task *out_row,
+                                struct xrt_status_generation *out_generation);
+/*!
+ * Bump the `conversion` counter from an event site (the conversion core calls
+ * it per readiness transition when it has no generation callback). Leaf lock.
+ */
+void
+ipc_server_status_bump_conversion(struct ipc_server *s);
+/*! @} */
+
+/*!
  * #960: per-class admission quota (ADR-035 D6). CONTROLLER 1, RELAY 1,
  * PRESENT_OWNER 2, DIAG 4, PROVIDER_HOST 2 (outside the app budget), APP =
  * s->max_clients minus the reserved controller slot (0 = unlimited within the cap).
  */
 uint32_t
 ipc_server_client_class_quota(const struct ipc_server *s, uint32_t client_class);
+
+/*!
+ * How many admitted connections hold @p client_class right now (takes the
+ * global state lock). The stereo camera manager uses it for the CAMERA_CONSUMER
+ * quota its in-process consumers share with connections.
+ */
+uint32_t
+ipc_server_client_class_count(struct ipc_server *s, uint32_t client_class);
 
 /*!
  * Function pointer the IPC server calls to learn whether the active
@@ -704,7 +1101,7 @@ ipc_server_set_workspace_supports_file_dialog_provider(ipc_server_workspace_supp
  * Function pointer the IPC server calls to summon (spawn-if-absent) the
  * registered workspace controller on demand. The standalone service registers
  * the orchestrator's spawn entry point here so UI surfaces inside ipc_server
- * (the macOS menu-bar status item / Ctrl+Space hotkey, #61) can launch the
+ * (the macOS menu-bar status item / toggle hotkey, #61) can launch the
  * controller through the same registry-discovery + crash-respawn path as
  * startup, rather than an ad-hoc spawn. Idempotent: a no-op when the controller
  * is already running.
@@ -725,6 +1122,75 @@ ipc_server_set_workspace_summon_provider(ipc_server_workspace_summon_fn fn);
  */
 bool
 ipc_server_request_workspace_summon(void);
+
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_reload_service_config` — re-read the service's persisted
+ * config (`service.json`) and apply it live (launch hotkey, per-controller
+ * mode) without restarting a running workspace controller. Returns true when
+ * the reload was accepted (it may complete asynchronously on the service's own
+ * thread). The standalone service registers it; nothing else does.
+ */
+typedef bool (*ipc_server_service_config_reload_fn)(void);
+
+/*!
+ * Register the config-reload provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_service_config_reload_provider(ipc_server_service_config_reload_fn fn);
+
+/*!
+ * ADR-054 N3d (#2051): function pointer the IPC server calls for the DIAG
+ * RPC `system_request_component_reselect` — a component class's `Enabled` /
+ * `Preferred` policy was just written (`displayxr-cli dp|input|conv
+ * use|reset|enable|disable`); re-read it and re-select now, by that class's
+ * own lifetime rules (display: the debounced re-probe; input: an arbiter
+ * re-rank; conversion: next create re-selects). @p component_class is a
+ * `TARGET_COMPONENT_CLASS_*` id (target_component_loader.h). Returns
+ * XRT_SUCCESS when the request was queued, XRT_ERROR_FEATURE_NOT_SUPPORTED
+ * for an unknown class, XRT_ERROR_NOT_IMPLEMENTED when the service runs no
+ * watch (the CLI then says "applies at the next service start"). The
+ * standalone service registers it; nothing else does.
+ */
+typedef xrt_result_t (*ipc_server_component_reselect_fn)(uint32_t component_class);
+
+//! Register the component-reselect provider. Pass NULL to clear.
+void
+ipc_server_set_component_reselect_provider(ipc_server_component_reselect_fn fn);
+
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_workspace_launch` — spawn workspace controller
+ * @p controller_id now, through the same path as the launch hotkey. Returns an
+ * `enum ipc_workspace_launch_status` value.
+ */
+typedef uint32_t (*ipc_server_workspace_launch_fn)(const char *controller_id);
+
+/*!
+ * Register the workspace-launch provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_launch_provider(ipc_server_workspace_launch_fn fn);
+
+/*!
+ * Display dashboard phase 8: function pointer the IPC server calls for the
+ * DIAG RPC `system_workspace_hotkey_suspend` — @p suspend true takes the
+ * launch-hotkey hook out of the input pipeline (a running controller and the
+ * persisted config are untouched; the service itself resumes after a 60 s
+ * safety timeout, re-armed by every suspend), false re-installs it from the
+ * current config. NOT tied to the caller's connection: the caller is a
+ * one-shot CLI process that exits at once. Returns true when accepted.
+ */
+typedef bool (*ipc_server_workspace_hotkey_suspend_fn)(bool suspend);
+
+/*!
+ * Register the hotkey-suspend provider. Same lifetime model as
+ * `ipc_server_set_workspace_pid_provider`. Pass NULL to clear.
+ */
+void
+ipc_server_set_workspace_hotkey_suspend_provider(ipc_server_workspace_hotkey_suspend_fn fn);
 
 /*
  *

@@ -25,7 +25,48 @@
 //
 // `build()` is memoised per shell process: GObject.registerClass() must run
 // exactly once per GType name, and an extension that is disabled and re-enabled
-// (lock screen, user toggle) goes through the entry point again.
+// (user toggle, a shell older than this extension's session-modes) goes through
+// the entry point again.
+//
+// ── The lock screen (extension version 14, displayxr-runtime#2071) ─────────
+//
+// metadata.json declares `"session-modes": ["user", "unlock-dialog"]`, so GNOME
+// keeps this extension ENABLED while the screen is locked instead of disabling
+// it (and dropping the bus name) at every lock — which on a laptop is every
+// suspend. A weaving app that lives across the lock therefore keeps its
+// geometry publisher and its phase anchor. What runs on the lock screen:
+//   * the geometry snapshot + WindowsChanged (window rects of the user's own
+//     session, on the user's own session bus),
+//   * CaptureExclusion1 (removing it at lock would make every excluded window
+//     capturable for the length of the lock),
+//   * WindowPlacement1 / move sync (a client moving its OWN window; nothing a
+//     locked user can drive) — but not the version 15 requests (keep-above,
+//     activate, minimize), which are refused while locked, and not the
+//     version 16 GetPointer / GetWindowAt, which answer only {"locked": true},
+//     and no window title to anyone (version 18; SetTitleAccess is refused),
+//   * the WorkspaceHotkey1 D-Bus object (so a registered client is not lost).
+// What does NOT: the workspace hotkey's GRAB. Entering the lock screen
+// releases it and leaving it re-grabs (WorkspaceHotkey.wantGrab(…, locked)),
+// a press is never acted on while locked, and the manifest bootstrap is
+// deferred to the unlock — a lock screen must not run user-chosen actions.
+// The extension adds no UI anywhere, so it adds none to the lock screen.
+// The session-mode test is Main.sessionMode.isLocked (not currentMode, which is
+// 'ubuntu' rather than 'user' on Ubuntu), followed through its 'updated' signal.
+//
+// ── The rule: other apps' windows are read-only (spec §12.4) ───────────────
+//
+// Every member that changes a window acts on the CALLER's own window, found by
+// the caller's PID from the bus daemon. Other apps' windows are only read
+// (GetWindows, GetAllWindows, GetPointer, GetWindowAt). Never add a member that
+// moves, focuses, minimizes, closes, restacks or types into another process's
+// window, not even behind a flag: this extension answers every process of the
+// user, so such a member would skip the consent GNOME asks for. Desktop control
+// goes through XR_DXR_desktop_control (ADR-056) instead.
+//
+// Other apps' window TITLES are not read out to everyone either (version 18): a
+// reply carries "title" only to a bus connection that asked for titles with
+// SetTitleAccess — the DisplayXR runtime, while the user's desktop-control grant
+// lasts. See "Window titles" below.
 //
 // ── The D-Bus surface ───────────────────────────────────────────────────────
 //
@@ -39,7 +80,24 @@
 // Object    : /org/displayxr/WindowGeometry
 // Interface : org.displayxr.WindowGeometry1
 //   Method  GetWindows() -> (s)   JSON snapshot (schema below)
+//   Method  GetPointer() -> (s)   (version 16) the pointer and the window under it:
+//           {"version": 1, "x", "y", "layout_mode",
+//            "over": "window"|"desktop"|"shell"|"outside",
+//            "window": <a snapshot window entry> | null, "window_type"}; while the
+//           screen is locked only {"version": 1, "locked": true}. See "The pointer".
+//   Method  GetWindowAt(i x, i y) -> (s)   (version 16) the same for a given stage
+//           point: what a click there would meet.
+//   Method  GetAllWindows() -> (s)   (version 16) GetWindows' snapshot with the
+//           app's dialogs and utility windows too (a "Save changes?" dialog);
+//           every entry has "window_type".
+//   Method  SetTitleAccess(u pid, b allow) -> (b titles)   (version 18) let THIS
+//           bus connection see window titles (allow) or stop (false). pid names
+//           the caller (0 = "me"); refused on the lock screen. `titles`: this
+//           connection gets titles from now on. Lasts until revoked, until the
+//           connection goes away, or until the extension is disabled. See
+//           "Window titles".
 //   Signal  WindowsChanged(s)     same JSON, emitted on any geometry change
+//           (version 18: never with titles — a signal reaches every listener)
 //
 // Service   : org.displayxr.WindowGeometry          (same bus name)
 // Object    : /org/displayxr/CaptureExclusion
@@ -61,6 +119,12 @@
 //   Method  GetPlacementCapabilities() -> (u caps)            (version 6+)
 //             bit 0: drag lattice (the table methods below)
 //             bit 1: SetDragLatticeAt, an explicit drag start (version 8)
+//             bit 2: BeginPointerDrag / EndPointerDrag (version 9)
+//             bit 3: EnableMoveSync (version 9, #1748; GNOME 45+)
+//             bit 4: move sync is tag-gated (version 10): a synced window
+//                    is held only while a tag subsurface is mapped
+//             bits 5, 6, 7: SetKeepAbove, ActivateWindow, SetMinimized
+//                    (version 15)
 //   Method  SetDragLattice(u pid, b extend, i cell, i minDx, i minDy,
 //                          i maxDx, i maxDy, ai dx, ai dy)
 //             -> (b accepted, i startX, i startY)
@@ -73,6 +137,40 @@
 //             physical pixel grid), and a table built mid-drag is built for a
 //             position the window has already left.
 //   Method  ClearDragLattice(u pid)
+//   Method  EnableMoveSync(u pid) -> (b ok)                  (version 9)
+//             (#1748) During a compositor move of the caller's
+//             window, keep its actor at the position the frame on screen was
+//             woven for, and move it on only when a frame woven for the new
+//             position has been committed. The caller tags every commit with
+//             a 1x1 synchronised subsurface at (x mod 256, y mod 256) of the
+//             logical content position it wove for. See "Move sync".
+//             Version 10: the window is held only while that tag is
+//             MAPPED; a commit with no tag mapped (a caller showing
+//             nothing woven) drags as a plain window, and a hold ends the
+//             frame its tag goes away (capability bit 4).
+//             Lives as long as the caller's bus connection (a caller renews
+//             it when the service reappears). A window in move sync gets no
+//             drag lattice (SetDragLattice* returns false). Applies to
+//             mutter's move grab and to the pointer drag alike. Returns false
+//             where move sync is not offered (GNOME 40-44, capability bit 3
+//             clear): the caller keeps the drag lattice.
+//   Method  BeginPointerDrag(u pid, u button) -> (b started)  (version 9)
+//   Method  EndPointerDrag(u pid)
+//             The extension moves the caller's window with the pointer while
+//             `button` is held, with no grab (see "The pointer drag").
+//   Method  SetKeepAbove(u pid, b above) -> (b ok)           (version 15)
+//   Method  ActivateWindow(u pid) -> (b ok)                  (version 15)
+//             Version 17: takes focus only when the app had the user's
+//             latest input and the user has not left it since; otherwise
+//             only flags the window as demanding attention (ok false).
+//   Method  SetMinimized(u pid, b minimized) -> (b ok)       (version 15)
+//             What a Wayland client cannot do for its own window: keep it
+//             above other windows, bring it to the front with focus (from the
+//             background, minimized or another workspace), minimize and
+//             restore it. Same gate and window choice as MoveWindow; refused
+//             during a grab or a pointer drag and on the lock screen;
+//             keep-above lasts as long as the caller's bus connection. See
+//             "The caller's own window".
 //   Signal  DragLatticeNeeded(u pid, i dx, i dy)
 //   Signal  DragLatticeDone(u pid, u moves, u corrected, u misses,
 //                           u maxCorrection, u tables, b landedOnTable)
@@ -89,6 +187,28 @@
 //   progress on that window — the user is still dragging it. See
 //   displayxr-runtime#1609 and docs/specs/runtime/wayland-window-geometry.md §7.
 //
+// Service   : org.displayxr.WindowGeometry          (same bus name)
+// Object    : /org/displayxr/WorkspaceHotkey
+// Interface : org.displayxr.WorkspaceHotkey1         (extension version 13+)
+//   Method  Configure(s accelerator, s unit) -> (b pending)
+//             Grab `accelerator` (GTK syntax, "<Control>space"; "" = release
+//             and forget) as a global keybinding for the caller, and remember
+//             it — with `unit`, a systemd USER unit ("" = none) — across the
+//             caller's exit and shell restarts. `pending`: a press happened
+//             while no caller was registered, within the last 30 s.
+//   Method  Suspend(b suspend, u timeoutMs)
+//             Release the grab (a hotkey-capture box must see the chord) until
+//             Suspend(false) or the timeout (capped at 60 s).
+//   Method  GetState() -> (s)               JSON diagnostics
+//   Signal  Activated(u timestamp)          the accelerator was pressed
+//   A press while the configuring client's bus connection is alive only emits
+//   Activated. A press while it is gone (the client exited — e.g. a
+//   socket-activated service that exits when idle) also starts `unit`
+//   (org.freedesktop.systemd1.Manager.StartUnit, mode "replace") and is
+//   reported back as `pending` by the client's next Configure. The extension
+//   knows nothing about what the client does with a press. See
+//   docs/specs/runtime/workspace-controller-registration.md § Linux.
+//
 // This extension is a SHARED asset — a vendor SDK runtime package may ship it
 // to serve its own non-DisplayXR apps (one publisher, many consumers; ADR-033).
 // Keep the UUID/bus/interface identifiers and the schema rules below intact:
@@ -100,36 +220,84 @@
 // JSON schema (version 1):
 // {
 //   "version": 1,
+//   "layout_mode": "logical",               // ext v11+: mutter's layout mode,
+//                                           // "logical" | "physical"; absent
+//                                           // when it cannot be told (every
+//                                           // monitor at scale 1: both agree)
 //   "windows": [
 //     {
+//       "id": 3517497060,                   // ext v16+: mutter's window id, unique
+//                                           // and stable for the window's lifetime;
+//                                           // UNSIGNED 64-bit, often > INT32_MAX
+//                                           // (read as int64 / double, not int)
+//       "parent_id": 3517497041,            // ext v16+, transient windows only (a
+//                                           // popup, a dialog): the owner's id
 //       "pid": 1234,
 //       "app_id": "cube_handle_vk_linux",   // wm_class / Wayland app-id
-//       "title": "...",
+//       "title": "...",                     // ext v18+: ONLY to a connection
+//                                           // SetTitleAccess let in; for any
+//                                           // other caller, in every
+//                                           // WindowsChanged and while the
+//                                           // screen is locked, the key is
+//                                           // absent ("" = an untitled window)
 //       "focus": true,
 //       "xwayland": false,
 //       "frame":  [x, y, w, h],             // Meta.Window.get_frame_rect()
 //       "buffer": [x, y, w, h],             // Meta.Window.get_buffer_rect()
-//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0 },
+//       "monitor": { "x": 0, "y": 0, "w": 3840, "h": 2160, "scale": 1.0,
+//                    "device_scale": 1.0,    // ext v11+: device px per
+//                                           // stage px on this monitor (the
+//                                           // stage view's scale). Absent
+//                                           // when it cannot be told.
+//                    "work_area": [0, 32, 3840, 2128] },
+//                                           // ext v19+: [x, y, w, h], stage
+//                                           // coordinates: the part of this
+//                                           // monitor that the top bar and a
+//                                           // fixed dock leave to windows
+//                                           // (mutter's work area, on the
+//                                           // window's workspace). Absent when
+//                                           // it cannot be told.
 //       "capture_excluded": false,          // ext v2+: CaptureExclusion1 active
 //       "lattice_drop": false,              // ext v7+: the last drag ended ON
 //                                           // the drag lattice and the window
 //                                           // has not moved since. A consumer
 //                                           // that snaps drops leaves it alone.
-//       "moving": false                     // ext v3+: an interactive grab
+//       "move_sync": false,                 // ext v9+: this pid is
+//                                           // in move sync (EnableMoveSync), so
+//                                           // an app builds no drag lattice.
+//       "moving": false,                    // ext v3+: an interactive grab
 //                                           // (move/resize) is in progress on
 //                                           // this window. A consumer that
 //                                           // repositions a window waits for
 //                                           // this to go false.
+//       "minimized": false,                 // ext v15+: minimized (by the app,
+//                                           // the user or the dock)
+//       "above": false,                     // ext v15+: kept above other
+//                                           // windows (SetKeepAbove, or the
+//                                           // user's "Always on Top")
+//       "maximized": false,                 // ext v16+: maximized both ways
+//                                           // (half-tiled is not)
+//       "fullscreen": false                 // ext v16+
 //     }, ...
 //   ]
 // }
 //
-// Coordinates are Mutter's global (stage) coordinates — logical pixels. At
-// monitor scale 1.0 (the only mode windowed weaving supports anyway) these are
-// physical desktop pixels, the same space X11's root coordinates live in. The
-// runtime anchors to "buffer" (the main surface — where its pixels land) and
-// falls back to "frame" (the window geometry, which includes a client-side
-// title bar) only when "buffer" is absent (displayxr-runtime#1654).
+// Coordinates are Mutter's global (stage) coordinates. Which space that is
+// depends on mutter's layout mode (extension version 11 says which):
+//   * LOGICAL  (fractional scaling, mutter 50's default): logical px; device
+//              px = stage px x the monitor scale.
+//   * PHYSICAL (Ubuntu 24.04 / GNOME 46 at an integer scale): the stage IS
+//              device px, and "scale" only says how big clients draw. A
+//              3840x2160 monitor at 200 % is a 3840x2160 rect with scale 2.
+// So "scale" is NOT the conversion factor; "device_scale" is. A consumer that
+// multiplies by "scale" reads that monitor as 7680x4320. Every
+// field kept its meaning ("stage coordinates", "mutter's monitor scale"), so
+// the additions are additive and the schema stays version 1; a consumer
+// without them should ask mutter (org.gnome.Mutter.DisplayConfig
+// GetCurrentState "layout-mode": 1 logical, 2 physical). The runtime anchors
+// to "buffer" (the main surface — where its pixels land) and falls back to
+// "frame" (the window geometry, which includes a client-side title bar) only
+// when "buffer" is absent (displayxr-runtime#1654).
 //
 // ── Portability rules for edits to this file ────────────────────────────────
 //
@@ -153,6 +321,1127 @@
 
     let built = null;
 
+    /*
+     * ── Which table entry a drag move lands on (extension version 9) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_lattice.js loads this
+     * file under plain gjs and drives it directly.
+     *
+     * The table is every phase-correct position the compositor can reach, so
+     * each entry is equally correct; the only freedom is WHICH one a move
+     * lands on. Plain nearest (versions 6-8) treats every direction alike, so
+     * along a straight drag it picks entries on either side of the drag line
+     * in turn, and the window wiggles sideways (runtime#1748). The table
+     * cannot be made dense enough to hide that: mutter places windows at whole
+     * logical px, so above 100 % only some device px are reachable.
+     *
+     * So the choice spends the error where it shows least. The sideways
+     * error counts PERP_WEIGHT times the error along the drag, which only
+     * makes the window lead or lag the pointer a little. The lag is capped at
+     * MAX_ALONG_PX; past it, and until the drag has a direction, the choice
+     * is plain nearest. Everything is in DEVICE px (logical x monitor scale),
+     * so it behaves the same at any output scale.
+     */
+    const LatticeChoice = {
+        //! Sideways error weight relative to along-drag error (squared: 3x).
+        PERP_WEIGHT: 9,
+        //! Largest lead or lag along the drag the choice may add, device px.
+        MAX_ALONG_PX: 6,
+        //! How fast the drag direction follows a turn, device px of travel.
+        DIR_MEMORY_PX: 8,
+        //! Travel before the direction is trusted, device px (a drag from rest).
+        MIN_TRAVEL_PX: 4,
+
+        //! Per-drag state. Displacements are from the drag start, so the
+        //! first move already has a direction from (0, 0).
+        create() {
+            return {ax: 0, ay: 0, lx: 0, ly: 0};
+        },
+
+        //! Feed the raw (compositor-proposed) displacement of each move.
+        observe(st, dx, dy, scale) {
+            const mx = (dx - st.lx) * scale, my = (dy - st.ly) * scale;
+            const d = Math.hypot(mx, my);
+            if (d > 0) {
+                // The direction is an AXIS: a drag that reverses keeps it,
+                // so a step against it is folded over before it is added.
+                const sgn = mx * st.ax + my * st.ay < 0 ? -1 : 1;
+                const decay = Math.exp(-d / LatticeChoice.DIR_MEMORY_PX);
+                st.ax = st.ax * decay + sgn * mx;
+                st.ay = st.ay * decay + sgn * my;
+            }
+            st.lx = dx;
+            st.ly = dy;
+        },
+
+        /*
+         * forEach(cb) calls cb(ex, ey) for each candidate entry (logical
+         * displacements). Returns [ex, ey] or null. @p isotropic forces plain
+         * nearest (DISPLAYXR_LATTICE_NEAREST=1, for A/B comparison).
+         */
+        choose(st, forEach, dx, dy, scale, isotropic = false) {
+            const n = Math.hypot(st.ax, st.ay);
+            const aniso = !isotropic && n >= LatticeChoice.MIN_TRAVEL_PX;
+            const ux = aniso ? st.ax / n : 1, uy = aniso ? st.ay / n : 0;
+            let best = null, bestC = Infinity, near = null, nearC = Infinity;
+            forEach((ex, ey) => {
+                const cx = (ex - dx) * scale, cy = (ey - dy) * scale;
+                const d = cx * cx + cy * cy;
+                if (d < nearC) {
+                    nearC = d;
+                    near = [ex, ey];
+                }
+                if (!aniso)
+                    return;
+                const al = cx * ux + cy * uy, pe = cy * ux - cx * uy;
+                if (Math.abs(al) > LatticeChoice.MAX_ALONG_PX)
+                    return;
+                const c = al * al + LatticeChoice.PERP_WEIGHT * pe * pe;
+                if (c < bestC) {
+                    bestC = c;
+                    best = [ex, ey];
+                }
+            });
+            return best ?? near;
+        },
+    };
+
+    /*
+     * ── Move-sync tag decode (extension version 9) ──
+     *
+     * Pure logic, no GI, unit-tested by scripts/test_gnome_extension_lattice.js.
+     * The runtime puts a 1x1 synchronised subsurface at (x mod TAG_MOD,
+     * y mod TAG_MOD) of the LOGICAL content position a frame was woven for
+     * (comp_vk_native_wl_move_sync_encode); the tag rides the frame's commit.
+     */
+    const MoveSyncChoice = {
+        //! Must match COMP_VK_NATIVE_WL_MOVE_SYNC_TAG_MOD in the runtime.
+        TAG_MOD: 256,
+
+        //! v mod m, non-negative for any v (a window may sit at negative
+        //! stage coordinates on a multi-monitor layout).
+        mod(v, m) {
+            return ((Math.round(v) % m) + m) % m;
+        },
+
+        //! The tag as the offset of the tag surface from the main surface.
+        decode(tagX, tagY, mainX, mainY) {
+            const m = MoveSyncChoice.TAG_MOD;
+            return [MoveSyncChoice.mod(tagX - mainX, m), MoveSyncChoice.mod(tagY - mainY, m)];
+        },
+
+        /*
+         * Which of a window's surface actors are the tag and the MAIN
+         * surface (extension version 12). @p surfaces: one {w, h, content}
+         * per actor under the window actor with a non-empty size, in tree
+         * order; @p texture: the main surface's texture
+         * (MetaWindowActor.get_texture(), a MetaShapedTexture), or null.
+         *
+         * The tag is the 1x1 surface. The main surface is the actor whose
+         * CONTENT is that texture: mutter sets the main surface's
+         * MetaShapedTexture as its surface actor's content and hands the
+         * same object out from the window actor, so the pairing is
+         * structural — the toplevel's own surface, the one the tag is a
+         * subsurface of (runtime and present-owner alike), whatever else
+         * the client stacks around it.
+         *
+         * Versions 9-11 took the LARGEST surface instead. Under
+         * libdecor-gtk (GLFW 3.4's and SDL's stock decorations on GNOME)
+         * the shadow subsurface is larger than the content, so every tag
+         * decoded against the shadow's origin, no frame ever resolved, and
+         * the hold timed out on every title-bar drag — stale frames and 3D
+         * stutter (found on the LeiaSR OpenGL example). The largest surface
+         * stands in only without a texture (none handed out, or no actor
+         * carrying it), where it is still the version 9-11 behaviour.
+         *
+         * Returns {main, tag, byTexture}: indices into @p surfaces (-1 when
+         * absent) and whether the main surface was found by its texture.
+         */
+        pick(surfaces, texture) {
+            let main = -1, tag = -1, best = -1, byTexture = false;
+            for (let i = 0; i < surfaces.length; i++) {
+                const s = surfaces[i];
+                if (s.w === 1 && s.h === 1) {
+                    tag = i;
+                    continue;
+                }
+                if (byTexture)
+                    continue;
+                if (texture && s.content === texture) {
+                    main = i;
+                    byTexture = true;
+                } else if (s.w * s.h > best) {
+                    best = s.w * s.h;
+                    main = i;
+                }
+            }
+            return {main, tag, byTexture};
+        },
+
+        //! The newest entry of @p hist ({x, y, t}, oldest first) whose
+        //! position matches @p tag, or null.
+        resolve(hist, tag) {
+            const m = MoveSyncChoice.TAG_MOD;
+            for (let i = hist.length - 1; i >= 0; i--) {
+                const h = hist[i];
+                if (MoveSyncChoice.mod(h.x, m) === tag[0] && MoveSyncChoice.mod(h.y, m) === tag[1])
+                    return h;
+            }
+            return null;
+        },
+
+        //! Positions the window had, kept this long (and at most HISTORY_MAX).
+        HISTORY_US: 1000 * 1000,
+        HISTORY_MAX: 256,
+        //! Behind the window this long AND this many stage frames with no
+        //! newer woven frame: follow the window (the app has stalled).
+        TIMEOUT_US: 100 * 1000,
+        TIMEOUT_FRAMES: 6,
+        //! After a timeout, re-sync only on a frame woven for a position the
+        //! window had this recently.
+        RESYNC_US: 60 * 1000,
+
+        //! Per-move state: a window at buffer (x, y) whose move starts now.
+        //! @p held: whether the actor is held from the start (a tag is
+        //! mapped, see gate()). Without it the move runs as a plain window
+        //! drag, but the position history is still kept, so a hold that
+        //! starts mid-move resolves the very next woven frame.
+        create(x, y, now, held = true) {
+            return {
+                held,
+                hist: [{x, y, t: now}],
+                shown: {x, y, t: now},
+                progressUs: now,
+                progressFrames: 0,
+                followSinceUs: 0, // > 0: timed out, following the window
+                lastHistLen: 0,
+                stats: {
+                    frames: 0, advanced: 0, timeouts: 0, untagged: 0, maxBehind: 0, backHops: 0,
+                    // v10: holds started (at the start or mid-move), holds
+                    // released because the tag went away.
+                    holds: held ? 1 : 0, tagLost: 0,
+                },
+            };
+        },
+
+        /*
+         * The tag gate (extension version 10). A move-synced process holds
+         * its window only while a tag subsurface is MAPPED: a process that
+         * enabled move sync but shows nothing woven (a present-owner showing
+         * a 2D page) tags no commit, and must drag as a plain window rather
+         * than stall into the timeout on every drag. Call once per stage
+         * frame, before onFrame(), with the decoded tag of the buffer about
+         * to be painted ([x, y]) or null. Returns
+         *   'hold'    the hold continues: run onFrame()
+         *   'start'   a tag appeared: the hold starts now, from the window's
+         *             current position; run onFrame()
+         *   'release' the tag went away: the hold ends NOW, the actor goes
+         *             to the window (no timeout, no hop back)
+         *   'plain'   no tag, no hold: the window drags as any window
+         */
+        gate(st, tag, now) {
+            if (st.held) {
+                if (tag)
+                    return 'hold';
+                st.held = false;
+                st.followSinceUs = 0;
+                st.shown = st.hist[st.hist.length - 1];
+                st.stats.tagLost++;
+                return 'release';
+            }
+            if (!tag) {
+                st.stats.untagged++;
+                return 'plain';
+            }
+            // Start from where the window is (the actor is there: mutter has
+            // been syncing it). The history is already seeded, so this very
+            // frame's tag resolves to the position it was woven for.
+            const cur = st.hist[st.hist.length - 1];
+            st.held = true;
+            st.shown = cur;
+            st.progressUs = now;
+            st.progressFrames = 0;
+            st.followSinceUs = 0;
+            st.lastHistLen = st.hist.length;
+            st.stats.holds++;
+            return 'start';
+        },
+
+        //! mutter moved the window to buffer (x, y).
+        onMove(st, x, y, now) {
+            const prev = st.hist[st.hist.length - 1];
+            // The window starts moving away from a caught-up actor: the
+            // timeout counts from here, not from the last frame painted (a
+            // still window schedules no frames at all).
+            if (st.shown.x === prev.x && st.shown.y === prev.y) {
+                st.progressUs = now;
+                st.progressFrames = 0;
+            }
+            st.hist.push({x, y, t: now});
+            while (st.hist.length > 2 &&
+                (now - st.hist[0].t > MoveSyncChoice.HISTORY_US || st.hist.length > MoveSyncChoice.HISTORY_MAX))
+                st.hist.shift();
+        },
+
+        /*
+         * One stage frame, before its paint. @p tag is the decoded tag of the
+         * buffer about to be painted ([x, y]) or null. Updates st.shown — the
+         * position the actor must be painted at — and returns
+         * {woven, cur, caughtUp, needTick, timedOut}.
+         */
+        onFrame(st, tag, now) {
+            st.stats.frames++;
+            let woven = null;
+            if (tag)
+                woven = MoveSyncChoice.resolve(st.hist, tag);
+            else
+                st.stats.untagged++;
+            const cur = st.hist[st.hist.length - 1];
+            let timedOut = false;
+            if (st.followSinceUs) {
+                // Timed out: follow the window until a frame woven after the
+                // stall arrives, then show it where it belongs (one step
+                // back, counted). Only a RECENT position (the window was
+                // there in the last RESYNC_US): an app resuming from a stall
+                // first presents frames woven for where the window was when
+                // it stalled, and re-syncing on one of those hops the window
+                // far back.
+                if (woven && woven.t >= st.followSinceUs && woven.t >= cur.t - MoveSyncChoice.RESYNC_US) {
+                    st.followSinceUs = 0;
+                    if (woven.t < st.shown.t)
+                        st.stats.backHops++;
+                    st.shown = woven;
+                    st.progressUs = now;
+                    st.progressFrames = 0;
+                    st.stats.advanced++;
+                } else {
+                    st.shown = cur;
+                }
+            } else if (woven && (woven.x !== st.shown.x || woven.y !== st.shown.y)) {
+                // By POSITION, newest match: see "Move sync" in build().
+                if (woven.t < st.shown.t)
+                    st.stats.backHops++; // a revisited position (a reversal)
+                st.shown = woven;
+                st.progressUs = now;
+                st.progressFrames = 0;
+                st.stats.advanced++;
+            }
+            const caughtUp = st.shown.x === cur.x && st.shown.y === cur.y;
+            // Keep the frame clock ticking while behind a window that has
+            // STOPPED. Once the pointer stops, nothing else schedules a stage
+            // update, and without one the frame woven for the final position
+            // does not land (measured: a ~300 ms stall at every stop). Only
+            // then: ticking on every frame of a moving drag measurably stalled
+            // the app every ~0.5 s instead.
+            const needTick = !caughtUp && st.hist.length === st.lastHistLen;
+            st.lastHistLen = st.hist.length;
+            if (caughtUp) {
+                st.progressUs = now;
+                st.progressFrames = 0;
+            } else if (!st.followSinceUs) {
+                const behind = Math.max(Math.abs(cur.x - st.shown.x), Math.abs(cur.y - st.shown.y));
+                st.stats.maxBehind = Math.max(st.stats.maxBehind, behind);
+                st.progressFrames++;
+                if (now - st.progressUs > MoveSyncChoice.TIMEOUT_US &&
+                    st.progressFrames >= MoveSyncChoice.TIMEOUT_FRAMES) {
+                    // No frame for a newer position in time: never leave the
+                    // window behind the pointer.
+                    st.followSinceUs = now;
+                    st.shown = cur;
+                    st.stats.timeouts++;
+                    timedOut = true;
+                }
+            }
+            return {woven, cur, caughtUp, needTick, timedOut};
+        },
+    };
+
+    /*
+     * ── The pointer drag (extension version 9, placement capability 4) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_pointer_drag.js loads
+     * this file under plain gjs and drives it directly.
+     *
+     * A DisplayXR app drags its window from anywhere in the content with a
+     * SECONDARY button (the left one belongs to the scene). Handing that to
+     * mutter with xdg_toplevel.move does not work: mutter accepts the request
+     * with any pressed button's serial, but its move grab ends only on the
+     * release of button 1 or of the resize button (mutter 50.1,
+     * src/compositor/meta-window-drag.c, process_pointer_event:
+     * `button == 1 || button == meta_prefs_get_mouse_button_resize ()`), so a
+     * right-button drag kept following the pointer after the release until
+     * the next click. Nothing outside mutter can end its grab (there is no
+     * introspected end_grab_op), so the app does not start one for such a
+     * button: it asks for this pointer drag instead.
+     *
+     * The extension follows the pointer itself, with NO grab: the app keeps
+     * its implicit pointer grab (it sees the release), every move goes
+     * through `move_frame` and so through the drag table's correction exactly
+     * as a compositor drag's does, and the drag ends the moment the button's
+     * bit leaves the pointer's modifier mask — however the release happened,
+     * wherever the pointer is. The mask is polled (a few ms), not taken from
+     * events: an event filter added by an extension runs after mutter's own,
+     * which consumes every event it delivers to a Wayland client.
+     */
+    const PointerDrag = {
+        //! Clutter.ModifierType.BUTTON1_MASK .. BUTTON5_MASK (1 << 8 .. 1 << 12).
+        maskFor(button) {
+            return button >= 1 && button <= 5 ? 1 << (7 + button) : 0;
+        },
+
+        /*
+         * The modifier bits that may stand for @p button. mutter 50.1 files
+         * the MIDDLE and RIGHT buttons under each other's mask: its table is
+         * indexed by the Clutter button number but written in evdev order
+         * (src/backends/native/meta-seat-impl.c, `maskmap` = {BUTTON1,
+         * BUTTON3, BUTTON2, ...}[clutter_button - 1]), so a held right button
+         * reads as BUTTON2_MASK. Measured: right held -> mods 0x200. Either
+         * bit is accepted for buttons 2 and 3; create() then watches the one
+         * that is actually set, so a mutter that fixes the table still works.
+         */
+        candidatesFor(button) {
+            if (button === 2 || button === 3)
+                return PointerDrag.maskFor(2) | PointerDrag.maskFor(3);
+            return PointerDrag.maskFor(button);
+        },
+
+        //! A drag of a window whose frame is at (fx, fy), the pointer at
+        //! (px, py) with modifier state @p mods. null: the button is not held
+        //! (already released) or has no mask (the side buttons).
+        create(button, fx, fy, px, py, mods) {
+            const mask = mods & PointerDrag.candidatesFor(button);
+            if (!mask)
+                return null;
+            return {button, mask, fx, fy, px, py, lastX: px, lastY: py, moves: 0};
+        },
+
+        /*
+         * One poll: the pointer at (x, y) with modifier state @p mods.
+         * Returns {end, move}: move = the frame position to go to (null =
+         * none), end = the button is up and the drag is over. The last
+         * position the pointer reached before the release still counts.
+         */
+        step(st, x, y, mods) {
+            let move = null;
+            if (x !== st.lastX || y !== st.lastY) {
+                st.lastX = x;
+                st.lastY = y;
+                st.moves++;
+                move = [st.fx + x - st.px, st.fy + y - st.py];
+            }
+            // Over when a watched bit is gone (both, if middle and right
+            // were both held at the start: ending early beats never ending).
+            return {end: (mods & st.mask) !== st.mask, move};
+        },
+    };
+
+    /*
+     * ── Which space the stage is in (extension version 11) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_stage_scale.js drives it
+     * under plain gjs.
+     *
+     * mutter has two monitor layout modes. In LOGICAL the stage is logical px
+     * and each stage view (one per CRTC) is painted at its monitor's scale; in
+     * PHYSICAL the stage is device px and every view's scale is 1, whatever
+     * the monitor scale says. The layout mode itself is not introspected, but
+     * the view scales give it away: any view scale other than 1 means
+     * LOGICAL; every view at 1 while some monitor is scaled means PHYSICAL;
+     * with every monitor at 1 the two agree and nothing needs telling.
+     */
+    const StageScale = {
+        EPS: 1e-4,
+
+        //! 'logical' | 'physical' | null (cannot be told, or need not be).
+        layoutMode(viewScales, monitorScales) {
+            const off1 = v => Math.abs(v - 1) > StageScale.EPS;
+            if (!viewScales || viewScales.length === 0)
+                return null;
+            if (viewScales.some(off1))
+                return 'logical';
+            if ((monitorScales ?? []).some(off1))
+                return 'physical';
+            return null;
+        },
+
+        //! Device px per stage px on a monitor at @p monitorScale, or null
+        //! when the layout mode is not known and the monitor is scaled.
+        deviceScale(layout, monitorScale) {
+            if (layout === 'physical')
+                return 1;
+            if (layout === 'logical' || Math.abs(monitorScale - 1) <= StageScale.EPS)
+                return monitorScale;
+            return null;
+        },
+    };
+
+    /*
+     * ── Workspace hotkey bookkeeping (extension version 13) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_workspace_hotkey.js
+     * drives it under plain gjs. The GI half (the grab, the D-Bus object, the
+     * cache file, StartUnit) is WorkspaceHotkeyService inside build().
+     */
+    const WorkspaceHotkey = {
+        //! A press with no registered client is reported to the next
+        //! Configure only if that comes within this long (a service that
+        //! never comes up must not launch anything minutes later).
+        PENDING_MS: 30000,
+        //! Longest suspend a caller may ask for (the runtime's safety timeout).
+        MAX_SUSPEND_MS: 60000,
+
+        //! Per-extension state.
+        create() {
+            return {
+                accelerator: '', unit: '', owner: null, pendingUntil: 0, suspendedUntil: 0,
+                // Bootstrap (version 13): the manifest set recorded at the last
+                // Configure, whether a cache file was read, the set already
+                // bootstrapped for in this shell session, the last non-empty unit.
+                manifests: '', hasCache: false, bootstrappedFor: '', lastUnit: '',
+            };
+        },
+
+        //! "" (release) or one or more distinct modifiers then one key name.
+        validAccelerator(a) {
+            if (a === '')
+                return true;
+            if (typeof a !== 'string' || a.length > 64)
+                return false;
+            const m = /^((?:<(?:Control|Shift|Alt|Super)>)+)([A-Za-z0-9_]+)$/.exec(a);
+            if (!m)
+                return false;
+            const mods = m[1].match(/<[A-Za-z]+>/g);
+            return new Set(mods).size === mods.length;
+        },
+
+        //! "" or a plain systemd unit name ending in .service.
+        validUnit(u) {
+            return u === '' || (typeof u === 'string' && u.length <= 255 &&
+                /^[A-Za-z0-9:_.\\@-]+\.service$/.test(u));
+        },
+
+        //! A client (bus unique name @p owner) configured the hotkey. Returns
+        //! whether a press is pending for it (and clears it).
+        configure(st, owner, accelerator, unit, nowMs, manifests = '') {
+            const pending = st.pendingUntil > nowMs && accelerator !== '';
+            st.pendingUntil = 0;
+            st.accelerator = accelerator;
+            st.unit = accelerator === '' ? '' : unit;
+            if (unit !== '')
+                st.lastUnit = unit;
+            st.manifests = manifests;
+            st.hasCache = true;
+            st.owner = owner;
+            if (accelerator === '')
+                st.suspendedUntil = 0;
+            return pending;
+        },
+
+        //! The client's bus connection went away. Returns true if it was ours.
+        ownerGone(st, owner) {
+            if (st.owner === null || st.owner !== owner)
+                return false;
+            st.owner = null;
+            return true;
+        },
+
+        //! A press: {emit, startUnit}. startUnit is the unit to start, or null.
+        //! @p locked: the session is on the lock screen (version 14, #2071) —
+        //! a press there is never acted on (the grab is released anyway; this
+        //! covers a press already queued when the lock came up).
+        press(st, nowMs, locked = false) {
+            if (locked || st.accelerator === '' || WorkspaceHotkey.suspended(st, nowMs))
+                return {emit: false, startUnit: null};
+            if (st.owner !== null)
+                return {emit: true, startUnit: null};
+            if (st.unit !== '') {
+                st.pendingUntil = nowMs + WorkspaceHotkey.PENDING_MS;
+                return {emit: true, startUnit: st.unit};
+            }
+            return {emit: true, startUnit: null};
+        },
+
+        //! Returns the suspend length applied, in ms (0 = resumed).
+        suspend(st, on, timeoutMs, nowMs) {
+            if (!on) {
+                st.suspendedUntil = 0;
+                return 0;
+            }
+            const ms = Math.min(Math.max(timeoutMs > 0 ? timeoutMs : WorkspaceHotkey.MAX_SUSPEND_MS, 1),
+                WorkspaceHotkey.MAX_SUSPEND_MS);
+            st.suspendedUntil = nowMs + ms;
+            return ms;
+        },
+
+        suspended(st, nowMs) {
+            return st.suspendedUntil > nowMs;
+        },
+
+        //! Whether the accelerator should be grabbed right now. Never while
+        //! @p locked (the lock screen, version 14, #2071): the extension stays
+        //! enabled there for the geometry publisher, not for the hotkey.
+        wantGrab(st, nowMs, locked = false) {
+            return !locked && st.accelerator !== '' && !WorkspaceHotkey.suspended(st, nowMs);
+        },
+
+        //! Whether the manifest bootstrap may start a unit now (#2071): not
+        //! from the lock screen; it runs at the unlock instead.
+        mayBootstrap(locked) {
+            return !locked;
+        },
+
+        /*
+         * Bootstrap (version 13): a controller installed since the last time a
+         * client configured the hotkey arms nothing until that client runs
+         * again. So the extension looks at the workspace-controller manifest
+         * roots itself — the same list, in the same order, as the runtime's
+         * service_workspace_registry.c — and when the set of manifests differs
+         * from the one recorded at the last Configure, starts the client's unit
+         * ONCE; the client comes up and configures (pushing "" when it sees no
+         * usable controller, which is recorded too, so this never repeats for
+         * an unchanged set).
+         */
+
+        //! systemd user unit started for a bootstrap when no Configure ever
+        //! named one (the DisplayXR runtime's .deb unit).
+        BOOTSTRAP_UNIT: 'displayxr.service',
+
+        //! The manifest roots for env {XRT_WORKSPACE_CONTROLLER_PATH,
+        //! XDG_DATA_HOME, HOME} — service_workspace_registry.c's POSIX order.
+        controllerRoots(env) {
+            const roots = [];
+            const add = r => {
+                if (r && !roots.includes(r))
+                    roots.push(r);
+            };
+            for (const p of (env.XRT_WORKSPACE_CONTROLLER_PATH ?? '').split(':'))
+                add(p);
+            if (env.XDG_DATA_HOME)
+                add(`${env.XDG_DATA_HOME}/DisplayXR/WorkspaceControllers`);
+            else if (env.HOME)
+                add(`${env.HOME}/.local/share/DisplayXR/WorkspaceControllers`);
+            add('/usr/local/share/displayxr/WorkspaceControllers');
+            add('/usr/share/displayxr/WorkspaceControllers');
+            return roots;
+        },
+
+        //! Canonical fingerprint of the manifests found: "root/name.json"
+        //! entries (only *.json), sorted, newline-joined; "" = none.
+        fingerprint(paths) {
+            return [...new Set(paths.filter(p => /\.json$/.test(p)))].sort().join('\n');
+        },
+
+        //! Whether to start the unit for manifest set @p current. Marks it
+        //! done for this shell session when it says yes (idempotent).
+        needBootstrap(st, current) {
+            if (current === '' || st.owner !== null || st.bootstrappedFor === current)
+                return false;
+            if (st.hasCache && st.manifests === current)
+                return false;
+            st.bootstrappedFor = current;
+            return true;
+        },
+
+        //! The unit a bootstrap starts: the last configured one, else the default.
+        bootstrapUnit(st) {
+            return st.unit !== '' ? st.unit : (st.lastUnit || WorkspaceHotkey.BOOTSTRAP_UNIT);
+        },
+
+        //! The cache file: what survives the client's exit and a shell restart.
+        //! `manifests` is the controller set seen at the last Configure.
+        serialize(st) {
+            return JSON.stringify({
+                version: 1, accelerator: st.accelerator, unit: st.unit,
+                manifests: st.manifests ?? '', lastUnit: st.lastUnit ?? '',
+            });
+        },
+
+        //! Restore from the cache file text; anything malformed leaves @p st
+        //! released. Never registers an owner (the client must Configure).
+        deserialize(st, text) {
+            let o = null;
+            try {
+                o = JSON.parse(text);
+            } catch (e) {
+                return false;
+            }
+            if (!o || o.version !== 1 || !WorkspaceHotkey.validAccelerator(o.accelerator) ||
+                !WorkspaceHotkey.validUnit(o.unit ?? ''))
+                return false;
+            st.accelerator = o.accelerator;
+            st.unit = o.accelerator === '' ? '' : (o.unit ?? '');
+            st.manifests = typeof o.manifests === 'string' ? o.manifests : '';
+            st.lastUnit = WorkspaceHotkey.validUnit(o.lastUnit ?? '') ? (o.lastUnit ?? '') : '';
+            st.hasCache = true;
+            return true;
+        },
+    };
+
+    /*
+     * ── The caller's own window: keep-above, activate, minimize (version 15) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_own_window.js loads this
+     * file under plain gjs and drives it with stand-in windows.
+     *
+     * A native Wayland client cannot keep its window above others (no protocol
+     * for it), bring it to the front from the background (xdg-activation
+     * without a fresh input serial only demands attention), or un-minimize it
+     * (xdg_toplevel has set_minimized and nothing to undo it). An app that
+     * expects its own window to do these — an always-on-top 3D companion, a
+     * hotkey that summons it — has no way there. WindowPlacement1 therefore
+     * takes three requests on the CALLER's own window, with MoveWindow's gate
+     * and window choice:
+     *   SetKeepAbove(u pid, b above) -> (b ok)          capability bit 5 (32)
+     *   ActivateWindow(u pid) -> (b ok)                 capability bit 6 (64)
+     *   SetMinimized(u pid, b minimized) -> (b ok)      capability bit 7 (128)
+     * Each is refused (false, nothing changed) unless `allowed` holds. Nothing
+     * here can reach another process's window: the window is chosen by the
+     * caller's PID from the bus, and the argument may only name the caller.
+     *
+     * Keep-above the extension set is undone when the caller's bus connection
+     * goes away and when the extension is disabled — but only what it set: a
+     * user's own "Always on Top" on the same window is never undone behind
+     * their back (an explicit SetKeepAbove(false) does clear it, as the window
+     * menu would). There is no SetMaximized: an app that places its own window
+     * (as the DisplayXR plugin does) fights a maximize, and mutter keeps a
+     * maximized window in the normal layer whatever its "above" flag says.
+     */
+    const OwnWindow = {
+        //! Whether a request from @p senderPid naming @p pid may act on @p win,
+        //! the caller's own window (null: it has none). The caller names itself
+        //! (0 = "me"); never while the user drags it or any extension pointer
+        //! drag runs (never fight the user); never on the lock screen, where a
+        //! locked user drives nothing, so nothing should change stacking or
+        //! focus behind the shield.
+        allowed({senderPid, pid, win, grabbed, pointerDrag, locked}) {
+            return senderPid > 0 && (pid === 0 || pid === senderPid) && !!win &&
+                win !== grabbed && !pointerDrag && !locked;
+        },
+
+        //! mutter 49 replaced get_maximized() (flags) with is_maximized().
+        isMaximized(win, maximizeBoth) {
+            if (typeof win.is_maximized === 'function')
+                return win.is_maximized();
+            return typeof win.get_maximized === 'function' && win.get_maximized() === maximizeBoth;
+        },
+
+        //! Which windows each client made keep-above: sender -> Set(win).
+        newTracker() {
+            return new Map();
+        },
+
+        //! SetKeepAbove on the caller's @p win for bus name @p sender. Returns
+        //! {ok, watch}: watch = @p sender has no record yet, so the service
+        //! starts watching its bus name. A maximized window is refused, as
+        //! GNOME's window menu greys "Always on Top" out for it.
+        keepAbove(tracker, sender, win, above, maximizeBoth) {
+            if (!above) {
+                if (win.is_above())
+                    win.unmake_above();
+                OwnWindow.forgetWindow(tracker, win);
+                return {ok: !win.is_above(), watch: false};
+            }
+            if (OwnWindow.isMaximized(win, maximizeBoth))
+                return {ok: false, watch: false};
+            if (win.is_above())
+                return {ok: true, watch: false}; // ours already, or the user's: not ours to record
+            win.make_above();
+            let wins = tracker.get(sender);
+            const watch = wins === undefined;
+            if (watch) {
+                // Kept even when it empties, so one client never gets two watches.
+                wins = new Set();
+                tracker.set(sender, wins);
+            }
+            wins.add(win);
+            return {ok: win.is_above(), watch};
+        },
+
+        //! The window is gone, or its keep-above was cleared: no client's any more.
+        forgetWindow(tracker, win) {
+            for (const wins of tracker.values())
+                wins.delete(win);
+        },
+
+        //! @p sender's bus connection went away, or the extension is disabled:
+        //! undo the keep-above it set on the windows that still have it.
+        //! Returns how many windows changed.
+        dropClient(tracker, sender) {
+            const wins = tracker.get(sender);
+            if (wins === undefined)
+                return 0;
+            tracker.delete(sender);
+            let n = 0;
+            for (const win of wins) {
+                if (win.is_above()) {
+                    win.unmake_above();
+                    n++;
+                }
+            }
+            return n;
+        },
+
+        //! SetMinimized on the caller's @p win. Restoring does not focus: an app
+        //! that wants its window back in front asks for ActivateWindow, which
+        //! restores it as well. With @p focus (a newFocusState()), a minimize
+        //! this request made is recorded as the app's own (see focusMoved).
+        minimize(win, minimized, focus = null) {
+            if (minimized) {
+                if (typeof win.can_minimize === 'function' && !win.can_minimize())
+                    return false;
+                if (!win.minimized) {
+                    win.minimize();
+                    if (win.minimized)
+                        focus?.selfMinimized.add(win);
+                }
+                return win.minimized === true;
+            }
+            if (win.minimized)
+                win.unminimize();
+            focus?.selfMinimized.delete(win);
+            return win.minimized === false;
+        },
+
+        /*
+         * ── ActivateWindow's focus policy (version 17) ──
+         *
+         * Version 15 activated with a server timestamp, newer than any input,
+         * so an app took keyboard focus even while the user was typing in
+         * another app (measured; spec §11.5). From version 17 an app takes
+         * focus only from itself: when the user's latest key press or click
+         * went to one of its windows, and the user has not moved focus away
+         * from it since (Alt+Tab, Super+H, minimizing it from the dock, a
+         * click elsewhere — a click elsewhere is also newer input). Otherwise
+         * nothing changes but the window is flagged as demanding attention
+         * (mutter flags it only when covered, minimized or on another
+         * workspace; GNOME then shows "… is ready"), which
+         * is what GNOME does for any app that asks from the background. That
+         * is mutter's own focus-stealing rule, applied with the time of the
+         * app's last input instead of "now". It also limits the rate by
+         * itself: once the user is elsewhere, nothing the app does takes focus
+         * until the user comes back to it. An app that wants its window back
+         * on screen anyway restores it with SetMinimized(false) first, which
+         * never takes focus.
+         *
+         * "Input" is mutter's per-window user time: mutter stamps it on every
+         * key press, button press and touch on a window (core/events.c), before
+         * shortcuts are handled, and on every activation. For the APP only
+         * those stamps count (notify::user-time); a new window's starting
+         * value (its creation time, not a stamp) does not, so recreating a
+         * window or opening a new one earns no focus. For everyone else
+         * (lastInput) the starting value counts too, so another app's window
+         * that just came up wins, as does mutter's own newest input
+         * (Meta.Display.get_last_user_time), which a closed window cannot take
+         * back. Input injected through the RemoteDesktop portal counts like
+         * the user's own.
+         *
+         * Not covered: an app summoned by a global shortcut while the user is
+         * in another app. mutter stamps the press on the focused window, so
+         * the app is refused and flagged.
+         */
+
+        //! mutter's 32-bit event times wrap; @p a is before @p b the way
+        //! XSERVER_TIME_IS_BEFORE reads it. 0 (never set) is before any time.
+        timeBefore(a, b) {
+            if (a === b)
+                return false;
+            if (a === 0)
+                return true;
+            if (b === 0)
+                return false;
+            return ((b - a) >>> 0) < 0x80000000;
+        },
+
+        //! The newest of @p times (0 when there is none). With @p now, by age
+        //! (now - t, mod 2^32): a time 2^31 ms (24.8 days) or more away from
+        //! now is dropped — the 32-bit order is not transitive across that
+        //! distance, so an untouched old window could otherwise read as newer
+        //! than everything. If that drops every time (a clock that does not
+        //! match), the plain order decides.
+        latestTime(times, now = 0) {
+            if (now) {
+                let best = 0, bestAge = 0x80000000;
+                for (const x of times) {
+                    const age = (now - x) >>> 0;
+                    if (x !== 0 && age < bestAge) {
+                        best = x;
+                        bestAge = age;
+                    }
+                }
+                if (best !== 0)
+                    return best;
+            }
+            let t = 0;
+            for (const x of times) {
+                if (OwnWindow.timeBefore(t, x))
+                    t = x;
+            }
+            return t;
+        },
+
+        //! away: pid -> the newest input time when focus left that app's
+        //! window. selfMinimized: windows minimized by their app's own request.
+        newFocusState() {
+            return {away: new Map(), selfMinimized: new WeakSet()};
+        },
+
+        //! Focus moved from a window of @p fromPid to one of @p toPid (0: no
+        //! window). @p lastInput: the newest input time at that moment.
+        //! @p fromSelfMinimized: the window losing focus is minimized by its
+        //! app's own SetMinimized — the app stepped aside, the user did not
+        //! leave it.
+        focusMoved(st, fromPid, toPid, lastInput, fromSelfMinimized) {
+            if (toPid > 0)
+                st.away.delete(toPid);
+            if (fromPid <= 0 || fromPid === toPid || fromSelfMinimized)
+                return;
+            st.away.set(fromPid, lastInput);
+        },
+
+        //! Whether app @p pid may take focus: @p appInput, its newest input,
+        //! is not older than @p lastInput, every other app's newest — or no
+        //! window has focus (@p nobodyFocused: nothing to take it from) — and
+        //! the user has not left the app since its last input.
+        mayTakeFocus(st, pid, appInput, lastInput, nobodyFocused = false) {
+            if (!nobodyFocused && OwnWindow.timeBefore(appInput, lastInput))
+                return false;
+            const away = st.away.get(pid);
+            return away === undefined || OwnWindow.timeBefore(away, appInput);
+        },
+    };
+
+    /*
+     * ── The pointer (version 16) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_pointer.js drives it.
+     *
+     * A Wayland client only learns where the pointer is while it is over its
+     * own surface, so an app cannot answer "what is under my mouse?" (an
+     * assistant reading or acting on what the user points at). The compositor
+     * knows. WindowGeometry1.GetPointer() -> (s json) reports the pointer
+     * position in stage coordinates (the snapshot's space; `layout_mode` says
+     * which) and the window under it, found the way a click would find it:
+     * mutter's reactive pick, so stacking order, input regions (a click-through
+     * window is passed over) and shell UI on top are all accounted for.
+     * Read-only, like GetWindows (which already lists every window); nothing is
+     * reported while the screen is locked.
+     */
+    const PointerPick = {
+        //! The window a picked actor belongs to: the first ancestor that is a
+        //! window actor (it has a meta_window). null for shell UI or the stage.
+        windowOf(actor) {
+            for (let a = actor; a; a = a.get_parent()) {
+                if (a.meta_window)
+                    return a.meta_window;
+            }
+            return null;
+        },
+
+        //! What the pick found when it is not a window: 'desktop' for the
+        //! desktop background (or the stage under it), else 'shell' (the panel,
+        //! a popup, the overview).
+        nonWindow(actor, stage, Meta) {
+            if (!actor || actor === stage)
+                return 'desktop';
+            for (let a = actor; a; a = a.get_parent()) {
+                if ((Meta.BackgroundActor && a instanceof Meta.BackgroundActor) ||
+                    (Meta.BackgroundGroup && a instanceof Meta.BackgroundGroup))
+                    return 'desktop';
+            }
+            return 'shell';
+        },
+
+        //! A window that IS the desktop: type DESKTOP, or the desktop-icons
+        //! extension's window (Ubuntu's default "ding", which is a NORMAL window
+        //! before mutter 49 because only 49+ lets it set its type).
+        isDesktopWindow(win, Meta) {
+            return win.get_window_type() === Meta.WindowType.DESKTOP || win.customJS_ding !== undefined ||
+                win.get_wm_class?.() === 'com.rastersoft.ding';
+        },
+
+        //! {parent_id} of a transient window (a popup menu, a dialog: its owner
+        //! window's id), else {} — such a window's own app_id/title may be empty.
+        parentOf(win) {
+            const parent = win.get_transient_for?.();
+            return parent ? {parent_id: Number(parent.get_id())} : {};
+        },
+
+        //! The window types GetAllWindows lists: what a user calls the app's
+        //! windows (normal, dialog, modal dialog, utility), not menus, popups,
+        //! tooltips, docks or the desktop.
+        inAllWindows(type, Meta) {
+            const T = Meta.WindowType;
+            return type === T.NORMAL || type === T.DIALOG || type === T.MODAL_DIALOG || type === T.UTILITY;
+        },
+
+        //! Maximized in both directions (half-tiled is not). mutter 49+ has
+        //! is_maximized(); older ones get_maximized(), the MaximizeFlags.
+        isMaximized(win, Meta) {
+            if (typeof win.is_maximized === 'function')
+                return win.is_maximized() === true;
+            if (typeof win.get_maximized === 'function')
+                return win.get_maximized() === Meta.MaximizeFlags.BOTH;
+            return false;
+        },
+
+        //! Whether (x, y) is on a monitor (@p rects: their [x, y, w, h]); a point
+        //! between or beside monitors is on none, and no click can reach it.
+        onMonitor(x, y, rects) {
+            return rects.some(([mx, my, mw, mh]) => x >= mx && x < mx + mw && y >= my && y < my + mh);
+        },
+
+        //! The JSON reply. @p over: 'window' | 'desktop' | 'shell' | 'outside';
+        //! @p window: the snapshot entry of the window hit (also for a desktop
+        //! window), else null.
+        reply({locked = false, x = 0, y = 0, layout = null, over = 'desktop', window = null, windowType = null}) {
+            if (locked)
+                return {version: 1, locked: true};
+            const r = {version: 1, x, y};
+            if (layout !== null)
+                r.layout_mode = layout;
+            r.over = over;
+            r.window = window;
+            if (window && windowType !== null)
+                r.window_type = windowType;
+            return r;
+        },
+    };
+
+    /*
+     * ── Window titles: only for a connection that asked (version 18) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_title_access.js drives it.
+     *
+     * Everything else in a window entry is geometry and state. A TITLE is
+     * content (a document name, a mail subject, who a chat is with), so it
+     * sits behind the user's desktop-control consent (ADR-056 D5; spec
+     * §12.5). From version 18 a reply carries "title" only to a bus
+     * connection that called SetTitleAccess(pid, true):
+     *   * the caller names itself (pid 0 = "me"; the PID comes from the bus
+     *     daemon), like every member that acts for the caller;
+     *   * the grant is for that CONNECTION (its unique bus name), not for the
+     *     process: the DisplayXR runtime asks on the private connection its
+     *     desktop-control backend reads windows on, so no other code in the
+     *     app's process gets titles through it;
+     *   * it lasts until SetTitleAccess(pid, false), until that connection
+     *     goes away (exit, crash, a closed private connection) or until the
+     *     extension is disabled. It is refused on the lock screen, and no
+     *     title is served while the screen is locked, grant or not.
+     * Every other caller gets the same entries without the "title" key, so a
+     * reader can tell "withheld" from an untitled window (""). WindowsChanged
+     * is a broadcast that every listener receives, so it never has titles; a
+     * connection with the grant reads them with a method call.
+     *
+     * The extension cannot check the desktop-control grant itself (mutter does
+     * not say which client holds a RemoteDesktop session; ADR-056 open
+     * question 1). SetTitleAccess is the runtime saying that it holds one,
+     * and the runtime calls it only while the grant lasts. A process that
+     * calls it without a grant still gets titles (it could read them off the
+     * accessibility bus too), but only by asking for them explicitly, on its
+     * own connection. No client gets other apps' titles by default any more.
+     */
+    const TitleAccess = {
+        //! Bus unique name -> {pid, watchId} of each connection that gets titles.
+        newTracker() {
+            return new Map();
+        },
+
+        //! Whether SetTitleAccess(@p pid, true) from a caller whose PID is
+        //! @p senderPid (0: the bus daemon could not say) may grant.
+        mayGrant({senderPid, pid, locked}) {
+            return senderPid > 0 && (pid === 0 || pid === senderPid) && !locked;
+        },
+
+        //! Whether a reply to bus name @p sender may carry titles.
+        mayRead(tracker, sender, locked) {
+            return !locked && !!tracker && typeof sender === 'string' && tracker.has(sender);
+        },
+
+        //! Record @p sender (process @p pid). True when it is new: the caller
+        //! then watches its bus name, which drops it when the name goes away.
+        grant(tracker, sender, pid) {
+            const known = tracker.get(sender);
+            if (known) {
+                known.pid = pid;
+                return false;
+            }
+            tracker.set(sender, {pid, watchId: 0});
+            return true;
+        },
+
+        //! Forget @p sender. Returns its record (the caller unwatches it), or null.
+        revoke(tracker, sender) {
+            const known = tracker.get(sender) ?? null;
+            tracker.delete(sender);
+            return known;
+        },
+
+        //! The title part of a window entry: {title} with @p titles, else nothing
+        //! at all (the key is left out, never set to "").
+        field(win, titles) {
+            return titles ? {title: win.get_title() ?? ''} : {};
+        },
+    };
+
+    /*
+     * ── The work area (version 19, displayxr-unity#399) ──
+     *
+     * Pure logic, no GI: scripts/test_gnome_extension_work_area.js drives it.
+     *
+     * A window entry's "monitor" is the whole monitor. An app that places its
+     * own window (the Unity plug-in's side-step steps into a corner) needs the
+     * part the top bar and a fixed dock leave to windows: mutter's WORK AREA of
+     * that monitor, published as monitor.work_area. Struts can differ between
+     * workspaces, so it is asked of the window's own workspace
+     * (Meta.Window.get_workspace(), which is the active one for a window on all
+     * workspaces), else of the active workspace. Absent when neither answers.
+     * Same on GNOME 42-50: Meta.Workspace.get_work_area_for_monitor() hands
+     * back a Meta.Rectangle (42-44) or an Mtk.Rectangle (45+), both x, y,
+     * width, height.
+     */
+    const WorkArea = {
+        //! The workspace to ask about @p win: its own, else the active one of
+        //! @p workspaceManager (global.workspace_manager), else null.
+        workspaceOf(win, workspaceManager) {
+            let ws = null;
+            try {
+                ws = win?.get_workspace?.() ?? null;
+            } catch (e) {
+                ws = null;
+            }
+            if (!ws) {
+                try {
+                    ws = workspaceManager?.get_active_workspace?.() ?? null;
+                } catch (e) {
+                    ws = null;
+                }
+            }
+            return ws;
+        },
+
+        //! [x, y, w, h] (stage coordinates) of monitor @p mon's work area on
+        //! workspace @p ws, or null when it cannot be told.
+        rect(ws, mon) {
+            if (!ws || typeof ws.get_work_area_for_monitor !== 'function' || !Number.isInteger(mon) || mon < 0)
+                return null;
+            let r = null;
+            try {
+                r = ws.get_work_area_for_monitor(mon);
+            } catch (e) {
+                return null;
+            }
+            const v = [r?.x, r?.y, r?.width, r?.height];
+            if (!v.every(Number.isInteger) || v[2] <= 0 || v[3] <= 0)
+                return null;
+            return v;
+        },
+
+        //! monitor.work_area of @p win on monitor @p mon, or null.
+        of(win, mon, workspaceManager) {
+            return WorkArea.rect(WorkArea.workspaceOf(win, workspaceManager), mon);
+        },
+    };
+
     globalThis.displayxrWindowGeometry = {
         //! gi: {Clutter, GObject, Meta, Gio, GLib} — however the caller's
         //! shell spells the import. Returns {WindowGeometryService}.
@@ -161,14 +1450,72 @@
                 built = buildModule(gi);
             return built;
         },
+        //! The drag-lattice entry choice, exported for its unit test.
+        LatticeChoice,
+        //! The move-sync tag decode, exported for its unit test.
+        MoveSyncChoice,
+        //! The pointer drag's pure logic, exported for its unit test.
+        PointerDrag,
+        //! The stage-space resolution, exported for its unit test.
+        StageScale,
+        //! The workspace hotkey's bookkeeping, exported for its unit test.
+        WorkspaceHotkey,
+        //! The own-window requests' gate and bookkeeping, exported for its unit test.
+        OwnWindow,
+        //! The pointer reply, exported for its unit test.
+        PointerPick,
+        //! Who gets window titles, exported for its unit test.
+        TitleAccess,
+        //! The monitor's work area, exported for its unit test.
+        WorkArea,
     };
 
-    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene}) {
+    function buildModule({Clutter, GObject, Meta, Gio, GLib, Graphene, Mtk, GdkPixbuf, moveSync = true,
+        Main = null, Shell = null}) {
+        //! mutter's layout mode right now (StageScale.layoutMode over the
+        //! stage views and monitor scales). Cheap: a handful of views.
+        function currentLayoutMode() {
+            const display = global.display;
+            const monitorScales = [];
+            for (let i = 0; i < display.get_n_monitors(); i++)
+                monitorScales.push(display.get_monitor_scale(i));
+            let viewScales = null;
+            try {
+                viewScales = global.stage.peek_stage_views().map(v => v.get_scale());
+            } catch (e) {
+                viewScales = null; // a shell without the API: say nothing
+            }
+            return StageScale.layoutMode(viewScales, monitorScales);
+        }
+
+        //! Device px per stage px on monitor @p mon (falls back to the monitor
+        //! scale, the pre-version-11 assumption, when it cannot be told).
+        function deviceScaleOf(mon, layout = currentLayoutMode()) {
+            const monitorScale = global.display.get_monitor_scale(mon);
+            return StageScale.deviceScale(layout, monitorScale) ?? monitorScale;
+        }
+
         const IFACE_XML = `
 <node>
   <interface name="org.displayxr.WindowGeometry1">
     <method name="GetWindows">
       <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetPointer">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetWindowAt">
+      <arg type="i" direction="in" name="x"/>
+      <arg type="i" direction="in" name="y"/>
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="GetAllWindows">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <method name="SetTitleAccess">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="allow"/>
+      <arg type="b" direction="out" name="titles"/>
     </method>
     <signal name="WindowsChanged">
       <arg type="s" name="json"/>
@@ -266,8 +1613,11 @@
         const CAPTURE_EXCLUSION_VERSION = 1;
 
         class CaptureExclusion {
-            constructor(onChanged) {
+            //! @p mayReadTitles(sender): whether a reply to that bus name may
+            //! carry window titles (version 18, see "Window titles").
+            constructor(onChanged, mayReadTitles = () => false) {
                 this._onChanged = onChanged;
+                this._mayReadTitles = mayReadTitles;
                 // bus unique name -> {pids: Set<number>, watchId}
                 this._clients = new Map();
                 this._stageSignals = [
@@ -299,8 +1649,9 @@
                     Gio.bus_unwatch_name(client.watchId);
                 this._clients.clear();
                 // Remove EVERY effect we added, whether or not its owner is
-                // still registered: a disabled extension (lock screen, logout,
-                // user toggle) must leave no window invisible to capture.
+                // still registered: a disabled extension (logout, user toggle;
+                // since version 14 no longer the lock screen) must leave no
+                // window invisible to capture.
                 for (const actor of global.get_window_actors())
                     actor.remove_effect_by_name(EXCLUDE_EFFECT_NAME);
                 inStagePaint = false;
@@ -442,7 +1793,10 @@
                 });
             }
 
-            GetState() {
+            //! Version 18: an excluded window's title only for a caller that may
+            //! read titles (an async handler, for the caller's bus name).
+            GetStateAsync(_params, invocation) {
+                const titles = this._mayReadTitles(invocation.get_sender());
                 const clients = [];
                 for (const [sender, client] of this._clients)
                     clients.push({sender, pids: [...client.pids]});
@@ -450,14 +1804,14 @@
                 for (const actor of global.get_window_actors()) {
                     if (actor.get_effect(EXCLUDE_EFFECT_NAME)) {
                         const win = actor.meta_window;
-                        windows.push({pid: win?.get_pid() ?? 0, title: win?.get_title() ?? ''});
+                        windows.push({pid: win?.get_pid() ?? 0, ...(win ? TitleAccess.field(win, titles) : {})});
                     }
                 }
-                return JSON.stringify({
+                invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
                     version: CAPTURE_EXCLUSION_VERSION,
                     clients, windows,
                     paints: {onscreen: excludeStats.onscreen, skipped: excludeStats.skipped},
-                });
+                })]));
             }
         }
 
@@ -521,6 +1875,32 @@
     <method name="ClearDragLattice">
       <arg type="u" direction="in" name="pid"/>
     </method>
+    <method name="EnableMoveSync">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="BeginPointerDrag">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="u" direction="in" name="button"/>
+      <arg type="b" direction="out" name="started"/>
+    </method>
+    <method name="EndPointerDrag">
+      <arg type="u" direction="in" name="pid"/>
+    </method>
+    <method name="SetKeepAbove">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="above"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="ActivateWindow">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
+    <method name="SetMinimized">
+      <arg type="u" direction="in" name="pid"/>
+      <arg type="b" direction="in" name="minimized"/>
+      <arg type="b" direction="out" name="ok"/>
+    </method>
 
     <signal name="DragLatticeNeeded">
       <arg type="u" name="pid"/>
@@ -581,6 +1961,21 @@
             typeof Meta.Window.prototype.add_external_constraint === 'function';
         const PLACEMENT_CAP_DRAG_LATTICE = 1;
         const PLACEMENT_CAP_EXPLICIT_START = 2;
+        //! BeginPointerDrag / EndPointerDrag (version 9): see "The pointer drag".
+        const PLACEMENT_CAP_POINTER_DRAG = 4;
+        //! How often the pointer drag reads the pointer, ms.
+        const POINTER_DRAG_POLL_MS = 4;
+        //! EnableMoveSync (version 9): see "Move sync". GNOME 45+ only.
+        const PLACEMENT_CAP_MOVE_SYNC = 8;
+        //! Version 10: a move-synced window is held only while a tag
+        //! subsurface is mapped (see "Move sync", the tag gate), so a synced
+        //! process that shows nothing woven drags as a plain window, with no
+        //! stall. Only ever set together with PLACEMENT_CAP_MOVE_SYNC.
+        const PLACEMENT_CAP_MOVE_SYNC_TAG_GATED = 16;
+        //! Version 15: the caller's own window (see "The caller's own window").
+        const PLACEMENT_CAP_KEEP_ABOVE = 32;
+        const PLACEMENT_CAP_ACTIVATE = 64;
+        const PLACEMENT_CAP_MINIMIZE = 128;
         //! A table no grab follows stops constraining after this long.
         const LATTICE_PRE_GRAB_US = 2 * 1000 * 1000;
         //! DISPLAYXR_TEST=1 (never in production): tables audit their paints
@@ -593,6 +1988,10 @@
         //! a read-only copy — see "Drag lattice"), so it is off by default and
         //! kept only for when mutter makes the rect writable.
         const LATTICE_USE_CONSTRAINT = GLib.getenv('DISPLAYXR_LATTICE_CONSTRAINT') === '1';
+        //! DISPLAYXR_LATTICE_NEAREST=1: land each move on the plain nearest
+        //! entry, as versions 6-8 did, instead of LatticeChoice's
+        //! direction-aware pick. For A/B comparison on a panel only.
+        const LATTICE_NEAREST = GLib.getenv('DISPLAYXR_LATTICE_NEAREST') === '1';
 
         let DragLatticeConstraint = null;
         if (HAVE_EXTERNAL_CONSTRAINT) {
@@ -665,7 +2064,16 @@
                 const r = win.get_frame_rect();
                 const dx = r.x - t.startX, dy = r.y - t.startY;
                 const inside = dx >= t.minDx && dx <= t.maxDx && dy >= t.minDy && dy <= t.maxDy;
-                const best = inside ? this._nearest(t, dx, dy) : null;
+                // Device px per stage px where the window is now: the
+                // choice weighs its errors in device px (LatticeChoice). 1 in
+                // mutter's PHYSICAL layout, whatever the monitor scale.
+                const mon = win.get_monitor();
+                const scale = mon >= 0 ? deviceScaleOf(mon) : 1;
+                LatticeChoice.observe(t.choice, dx, dy, scale);
+                const best = inside
+                    ? LatticeChoice.choose(t.choice, this._candidates(t, dx, dy), dx, dy, scale,
+                        LATTICE_NEAREST)
+                    : null;
                 if (!best) {
                     this._stats.misses++;
                     this._drag.misses++;
@@ -831,6 +2239,9 @@
                         (LATTICE_TEST ? 120 * 1000 * 1000 : LATTICE_PRE_GRAB_US),
                     entries: dxs.length,
                     piece,
+                    // The drag direction survives an extension of the same
+                    // drag; a new start begins from rest.
+                    choice: merge && prev.choice ? prev.choice : LatticeChoice.create(),
                 });
                 if (LATTICE_TEST) {
                     // Test mode: audit paints from the moment the table lands,
@@ -952,24 +2363,32 @@
                 return null;
             }
 
-            _nearest(t, dx, dy) {
+            //! The entries a move to (dx, dy) may land on: the 5 x 5 buckets
+            //! around it, as a forEach for LatticeChoice.
+            _candidates(t, dx, dy) {
                 const bx = Math.floor(dx / t.cell), by = Math.floor(dy / t.cell);
-                let best = null, bestD = Infinity;
-                for (let j = -2; j <= 2; j++) {
-                    for (let i = -2; i <= 2; i++) {
-                        const b = t.buckets.get(`${bx + i},${by + j}`);
-                        if (!b)
-                            continue;
-                        for (let k = 0; k < b.length; k += 2) {
-                            const ex = b[k] - dx, ey = b[k + 1] - dy;
-                            const d = ex * ex + ey * ey;
-                            if (d < bestD) {
-                                bestD = d;
-                                best = [b[k], b[k + 1]];
-                            }
+                return cb => {
+                    for (let j = -2; j <= 2; j++) {
+                        for (let i = -2; i <= 2; i++) {
+                            const b = t.buckets.get(`${bx + i},${by + j}`);
+                            if (!b)
+                                continue;
+                            for (let k = 0; k < b.length; k += 2)
+                                cb(b[k], b[k + 1]);
                         }
                     }
-                }
+                };
+            }
+
+            _nearest(t, dx, dy) {
+                let best = null, bestD = Infinity;
+                this._candidates(t, dx, dy)((x, y) => {
+                    const d = (x - dx) * (x - dx) + (y - dy) * (y - dy);
+                    if (d < bestD) {
+                        bestD = d;
+                        best = [x, y];
+                    }
+                });
                 return best;
             }
 
@@ -1046,9 +2465,436 @@
             }
         }
 
+
+        /*
+         * ── Move sync (extension version 9, #1748) ───────────────────────
+         *
+         * The lattice above keeps a STALE weave correct by only letting the
+         * window land where the stale weave is still phase-correct. This does
+         * the opposite: the window may land anywhere, and the stage never
+         * shows a frame anywhere but where it was woven for.
+         *
+         * mutter keeps running the grab and moves the MetaWindow as usual
+         * (so edge tiling, workspaces and the published geometry the runtime
+         * weaves from all see the real position). What is held back is only
+         * the window's ACTOR: on every frame, in the stage's before-update
+         * (after this frame's input and commits, before layout and paint),
+         * this code places it at the position the buffer it is about to
+         * paint was woven for, overriding the position mutter synced on the
+         * last move.
+         *
+         * Not meta_window_actor_freeze(): freezing a Wayland window actor
+         * also stops mutter syncing the surface actors' state — the new
+         * texture AND the subsurface positions — until thaw, so a frozen
+         * actor would hide exactly the tag this relies on.
+         *
+         * Which position that is comes from the buffer's commit: the runtime
+         * places a 1x1 clear synchronised subsurface at (x mod 256, y mod 256)
+         * of the content position it wove for. A synchronised subsurface's
+         * position is applied atomically with the parent's buffer, so tag and
+         * pixels cannot disagree. The tag is resolved against the positions
+         * the window has had in the last second (newest first).
+         *
+         * Every tagged frame is shown where its tag says (MoveSyncChoice
+         * below). The tag names a POSITION, and a position is all the actor
+         * needs; which moment of the history it came from is ambiguous only
+         * when the window revisits a position (a reversal), and then either
+         * answer puts the actor on the same pixel. Commits reach mutter in
+         * the order they were presented, and each was woven for a position
+         * the window had at or after the previous one's, so this never walks
+         * back in time. An earlier rule ignored tags that resolved OLDER than
+         * the one shown; at a reversal the ambiguous match made the frames
+         * woven on the way to the turn look older, so they were painted where
+         * they were not woven for (measured: 1-2 % of a reversal's frames).
+         *
+         * A window whose app stops committing is not left behind: once the
+         * actor has been behind the window for TIMEOUT_US (100 ms) AND
+         * TIMEOUT_FRAMES stage frames (a stalled SHELL is not a stalled app)
+         * with no newer woven frame, it FOLLOWS the window (the plain
+         * compositor drag: a stale frame at the new place, counted as a
+         * timeout) until a frame woven for a position the window had in the
+         * last RESYNC_US arrives, which is shown where it belongs. The frame
+         * logic is MoveSyncChoice (pure, unit-tested); this class is its GI
+         * side.
+         *
+         * The window advances only when a frame for a new position lands, a
+         * few frames behind the pointer (the runtime re-weaves every refresh
+         * during a move; see docs/specs/runtime/wayland-window-geometry.md §9
+         * for the measurements).
+         *
+         * The tag gate (version 10). EnableMoveSync is per PROCESS, but a
+         * process may show nothing woven for long stretches (a browser on a
+         * 2D page): it tags no commit, and holding its window would stall
+         * every drag into the timeout. So a hold runs only while a tag
+         * subsurface is MAPPED: a move that starts with none drags as a plain
+         * window (the position history is still kept); a tag appearing
+         * mid-move starts the hold from the window's current position, and
+         * the kept history resolves that very frame; a tag going away ends
+         * the hold at once — the actor goes to the window, counted as a
+         * tag-lost release, no timeout. An in-process app keeps its tag
+         * mapped whenever it can be dragged, so nothing changes for it.
+         */
+        //! After the grab ends, give the last woven frame this long to land.
+        const MOVE_SYNC_SETTLE_US = 300 * 1000;
+
+        class MoveSync {
+            constructor(debug) {
+                this._debug = debug;
+                this._clients = new Map(); // bus unique name -> {pids, watchId}
+                this._st = new Map();      // Meta.Window -> per-drag state
+                this._stageId = 0;
+                //! DISPLAYXR_STAMP_AUDIT=1: one DXRSYNC line per frame of a hold.
+                this._trace = GLib.getenv('DISPLAYXR_STAMP_AUDIT') === '1';
+            }
+
+            destroy() {
+                for (const win of [...this._st.keys()])
+                    this._release(win, 'disabled');
+                for (const c of this._clients.values())
+                    Gio.bus_unwatch_name(c.watchId);
+                this._clients.clear();
+            }
+
+            register(sender, pid) {
+                let c = this._clients.get(sender);
+                if (!c) {
+                    c = {pids: new Set(), watchId: 0};
+                    c.watchId = Gio.bus_watch_name_on_connection(Gio.DBus.session, sender,
+                        Gio.BusNameWatcherFlags.NONE, null, () => {
+                            Gio.bus_unwatch_name(c.watchId);
+                            this._clients.delete(sender);
+                        });
+                    this._clients.set(sender, c);
+                }
+                c.pids.add(pid);
+                if (this._debug)
+                    log(`displayxr: move sync enabled for pid ${pid}`);
+            }
+
+            isPidSynced(pid) {
+                for (const c of this._clients.values()) {
+                    if (c.pids.has(pid))
+                        return true;
+                }
+                return false;
+            }
+
+            //! A move of this window is tracked (held or plain; see onGrabBegin).
+            isActive(win) {
+                return this._st.has(win);
+            }
+
+            //! The actor is held right now.
+            isHeld(win) {
+                return this._st.get(win)?.held ?? false;
+            }
+
+            /*
+             * A move of a synced process's window starts. It is HELD only if
+             * a tag is mapped right now (the tag gate, version 10 —
+             * MoveSyncChoice.gate): otherwise it drags as a plain window,
+             * and the per-frame gate starts the hold the moment a tag
+             * appears. Either way the move is tracked (position history,
+             * geometry published every frame) until it ends.
+             */
+            onGrabBegin(win, isMove) {
+                if (!win || !isMove || !this.isPidSynced(win.get_pid()) || win.is_fullscreen())
+                    return;
+                const actor = win.get_compositor_private();
+                if (!actor)
+                    return;
+                const now = GLib.get_monotonic_time();
+                const prev = this._st.get(win);
+                if (prev) { // grabbed again while settling: same hold continues
+                    prev.grabbing = true;
+                    return;
+                }
+                const b = win.get_buffer_rect();
+                const held = this._readTag(actor) !== null;
+                const st = Object.assign(MoveSyncChoice.create(b.x, b.y, now, held), {
+                    actor, grabbing: true, settleUs: 0, w: b.width, h: b.height,
+                });
+                this._st.set(win, st);
+                this._ensureStage();
+                if (this._debug) {
+                    log(`displayxr: move sync pid ${win.get_pid()}: ` +
+                        `${held ? 'tag mapped, hold' : 'no tag mapped, plain drag until one appears'}`);
+                }
+            }
+
+            onPositionChanged(win) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                const b = win.get_buffer_rect();
+                if (b.width !== st.w || b.height !== st.h) {
+                    // A resize (tiling, unmaximise under the pointer): not a
+                    // move any more. Let mutter place and size it normally.
+                    this._release(win, 'resized');
+                    return;
+                }
+                MoveSyncChoice.onMove(st, b.x, b.y, GLib.get_monotonic_time());
+            }
+
+            onGrabEnd(win) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                st.grabbing = false;
+                st.settleUs = GLib.get_monotonic_time() + MOVE_SYNC_SETTLE_US;
+                if (win.get_maximize_flags?.() || win.is_fullscreen())
+                    this._release(win, 'maximized');
+                else if (!st.held)
+                    this._release(win, 'plain drag'); // nothing to settle
+            }
+
+            forget(win) {
+                if (this._st.has(win))
+                    this._release(win, 'unmanaged');
+            }
+
+            _ensureStage() {
+                if (this._stageId)
+                    return;
+                // before-update: after mutter's own handler (which applies
+                // time-constrained commits for this frame), before layout and
+                // paint, so the position set here is the one painted.
+                this._stageId = global.stage.connect('before-update', () => this._beforeUpdate());
+            }
+
+            _dropStage() {
+                if (this._stageId && this._st.size === 0) {
+                    global.stage.disconnect(this._stageId);
+                    this._stageId = 0;
+                }
+            }
+
+            //! The tag of the buffer the window shows NOW: [x, y] or null.
+            _readTag(actor) {
+                // Every surface actor under the window actor, with its
+                // position relative to the window actor. mutter 45-50 keep
+                // them flat under one container; summing the offsets covers
+                // a nested tree as well.
+                const surfaces = [];
+                const walk = (a, ox, oy) => {
+                    for (const ch of a.get_children()) {
+                        const [w, h] = ch.get_size();
+                        const [x, y] = ch.get_position();
+                        if (w > 0 && h > 0)
+                            surfaces.push({actor: ch, w, h, x: ox + x, y: oy + y, content: ch.get_content()});
+                        walk(ch, ox + x, oy + y);
+                    }
+                };
+                walk(actor, 0, 0);
+                // The main surface by its texture (version 12), not by size:
+                // see MoveSyncChoice.pick.
+                const texture = actor.get_texture?.() ?? null;
+                const {main, tag, byTexture} = MoveSyncChoice.pick(surfaces, texture);
+                if (main < 0 || tag < 0 || !surfaces[tag].actor.visible)
+                    return null;
+                if (this._debug && this._mainRule !== byTexture) {
+                    this._mainRule = byTexture;
+                    log(`displayxr: move sync: main surface found by ${byTexture
+                        ? 'its texture' : 'size (no texture match — a decorated window may decode wrong)'} ` +
+                        `(${surfaces.length} surface actors)`);
+                }
+                const t = surfaces[tag], m = surfaces[main];
+                return MoveSyncChoice.decode(t.x, t.y, m.x, m.y);
+            }
+
+            _beforeUpdate() {
+                const now = GLib.get_monotonic_time();
+                for (const [win, st] of [...this._st]) {
+                    if (st.actor.is_destroyed()) {
+                        this._release(win, 'destroyed');
+                        continue;
+                    }
+                    const tag = this._readTag(st.actor);
+                    const prevShown = st.shown;
+                    const gate = MoveSyncChoice.gate(st, tag, now);
+                    if (gate === 'release' || gate === 'plain') {
+                        if (gate === 'release') {
+                            // The tag went away (unmapped or hidden): what is
+                            // painted from now on is woven for nowhere in
+                            // particular. Hand the actor to the window at
+                            // once — no timeout, no hop back.
+                            st.actor.set_position(st.shown.x, st.shown.y);
+                            if (this._trace)
+                                log(`DXRSYNC t=${now} gate=release cur=${st.shown.x},${st.shown.y}`);
+                            if (this._debug) {
+                                log(`displayxr: move sync hold released (tag unmapped) at ` +
+                                    `(${st.shown.x},${st.shown.y}); plain drag until a tag appears`);
+                            }
+                        }
+                        if (!st.grabbing)
+                            this._release(win, gate === 'release' ? 'tag unmapped' : 'plain drag');
+                        continue;
+                    }
+                    if (gate === 'start' && this._debug) {
+                        log(`displayxr: move sync hold started mid-move (a tag appeared) at ` +
+                            `(${st.shown.x},${st.shown.y})`);
+                    }
+                    const r = MoveSyncChoice.onFrame(st, tag, now);
+                    if (this._trace) {
+                        log(`DXRSYNC t=${now} tag=${tag} woven=${r.woven ? `${r.woven.x},${r.woven.y}` : 'none'} ` +
+                            `shown=${prevShown.x},${prevShown.y} cur=${r.cur.x},${r.cur.y} hist=${st.hist.length}`);
+                    }
+                    if (r.needTick)
+                        st.actor.queue_redraw();
+                    if (r.timedOut && this._debug) {
+                        log(`displayxr: move sync timeout — no frame woven for (${r.cur.x},${r.cur.y}) in ` +
+                            `${MoveSyncChoice.TIMEOUT_US / 1000} ms; following the window with stale frames`);
+                    }
+                    const caughtUp = r.caughtUp;
+                    // mutter re-synced the actor to the window on the last
+                    // move: put it back where the buffer was woven for.
+                    const [ax, ay] = st.actor.get_position();
+                    if (ax !== st.shown.x || ay !== st.shown.y)
+                        st.actor.set_position(st.shown.x, st.shown.y);
+                    if (!st.grabbing && (caughtUp || now > st.settleUs))
+                        this._release(win, caughtUp ? 'settled' : 'settle timeout');
+                }
+            }
+
+            _release(win, why) {
+                const st = this._st.get(win);
+                if (!st)
+                    return;
+                this._st.delete(win);
+                if (!st.actor.is_destroyed()) {
+                    // Hand the actor back to mutter where the window is.
+                    const b = win.get_buffer_rect();
+                    st.actor.set_position(b.x, b.y);
+                }
+                this._dropStage();
+                if (this._debug) {
+                    const d = st.stats;
+                    log(`displayxr: move sync done (${why}) — ${d.frames} frame(s), ${d.advanced} advance(s) on a ` +
+                        `woven frame, ${d.timeouts} timeout(s), ${d.backHops} back hop(s), ${d.untagged} untagged, ` +
+                        `max behind ${d.maxBehind} logical px, ${d.holds} hold(s), ` +
+                        `${d.tagLost} tag-lost release(s)`);
+                }
+            }
+        }
+
+        /*
+         * Stamp audit (DISPLAYXR_STAMP_AUDIT=1, measurement only, #1748): with
+         * the runtime's DXR_WL_ORIGIN_STAMP=1, every frame carries a barcode of
+         * the present origin it was woven for in its top-left 352x8 device px.
+         * After each stage paint, read it back from the grabbed window's texture
+         * and log it next to where the stage painted that window. Costs a GPU
+         * readback per paint; never on in production.
+         *
+         * DISPLAYXR_STAMP_AUDIT=2 is the light variant: no readback and no
+         * per-paint line, only paint intervals, summarised in one DXRPAINTS
+         * line per drag — so the audit's own cost cannot be what stalls.
+         */
+        const STAMP_BLOCK = 8, STAMP_BLOCKS = 44;
+        class StampAudit {
+            constructor(light) {
+                this._light = light;
+                this._path = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'displayxr-stamp.png']);
+                this._paints = 0;
+                this._lastUs = 0;
+                this._gaps = [];
+            }
+
+            //! Light mode: one summary per drag.
+            flush() {
+                if (!this._light || this._paints === 0)
+                    return;
+                log(`DXRPAINTS t=${GLib.get_monotonic_time()} paints=${this._paints} ` +
+                    `gaps>60ms=[${this._gaps.join(',')}]`);
+                this._paints = 0;
+                this._lastUs = 0;
+                this._gaps = [];
+            }
+
+            sample(win, syncActive) {
+                if (this._light) {
+                    const now = GLib.get_monotonic_time();
+                    if (this._lastUs && now - this._lastUs > 60000)
+                        this._gaps.push(Math.round((now - this._lastUs) / 1000));
+                    this._lastUs = now;
+                    this._paints++;
+                    return;
+                }
+                const actor = win.get_compositor_private();
+                if (!actor || !Mtk || !GdkPixbuf)
+                    return;
+                const mon = win.get_monitor();
+                if (mon < 0)
+                    return;
+                const g = global.display.get_monitor_geometry(mon);
+                const scale = deviceScaleOf(mon); // device px per stage px
+                const cw = Math.ceil(STAMP_BLOCK * STAMP_BLOCKS / scale) + 2;
+                const chh = Math.ceil(STAMP_BLOCK / scale) + 1;
+                const clip = new Mtk.Rectangle({x: 0, y: 0, width: cw, height: chh});
+                let woven = 'none', seq = -1;
+                try {
+                    const img = actor.get_image(clip);
+                    if (img) {
+                        img.writeToPNG(this._path);
+                        const pb = GdkPixbuf.Pixbuf.new_from_file(this._path);
+                        const px = pb.get_pixels(), rs = pb.get_rowstride(), nc = pb.get_n_channels();
+                        const k = pb.get_width() / cw; // image px per logical px
+                        const bit = i => {
+                            const x = Math.floor(((STAMP_BLOCK * i + STAMP_BLOCK / 2) / scale) * k);
+                            const y = Math.floor(((STAMP_BLOCK / 2) / scale) * k);
+                            return px[y * rs + x * nc] > 127 ? 1 : 0;
+                        };
+                        const field = (from, n) => {
+                            let v = 0;
+                            for (let i = 0; i < n; i++)
+                                v = v * 2 + bit(from + i);
+                            return v;
+                        };
+                        if (bit(0) === 1 && bit(1) === 0 && bit(2) === 1 && bit(3) === 0) {
+                            woven = `${field(4, 16) - 32768},${field(20, 16) - 32768}`;
+                            seq = field(36, 8);
+                        }
+                    }
+                } catch (e) {
+                    woven = `error:${e.message}`;
+                }
+                const [ax, ay] = actor.get_position();
+                const toPx = v => {
+                    const t = v * scale;
+                    return t >= 0 ? Math.floor(t + 0.5) : -Math.floor(-t + 0.5);
+                };
+                const [ptrX, ptrY] = global.get_pointer();
+                const b = win.get_buffer_rect();
+                log(`DXRSTAMP t=${GLib.get_monotonic_time()} pid=${win.get_pid()} ` +
+                    `paint=${toPx(ax - g.x)},${toPx(ay - g.y)} woven=${woven} seq=${seq} ` +
+                    `actor=${ax},${ay} win=${b.x},${b.y} ptr=${ptrX},${ptrY} scale=${scale} sync=${syncActive ? 1 : 0}`);
+            }
+        }
+
         class WindowPlacement {
-            constructor(getGrabbedWindow) {
+            constructor(getGrabbedWindow, onPointerDrag = () => {}) {
                 this._getGrabbedWindow = getGrabbedWindow;
+                //! (win) at a pointer drag's start, (null, win) at its end: the
+                //! service treats it as the grab it stands in for.
+                this._onPointerDrag = onPointerDrag;
+                this._pd = null;
+                //! Version 15: the windows each client made keep-above, and the
+                //! watch on each such client's bus name (sender -> watch id).
+                this._above = OwnWindow.newTracker();
+                this._aboveWatch = new Map();
+                //! Version 17: ActivateWindow's focus policy (OwnWindow.mayTakeFocus).
+                //! _stamps: pid -> the newest time mutter stamped on its windows
+                //! (input, activation; not a window's starting value).
+                this._focus = OwnWindow.newFocusState();
+                this._stamps = new Map();
+                this._stampSignals = new Map();
+                this._focusWin = global.display.focus_window;
+                this._focusId = global.display.connect('notify::focus-window',
+                    () => this._onFocusWindow());
+                this._createdId = global.display.connect('window-created',
+                    (_d, win) => this._watchStamps(win));
+                // Windows from before: no stamp until their next input.
+                for (const win of this._allWindows())
+                    this._watchStamps(win);
                 // DISPLAYXR_DEBUG=1 in the shell's environment: per-drag lattice
                 // lines in the journal.
                 this._debug = GLib.getenv('DISPLAYXR_DEBUG') === '1';
@@ -1057,22 +2903,73 @@
                     (...a) => this._emitDone(...a),
                     win => win !== null && win === this._getGrabbedWindow(),
                     this._debug);
+                // Only where the entry point offers it (GNOME 45+; the 40-44
+                // entry point passes moveSync: false — never run there).
+                this._moveSync = moveSync ? new MoveSync(this._debug) : null;
+                const audit = GLib.getenv('DISPLAYXR_STAMP_AUDIT');
+                this._stampAudit = audit === '1' || audit === '2' ? new StampAudit(audit === '2') : null;
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(PLACEMENT_IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowPlacement');
             }
 
             //! Grab lifecycle, forwarded by the service (it owns the display
             //! signals).
-            onGrabBegin(win) {
+            onGrabBegin(win, isMove = true) {
                 this._lattice.onGrabBegin(win);
+                this._moveSync?.onGrabBegin(win, isMove);
             }
 
             onGrabEnd(win) {
                 this._lattice.onGrabEnd(win);
+                this._moveSync?.onGrabEnd(win);
+                this._stampAudit?.flush();
+            }
+
+            //! Keep-above went off on @p win, whoever cleared it.
+            onKeepAboveCleared(win) {
+                OwnWindow.forgetWindow(this._above, win);
+            }
+
+            //! @p win was minimized or restored, by anyone: a restore ends
+            //! "minimized by its own app".
+            onMinimizedChanged(win) {
+                if (!win.minimized)
+                    this._focus.selfMinimized.delete(win);
             }
 
             onWindowUnmanaged(win) {
+                OwnWindow.forgetWindow(this._above, win);
                 this._lattice.forget(win);
+                this._moveSync?.forget(win);
+            }
+
+            onPositionChanged(win) {
+                this._moveSync?.onPositionChanged(win);
+            }
+
+            //! Stamp audit: one line per stage paint for the grabbed window and
+            //! any window still settling in move sync.
+            auditStamps(grabbed) {
+                if (!this._stampAudit)
+                    return;
+                const wins = new Set();
+                if (grabbed)
+                    wins.add(grabbed);
+                for (const w of this._moveSync?._st.keys() ?? [])
+                    wins.add(w);
+                for (const w of wins)
+                    this._stampAudit.sample(w, this._moveSync?.isHeld(w) ?? false);
+            }
+
+            EnableMoveSyncAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let ok = false;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) && this._moveSync) {
+                        this._moveSync.register(invocation.get_sender(), senderPid);
+                        ok = true;
+                    }
+                    invocation.return_value(new GLib.Variant('(b)', [ok]));
+                });
             }
 
             _emitNeeded(pid, dx, dy) {
@@ -1095,6 +2992,17 @@
                 return this._lattice?.landedOnTable(win) ?? false;
             }
 
+            //! Move sync is holding this window's actor (a move is running
+            //! or settling).
+            moveSyncHolding(win) {
+                return this._moveSync?.isActive(win) ?? false;
+            }
+
+            //! For the published snapshot: see "move_sync".
+            moveSynced(win) {
+                return this._moveSync?.isPidSynced(win.get_pid()) ?? false;
+            }
+
             //! Per-frame paint audit, forwarded by the service's stage hook.
             auditPaint() {
                 if (this._lattice?.anyGrabbing())
@@ -1102,14 +3010,110 @@
             }
 
             GetPlacementCapabilities() {
-                return this._lattice.supported()
-                    ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0;
+                return (this._lattice.supported()
+                    ? PLACEMENT_CAP_DRAG_LATTICE | PLACEMENT_CAP_EXPLICIT_START : 0) |
+                    (this._moveSync ? PLACEMENT_CAP_MOVE_SYNC | PLACEMENT_CAP_MOVE_SYNC_TAG_GATED : 0) |
+                    PLACEMENT_CAP_POINTER_DRAG |
+                    PLACEMENT_CAP_KEEP_ABOVE | PLACEMENT_CAP_ACTIVATE | PLACEMENT_CAP_MINIMIZE;
+            }
+
+            /*
+             * The pointer drag (see "The pointer drag" at the top of this
+             * file): move the caller's window with the pointer while @p button
+             * is held. Refused when the button is already up (a quick click:
+             * the drag is over before it began), when a grab or another
+             * pointer drag is running, or for a fullscreen / unmovable window.
+             */
+            BeginPointerDragAsync([pid, button], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    let started = false;
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid))
+                        started = this._beginPointerDrag(this._windowOfPid(senderPid), senderPid, button);
+                    invocation.return_value(new GLib.Variant('(b)', [started]));
+                });
+            }
+
+            EndPointerDragAsync([pid], invocation) {
+                this._senderPid(invocation.get_sender(), senderPid => {
+                    if (this._pd && senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        this._pd.pid === senderPid)
+                        this._endPointerDrag('the app saw the release');
+                    invocation.return_value(null);
+                });
+            }
+
+            _beginPointerDrag(win, pid, button) {
+                const refuse = why => {
+                    if (this._debug)
+                        log(`displayxr: pointer drag refused pid=${pid} button=${button}: ${why}`);
+                    return false;
+                };
+                if (!win)
+                    return refuse('no window for this process');
+                if (this._pd || this._getGrabbedWindow())
+                    return refuse('a grab or another pointer drag is running');
+                if (win.is_fullscreen() || win.allows_move?.() === false)
+                    return refuse('the window cannot be moved (fullscreen?)');
+                const [x, y, mods] = global.get_pointer();
+                const f = win.get_frame_rect();
+                const st = PointerDrag.create(button, f.x, f.y, x, y, mods);
+                if (!st)
+                    return refuse(`the button is not held (mods 0x${mods.toString(16)})`);
+                const pd = {win, pid, st, timer: 0, unmanaging: 0};
+                pd.unmanaging = win.connect('unmanaging', () => this._endPointerDrag('the window went away'));
+                pd.timer = GLib.timeout_add(GLib.PRIORITY_HIGH, POINTER_DRAG_POLL_MS, () => {
+                    const [px, py, pm] = global.get_pointer();
+                    const r = PointerDrag.step(pd.st, px, py, pm);
+                    if (r.move && !pd.win.is_fullscreen())
+                        pd.win.move_frame(true, r.move[0], r.move[1]);
+                    if (r.end) {
+                        pd.timer = 0; // this source ends with the SOURCE_REMOVE below
+                        this._endPointerDrag('the button is up');
+                        return GLib.SOURCE_REMOVE;
+                    }
+                    return GLib.SOURCE_CONTINUE;
+                });
+                this._pd = pd;
+                this._onPointerDrag(win);
+                if (this._debug)
+                    log(`displayxr: pointer drag start pid=${pid} button=${button} (mask 0x${st.mask.toString(16)}) ` +
+                        `frame=(${f.x},${f.y}) pointer=(${x},${y})`);
+                return true;
+            }
+
+            //! End a running pointer drag (no-op when none runs).
+            _endPointerDrag(why) {
+                const pd = this._pd;
+                if (!pd)
+                    return;
+                this._pd = null;
+                if (pd.timer)
+                    GLib.source_remove(pd.timer);
+                if (pd.unmanaging) {
+                    try {
+                        pd.win.disconnect(pd.unmanaging);
+                    } catch (e) {
+                        // the window is already gone
+                    }
+                }
+                this._onPointerDrag(null, pd.win);
+                if (this._debug) {
+                    const f = pd.win.get_frame_rect?.();
+                    log(`displayxr: pointer drag end (${why}) pid=${pd.pid} after ${pd.st.moves} move(s)` +
+                        `${f ? `, frame (${f.x},${f.y})` : ''}`);
+                }
+            }
+
+            //! A compositor grab is starting: it owns the pointer from now on.
+            cancelPointerDrag() {
+                this._endPointerDrag('a compositor grab started');
             }
 
             SetDragLatticeAsync([pid, extend, cell, minDx, minDy, maxDx, maxDy, dxs, dys], invocation) {
                 this._senderPid(invocation.get_sender(), senderPid => {
                     let ok = false, sx = 0, sy = 0;
-                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        !this._moveSync?.isPidSynced(senderPid)) {
                         const win = this._windowOfPid(senderPid);
                         ok = this._lattice.set(win, senderPid, extend, cell,
                             [minDx, minDy, maxDx, maxDy], dxs, dys);
@@ -1128,7 +3132,8 @@
                 invocation) {
                 this._senderPid(invocation.get_sender(), senderPid => {
                     let ok = false, sx = 0, sy = 0;
-                    if (senderPid > 0 && (pid === 0 || pid === senderPid)) {
+                    if (senderPid > 0 && (pid === 0 || pid === senderPid) &&
+                        !this._moveSync?.isPidSynced(senderPid)) {
                         const win = this._windowOfPid(senderPid);
                         ok = this._lattice.set(win, senderPid, extend, cell,
                             [minDx, minDy, maxDx, maxDy], dxs, dys, [startX, startY]);
@@ -1152,8 +3157,30 @@
             }
 
             destroy() {
+                // A request whose sender PID is still being looked up must not act
+                // after this (it would leave a window above with nobody to undo it).
+                this._destroyed = true;
+                for (const sender of [...this._above.keys()])
+                    this._dropAboveClient(sender);
+                if (this._focusId) {
+                    global.display.disconnect(this._focusId);
+                    this._focusId = 0;
+                }
+                if (this._createdId) {
+                    global.display.disconnect(this._createdId);
+                    this._createdId = 0;
+                }
+                for (const [win, ids] of this._stampSignals) {
+                    for (const id of ids)
+                        win.disconnect(id);
+                }
+                this._stampSignals.clear();
+                this._focusWin = null;
+                this._endPointerDrag('the extension is disabled');
                 this._lattice?.destroy();
                 this._lattice = null;
+                this._moveSync?.destroy();
+                this._moveSync = null;
                 if (this._dbus) {
                     this._dbus.unexport();
                     this._dbus = null;
@@ -1199,6 +3226,150 @@
                 return best;
             }
 
+            /*
+             * The caller's own window (version 15; see "The caller's own window"
+             * near the top of this file). @p act(win, sender) runs only when
+             * OwnWindow.allowed holds and returns whether it took effect.
+             */
+            _ownWindowAsync(pid, invocation, act) {
+                const sender = invocation.get_sender();
+                this._senderPid(sender, senderPid => {
+                    let ok = false;
+                    const win = senderPid > 0 && !this._destroyed ? this._windowOfPid(senderPid) : null;
+                    if (OwnWindow.allowed({
+                        senderPid, pid, win, grabbed: this._getGrabbedWindow(),
+                        pointerDrag: this._pd !== null, locked: Main?.sessionMode?.isLocked === true,
+                    })) {
+                        try {
+                            ok = act(win, sender) === true;
+                        } catch (e) {
+                            log(`displayxr: own-window request from pid ${senderPid} failed: ${e}`);
+                        }
+                    }
+                    invocation.return_value(new GLib.Variant('(b)', [ok]));
+                });
+            }
+
+            //! Undo the keep-above @p sender set, and stop watching it.
+            _dropAboveClient(sender) {
+                const watchId = this._aboveWatch.get(sender);
+                if (watchId !== undefined) {
+                    Gio.bus_unwatch_name(watchId);
+                    this._aboveWatch.delete(sender);
+                }
+                OwnWindow.dropClient(this._above, sender);
+            }
+
+            SetKeepAboveAsync([pid, above], invocation) {
+                this._ownWindowAsync(pid, invocation, (win, sender) => {
+                    const r = OwnWindow.keepAbove(this._above, sender, win, above,
+                        Meta.MaximizeFlags?.BOTH);
+                    if (r.watch) {
+                        // Lives as long as the caller's connection: an app that
+                        // exits or crashes leaves no window stuck on top.
+                        this._aboveWatch.set(sender, Gio.bus_watch_name_on_connection(
+                            Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE,
+                            null, () => this._dropAboveClient(sender)));
+                    }
+                    return r.ok;
+                });
+            }
+
+            _allWindows() {
+                return (typeof global.display.list_all_windows === 'function'
+                    ? global.display.list_all_windows()
+                    : global.get_window_actors().map(a => a.meta_window)).filter(w => !!w);
+            }
+
+            //! Follow the times mutter stamps on @p win (notify::user-time is
+            //! emitted only by meta_window_set_user_time: input, activation).
+            _watchStamps(win) {
+                if (this._stampSignals.has(win) || win.is_override_redirect())
+                    return;
+                this._stampSignals.set(win, [
+                    win.connect('notify::user-time', () => {
+                        const pid = win.get_pid();
+                        if (pid > 0) {
+                            this._stamps.set(pid, OwnWindow.latestTime(
+                                [this._stamps.get(pid) ?? 0, win.get_user_time()]));
+                        }
+                    }),
+                    win.connect('unmanaged', () => {
+                        const pid = win.get_pid();
+                        for (const id of this._stampSignals.get(win) ?? [])
+                            win.disconnect(id);
+                        this._stampSignals.delete(win);
+                        // The app's last window is gone: forget it (a new process
+                        // may get the same pid).
+                        if (pid > 0 && !this._allWindows().some(w => w !== win && w.get_pid() === pid)) {
+                            this._stamps.delete(pid);
+                            this._focus.away.delete(pid);
+                        }
+                    }),
+                ]);
+            }
+
+            //! The newest input time of everyone: mutter's own high-water mark
+            //! and the user time of every window not of @p exceptPid, including
+            //! a new window's starting value (another app's window that just
+            //! came up wins; the app's own starting values are neither its input
+            //! nor anyone else's).
+            _lastInput(exceptPid = 0) {
+                const now = global.display.get_current_time_roundtrip();
+                const times = this._allWindows()
+                    .filter(w => !w.is_override_redirect() && (exceptPid <= 0 || w.get_pid() !== exceptPid))
+                    .map(w => w.get_user_time());
+                if (typeof global.display.get_last_user_time === 'function')
+                    times.push(global.display.get_last_user_time());
+                return OwnWindow.latestTime(times, now);
+            }
+
+            _onFocusWindow() {
+                const from = this._focusWin, to = global.display.focus_window;
+                this._focusWin = to;
+                let fromPid = 0, toPid = 0, selfMinimized = false;
+                try {
+                    // A window that just closed may already be gone.
+                    fromPid = from ? from.get_pid() : 0;
+                    // The app's dialog had focus while the app minimized its
+                    // main window: judge by the window it belongs to.
+                    const root = from?.find_root_ancestor?.() ?? from;
+                    selfMinimized = !!root && root.minimized && this._focus.selfMinimized.has(root);
+                } catch (e) {
+                    fromPid = 0;
+                }
+                toPid = to ? to.get_pid() : 0;
+                OwnWindow.focusMoved(this._focus, fromPid, toPid, this._lastInput(), selfMinimized);
+            }
+
+            ActivateWindowAsync([pid], invocation) {
+                this._ownWindowAsync(pid, invocation, win => {
+                    // Version 17: take focus only from the app itself (see the
+                    // focus policy next to OwnWindow.mayTakeFocus). Otherwise
+                    // only flag it, as GNOME does for an app that asks from
+                    // the background; ok = false (no focus).
+                    const app = win.get_pid();
+                    if (!win.has_focus() && !OwnWindow.mayTakeFocus(this._focus, app,
+                        this._stamps.get(app) ?? 0, this._lastInput(app),
+                        global.display.focus_window === null)) {
+                        win.set_demands_attention();
+                        return false;
+                    }
+                    // A server timestamp, not 0: activate(0) skips the
+                    // focus-stealing check but, for a window on another
+                    // workspace, only marks it as demanding attention.
+                    // Main.activateWindow() would also close the Overview and
+                    // the calendar. activate() restores a minimized window too.
+                    win.activate(global.display.get_current_time_roundtrip());
+                    return win.has_focus();
+                });
+            }
+
+            SetMinimizedAsync([pid, minimized], invocation) {
+                this._ownWindowAsync(pid, invocation,
+                    win => OwnWindow.minimize(win, minimized, this._focus));
+            }
+
             MoveWindowAsync([pid, x, y], invocation) {
                 this._senderPid(invocation.get_sender(), senderPid => {
                     let moved = false;
@@ -1218,6 +3389,333 @@
             }
         }
 
+        const HOTKEY_IFACE_XML = `
+<node>
+  <interface name="org.displayxr.WorkspaceHotkey1">
+    <method name="Configure">
+      <arg type="s" direction="in" name="accelerator"/>
+      <arg type="s" direction="in" name="unit"/>
+      <arg type="b" direction="out" name="pending"/>
+    </method>
+    <method name="Suspend">
+      <arg type="b" direction="in" name="suspend"/>
+      <arg type="u" direction="in" name="timeoutMs"/>
+    </method>
+    <method name="GetState">
+      <arg type="s" direction="out" name="json"/>
+    </method>
+    <signal name="Activated">
+      <arg type="u" name="timestamp"/>
+    </signal>
+  </interface>
+</node>`;
+
+        //! Protocol revision of WorkspaceHotkey1, reported by GetState().
+        const WORKSPACE_HOTKEY_VERSION = 1;
+
+        /*
+         * The workspace hotkey (version 13): one global keybinding a client
+         * configures, kept alive across that client's exit. Mutter's
+         * grab_accelerator rather than Main.wm.addKeybinding: the accelerator
+         * is the client's (its own config file is authoritative), so a
+         * gsettings schema — which a system-wide extension would also have to
+         * compile into /usr/share/glib-2.0/schemas — adds nothing; the last
+         * configured value is cached in a small JSON file instead.
+         */
+        class WorkspaceHotkeyService {
+            constructor() {
+                this._st = WorkspaceHotkey.create();
+                this._action = 0;
+                this._actionName = '';
+                this._grabbedAccel = '';
+                this._watchId = 0;
+                this._suspendTimer = 0;
+                //! The session is on the lock screen (version 14, #2071). Set
+                //! by the owner through setLocked() before the first _sync().
+                this._locked = WorkspaceHotkeyService.sessionLocked();
+                //! A bootstrap came due while locked: run it at the unlock.
+                this._bootstrapDeferred = false;
+                const base = typeof GLib.get_user_state_dir === 'function'
+                    ? GLib.get_user_state_dir() : GLib.get_user_cache_dir();
+                this._cacheDir = GLib.build_filenamev([base, 'displayxr']);
+                this._cachePath = GLib.build_filenamev([this._cacheDir, 'workspace-hotkey.json']);
+                this._loadCache();
+
+                this._accelSignal = global.display.connect('accelerator-activated',
+                    (_display, action, _device, timestamp) => {
+                        if (this._action !== 0 && action === this._action)
+                            this._onPress(timestamp);
+                    });
+                this._dbus = Gio.DBusExportedObject.wrapJSObject(HOTKEY_IFACE_XML, this);
+                this._dbus.export(Gio.DBus.session, '/org/displayxr/WorkspaceHotkey');
+                this._sync();
+
+                // Bootstrap (version 13): a controller installed since the last
+                // Configure gets its chord without waiting for the service to
+                // run for another reason. Checked a few seconds after enable
+                // (off the login critical path) and whenever a manifest root
+                // changes (inotify on the roots that exist; debounced).
+                this._monitors = [];
+                this._bootstrapTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT_IDLE, 5, () => {
+                    this._bootstrapTimer = 0;
+                    this._maybeBootstrap();
+                    return GLib.SOURCE_REMOVE;
+                });
+                for (const root of this._roots()) {
+                    try {
+                        const dir = Gio.File.new_for_path(root);
+                        if (dir.query_file_type(Gio.FileQueryInfoFlags.NONE, null) !== Gio.FileType.DIRECTORY)
+                            continue;
+                        const mon = dir.monitor_directory(Gio.FileMonitorFlags.NONE, null);
+                        mon.connect('changed', () => this._scheduleBootstrap());
+                        this._monitors.push(mon);
+                    } catch (e) {
+                        // An unreadable root is simply not watched.
+                    }
+                }
+            }
+
+            //! Whether the shell is on the lock screen right now.
+            static sessionLocked() {
+                return Main?.sessionMode?.isLocked === true;
+            }
+
+            //! The lock screen came up or went away (#2071): release or
+            //! re-take the grab, and run a bootstrap deferred by the lock.
+            setLocked(locked) {
+                if (locked === this._locked)
+                    return;
+                this._locked = locked;
+                log(`displayxr: workspace hotkey: ${locked ? 'screen locked — grab released' : 'unlocked — grab restored'}`);
+                this._sync();
+                if (!locked && this._bootstrapDeferred) {
+                    this._bootstrapDeferred = false;
+                    this._scheduleBootstrap();
+                }
+            }
+
+            _roots() {
+                return WorkspaceHotkey.controllerRoots({
+                    XRT_WORKSPACE_CONTROLLER_PATH: GLib.getenv('XRT_WORKSPACE_CONTROLLER_PATH') ?? '',
+                    XDG_DATA_HOME: GLib.getenv('XDG_DATA_HOME') ?? '',
+                    HOME: GLib.get_home_dir(),
+                });
+            }
+
+            //! Fingerprint of the *.json manifests in the roots right now.
+            //! A handful of readdirs; no file is opened.
+            _scanManifests() {
+                const found = [];
+                for (const root of this._roots()) {
+                    try {
+                        const en = Gio.File.new_for_path(root).enumerate_children(
+                            'standard::name', Gio.FileQueryInfoFlags.NONE, null);
+                        let info;
+                        while ((info = en.next_file(null)) !== null)
+                            found.push(`${root}/${info.get_name()}`);
+                        en.close(null);
+                    } catch (e) {
+                        // Missing root: nothing there.
+                    }
+                }
+                return WorkspaceHotkey.fingerprint(found);
+            }
+
+            _scheduleBootstrap() {
+                if (this._bootstrapTimer)
+                    GLib.source_remove(this._bootstrapTimer);
+                this._bootstrapTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT_IDLE, 2, () => {
+                    this._bootstrapTimer = 0;
+                    this._maybeBootstrap();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+
+            _maybeBootstrap() {
+                if (!WorkspaceHotkey.mayBootstrap(this._locked)) {
+                    this._bootstrapDeferred = true;
+                    return;
+                }
+                const current = this._scanManifests();
+                if (!WorkspaceHotkey.needBootstrap(this._st, current))
+                    return;
+                const unit = WorkspaceHotkey.bootstrapUnit(this._st);
+                log(`displayxr: workspace hotkey: controller manifests changed; starting ${unit} once so it ` +
+                    'can configure the launch chord');
+                this._startUnit(unit);
+            }
+
+            _startUnit(unit) {
+                Gio.DBus.session.call(
+                    'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+                    'org.freedesktop.systemd1.Manager', 'StartUnit',
+                    new GLib.Variant('(ss)', [unit, 'replace']),
+                    null, Gio.DBusCallFlags.NONE, -1, null,
+                    (conn, res) => {
+                        try {
+                            conn.call_finish(res);
+                        } catch (e) {
+                            log(`displayxr: workspace hotkey: StartUnit ${unit} failed: ${e.message}`);
+                        }
+                    });
+            }
+
+            destroy() {
+                if (this._bootstrapTimer) {
+                    GLib.source_remove(this._bootstrapTimer);
+                    this._bootstrapTimer = 0;
+                }
+                for (const mon of this._monitors ?? [])
+                    mon.cancel();
+                this._monitors = [];
+                this._ungrab();
+                if (this._accelSignal) {
+                    global.display.disconnect(this._accelSignal);
+                    this._accelSignal = 0;
+                }
+                this._unwatch();
+                if (this._suspendTimer) {
+                    GLib.source_remove(this._suspendTimer);
+                    this._suspendTimer = 0;
+                }
+                if (this._dbus) {
+                    this._dbus.unexport();
+                    this._dbus = null;
+                }
+            }
+
+            _loadCache() {
+                try {
+                    const [ok, bytes] = GLib.file_get_contents(this._cachePath);
+                    if (ok)
+                        WorkspaceHotkey.deserialize(this._st, new TextDecoder().decode(bytes));
+                } catch (e) {
+                    // No cache yet: nothing is grabbed until a client configures.
+                }
+            }
+
+            _saveCache() {
+                try {
+                    // A released hotkey is cached too (accelerator ""): it records
+                    // the manifest set the client answered for, so the bootstrap
+                    // does not start the client again for an unchanged set.
+                    GLib.mkdir_with_parents(this._cacheDir, 0o700);
+                    GLib.file_set_contents(this._cachePath, WorkspaceHotkey.serialize(this._st));
+                } catch (e) {
+                    log(`displayxr: workspace hotkey: could not write ${this._cachePath}: ${e.message}`);
+                }
+            }
+
+            _grab(accel) {
+                const action = global.display.grab_accelerator(accel, Meta.KeyBindingFlags.NONE);
+                if (!action) {
+                    // Another binding owns the chord (or it does not parse).
+                    log(`displayxr: workspace hotkey: could not grab ${accel}`);
+                    return;
+                }
+                this._action = action;
+                this._grabbedAccel = accel;
+                this._actionName = Meta.external_binding_name_for_action(action);
+                Main.wm.allowKeybinding(this._actionName, Shell.ActionMode.NORMAL | Shell.ActionMode.OVERVIEW);
+            }
+
+            _ungrab() {
+                if (this._action === 0)
+                    return;
+                global.display.ungrab_accelerator(this._action);
+                Main.wm.allowKeybinding(this._actionName, Shell.ActionMode.NONE);
+                this._action = 0;
+                this._actionName = '';
+                this._grabbedAccel = '';
+            }
+
+            //! Make the grab match the state (accelerator, suspend).
+            _sync() {
+                const want = WorkspaceHotkey.wantGrab(this._st, Date.now(), this._locked);
+                if (want && this._action !== 0 && this._grabbedAccel === this._st.accelerator)
+                    return;
+                this._ungrab();
+                if (want)
+                    this._grab(this._st.accelerator);
+            }
+
+            _unwatch() {
+                if (this._watchId) {
+                    Gio.bus_unwatch_name(this._watchId);
+                    this._watchId = 0;
+                }
+            }
+
+            _onPress(timestamp) {
+                const r = WorkspaceHotkey.press(this._st, Date.now(), this._locked);
+                if (r.emit && this._dbus) {
+                    this._dbus.emit_signal('Activated', new GLib.Variant('(u)', [(timestamp ?? 0) >>> 0]));
+                }
+                if (r.startUnit)
+                    this._startUnit(r.startUnit);
+            }
+
+            ConfigureAsync(params, invocation) {
+                const [accelerator, unit] = params;
+                if (!WorkspaceHotkey.validAccelerator(accelerator) || !WorkspaceHotkey.validUnit(unit)) {
+                    invocation.return_dbus_error('org.freedesktop.DBus.Error.InvalidArgs',
+                        `bad accelerator '${accelerator}' or unit '${unit}'`);
+                    return;
+                }
+                const sender = invocation.get_sender();
+                if (this._st.owner !== sender) {
+                    this._unwatch();
+                    // Registered exactly as long as the caller's bus connection.
+                    this._watchId = Gio.bus_watch_name_on_connection(
+                        Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE, null,
+                        () => {
+                            if (WorkspaceHotkey.ownerGone(this._st, sender))
+                                this._unwatch();
+                        });
+                }
+                // The manifest set this Configure answers for (bootstrap).
+                const pending = WorkspaceHotkey.configure(this._st, sender, accelerator, unit, Date.now(),
+                    this._scanManifests());
+                if (accelerator === '') {
+                    this._unwatch();
+                    this._st.owner = null;
+                }
+                this._saveCache();
+                this._sync();
+                invocation.return_value(new GLib.Variant('(b)', [pending]));
+            }
+
+            SuspendAsync(params, invocation) {
+                const [on, timeoutMs] = params;
+                if (this._suspendTimer) {
+                    GLib.source_remove(this._suspendTimer);
+                    this._suspendTimer = 0;
+                }
+                const ms = WorkspaceHotkey.suspend(this._st, on, timeoutMs, Date.now());
+                if (ms > 0) {
+                    this._suspendTimer = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+                        this._suspendTimer = 0;
+                        this._sync();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+                this._sync();
+                invocation.return_value(null);
+            }
+
+            GetState() {
+                return JSON.stringify({
+                    version: WORKSPACE_HOTKEY_VERSION,
+                    accelerator: this._st.accelerator,
+                    unit: this._st.unit,
+                    registered: this._st.owner !== null,
+                    grabbed: this._action !== 0,
+                    suspended: WorkspaceHotkey.suspended(this._st, Date.now()),
+                    locked: this._locked,
+                });
+            }
+        }
+
         /*
          * ── The extension proper ─────────────────────────────────────────
          *
@@ -1231,15 +3729,44 @@
                 this._windowSignals = new Map(); // Meta.Window -> [handler ids]
                 this._displaySignals = [];
                 this._emitQueued = false;
+                // Version 18: the connections that get window titles.
+                this._titleAccess = TitleAccess.newTracker();
 
                 this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE_XML, this);
                 this._dbus.export(Gio.DBus.session, '/org/displayxr/WindowGeometry');
                 // Both objects are exported BEFORE the name is requested, so a
                 // client that sees the name appear can always reach
                 // CaptureExclusion1.
-                this._captureExclusion = new CaptureExclusion(() => this._queueEmit());
+                this._captureExclusion = new CaptureExclusion(() => this._queueEmit(),
+                    sender => this._mayReadTitles(sender));
                 this._grabbedWindow = null;
-                this._placement = new WindowPlacement(() => this._grabbedWindow);
+                // A pointer drag stands in for a grab (the window is `moving`,
+                // its drag table corrects every move, and it ends with a
+                // DragLatticeDone), so it is reported exactly like one.
+                this._placement = new WindowPlacement(() => this._grabbedWindow, (win, ended) => {
+                    if (win) {
+                        this._grabbedWindow = win;
+                        this._placement?.onGrabBegin(win);
+                    } else {
+                        this._placement?.onGrabEnd(ended);
+                        if (this._grabbedWindow === ended)
+                            this._grabbedWindow = null;
+                    }
+                    this._queueEmit();
+                });
+                // Version 13: the workspace hotkey. Only with the shell's own
+                // keybinding plumbing (Main, Shell) at hand; without it the
+                // object is not exported and a client falls back.
+                this._workspaceHotkey = Main?.wm && Shell ? new WorkspaceHotkeyService() : null;
+                // Version 14 (#2071): GNOME keeps this extension enabled on the
+                // lock screen (metadata.json session-modes), so follow the
+                // session mode instead of being torn down by it. Only the
+                // hotkey cares; everything else keeps running.
+                this._sessionModeId = 0;
+                if (Main?.sessionMode && typeof Main.sessionMode.connect === 'function') {
+                    this._sessionModeId = Main.sessionMode.connect('updated',
+                        () => this._workspaceHotkey?.setLocked(WorkspaceHotkeyService.sessionLocked()));
+                }
                 this._nameId = Gio.DBus.session.own_name(
                     'org.displayxr.WindowGeometry',
                     Gio.BusNameOwnerFlags.NONE, null, null);
@@ -1253,16 +3780,28 @@
                     }));
                 this._displaySignals.push(
                     display.connect('notify::focus-window', () => this._queueEmit()));
+                // v19: a strut that comes or goes (a dock set to fixed or
+                // hidden, a monitor change) moves monitor.work_area.
+                try {
+                    this._displaySignals.push(
+                        display.connect('workareas-changed', () => this._queueEmit()));
+                } catch (e) {
+                    log(`displayxr: no workareas-changed signal (${e}); work_area follows the next emit`);
+                }
                 // Interactive grabs (move / resize). Published as `moving` so a
                 // consumer that repositions a window knows to wait for the user
                 // to let go. The signal's argument list grew a `screen`
                 // parameter in older shells, so the window is found by type
                 // rather than by position.
                 const grabWindow = args => args.find(a => a instanceof Meta.Window) ?? null;
+                const moveOps = new Set([Meta.GrabOp.MOVING, Meta.GrabOp.KEYBOARD_MOVING,
+                    Meta.GrabOp.MOVING_UNCONSTRAINED].filter(v => v !== undefined));
+                const isMoveOp = args => args.some(a => typeof a === 'number' && moveOps.has(a));
                 this._displaySignals.push(
                     display.connect('grab-op-begin', (..._args) => {
+                        this._placement?.cancelPointerDrag();
                         this._grabbedWindow = grabWindow(_args);
-                        this._placement?.onGrabBegin(this._grabbedWindow);
+                        this._placement?.onGrabBegin(this._grabbedWindow, isMoveOp(_args));
                         this._queueEmit();
                     }));
                 this._displaySignals.push(
@@ -1282,12 +3821,24 @@
                     this._auditId = global.stage.connect('after-paint',
                         () => this._placement?.auditPaint());
                 }
+                if (['1', '2'].includes(GLib.getenv('DISPLAYXR_STAMP_AUDIT'))) {
+                    this._stampAuditId = global.stage.connect('after-paint',
+                        () => this._placement?.auditStamps(this._grabbedWindow));
+                }
             }
 
             disable() {
+                if (this._sessionModeId) {
+                    Main.sessionMode.disconnect(this._sessionModeId);
+                    this._sessionModeId = 0;
+                }
                 if (this._auditId) {
                     global.stage.disconnect(this._auditId);
                     this._auditId = 0;
+                }
+                if (this._stampAuditId) {
+                    global.stage.disconnect(this._stampAuditId);
+                    this._stampAuditId = 0;
                 }
                 for (const [win, ids] of this._windowSignals)
                     for (const id of ids)
@@ -1305,7 +3856,18 @@
                     this._placement.destroy();
                     this._placement = null;
                 }
+                if (this._workspaceHotkey) {
+                    this._workspaceHotkey.destroy();
+                    this._workspaceHotkey = null;
+                }
                 this._grabbedWindow = null;
+                // Version 18: every title grant ends with the extension (a lookup
+                // still in flight finds no tracker and grants nothing).
+                if (this._titleAccess) {
+                    for (const sender of [...this._titleAccess.keys()])
+                        this._revokeTitles(sender);
+                    this._titleAccess = null;
+                }
 
                 if (this._nameId) {
                     Gio.DBus.session.unown_name(this._nameId);
@@ -1321,8 +3883,36 @@
                 if (this._windowSignals.has(win))
                     return;
                 const ids = [
-                    win.connect('position-changed', () => this._queueEmit()),
+                    win.connect('position-changed', () => {
+                        this._placement?.onPositionChanged(win);
+                        // A window in move sync: publish the move NOW. The
+                        // runtime weaves each frame for the position it read
+                        // last, and a BEFORE_REDRAW later added here runs
+                        // only in the NEXT frame (the laters of this one have
+                        // already run), so a coalesced emit reached it every
+                        // other frame: the window advanced on half the paints
+                        // and lagged a frame more. Nothing is corrected after
+                        // the fact in move sync, so the raw position is the
+                        // one to weave for (the lattice path keeps the later:
+                        // there a raw position is about to be replaced).
+                        this._queueEmit(this._placement?.moveSyncHolding(win) ?? false);
+                    }),
                     win.connect('size-changed', () => this._queueEmit()),
+                    // v15: the snapshot reports both (an app reads its own window's
+                    // state back; the user may change either from the dock or
+                    // the window menu).
+                    win.connect('notify::minimized', () => {
+                        this._placement?.onMinimizedChanged(win);
+                        this._queueEmit();
+                    }),
+                    win.connect('notify::above', () => {
+                        // Cleared (by the user from the window menu, or on request):
+                        // no longer the extension's to undo — if the user sets it
+                        // again, it is theirs.
+                        if (!win.is_above())
+                            this._placement?.onKeepAboveCleared(win);
+                        this._queueEmit();
+                    }),
                     win.connect('unmanaged', () => {
                         this._placement?.onWindowUnmanaged(win);
                         const old = this._windowSignals.get(win);
@@ -1343,7 +3933,11 @@
             // same queue is reached through the free function. Either way the
             // callback runs BEFORE_REDRAW; with neither we emit immediately,
             // which is correct but uncoalesced.
-            _queueEmit() {
+            _queueEmit(immediate = false) {
+                if (immediate && this._dbus) {
+                    this._emit();
+                    return;
+                }
                 if (this._emitQueued || !this._dbus)
                     return;
                 const laters = global.compositor?.get_laters?.();
@@ -1367,51 +3961,197 @@
             }
 
             _emit() {
+                // A signal reaches every listener on the bus: never with titles.
                 if (this._dbus) {
                     this._dbus.emit_signal(
                         'WindowsChanged',
-                        new GLib.Variant('(s)', [this._snapshotJson()]));
+                        new GLib.Variant('(s)', [this._snapshotJson(false, false)]));
                 }
             }
 
-            _snapshotJson() {
+            /*
+             * ── Window titles (version 18; see "Window titles" near the top) ──
+             */
+
+            //! Whether a reply to bus name @p sender may carry window titles.
+            _mayReadTitles(sender) {
+                return TitleAccess.mayRead(this._titleAccess, sender, Main?.sessionMode?.isLocked === true);
+            }
+
+            _titlesFor(invocation) {
+                return this._mayReadTitles(invocation.get_sender());
+            }
+
+            _revokeTitles(sender) {
+                const known = this._titleAccess ? TitleAccess.revoke(this._titleAccess, sender) : null;
+                if (known?.watchId)
+                    Gio.bus_unwatch_name(known.watchId);
+                if (known && GLib.getenv('DISPLAYXR_DEBUG') === '1')
+                    log(`displayxr: window titles no longer go to ${sender} (pid ${known.pid})`);
+            }
+
+            //! SetTitleAccess(u pid, b allow) -> (b titles). Both answers go through
+            //! the PID lookup, so a revoke never overtakes the grant before it.
+            SetTitleAccessAsync([pid, allow], invocation) {
+                const sender = invocation.get_sender();
+                Gio.DBus.session.call(
+                    'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                    'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
+                    new GLib.VariantType('(u)'), Gio.DBusCallFlags.NONE, 1000, null,
+                    (conn, res) => {
+                        let senderPid = 0;
+                        try {
+                            senderPid = conn.call_finish(res).deepUnpack()[0];
+                        } catch (e) {
+                            senderPid = 0; // the caller is gone, or the bus daemon cannot say
+                        }
+                        let titles = false;
+                        if (!allow) {
+                            this._revokeTitles(sender);
+                        } else if (this._titleAccess && TitleAccess.mayGrant({
+                            senderPid, pid, locked: Main?.sessionMode?.isLocked === true,
+                        })) {
+                            if (TitleAccess.grant(this._titleAccess, sender, senderPid)) {
+                                // Exactly as long as the caller's bus connection: an
+                                // exit, a crash or a closed private connection ends it.
+                                this._titleAccess.get(sender).watchId = Gio.bus_watch_name_on_connection(
+                                    Gio.DBus.session, sender, Gio.BusNameWatcherFlags.NONE, null,
+                                    () => this._revokeTitles(sender));
+                                if (GLib.getenv('DISPLAYXR_DEBUG') === '1')
+                                    log(`displayxr: window titles go to ${sender} (pid ${senderPid})`);
+                            }
+                            titles = true;
+                        }
+                        invocation.return_value(new GLib.Variant('(b)', [titles]));
+                    });
+            }
+
+            //! One window as the snapshot (and GetPointer) report it; its title
+            //! only with @p titles (version 18).
+            _windowEntry(win, focus, layout, titles) {
                 const display = global.display;
-                const focus = display.focus_window;
+                const frame = win.get_frame_rect();
+                const buffer = win.get_buffer_rect();
+                const mon = win.get_monitor();
+                let monitor = null;
+                if (mon >= 0) {
+                    const g = display.get_monitor_geometry(mon);
+                    const scale = display.get_monitor_scale(mon);
+                    monitor = {x: g.x, y: g.y, w: g.width, h: g.height, scale};
+                    // v11: the factor a consumer converts by. Absent when
+                    // the layout mode cannot be told.
+                    const deviceScale = StageScale.deviceScale(layout, scale);
+                    if (deviceScale !== null)
+                        monitor.device_scale = deviceScale;
+                    // v19: what the top bar and a fixed dock leave to
+                    // windows. Absent when it cannot be told.
+                    const workArea = WorkArea.of(win, mon, global.workspace_manager);
+                    if (workArea)
+                        monitor.work_area = workArea;
+                }
+                return {
+                    id: Number(win.get_id()),
+                    pid: win.get_pid(),
+                    app_id: win.get_wm_class() ?? '',
+                    ...TitleAccess.field(win, titles),
+                    focus: win === focus,
+                    xwayland: win.get_client_type() === Meta.WindowClientType.X11,
+                    frame: [frame.x, frame.y, frame.width, frame.height],
+                    buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
+                    monitor,
+                    capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
+                    lattice_drop: this._placement?.latticeDrop(win) ?? false,
+                    move_sync: this._placement?.moveSynced(win) ?? false,
+                    moving: win === this._grabbedWindow,
+                    minimized: win.minimized === true,
+                    above: win.is_above(),
+                    maximized: PointerPick.isMaximized(win, Meta),
+                    fullscreen: win.is_fullscreen() === true,
+                    ...PointerPick.parentOf(win),
+                };
+            }
+
+            //! @p all: GetAllWindows (dialogs and utility windows too, each
+            //! entry with its window_type), else GetWindows (normal only).
+            //! @p titles: with window titles (version 18: only for a caller
+            //! _mayReadTitles lets in).
+            _snapshotJson(all, titles) {
+                const focus = global.display.focus_window;
                 const windows = [];
+                const layout = currentLayoutMode();
                 for (const actor of global.get_window_actors()) {
                     const win = actor.meta_window;
-                    if (!win || win.get_window_type() !== Meta.WindowType.NORMAL)
+                    if (!win)
                         continue;
-                    const frame = win.get_frame_rect();
-                    const buffer = win.get_buffer_rect();
-                    const mon = win.get_monitor();
-                    let monitor = null;
-                    if (mon >= 0) {
-                        const g = display.get_monitor_geometry(mon);
-                        monitor = {
-                            x: g.x, y: g.y, w: g.width, h: g.height,
-                            scale: display.get_monitor_scale(mon),
-                        };
-                    }
-                    windows.push({
-                        pid: win.get_pid(),
-                        app_id: win.get_wm_class() ?? '',
-                        title: win.get_title() ?? '',
-                        focus: win === focus,
-                        xwayland: win.get_client_type() === Meta.WindowClientType.X11,
-                        frame: [frame.x, frame.y, frame.width, frame.height],
-                        buffer: [buffer.x, buffer.y, buffer.width, buffer.height],
-                        monitor,
-                        capture_excluded: this._captureExclusion?.isExcluded(win) ?? false,
-                        lattice_drop: this._placement?.latticeDrop(win) ?? false,
-                        moving: win === this._grabbedWindow,
-                    });
+                    const type = win.get_window_type();
+                    if (all ? !PointerPick.inAllWindows(type, Meta) : type !== Meta.WindowType.NORMAL)
+                        continue;
+                    const entry = this._windowEntry(win, focus, layout, titles);
+                    if (all)
+                        entry.window_type = type;
+                    windows.push(entry);
                 }
-                return JSON.stringify({version: 1, windows});
+                const snapshot = {version: 1};
+                if (layout !== null)
+                    snapshot.layout_mode = layout;
+                snapshot.windows = windows;
+                return JSON.stringify(snapshot);
             }
 
-            GetWindows() {
-                return this._snapshotJson();
+            // The getters are async handlers (params, invocation) from version 18:
+            // only the invocation says who is asking, and so whether titles go in.
+            // Each still answers at once.
+            GetWindowsAsync(_params, invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._snapshotJson(false, this._titlesFor(invocation))]));
+            }
+
+            //! Version 16: with the app's dialogs and utility windows (GetWindows
+            //! keeps to normal windows, which its consumers rely on).
+            GetAllWindowsAsync(_params, invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._snapshotJson(true, this._titlesFor(invocation))]));
+            }
+
+            //! Version 16: where the pointer is and the window under it (see "The
+            //! pointer"). The window is what mutter's pick finds there, so stacking,
+            //! input regions (a click-through window is passed over) and shell UI
+            //! on top are what the user's click would meet.
+            GetPointerAsync(_params, invocation) {
+                const [x, y] = global.get_pointer();
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._pickJson(x, y, this._titlesFor(invocation))]));
+            }
+
+            //! Version 16: the same for any stage point (what a click at x, y
+            //! would meet), e.g. to check a target before acting on it.
+            GetWindowAtAsync([x, y], invocation) {
+                invocation.return_value(new GLib.Variant('(s)',
+                    [this._pickJson(x, y, this._titlesFor(invocation))]));
+            }
+
+            _pickJson(x, y, titles) {
+                if (Main?.sessionMode?.isLocked === true)
+                    return JSON.stringify(PointerPick.reply({locked: true}));
+                const layout = currentLayoutMode();
+                const display = global.display;
+                const monitors = [];
+                for (let i = 0; i < display.get_n_monitors(); i++) {
+                    const g = display.get_monitor_geometry(i);
+                    monitors.push([g.x, g.y, g.width, g.height]);
+                }
+                if (!PointerPick.onMonitor(x, y, monitors))
+                    return JSON.stringify(PointerPick.reply({x, y, layout, over: 'outside'}));
+                const actor = global.stage.get_actor_at_pos(Clutter.PickMode.REACTIVE, x, y);
+                const win = PointerPick.windowOf(actor);
+                let over = win ? 'window' : PointerPick.nonWindow(actor, global.stage, Meta);
+                if (win && PointerPick.isDesktopWindow(win, Meta))
+                    over = 'desktop';
+                return JSON.stringify(PointerPick.reply({
+                    x, y, layout, over,
+                    window: win ? this._windowEntry(win, display.focus_window, layout, titles) : null,
+                    windowType: win ? win.get_window_type() : null,
+                }));
             }
         }
 

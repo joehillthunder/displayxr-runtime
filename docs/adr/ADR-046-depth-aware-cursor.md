@@ -1,0 +1,1527 @@
+# ADR-046: Depth-aware cursor — opt-in only; the app knows the depth, the runtime places the cursor
+
+**Status:** Proposed (2026-10-06) · Phase 1 implemented · Phase 3a implemented (Metal) · spec v3 anchor modes (2026-10-07) · Amendment 1 (lifted content, 2026-10-10) accepted · Amendment 2 (one policy, runtime draws, app chooses the look, 2026-10-11) accepted, §B built on Metal, Vulkan, GL, D3D11 and D3D12 (spec v5), §B.7 crosstalk softening of the lifted cursor (2026-10-11; Metal + D3D11 + Vulkan + D3D12 + GL) · Amendment 3 (measured-disparity fallback, 2026-10-11) accepted · Amendment 4 (the runtime draws the web cursor, 2026-10-13) proposed · spec:
+[XR_DXR_cursor_depth.md](../specs/extensions/XR_DXR_cursor_depth.md) · sibling of
+[ADR-040](ADR-040-rear-depth-budget.md) (the same cue conflict, at the cursor instead of the desktop)
+
+## In one paragraph
+
+The OS cursor is flat. It is drawn at zero disparity, on the display plane (the ZDP). When it
+hovers content that pops out of the glass, it is drawn **over** pixels whose disparity says they
+are **in front of** it. That is a depth violation, and it reads as a broken image. The shell
+already avoids this for window surfaces by lifting its cursor to the window plane. The DisplayXR
+Browser demos now lift it to the hovered 3D object. This ADR makes that a platform service for
+any app that knows the depth of its content: model viewers, splat viewers, stereo media with a
+depth map. **The service is opt-in, and an app that doesn't ask pays nothing.** The app reports
+the nearest content point under the cursor. The runtime returns where to draw a cursor sprite,
+and how big, so that it sits just in front of that content. The runtime also smooths the
+movement over time, so every DisplayXR cursor behaves the same way.
+
+## Context
+
+### The conflict
+
+A cursor at disparity 0 drawn over content at crossed disparity *d* < 0 gives two cues that
+disagree:
+
+- Occlusion says the cursor is in front, because it covers the content.
+- Disparity says the cursor is behind, because the content is nearer.
+
+This is the same class of conflict as rear content over a busy desktop (ADR-040), with the roles
+swapped. Unlike ADR-040, it is under the user's eye all the time, wherever they are pointing.
+
+### Who can know the depth
+
+Only the app knows what is under the cursor. The runtime receives finished pixels and has no
+scene to raycast. So "the runtime raytraces" isn't available, and doesn't need to be: an app
+that renders 3D already has the answer for almost nothing.
+
+| Content | Cheapest exact source |
+|---|---|
+| Meshes | Readback of a few depth-buffer texels around the cursor, without stalling (PBO plus fence, `mapAsync`, or a staging copy). A BVH raycast also works. |
+| Gaussian splats | Alpha-weighted expected depth from the splat pass, read back the same way. Never raycast splats. |
+| Stereo / RGB-D media | Sample the depth map. For lifted 2D content the `XR_DXR_lift` depth map already exists. |
+
+A readback is one frame late. The time filter below absorbs that.
+
+### Who should decide where the cursor goes
+
+If every app invents its own margin, comfort clamp and smoothing, cursors behave differently
+from app to app. Those decisions are policy about perception, which ADR-040 already established
+is the runtime's to own. Drawing stays with the app, because the app owns its swapchains.
+
+## Decision
+
+### 0. First principle: opt-in, zero cost otherwise
+
+The runtime does **no cursor work for anyone who didn't ask for it**, and that holds for every
+later phase:
+
+1. Enabling the extension costs nothing.
+2. Cursor work happens **only** on an `xrLocateViews` call that chains an `XrCursorDepthHintDXR`.
+   With no hint, there's no math, no state change and no allocation.
+3. The runtime **never touches the OS cursor**. Hiding it while the depth cursor is shown is
+   the app's job, in the app's window.
+4. Any phase that costs the runtime GPU time gets its own explicitly chained request struct, and
+   costs nothing until that struct is chained:
+   - drawing the sprite (Phase 2);
+   - reading the submitted depth layer (Phase 3a), or measuring disparity from the atlas (Phase 3b).
+
+   Even when chained, that cost is bounded to a cursor-sized patch and to frames where the
+   cursor is over a 3D canvas.
+
+This is enforced structurally. The runtime code sits behind the runtime extension gate, then
+behind the hint lookup.
+
+### 1. Division of labour
+
+- **App:** owns the content, so it supplies the depth. It reports the content point nearest the
+  viewer within the cursor's footprint (the whole sprite plus a little, not just the hotspot
+  pixel). Using the footprint is what stops a nearer edge beside the hotspot from cutting through
+  the sprite.
+- **Runtime:** owns placement and policy. It decides where along the line of sight the sprite
+  goes, how big it must be to keep a constant apparent size, and how it moves over time.
+- **App:** draws the sprite last, with depth testing off, at the pose it was given. Every view
+  then renders it at the correct disparity.
+
+### 2. Geometry is solved from the views, never from rig internals
+
+The hint and the result travel through the same `xrLocateViews` call. The runtime solves
+everything from the views that call has just produced:
+
+- **S**, the canvas point under the cursor, is where the outermost pair of view rays through
+  canvas point (u, v) meet. Every Kooima frustum frames the same canvas, so those rays meet.
+- **E**, the cyclopean eye, is the midpoint of that pair.
+- A point's depth is **t**: its distance in front of E along the display normal, divided by S's
+  distance. So t = 1 on the canvas, and t < 1 in front of it.
+- The sprite's height is scaled by t, so its apparent size is constant. Where it goes
+  laterally is the anchor mode (§7). The default, HYBRID, puts it at **C = E + t·(S − E)**
+  while the pointer moves: on the cyclopean ray, so it never slides sideways as it rises.
+
+Because only located views are used, the result is correct for:
+
+- display rigs and camera rigs;
+- any m2v scale;
+- display zones, where the canvas is the zone;
+- any view count of 2 or more.
+
+The unit tests check this by applying a random rigid transform plus a 12.5× uniform scale and
+asserting the same placement. With one active view (2D) the result is inactive and the OS cursor
+stays.
+
+### 3. Policy works in disparity, not distance
+
+The policy works in **d = 1 − 1/t**, in units of the eye baseline:
+
+- on-screen disparity = baseline × d;
+- d = 0 on the canvas;
+- d < 0 in front of it.
+
+The eye compares disparities, so the margin, clamp and slew rates are expressed here:
+
+| Parameter | Default | Why |
+|---|---|---|
+| margin in front of content | 0.015 | about 1 mm crossed on screen at 63–65 mm IPD: reads as in front without looking detached. Spec v3 briefly lowered it to 0.005 after a head-tracked-panel test; Amendment 2 A.2 restored 0.03, then halved it to 0.015 (2026-10-11). Apps can override it (`XrCursorDepthOptionsDXR::margin`) |
+| clamp | [−0.6, +0.6] — **superseded by Amendment 2: [−0.6, 0], never behind the glass** | t ≥ 0.625: never more than about 3/8 of the way to the eye |
+| rise time constant | 30 ms | never lag behind content that comes forward, or the violation is visible |
+| sink time constant | 250 ms | no flicker when the footprint crosses an edge |
+| stale gap | 0.5 s | after a pause the cursor snaps into place instead of gliding in |
+
+When nothing is under the cursor, the target is d = 0 (the display plane). ~~Content behind the
+display plane gives d > 0, and the cursor settles onto it.~~ Amendment 2: content on or behind
+the plane leaves the cursor on the plane. A second locate in the same frame
+(several zones) doesn't advance the filter.
+
+### 4. Phases
+
+| Phase | What | Runtime cost while requested |
+|---|---|---|
+| **1 (this ADR, implemented)** | `XR_DXR_cursor_depth` v1: app hint in, placement out, app draws. Pure placement module `u_cursor_depth` with tests; state-tracker fill in `xrLocateViews`. Works in-process and over IPC, on every graphics API. | A few dozen flops per locate |
+| 2 | **Runtime-drawn cursor** (`XrCursorDepthDrawRequestDXR`): the compositor draws the sprite into the atlas before the display processor, reading the OS cursor position at the last moment before compositing. For apps that would rather not draw. | One quad per view |
+| 3a (*implemented, Metal; spec v2*) | **Depth-layer source** (`XrCursorDepthSourceDXR`, `XR_KHR_composition_layer_depth`): for apps that already submit depth with their projection layer, as engines commonly can. The app chains one struct on the hint and sends no point. The compositor copies a cursor-sized patch (at most 64×64) of the two outermost views' submitted depth, never waiting on the GPU. The state tracker turns the nearest texel into a point through that layer's own view and `nearZ`/`farZ`, and feeds it to the v1 placement. Depth is exact, and the app needs no hit-test code. See §6. | One ≤ 32 KB blit per requested frame, plus a CPU min over ≤ 8 K floats |
+| 3b | **Runtime-measured depth** (`XrCursorDepthMeasureRequestDXR`): for apps that have no depth (stereo photos and video, legacy content). The compositor block-matches a cursor-sized patch between the outermost views of the submitted atlas. The measured disparity feeds the same filter. It fails safe, falling back to d = 0 on textureless or ambiguous patches. | One tiny compute dispatch |
+| 3c (*Amendment 1*) | **Lifted content** (`XR_DXR_lift` weave rects): the service draws the cursor into the lifted views, placed from the conversion's own depth map and the plug-in's relief mapping. | One ≤ 64×64 depth-patch copy and one quad per view, per opted-in rect under the cursor |
+| 4 (*implemented, D3D11 service; see §B as built in the D3D11 service*) | **Shell / IPC**: an opted-in client's placement is shared with the service, so the workspace controller's cursor rises onto window content, not just window surfaces. Clients that didn't opt in keep today's window-plane behaviour. | none extra |
+| 5 | **Web** (*started: displayxr-web `DepthCursor` + `./cursor-depth`*): the inline3d SDK ports the same placement function. The SDK owns its views, so it needs no runtime round-trip. It gets the hint from depth readback or splat expected depth, and draws the sprite with `cursor: none` over the canvas. It is opt-in per viewer (`cursor: 'depth'`). The browser can later offer the lift depth map for converted video. | none in the runtime |
+
+### 5. Reference adoption and evidence
+
+`cube_handle_metal_macos` is the first app to use the extension. Each frame it hit-tests rays
+from the two outer views through a ring of footprint points against the cube, sends the nearest
+hit as the hint, and draws a crosshair at the returned pose with depth testing off. The OS cursor
+is hidden while the crosshair is shown. To opt out, set `DISPLAYXR_CURSOR_DEPTH=0`. For headless
+checks, `DISPLAYXR_CURSOR_DEPTH_UV=u,v` scripts the cursor position. Atlas captures on macOS
+(sim_display, 2 views) gave:
+
+| Cursor UV | Over | Cursor disparity between views | Meaning |
+|---|---|---|---|
+| 0.5, 0.5 | the cube | −23.4 px with the original 0.03 margin; the cube's nearest edge there is about −15 px (for spec v3's 0.005 margin, see §7) | in front of the cube |
+| 0.5, 0.65 | the floor grid, which the app doesn't report as content | 0 px | on the display plane |
+| 0.1, 0.1 | empty space | 0 px | on the display plane |
+
+In every capture, the midpoint of the two cursor images sat at the requested u, and both sat at
+the same v. So the cursor rises along the line of sight and doesn't drift sideways.
+
+### 6. Phase 3a as built: the depth-layer source
+
+**The request.** Spec v2 adds `XrCursorDepthSourceDXR`, chained on the hint, with
+`source = XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR`. The struct is new; no existing struct
+grows. The request covers one frame, so the app chains it every frame for as long as it wants
+the service.
+
+**Zero cost when not requested, in code as well as in principle.** Each stage is gated:
+
+| Stage | Gate | Cost for an app that didn't ask |
+|---|---|---|
+| `xrLocateViews` | extension enabled → hint chained → source struct chained | nothing; the source struct is looked up only behind the hint |
+| `xrEndFrame` | `sess->cursor_depth_source.armed`, set only by such a locate | one bool test, and only inside the depth-layer submit path |
+| Metal `layer_commit` | `req.requested \|\| in_flight` | two field tests; no buffer, no command buffer, no copy |
+| compositor gate | `u_cursor_depth_patch_should_sample()` | unit-tested: a zero-initialised request returns false |
+
+The readback buffers (three 32 KB shared buffers) are allocated on the first real request, never
+before. A command buffer is created only once a copy has been encoded. An app that submits depth
+for its own reasons, but doesn't request the source, gets no extra work. Its depth swapchains
+were already referenced by the layer accumulator, and Phase 3a adds no reference.
+
+**Who does what.**
+
+1. At the armed frame's `xrEndFrame`, the state tracker records the outermost two views (0 and
+   active − 1) of the first projection layer that carries depth. It records them from the
+   layer **as the app submitted it**: the layer's `XrSpace`, each view's pose and fov, and each
+   view's `minDepth`/`maxDepth`/`nearZ`/`farZ`. It keys the record by a tag and hands the
+   compositor a one-frame request: the tag, the cursor UV, the footprint, the two view indices,
+   and whether Z is reversed.
+2. At commit, the Metal compositor copies each view's footprint rectangle out of the depth
+   sub-image into a shared buffer, on its own command buffer, and commits it. On a later commit
+   it checks that command buffer's `status`. It never calls `waitUntilCompleted`, and when all
+   three slots are busy it skips the frame. Once the copy is done, it reduces each patch to its
+   nearest texel on the CPU (at most 8 K floats) and publishes the tag, the texel's position
+   within the sub-image, and the raw depth.
+3. At the next locate, the state tracker:
+   - looks up the record by tag;
+   - unprojects each view's texel through that view's recorded pose and fov;
+   - keeps the nearer of the two in disparity;
+   - passes it to the v1 placement as if the app had sent it.
+
+**Why the point is rebuilt in the state tracker, not in the compositor.** The poses the
+compositor holds have already been through `handle_space`, so they are in the runtime's
+tracking space, not the app's. The view poses the app submitted with the layer are in the
+layer's own space. That is the locate space whenever the two `XrSpace` handles are equal.
+v2 **requires** them to be equal. A layer in a different space gives "no content" and a one-time
+WARN. Converting between two app spaces would cost a space locate per frame for a cursor.
+
+**Depth conventions** are handled by one pure function, `u_cursor_depth_linear_depth()`. It uses
+the fact that 1/z is linear in window depth for every perspective projection:
+
+- D3D, Vulkan and Metal [0,1] clip depth, and GL [−1,1] NDC under the default depth range, all
+  produce the same window-depth curve.
+- Reversed Z (`nearZ > farZ`) and an infinite plane (1/∞ = 0) need no special case.
+- The far end of the mapping, where a cleared buffer sits, counts as no content.
+
+**Footprint.** The footprint is the sprite plus 50% (radius 0.75 × `cursorHeight` canvas
+heights), the same rule the v1 guidance gives apps. Both outer views are searched at the
+cursor's canvas UV, and the nearest texel across both wins. The patch is capped at 64×64 rather
+than the 32×32 first suggested. A footprint of that size on a 4K panel's tile is about 50 texels
+across, so a 32 cap would shrink the footprint and bring back the cut-through at edges that §1
+exists to prevent.
+
+**Bug found on the way.** `comp_layer_accum_projection_depth()` stored depth swapchains at
+`[i + view_count]`, but both getters read `[XRT_MAX_VIEWS + i]`. So every depth lookup returned
+NULL. Nothing in DisplayXR read submitted depth before, so it was latent. The fix is in the
+same PR.
+
+**Metal depth swapchains.** A `Depth32Float` swapchain now takes the private, no-IOSurface path.
+A depth format can't be IOSurface-backed, or use shared storage, on macOS. This affects only
+apps that create a depth swapchain.
+
+**Build-flag caveat (needs a decision).** `XRT_FEATURE_OPENXR_LAYER_DEPTH` defaults **OFF**
+(top-level `CMakeLists.txt`, because of CTS concerns about multi-view depth swapchains). So a
+default build does not advertise `XR_KHR_composition_layer_depth`, and Phase 3a stays dormant.
+The reference app then logs why and keeps its hit test. Turning the flag on is a separate,
+CTS-visible decision, deliberately not made here. The evidence below comes from a build with
+`-DXRT_FEATURE_OPENXR_LAYER_DEPTH=ON`.
+
+*Update (#1956).* The flag was measured: ON is zero-red on all 7 in-process CTS arms once
+`comp_gl` advertises and allocates depth (#1957). The one prerequisite the CTS can't see was the
+IPC path. The Windows D3D11 service now advertises D24S8/D32/D16, the in-process parity set. It
+advertises each format only after probing that it can share one cross-process. On WARP that
+probe refuses D24S8, so the list is D32 + D16. The images are
+TYPELESS NT-handle textures with a keyed mutex. D3D11 and D3D12 clients open them as-is. The
+Vulkan client offers only the formats its device can import as `D3D11_TEXTURE_BIT`. The GL
+client's WGL interop path does not offer depth yet (#1969). The POSIX service (null compositor
++ multi) already advertised importable depth formats. The service still only stores the
+submitted depth: the Phase 3a readback over IPC remains a stub, as listed below.
+
+**Compositors.** Metal reads the patch. vk_native, D3D11, D3D12, GL and the IPC/service path have
+compile-safe stubs: `oxr_session_cursor_depth_hand_request()` returns false. They report no
+content (cursor on the display plane) with a one-time WARN. Wiring vk_native is the next step,
+and it can be tested on macOS through MoltenVK.
+
+*Note (2026-10-23, #2317 audit):* this paragraph is about the Phase 3a depth *patch* only, and
+still holds (`oxr_session_cursor_depth_hand_request()` returns false for everything but Metal).
+The Amendment 3 *measured-disparity* source is separate and has since landed on every in-process
+native compositor (vk_native, D3D11, D3D12, GL, Metal) and the D3D11 service
+(`oxr_session_cursor_measure_hand_request()`), so those paths do not fall back to "no content"
+when the app opts into measurement.
+
+**Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, atlas captures 1512×1646, cursor
+x offset between the two stacked tiles):
+
+| Cursor UV | App hit test (v1) | Depth-layer source (v2) |
+|---|---|---|
+| 0.5, 0.5 (over the cube) | 22.6 px, target d = −0.066 | 24.6 px, target d = −0.081 |
+| 0.1, 0.1 (empty space) | 0 px | 0 px |
+
+The depth-layer source places the cursor about 2 px further forward. That is expected, because
+it searches every texel of the footprint box, while the app's hit test casts 9 rays (the centre
+and a ring of 8). The box's corners reach √2 times further than the ring, so the box finds a
+slightly nearer cube edge. A run without the request, in hint mode and with
+`DISPLAYXR_CURSOR_DEPTH=0`, logs none of the Phase 3a one-time WARNs. A run with the request logs
+each of them exactly once.
+
+### 7. Spec v3: anchor modes, and why HYBRID is the default
+
+**What the tester saw.** On a real head-tracked panel, the v1/v2 cursor read as "at the glass"
+even when its disparity put it on the content. The cause is a cue conflict of its own. The sprite
+sat on the cyclopean ray through the pointer's canvas point (§2), so each eye's image of it on the
+glass was S ∓ (baseline/2)·d whatever the head did. That is disparity with **no motion parallax**.
+On a head-tracked display everything else parallaxes as the head moves, so a cursor that doesn't
+reads as lying on the one surface that also doesn't: the glass. A world-fixed cursor read
+correctly, but sat a millimetre or two beside the click point.
+
+**The modes** (`XrCursorDepthOptionsDXR::anchorMode`, a new struct chained on the hint; no
+existing struct grows). With f the display normal away from the viewer and e = dot(S − E, f):
+
+| Mode | Sprite centre C | Aim | Parallax |
+|---|---|---|---|
+| SCREEN (v1/v2) | E + t·(S − E) | exact, always | none: reads as at the glass |
+| WORLD | S − f·(1 − t)·e | ~1–2 mm off for an off-axis viewer, always | correct |
+| **HYBRID (default)** | moving: SCREEN, and store the line of sight (E₀, S₀, D₀ = e); still: E₀ + s·(S₀ − E₀), s = 1 − (1 − t)·e / D₀ | exact while moving, and on the click point while still unless the head moves | correct while still |
+
+"Moving" means `cursorUV` changed by more than 1e-4 since the last moving placement. HYBRID
+re-anchors on the first hinted locate and whenever the time filter re-primes; the anchor lives
+beside the filter in the session and is touched only by a hinted locate, so §0 holds.
+
+**The anchor is the line of sight at the last pointer move, not a point.** While the pointer is
+still, C is the point on the anchor-time line E₀ → S₀ whose distance in front of the glass,
+(1 − s)·D₀, equals the current depth (1 − t)·e. Three properties follow, all unit-tested:
+
+- **Continuity:** on the frame the pointer stops, the geometry is the anchor's, so s = t and C is
+  the last moving placement exactly. No jump.
+- **Parallax:** a lateral head move at fixed t leaves e, and so s and C, unchanged. The sprite is
+  world-fixed and parallaxes like content at its depth.
+- **No drift from depth changes:** when the content under a still pointer changes depth, C slides
+  along the anchor-time line, so from the eye that aimed it, it stays on the click point.
+
+An earlier draft of the rule stored the line's *foot* on the glass and lifted C from it along the
+display normal. The headless captures below exposed the flaw: a depth change under a still
+pointer then moved the sprite off the click point by about |Δd| × the viewer's lateral offset
+(27 px for sim_display's viewer, 0.10 m above the canvas centre, when the scripted pointer
+anchored at d = 0 on frame 1 and the cursor then rose to the cube). The web SDK takes the same
+line-of-sight rule (inline3d 1.37.1).
+
+**Why HYBRID beats both pure modes.** While the pointer moves, the user is aiming, and the eye
+tracks the cursor, not the head; there SCREEN's exact aim is what matters and a parallax deficit
+over a few frames is invisible. While it is still, the user is looking at the scene, often moving
+their head to see around it, and the cursor must parallax like the content it rests on; there
+WORLD's behaviour is right. The only cost is that the drawn sprite drifts from the click point as
+the **head** moves while the pointer is still: its image on the glass moves by about |d| × the
+head's lateral displacement. For content near the glass (d ≈ −0.005 with the new margin), 20 cm of
+head motion moves it about 1 mm. The next mouse movement re-aims it exactly. Hit testing is
+unchanged: the click is always at the pointer's canvas point.
+
+**Evidence** (macOS, sim_display SBS, `cube_handle_metal_macos`, `DISPLAYXR_CURSOR_DEPTH_UV=0.5,0.5`,
+atlas 1512×1646, two tiles of 1512×823 stacked; disparity = cursor x in the right-eye tile minus
+the left-eye tile; the cube's nearest edge under the cursor is about −15 px). The scripted pointer
+never moves, so HYBRID anchors on frame 1 at d = 0 and the cursor then rises to the cube with the
+pointer still: the depth-change case.
+
+| `DISPLAYXR_CURSOR_DEPTH_ANCHOR` | Target d | Cursor disparity | Cursor y in tile (pointer at 411) |
+|---|---|---|---|
+| unset (options not chained → HYBRID) | −0.040 | −16.6 px | 411 |
+| `hybrid` | −0.040 | −16.6 px | 411 |
+| `screen` | −0.040 | −16.6 px | 411 |
+| `world` | −0.040 | −16.6 px | 438 |
+| *foot-anchored draft of HYBRID* | *−0.040* | *−16.6 px* | *438* |
+| *before v3: 0.03 margin, SCREEN (§5)* | *−0.066* | *−23.4 px* | — |
+
+All sit just in front of the cube's edge, about 7 px nearer it than with the old margin. HYBRID
+stays on the click point like SCREEN; WORLD sits 27 px below it for this off-axis viewer. In every
+capture the midpoint of the two cursor images is at the requested u (0.4995).
+
+**A deliberate default change.** An app that doesn't chain the options struct gets HYBRID and
+the 0.005 margin, which is different from v2. It is tester-driven, both changes go the same way
+(the cursor reads as on the content), and an app that wants the old placement chains
+`XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR` with `margin = 0.03`. The web SDK's depth cursor
+implements the identical rule with the same numbers.
+
+## Consequences
+
+- An app that already raycasts or reads depth gets a correct, consistent cursor for one struct
+  on `xrLocateViews` and one sprite draw.
+- An app that doesn't opt in is byte-for-byte unaffected.
+- The placement math is a pure function of the views, so the SDK port (Phase 5) can be checked
+  against the C unit tests' expected values.
+- The hint is a frame old. A cursor moving fast across a depth edge can show a single frame
+  where the cursor sits behind the nearer content. The footprint dilation and the fast rise keep
+  that to the edge itself. Phase 3a as built does not remove this lag. It reads frame N's
+  submitted depth, but the result reaches the placement one or two frames later, because waiting
+  on the GPU would stall the pipeline (§6). So it has the same lag, and the same mitigation.
+- **Head motion and look-around (revised in spec v3, §7).** v1/v2 anchored the sprite to the
+  screen: on the cyclopean ray, so each eye saw it on the glass at S ∓ (baseline/2)·d whatever
+  the head did (still unit-tested, now as the SCREEN-mode property). The reasoning was that a
+  mouse is a 2D screen-space device and its click target must not drift. Testing on a real
+  head-tracked panel showed the price: a sprite with disparity but no motion parallax conflicts
+  with everything around it that does parallax, and reads as at the glass. The default is now
+  HYBRID: screen-anchored while the pointer moves (exact aim), and anchored to that line of
+  sight while it is still (correct parallax, unit-tested: the sprite does not move in locate
+  space as the head moves laterally).
+  The click target never drifts, because hit testing stays at the pointer's canvas point. Only
+  the drawn sprite drifts, by |d| × head displacement (about 1 mm for 20 cm of head motion over
+  content near the glass), and only until the mouse next moves. A depth change under a still
+  pointer does not drift it: the anchor is the line of sight, not a point (§7). SCREEN and WORLD remain
+  available through `XrCursorDepthOptionsDXR`.
+- An app-drawn cursor shows the app's frame latency, not the hardware cursor's. Phase 2's late
+  cursor read narrows that but cannot remove it. This is inherent to any cursor that has
+  disparity.
+
+## Alternatives considered
+
+- **Runtime raycasting.** The runtime has no scene, so this is impossible.
+- **Always-on atlas measurement.** It would serve every app with no cooperation, but it charges
+  every app for a service most don't use, which violates §0. It is kept as the opt-in Phase 3b.
+- **Each app does it all.** It works, and is what the demos do today. But the policy diverges
+  between apps, and the math is subtle to get rig-agnostic. §2 is easy to get wrong for
+  camera-rig apps.
+- **Give the hint in display space (metres from the display plane).** The app would then need
+  the world-to-display mapping, which camera rigs scale and move. The locate space is the one
+  space the app and the runtime already share.
+
+## Amendment 1 (2026-10-10): lifted content — the service draws, the conversion supplies the depth
+
+**Accepted** (David, 2026-10-10). Tracking: runtime #1907, under epic #1858.
+
+### Why lifted content needs its own path
+
+Every earlier phase assumes the app renders the views, so the app can draw the sprite into them
+(Phase 1, 3a, 5) or at least submit them (2, 3b). A 2D video lifted through `XR_DXR_lift`
+breaks that assumption. The browser hands the service a **2D** frame on a lift-flagged weave
+rect. The conversion module makes the views on the service's lift thread, and the service
+writes them into the weave input (`lift_weave_rects_nview` / `lift_weave_rect_batch` in
+`comp_d3d11_service.cpp`) and weaves. The page never holds a view it could draw into. The only
+code that holds both the views and their depth is the service, at that write. That is also
+where the workspace controller's cursor is already drawn (the shell pushes `hit_z` and a
+sprite, and the service draws one disparity-shifted sprite per tile before the weave), so the
+service draws here too.
+
+### Decision
+
+1. **Opt-in per lifted rect.** A struct chained on `XrWeaveRectLiftDXR::next` asks for a
+   depth cursor on that rect. No struct, no work: §0 holds. The caller hides its own OS cursor
+   over the rect only while the runtime reports, on the weave output, that it drew the cursor
+   for that rect in the frame just woven. Every frame the runtime cannot place the cursor (no
+   depth, no display mapping, cursor outside the rect, 2D fallback), it reports "not drawn" and
+   the OS cursor stays. The failure mode is today's flat cursor, never no cursor.
+2. **Depth source: the conversion's own depth map** (Phase 3c). It is the map from the inference
+   that made the views being woven (`same_inference`). The service copies a cursor-footprint
+   patch (§6's rule, at most 64×64, from the depth map's texels covering the rect's active
+   region) to a small staging ring and reads it back without waiting on the GPU, a frame or two
+   later, exactly like Phase 3a. The nearest texel in the patch is the content point.
+3. **Display mapping from the plug-in, not invented by the runtime.** Placement needs the
+   content's distance in front of the screen **as the views present it**, which depends on how
+   the module rendered: convergence (including its own auto-convergence, which changes per
+   frame), relief thickness, and camera model. The runtime cannot recover that from relative
+   depth, which is why `depthToDisplay` stays metric-only. So `xrt_dp_lift_depth` gains a
+   per-conversion **relief mapping**, appended under a new feature macro (ADR-020, no ABI bump):
+   display z of a texel, in metres toward the viewer (screen = 0), as an affine function of its
+   inverse decoded depth, `z = relief_scale · (1 / depth) + relief_offset`. A module that renders
+   with a physical off-axis camera has this exactly. The Leia plug-in's off-axis renderer places
+   normalised depth n = 1 − h at z = C − n·D, which is affine in h, and h is proportional to
+   1/depth for both its relative and metric models. A module that renders dimensionless
+   disparity reports no mapping, and the cursor stays flat. Because the mapping is per
+   conversion, the cursor tracks the content through convergence changes instead of fighting
+   them.
+4. **Placement and drawing.**
+   - **Placement** is §2–§3 unchanged, using the viewpoints the views were synthesized for (the
+     result's ADR-048 echo): E is their midpoint, S is the cursor's point on the rect, and the
+     content's z gives t and then d.
+   - **Policy and smoothing:** `u_cursor_depth_target` and `u_cursor_depth_filter_step` apply
+     the same margin, clamp and smoothing as every other cursor, with one filter per rect.
+   - **Per-view position:** each view's sprite position is the projection of C = E + t·(S − E)
+     from **that view's** viewpoint onto the rect, so it is exact for SBS and N-view alike, and
+     the sprite keeps its on-screen size.
+   - **Cursor position:** the service reads the OS cursor position at draw time and maps it into
+     the bound window, as the workspace cursor path already does, so pointer latency is the
+     weave's, not the conversion's.
+5. **One drawer.** The workspace cursor pass is factored into a service helper that draws a
+   sprite at per-view positions into an atlas. The shell keeps its behaviour through it, and
+   lifted rects use it too.
+   - **Sprite:** the system arrow for v1. The browser hides the hardware cursor, so the
+     service cannot read the page's cursor shape. A caller-supplied sprite can follow in the
+     same struct.
+6. **Inside the shell.** A lifted rect inside a workspace client would draw a second cursor
+   next to the controller's. Until Phase 4 shares placements with the controller, the service
+   skips the lift cursor while a workspace controller's cursor is visible.
+
+### Not changed
+
+- `depthToDisplay` (`XR_DXR_lift` v3) stays metric-only. The relief mapping is an internal
+  DP-contract field that serves the cursor. Exposing it to apps is a separate decision.
+- No cost for any rect, stream or session that does not chain the request.
+
+## Amendment 2 (2026-10-11): one cursor policy everywhere, the runtime draws, the app chooses the look
+
+**Accepted** (David, 2026-10-11). It supersedes §3's clamp and every per-implementation tuning,
+and turns Phase 2 (runtime-drawn cursor) into the default way apps adopt the cursor.
+
+### Why
+
+By 2026-10-11 five implementations had diverged:
+- the runtime placement (`u_cursor_depth`, Phase 1);
+- the SDK's `DepthCursor` / `cursor: 'depth'` on `./model` and `./splat`;
+- the SDK's stereo-tile cursor on `./call` and `./camera` (web #159/#162);
+- the lifted-video cursor (Amendment 1, #1908);
+- the shell's workspace cursor.
+
+Two of them could sink the cursor **behind** the glass. Margins ranged from 0.005 to 0.03 of the
+eye baseline. Three different sprites were in use. A tester on a head-tracked panel also showed
+that a cursor with disparity but no motion parallax reads as being at the glass (#1847). Apps,
+meanwhile, had to hit-test, draw a sprite and manage the OS cursor themselves, which is why no
+demo had adopted the cursor.
+
+### Decision
+
+#### A. One policy, for every DisplayXR depth cursor
+
+Every implementation listed above follows these rules, with the same defaults. Where a pure
+module exists (`u_cursor_depth` in the runtime, `./cursor-depth` in the SDK), it is the single
+implementation that the others call.
+
+1. **Never behind the glass.** The cursor is either **on the screen plane** or **in front of
+   it**. It moves only to stay ahead of content that comes **out** of the screen. With `d` as
+   the content's disparity under the cursor footprint (eye-baseline units, < 0 in front):
+
+   `target = d < 0 ? max(d − margin, d_min) : 0`
+
+   Content on or behind the glass leaves the cursor on the glass. This replaces §3's
+   `[−0.6, +0.6]` clamp with `[−0.6, 0]`. Rationale: a cursor behind the glass sits behind the
+   page, the window chrome and the desktop, which recreates the depth conflict it exists to
+   remove.
+2. **Margin 0.015 eye baselines**, about 1 mm of crossed on-screen disparity at a 63–65 mm IPD.
+   Implementations expose it as a `margin` option and keep 0.015 as the default.
+   *Halved 2026-10-11 after the Windows Leia panel check: 0.03 floated visibly off the content.*
+   (As first written, A.2 was 0.03, about 2 mm, the value the reference app
+   `cube_handle_metal_macos` had shown since Phase 1.)
+3. **On the plane, it is the OS cursor.** Nothing is drawn while the filtered disparity is above
+   the **draw threshold**, −0.005 baselines (about 0.3 mm on screen) and never less than 0.5 px
+   on the panel. While nothing is drawn, the OS cursor is the cursor, untouched. The drawn
+   cursor exists only while content pops out under it, and the filter hands it back smoothly.
+4. **Filter unchanged** (§3): rise 30 ms, sink 250 ms, stale 0.5 s.
+5. **Anchor: hybrid, line of sight.**
+   - While the pointer moves, the sprite sits on the cyclopean ray through the pointer's canvas
+     point, exactly over the click point.
+   - While the pointer is still, the runtime keeps the line of sight from the last pointer move
+     (E₀ → S₀) and places the sprite on it at the current depth: the point whose distance in front
+     of the glass is (1 − t)·eyeToCanvas.
+
+   A head move leaves the sprite fixed in the world, so it parallaxes like content. A depth
+   change slides it along that line, so it stays on the click point for the viewer who placed
+   it. It is continuous at the moment the pointer stops. Screen-anchored and world-anchored modes
+   remain options. This rule is the one in #1847 and SDK 1.37.1; Amendment 1's lifted-video
+   cursor adopts it in its next revision.
+6. **Default look: the cursor the user already has.** The drawn sprite mirrors the **current OS
+   cursor shape** for that window (arrow, hand, I-beam, or whatever the app or page set). It is
+   drawn at the OS cursor's physical size (its pixel size times the panel's pixel pitch) and
+   scaled by t, so its apparent size never changes. Where the shape cannot be read, the
+   fallback is the classic arrow: 12 × 19 px, white with a dark outline (web #162's).
+
+#### B. The runtime draws; the app chooses the look (same split as the shell)
+
+The shell already works this way (`XR_DXR_spatial_workspace` v13+): the controller owns the
+sprite and the depth, and the runtime owns the drawing. Apps get the same contract in
+`XR_DXR_cursor_depth`:
+
+1. **Request.** A new struct chained on `XrCursorDepthHintDXR` asks the runtime to draw:
+   - `XrSwapchain image`: an ordinary swapchain the app created with `xrCreateSwapchain`, in its
+     own graphics API, filled with any sprite (static, animated, a different shape per state).
+     `XR_NULL_HANDLE` means the default look from A.6.
+   - `XrVector2f hotSpot`: normalised UV of the click point inside the sprite.
+   - `float sizeMeters`: physical size; 0 = the OS cursor's size.
+   - `XrBool32 visible`.
+
+   Because the app fills the swapchain in its own API, the runtime never has to create or upload
+   textures per graphics API.
+2. **Report.** A new struct chained on `XrViewState` says whether the runtime will draw the
+   cursor in the frame being located. The app hides its OS cursor exactly while that is true
+   (or lets the `displayxr-common` helper do it). The runtime still never touches the OS cursor
+   (§0). Any frame the runtime cannot place the cursor, it reports "not drawn", so the fallback
+   is always the flat OS cursor and never no cursor.
+3. **Where it is drawn.** After the app's layers and before the display processor, one sprite
+   per view at the placement pose, on top and never occluded.
+   - **In-process:** each native compositor draws it as a runtime-owned quad. Every backend
+     already composites quad layers in stereo.
+   - **Service / IPC:** through the drawer Amendment 1 factored out (`svc_draw_cursor_quads`).
+     That one path serves the shell, lifted rects and apps.
+4. **Depth sources unchanged:** the app's hint point (§1), the submitted depth layer (§6,
+   Phase 3a), or the conversion's depth map (Amendment 1). The app picks one. The policy in A is
+   applied to whichever it picks.
+5. **App-drawn placement stays supported.** The v1–v3 placement output is not removed. An app
+   that wants to draw the cursor itself still can, with the same policy.
+6. **§0 holds.** No request, no work: no sprite, no copies, no state. The draw request is per
+   frame.
+
+#### C. Web
+
+- The SDK's `DepthCursor`, `cursor: 'depth'` on `./model` and `./splat`, and the stereo-tile
+  cursor on `./call` and `./camera` all use the shared `./cursor-depth` core with the policy in
+  A and the arrow look. The SDK's crosshair is retired.
+- Later, the browser feeds the page's computed CSS `cursor` (including `url(...)` images) to the
+  runtime as the sprite (B.1). Pages then style the depth cursor with plain CSS, and the SDK
+  needs no cursor code for it.
+  *Designed in Amendment 4 (proposed): the page supplies only the depth; the browser feeds its
+  real cursor; the runtime draws at the weave.*
+
+#### §A as built in the runtime (#1847, `XR_DXR_cursor_depth` spec v4)
+
+- `u_cursor_depth_target()` is A.1 verbatim; the upper clamp is 0 whatever the tuning says
+  (`max_disparity` defaults to 0 and a value > 0 is treated as 0). Margin default 0.015 (A.2; 0.03 until 2026-10-11),
+  still overridable through `XrCursorDepthOptionsDXR::margin`.
+- A.3 is `u_cursor_depth_should_draw()` (threshold −0.005). The state tracker reports it as
+  `XrCursorDepthPlacementDXR::isActive`, whose meaning was already "draw nothing, show the OS
+  cursor", so no struct changed. The filter and the HYBRID anchor step on every locate, drawn or
+  not, so the hand-back is smooth. `disparity` / `targetDisparity` stay filled as diagnostics.
+- The 0.5 px floor is left to the drawing backend (Part B): the placement does not know the
+  panel's pixel pitch, and −0.005 baselines (~0.33 mm at 65 mm IPD) is above 0.5 px on every
+  current panel.
+- A.5 (hybrid line-of-sight anchor) was already the v3 default and is unchanged.
+
+#### §B as built on Metal (`XR_DXR_cursor_depth` spec v5)
+
+- **API.** `XrCursorDepthDrawInfoDXR` (on the hint: `image`, `hotSpot`, `sizeMeters`, `visible`)
+  and `XrCursorDepthDrawStateDXR` (on `XrViewState`: `willDraw`). New structs only. The app's
+  sprite is sampled as **straight alpha** from its last released image (the shell cursor's
+  convention). `sizeMeters` is the sprite's height at the glass; ≤ 0 = the OS cursor's size.
+- **State tracker.** A hinted locate that chains the draw request runs the placement even when
+  the app did not chain `XrCursorDepthPlacementDXR`. When the placement is active it records the
+  locate space, hotspot point C, display-plane orientation and one *unit* = canvas height × t,
+  and reports `willDraw`. At `xrEndFrame` (one bool test otherwise) it maps C into **each view of
+  the frame's first projection layer, with the poses and fovs the app submitted**, as an affine
+  map per view (where C lands in the tile, and where one unit along the sprite's X and Y goes).
+  The map is exact because every Kooima image plane is parallel to the display plane, which the
+  sprite lies parallel to. Same-space rule as §6: a layer in another space, a zones frame, or a
+  frame without a projection layer draws nothing and makes the next locates report
+  `willDraw = XR_FALSE` (one-time WARN) until a frame is drawable again, so the fallback is always
+  the OS cursor. Pure helpers in `u_cursor_depth` (`u_cursor_draw_*`), unit-tested, including
+  the compositor gate `u_cursor_draw_should_draw()` (false for a zero-initialised request).
+- **Metal compositor.** The request is consumed by the next commit (one field test otherwise).
+  The cursor is drawn **inside the atlas encoder, after the projection, quad and window-space
+  layers and before the display processor**: one alpha-blended triangle strip per tile, depth
+  off, scissored to the tile, through its own small shader library and four pipelines (straight /
+  premultiplied × UNORM / `_sRGB` target) built on the first request. A frame carrying the cursor
+  never takes the zero-copy path. Because the draw is inside the atlas pass, the
+  `/tmp/dxr_atlas_trigger` dump shows it.
+- **Default look (A.6).** The current OS cursor is mirrored: when the commit runs on the main
+  thread (AppKit is main-thread-only; the `cube_*_macos` apps pump events and render there),
+  `[NSCursor currentCursor]`'s image is rasterised into a small premultiplied `_sRGB` texture,
+  only when the cursor object changes, with its hotspot and its size in points × the panel's
+  metres per point (pixel pitch × backing scale). Off the main thread the last snapshot is
+  kept, else the classic arrow (12 × 19, white fill, dark outline, rasterised procedurally,
+  4 × 4 supersampled). `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow.
+- **Multi-screen (ADR-047 M3) on Metal.** A window split per screen gets one view set per
+  segment, each framing ONLY its segment, so the cursor is placed once per locate, after every
+  segment is located, from the view set of the segment under the pointer
+  (`oxr_segment_views_cursor_segment`: the hint's window-wide `cursorUV` re-expressed over that
+  segment) — its own screen's eyes and canvas, so its disparity is that screen's. xrEndFrame draws
+  with that segment's submitted views (`[firstView, +viewCount)` of the layer) and flags the
+  request `segment_valid` with the segment's rect; the compositor places the views at the
+  segment's rect of each tile — `comp_segments_tile_rect`, the same mapping as the segment's
+  layer views — with `u_cursor_draw_into_subrect`, clips to it, and sizes the sprite against the
+  segment's height. Before this the cursor was placed by whichever segment was located last (the
+  majority) from the window-wide uv, and drawn with segment 0's views over whole tiles, so on a
+  secondary screen it landed off its segment or mapped to no pixels (willDraw = false). Not yet:
+  an app sprite's `sizeMeters` is converted with the session screen's pixel pitch, and the
+  depth-layer / measured sources sample the layer's first view set.
+- **Not yet:** the service (`svc_draw_cursor_quads`; since drawn on the D3D11 service, Phase 4,
+  below); display zones (since drawn, runtime#1949, below); multi-screen routed frames are drawn on Metal
+  only (below; Vulkan and GL skip them); the 0.5 px floor of A.3 is not applied
+  (−0.005 is above it on current panels).
+
+#### §B as built on Vulkan and GL (`XR_DXR_cursor_depth` spec v5, unchanged)
+
+- **One default look for every backend.** The Metal compositor's default-look code moved to
+  `compositor/util/comp_cursor_look.{h,c}` (+ `comp_cursor_look_macos.m`), a small library the
+  Metal, vk_native and GL compositors all link: it picks the look (mirrored `[NSCursor
+  currentCursor]` on the main thread, else the last snapshot, else the procedural arrow from
+  `u_cursor_draw_arrow_rgba()`), rasterises it once per change into premultiplied, sRGB-encoded
+  RGBA8, and reports aspect, hotspot and size in points plus the main screen's backing scale.
+  Each compositor only uploads the pixels when the look's `generation` moves.
+  `DXR_CURSOR_DEFAULT_LOOK=arrow` forces the arrow on all three. **OS-cursor mirroring is
+  macOS-only:** Linux (`XFixesGetCursorImage`) and Windows (`GetCursorInfo` + `GetIconInfo`)
+  draw the arrow; mirroring there is future work.
+- **State tracker.** Additive only: `oxr_session_cursor_draw_supported()` /
+  `_hand_request()` gained the `is_vk_native_compositor` and `is_gl_native_compositor` arms.
+  The placement, the per-view map and the zero-cost gate are the Metal ones.
+- **vk_native.** The request is consumed by the next commit (one field test otherwise) and
+  resolved there into tile-normalised corners per view (`u_cursor_draw_corners`). A cursor frame
+  never zero-copies and always takes the renderer's **compose render pass** (the blit fast path
+  cannot blend): the cursor is the pass's last draw, one quad per view tile through the pass's
+  own pipelines (the QUAD vertex path with an affine MVP built from three corners; straight or
+  premultiplied blend), scissored to the tile, depth off. Because the pass renders into the
+  private `_SRGB` compose target and publishes to the atlas with a raw copy, the sprite blends
+  in linear light, an `_SRGB` sprite is decoded on sample (the same single source-view choice as
+  every layer, `compose_source_view()`), and the atlas stays ENCODED — never double-encoded. The
+  default look is an `R8G8B8A8_SRGB` image (UNORM under the legacy colour hatch) uploaded
+  through a staging buffer inside the same command buffer. Nothing is created before the first
+  request; the descriptor pool carries one extra set for the cursor. **Ordering differs from
+  Metal:** vk_native stamps window-space layers in a later, weave-time pass (several call sites,
+  some on the async weave hand-off), so the cursor is drawn over projection, quad and equirect2
+  layers but **under** window-space layers. Both the projection-only and the post-compose
+  `$TMPDIR/displayxr_atlas_trigger` captures show it.
+- **GL.** Drawn after the window-space layers, before the DP, into whatever the atlas pass is
+  painting: the private `GL_SRGB8_ALPHA8` compose target with `GL_FRAMEBUFFER_SRGB` on, or the
+  ENCODED atlas directly. The source is bound through `gl_bind_layer_source()` (decode iff
+  composing), the same rule as every layer; a cursor frame counts as one more sub-rect layer in
+  `gl_frame_takes_fast_path()` (a scene-linear UNORM sprite forces the compose path when it
+  exists). A small program (corners as uniforms, `gl_VertexID` strip), per-tile viewport +
+  scissor, blend state restored. A GL sprite is sampled bottom-up (its top is its last row —
+  the Metal compositor's GL-source flip). A layered (`arraySize > 1`) GL sprite is not drawn
+  yet (one-time WARN). On Apple's GL 4.1 there is no `glCopyImageSubData`, so every macOS GL
+  frame composes in encoded space, cursor included; the linear compose-target path was not run
+  here.
+- **Measured** (macOS, sim-display Cropped SBS, cube reference apps at `cursorUV` 0.5,0.5 over
+  the cube, `DXR_CURSOR_DEFAULT_LOOK=arrow`): GL −23.6 px in the 1512 × 1646 atlas (Metal −24.0
+  on the same app geometry), vk_native −22.0 px in its 1280 × 1440 atlas; nothing drawn at
+  0.1,0.1; the arrow's fill reads (255,255,255) and its outline (5,5,8), the custom ring
+  (0,220,255) — exactly the authored bytes, so no encode is lost or doubled.
+- **GL on macOS: a crash found here was the repaint thread, not the cursor (fixed).** While
+  this landed, `cube_handle_gl_macos` crashed in roughly 1 of 5 launches once the depth cursor was
+  active, on the #868 repaint thread (`gl_repaint_thread` → `glBlitFramebuffer`) or in the app's
+  own draw. The cause was unrelated to cursors: an app that binds an `NSOpenGLView` hands the
+  runtime that view, and the GL compositor adopted the view's `openGLContext`, which is the
+  context the app renders with. The repaint thread then replayed on it while the app thread drew,
+  so one GL context was in use on two threads. Hiding the OS cursor only changed frame timing
+  enough to open the repaint gate. With `DXR_WEAVE_REPAINT_FORCE=1` the old build crashes 10/10
+  launches even with the extension off. The fix: the GL compositor never starts the repaint
+  thread on an app-owned context (it stays on for the private contexts of the own-window, plain-`NSView` and offscreen
+  paths). The GL cube's depth cursor is default-on again, like the Metal and Vulkan cubes.
+- **Found in passing (Metal, #1941):** on the Vulkan-app-on-Metal fallback a custom sprite is
+  handed over as the client swapchain and cast to the native Metal type — runtime#1948.
+
+#### §B as built in display-zones frames (`XR_DXR_cursor_depth` spec v6, unchanged; runtime#1949)
+
+- **One cursor per frame, in the zone under the pointer.** The hint already rides the
+  zone-scoped locate of that zone (§2.1 of the spec): the zone rect is that locate's canvas, so
+  `cursorUV`, the placement and its *unit* (zone height × t) are all zone-relative. The arming
+  locate now also records the `XrDisplayZoneDXR::zoneId` it carried.
+- **State tracker.** In a zones frame `xrEndFrame` maps the placement through the views of the
+  frame's projection layer whose chained `XrDisplayZoneDXR` has that `zoneId` (its submitted
+  poses and fovs, same-space rule unchanged), so the map is ZONE-normalised; the request
+  (`u_cursor_draw_request`) gains `zone_valid` / `zone_id` / `zone_rect` (the rect as SUBMITTED —
+  authoritative per ADR-027). No such zone, a zone-scoped hint in a frame without zones, or a
+  zones frame whose hint was not zone-scoped: nothing drawn, `willDraw = XR_FALSE` on the next
+  locates, one-time WARN — the same OS-cursor fallback as before. No new struct, no spec bump:
+  `willDraw` already tells the app frame by frame.
+- **Compositors (Metal, vk_native, GL).** One pure helper, `u_cursor_draw_into_zone()`, re-expresses
+  the zone-normalised views in the tile exactly the way each compositor places the zone's own
+  layer (zone rect scaled by tile / window), and returns the zone's sub-rect as a clip; the draw
+  is scissored to tile ∩ zone, so a cursor at a zone edge never bleeds into a 2D zone or a
+  neighbouring 3D zone. `u_cursor_draw_canvas_px_h()` sizes the sprite against the zone's height
+  (the canvas its unit was built for). A non-zone request is untouched (clip = whole tile).
+  Zero cost unchanged: all of it runs only on a requested frame.
+- **D3D11 / D3D12** (runtime#1944) use the same two helpers in their resolve step (`u_cursor_draw_into_zone` with the window dims the renderer scales `zone_3d.rect` by; the scissor is tile box ∩ the returned clip), skipping only on a zones-frame / zone-request mismatch.
+- **Reference app.** `cube_zones_{metal,vk}_macos` adopt `dxr::CursorDepth` via
+  `test_apps/common/cursor_depth_zones.h`: pick the topmost 3D zone under the pointer, hand the
+  helper the pointer in that zone's UV, chain the hint only on that zone's locate.
+
+#### §B as built on D3D11 and D3D12 (in-process; `XR_DXR_cursor_depth` spec v5)
+
+- **Same contract as Metal.** The state tracker hands `comp_d3d11/12_compositor_set_cursor_draw_request`
+  the same one-frame `u_cursor_draw_request`; the commit consumes it with one field test. A cursor
+  frame never zero-copies. The compositor resolves the request into per-tile corners
+  (`u_cursor_draw_corners`) — sprite height in metres ÷ the canvas height in metres (canvas px ×
+  the panel's pixel pitch from the window metrics) — and hands them to its renderer before the
+  projection pass. The renderer draws them **last in the window-space pass**: after the
+  projection, quad and window-space layers, before the compose publish and (D3D12) the atlas's
+  final barrier, so before the display processor. One alpha-blended triangle strip per tile
+  (straight for the app's sprite, premultiplied for the default look), depth off (no DSV), no
+  culling, scissored to the tile (∩ the zone in a display-zones frame — see the zones section
+  above). Multi-screen routed frames draw nothing (one-time WARN). `willDraw` is gated in the
+  state tracker (`u_cursor_draw_placement_drawable`, runtime#1951) for every backend alike.
+- **Shaders.** One shared HLSL pair, `d3d_shared/comp_cursor_shaders.h` (corners in b0 — a
+  D3D11 constant buffer, 16 D3D12 root constants on the existing quad root signature), compiled
+  with `D3DCompile` on the first cursor frame only, like every other in-process shader here. A
+  `DXR_LAYERED` variant samples array layer 0 of a layered sprite. D3D12 builds six pipelines
+  (`[straight | straight layered | premultiplied][_SRGB target]`), since a D3D12 PSO bakes its
+  blend and RTV format.
+- **Colour (ADR-044).** The cursor takes the frame's treatment: on a composing frame it is drawn
+  into the private `_SRGB` compose target through the source's format-honest view (decoding), on
+  a fast-path frame straight into the encoded atlas through the non-decoding view. A
+  non-`_SRGB` app sprite (scene-linear, owes the encode) makes the frame compose; the cursor is
+  not counted as a contributing layer, so a fast-path frame blends the sprite's anti-aliased
+  edges in encoded space, as on Metal. The default look is uploaded once per shape into a
+  TYPELESS texture with a UNORM and an `_SRGB` view, so the white arrow is white either way.
+- **Default look (A.6) — the shared `comp_cursor_look`** (the same entry point Metal, Vulkan and
+  GL use), whose Windows half is `comp_cursor_look_win.c`: `GetCursorInfo()` → `HCURSOR`, drawn
+  with `DrawIconEx` into a 32-bit DIB **twice, over black and over white**, and recovered by
+  `u_cursor_draw_unblend` (alpha = 1 − (white − black); the render over black is the
+  premultiplied colour). That reads every cursor kind the same way — 32-bit alpha, colour + AND
+  mask, monochrome AND/XOR — and turns XOR (invert) pixels into opaque white. Drawn at the size
+  the OS draws it on this panel: the user's pointer size (`HKCU\Control Panel\Cursors`
+  `CursorBaseSize`, 32 by default, read once per process) × the window's `GetDpiForWindow` / 96
+  (passed as the look's backing scale) — `u_cursor_os_height_px_win` — with
+  `GetSystemMetricsForDpi(SM_CYCURSOR, dpi)` and the image's own size only as floors. The metric
+  alone is a stepped table (240 DPI → 64) while Windows scales every cursor to 32 × 2.5 = 80 px at
+  250 %, so the runtime-drawn cursor was 20 % smaller than the OS one on a 250 % panel (David, the
+  win SR laptop, 2026-10-14); its `height_pt` is that size in 96-DPI points, so the
+  physical size is `height_pt` × DPI / 96 × the panel's pixel pitch. Cached by `HCURSOR` + scale,
+  so it re-rasterises only on a shape change. `GetCursorInfo` is global, so the compositor thread
+  may call it. While the app has hidden its cursor with `SetCursor(NULL)` — which it does as soon
+  as a locate reports `willDraw`, i.e. on most drawn frames — the shape is the **class cursor of
+  the window under the pointer**, else the last shape, else `IDC_ARROW`. With
+  `DXR_CURSOR_DEFAULT_LOOK=arrow`, or if the cursor cannot be read: the shared classic arrow.
+- **App sprite.** Straight alpha, last released image, hotspot as given; `sizeMeters` ≤ 0 = 19 px
+  at the window's DPI × pixel pitch (the classic arrow's size, as Metal's 19 pt). D3D12 dips the
+  image RENDER_TARGET → PIXEL_SHADER_RESOURCE → RENDER_TARGET around the draw, as for
+  window-space layers.
+- **Reference apps.** `cube_handle_d3d11_win` / `cube_handle_d3d12_win` adopt v5 the way
+  `cube_handle_metal_macos` does (analytic cube hit test → hint; `DISPLAYXR_CURSOR_DEPTH_DRAW`,
+  `_SPRITE=custom`, `_UV`, `DISPLAYXR_CURSOR_DEPTH=0`), hiding the OS cursor over the client
+  area exactly while `willDraw` (`WM_SETCURSOR` → `SetCursor(NULL)`). Their `app` mode keeps the
+  OS cursor and logs the placement; it draws no in-app crosshair.
+
+#### §B compositor refusals make `willDraw` false (runtime#1952)
+
+The state tracker checks everything it can see before it hands a request over
+(`u_cursor_draw_placement_drawable` on the located and the submitted views, #1951). A native
+compositor can still decline for reasons only it sees. Those reasons now reach `willDraw` too, so
+the app never hides its OS cursor for a frame that draws no sprite (after one frame of lag: a
+refusal is only known at the commit).
+
+- **Report.** `u_cursor_draw_request` carries a `report` pointer (owned by the session) and a
+  `report_only` flag. During the commit that consumes the request, the compositor writes
+  `u_cursor_draw_report_drew()` or `u_cursor_draw_report_refused(reason)`; the last write wins,
+  so the renderer can override the compositor. The state tracker arms the report as **NOT_REACHED**
+  before handing it, so a commit that never reaches its cursor pass (an early-out frame, a path
+  with no compose pass) counts as a refusal without any backend code.
+- **Latch.** Right after `xrt_comp_layer_commit` (one bool test, true only on a frame that handed
+  a request) the report is folded into `u_cursor_draw_latch`: a refusal makes the next locate
+  report `willDraw = XR_FALSE`; a commit that drew restores it. One WARN per distinct reason, never
+  per frame.
+- **Report-only probe.** While the latch is refused the request is still handed over, as
+  report-only: every check runs and the outcome is reported, but nothing is drawn (the app is
+  showing its OS cursor; drawing too would show two cursors). Without the probe the report would
+  oscillate: false, then a skipped request, then true, then refused again.
+- **Reasons** (`enum u_cursor_draw_refusal`) and where they come from:
+
+  | Reason | Metal | vk_native | GL | D3D11 / D3D12 |
+  |---|---|---|---|---|
+  | zone mismatch / zone unplaceable | yes | yes | yes | yes |
+  | multi-screen routed frame | (draws the pointer's segment; refuses a frame/request routing mismatch) | yes | yes (Windows) | yes |
+  | no display info / canvas height | yes | yes | yes | yes |
+  | sprite unusable (empty, no view, layered GL) | yes | yes (renderer: no source view) | yes | yes (renderer: no SRV / resource) |
+  | default look build / upload failed | yes | yes (+ renderer: image not ready) | yes | yes (renderer: upload) |
+  | pipeline / descriptor creation failed | yes | descriptor set (renderer) | program | yes (+ D3D12 SRV heap full) |
+  | no compose pass | (n/a) | renderer: pass unavailable | (n/a) | (n/a) |
+  | no tile area to draw into | yes | yes | yes | yes |
+  | never reached the cursor pass | default | default | default | default |
+
+- **Verification hook.** `DXR_CURSOR_DRAW_REFUSE=1` makes every compositor refuse (reason
+  FORCED); `DXR_CURSOR_DRAW_REFUSE_PERIOD_MS=N` refuses during the first half of every N ms, so a
+  single run shows `willDraw` flipping both ways (`compositor/util/comp_cursor_look.c`).
+
+#### §B.7 Crosstalk softening of the lifted cursor (2026-10-11)
+
+**Accepted** (David, 2026-10-11, after the Windows Leia panel check). A lifted runtime-drawn
+cursor with a white fill and sharp edges showed crosstalk ghosting. On a lenticular panel a
+little of each view leaks into its neighbours, so the leaked copy of the cursor sits one ghost
+offset away (the on-screen disparity between neighbouring drawn views). How visible it is scales
+with contrast times edge sharpness. On the glass the views coincide and there is no ghost.
+
+**Decision: soften with lift.** Both effects are exactly zero on the glass and grow with the
+same lift, the drawn cursor's disparity:
+
+- **Edge softening.** Blur radius in panel px = `k_blur` × |ghost offset px|, capped at
+  `blur_max_px`. This is the multiview anti-aliasing rule (low-pass in proportion to the depth
+  offset), and it reads as natural depth of field. The ghost offset is measured from the
+  request's own per-view hotspot positions (`u_cursor_draw_ghost_px`: the largest distance
+  between neighbouring views, in the canvas's panel px), so it is right for every rig, view
+  count and zone.
+- **Opacity.** It eases from 1 to `alpha_min` with a smoothstep over |disparity| up to
+  `full_d`. It is not the shell's 0.3: the cursor must stay the most legible thing on screen.
+- **Any sprite:** the mirrored OS cursor, the classic arrow, or the app's swapchain sprite.
+  The blur accumulates premultiplied, so a straight-alpha sprite's clear texels add no colour.
+- **Hotspot unchanged.** The quad is padded by the blur radius on every side
+  (`u_cursor_draw_soften_quad`) so the soft edge is not clipped. Its texture coordinates run
+  outside 0..1 on the pad, and the shader treats those taps as transparent. The uv → position
+  map, and so the click point, does not move.
+- **Cost.** 13 taps (centre, 4 at r/2, 8 at r; Gaussian, sigma 0.6 r) on one cursor-sized quad
+  per view, on cursor frames only. A frame whose softening is (0 px, 1.0) takes the crisp
+  pipeline, so the result is bit-identical to the unsoftened draw. §0 holds: the knobs are read
+  on the first cursor frame, and a session that never asks pays nothing.
+
+**Defaults, and why:**
+
+| Knob | Default | Why |
+|---|---|---|
+| `DXR_CURSOR_SOFTEN` | `both` | The panel showed the ghost with a default-look cursor; the fix is default-on for every runtime-drawn cursor. `off` / `alpha` / `blur` are the A/B presets. |
+| `DXR_CURSOR_SOFTEN_BLUR_K` | 0.1 | It reaches the cap at a ghost offset of about 15 px. On a ~0.09 mm-pitch Leia panel that is ~1.3 mm of crossed disparity, just past the 0.015-baseline margin (~1 mm). The blur therefore rises over the first millimetre of lift and then holds. |
+| `DXR_CURSOR_SOFTEN_BLUR_MAX_FRAC` | 0.06 × the drawn sprite height | The cap is **proportional to the cursor's drawn size**, so it reads the same at 96 and 240 DPI and with accessibility pointer sizes. 0.06 is ~4 px on the 64 px OS arrow at 240 DPI: David's pick on the Windows SR panel (2026-10-12), where a 1.5 px absolute cap was invisible. |
+| `DXR_CURSOR_SOFTEN_BLUR_MAX_PX` | 8 | A hard ceiling only, in panel px (the proportional cap does the work). |
+| `DXR_CURSOR_SOFTEN_ALPHA_MIN` | 0.5 | Half opacity at full lift. On the panel 0.75 was invisible; 0.5 helps and the cursor stays findable (the shell's 0.3 would not). |
+| `DXR_CURSOR_SOFTEN_FULL_D` | 0.03 baselines | The lift over typical content (a cube's front face is d ≈ −0.03). At 0.1 the fade never showed on the panel (alpha ≈ 0.93 over the cube). |
+
+All five are read once (`comp_cursor_soften_params`, one WARN line with the effective values),
+are parsed by the pure, unit-tested `u_cursor_soften_params_parse` / `u_cursor_draw_soften`, and
+are listed in the `DXR_*` census (`docs/roadmap/control-panel-performance-settings.md`).
+
+**As built.** The state tracker now carries the placement's filtered disparity on the request
+(`u_cursor_draw_request::disparity`; internal struct, no spec change). Implemented in:
+
+- **Metal:** a `cursor_fragment_soft` function plus `pipe_soft[premul][srgb]`.
+- **D3D11 in-process:** a `DXR_SOFTEN` variant of the shared `comp_cursor_shaders.h` pixel
+  shader, plain and layered. Its parameters go in their own b1 constant buffer, so the b0 layout
+  is unchanged.
+- **D3D12 in-process:** the same shared `DXR_SOFTEN` shader, compiled with
+  `DXR_SOFTEN_ROOT_B0` as well: its four parameters sit at b0 `packoffset(c4)`, which is root
+  constants 16..19 of the quad root signature's existing 32-constant parameter. The cursor's 16
+  corner constants are unchanged, and the root signature (shared with every quad pass) gains no
+  parameter. `pso_soft[variant][target]` (six pipelines) are built on the first frame that
+  softens. If they cannot be built, the runtime logs once and draws the crisp quad: the
+  compositor keeps the crisp corners next to the padded ones (`soft_corners`), so the fallback is
+  the unsoftened draw, never a refusal.
+- **GL:** `FS_CURSOR_SOFT`, the same kernel in GLSL 330, as a second program built on the first
+  frame that softens (a build failure logs once and draws crisp). An on-glass frame keeps the crisp
+  program, with the unpadded quad and uv 0..1. The tile px for the ghost offset are the window's
+  client area (else the effective grid), or the window for a zone request; a GL app sprite is
+  flipped in v after padding, and the pad is symmetric, so the flip does not move the hotspot.
+  **Measured** (macOS, sim-display anaglyph 2 × 1 tiles of 1512 × 823, `cube_handle_gl_macos`
+  with the cube's rotation frozen for a static background, the arrow at UV 0.5, 0.5 over the
+  cube, ~20 tile px of tile-to-tile disparity): the white fill's peak falls from 255 to ~190
+  (`alpha` / `both`), the largest horizontal edge step from 249 to ~120 (`blur`) and ~65–80
+  (`both`), and the touched footprint grows from ~100–116 px to ~172–176 px. `off` and `alpha`
+  touch exactly the same pixels; on the glass (UV 0.2, 0.15, over the background) nothing is
+  drawn in any preset.
+- **vk_native:** `zone_blit_soft.frag` / `zone_blit_soft_array.frag`, the same kernel. What
+  differs from Metal and D3D11:
+  - **Push-constant packing.** The compose pass's push-constant block is already 128 bytes, the
+    guaranteed Vulkan maximum, so nothing is added to it. The blur radius in sprite uv rides the
+    reserved `params.zw`, and the opacity rides `color_scale` (all four components for a
+    premultiplied sprite, alpha only for a straight one; the shader ends in the usual
+    `* color_scale + color_bias`). The padded quad's uv span (−r..1+r) goes in `src_rect`.
+  - **Straight vs premultiplied is a specialization constant** (`constant_id = 0`), fixed per
+    blend column when the pipeline is built: the UNPREMULT column is the straight-alpha one.
+    `zone_create_pipeline()` gained an optional `VkSpecializationInfo` (NULL for every layer
+    pipeline).
+  - **Lazy pipelines.** `pipelines_soft[blend][sampler]` (premultiplied and straight, 2D and
+    2D_ARRAY: four pipelines) are built on the first cursor frame that needs softening and
+    destroyed with the compose pass's own. If they cannot be built the runtime logs once and
+    draws the crisp cursor; it never refuses the cursor for it.
+  - An on-glass frame (0 px, 1.0) binds the crisp pipeline with exactly the push constants it
+    had before (`u_cursor_draw_soften_quad` at radius 0 returns the corners unchanged and the uv
+    span 0..1), so it is bit-identical to the unsoftened draw.
+  - **Measured** (Linux, sim-display Anaglyph 2 × 1 tiles of 1440 × 900 on a 2880 × 1800
+    canvas, `cube_handle_vk_linux` with a scripted cursor at 0.5, 0.5 over the cube, d ≈ −0.06
+    to −0.074, ghost ≈ 30–37 canvas px): the default 19 px arrow gets the 0.06 × sprite cap,
+    1.14 px; a 2 cm arrow (186 px) gets 3.0–3.7 px at the defaults and the 8 px ceiling with
+    `BLUR_K=1`. Peak coverage of the white fill falls from 1.00 to 0.74 with the opacity (0.5
+    blended in linear light, then encoded), and the arrow's partially covered edge pixels grow
+    from ~575 (crisp) to ~845 (`blur`) and ~1440 (8 px), with the hotspot and the tile-to-tile
+    disparity (−14.4 tile px) unchanged.
+
+**Follow-ups:** none left. The last one, the D3D11 service drawer `svc_draw_cursor_quads`
+(IPC apps, the shell's lifted cursor and lifted rects), landed with Phase 4 (below).
+
+**App opt-out.** An `XrCursorDepthDrawInfoDXR` flag to turn the softening off for a sprite that
+is already soft (or must stay crisp) comes with the next `XR_DXR_cursor_depth` spec bump. This
+change does not bump the extension: the softening is a drawing decision the runtime owns, like
+the default look.
+
+#### §B as built in the D3D11 service (Phase 4; `XR_DXR_cursor_depth` spec v5, unchanged)
+
+IPC clients of the Windows D3D11 service (forced-IPC apps and apps under the shell) get the
+runtime-drawn cursor through the service's one drawer, `svc_draw_cursor_quads` (B.3).
+
+- **Transport.** `compositor_set_cursor_draw_request` carries the frame's `u_cursor_draw_request`
+  (per-view maps, hotspot, `sizeMeters`, filtered disparity, report-only, zone) as a POD
+  (`ipc_cursor_draw_request`), sent right before the `layer_commit` it belongs to, and only on a
+  frame whose locate armed the request: no request, no IPC traffic, no service state (§0). The
+  state tracker's gate is `oxr_session_cursor_draw_via_service()` (service mode, no in-process
+  multi-compositor, no native compositor, not a bridge relay; Windows).
+- **willDraw across the process boundary (#1952).** The service answers each request with the
+  outcome of the **previous** one (`ipc_cursor_draw_outcome`), because a request is only drawn at
+  or after its commit; the client writes it into the request's report and the latch folds it as
+  usual. So the latch runs one frame later than in-process, and the first request of a session
+  has nothing to fold. A request no commit consumed, or one the render thread left unanswered for
+  3 frames (`SVC_CURSOR_OUTCOME_MAX_LAG`), is `NOT_REACHED`. A service with no drawer answers
+  every request "not drawn".
+- **Direct client** (no workspace, or a client that is not a placed workspace tile, such as one
+  running beside the shell under the foreground override). The commit consumes the request (one
+  bool test otherwise) and
+  draws it into the client's own atlas after every layer, before the publish and so before the
+  display processor: the in-process D3D11 semantics through the same shared pieces. Per view:
+  `u_cursor_draw_corners` into the base projection layer's painted tile, as an axis-aligned rect
+  (`u_cursor_draw_quad_rect`; exact, since every Kooima image plane is parallel to the display
+  plane), clipped to the tile. Size: `sizeMeters`, else the OS cursor's size at the client
+  window's DPI, over the client's canvas. Default look: the shared `comp_cursor_look` (mirrored OS
+  cursor, else the arrow), uploaded once per shape into a TYPELESS texture; a composing commit
+  samples it decoded into its private `_SRGB` target, a fast-path one writes the stored bytes into
+  the encoded atlas (ADR-044). The draw goes through the in-process compositors' own
+  `comp_cursor_shaders`. A cursor frame never zero-copies (`[ZC] reason=cursor`).
+- **Under the shell: lift, don't add.** A request never draws a second cursor into a placed
+  workspace window. When the workspace cursor is over a client's **content** (the controller's over-window
+  flag plus the focused slot's content rect, the rect pointer input is forwarded through, so the
+  client whose hint follows the pointer is the one lifted) and that client's last frame carried a
+  request, the workspace cursor is **lifted** onto the content. Each eye's tile takes the client's
+  per-view hotspot offset from its outermost pair's midpoint (`u_cursor_draw_view_offset`; eye 0 =
+  first view, eye 1 = last), scaled by the window's size in the combined atlas, on top of the
+  window plane's disparity (`hit_z`). The cursor keeps its position (the controller's click point),
+  sprite and size. A cursor over a window without a request, over chrome, or hidden is drawn
+  exactly as before.
+- **The one-fade rule.** The controller's over-window dim (`cursor_dim_factor`, spec 23) does not
+  apply to the runtime-lifted cursor; B.7 softening is its only fade (the client's filtered
+  disparity; ghost = the drawn eye-to-eye offset in panel px; blur cap 0.06 × the drawn sprite).
+  Purely service-side: the controller keeps pushing `hit_z`, `over_window` and the dim factor as it
+  does today, and needs no change. Each compose tick answers every requesting client: drawn if the
+  cursor was lifted onto it, else `NOT_REACHED` (its window is hidden under the shell anyway; the
+  answer keeps `willDraw` honest).
+- **B.7 in the drawer.** An optional style on `svc_draw_cursor_quads`: alpha convention, shared
+  shaders, blur radius and opacity. A NULL style is the original blit path byte for byte; a crisp
+  on-glass draw is unchanged. Softened draws use the shared `DXR_SOFTEN` kernel. Under the
+  workspace compose pass they compile with `DXR_SVC_LINEARIZE`, which honours the pass's ADR-021
+  linearize flag exactly as the crisp blit does. The Amendment 1 lifted-rect cursor is softened
+  the same way. The knobs are the same `DXR_CURSOR_SOFTEN*`, read once **from the service's own
+  environment** (as are `DXR_CURSOR_DEFAULT_LOOK` and `DXR_CURSOR_DRAW_REFUSE*`): set them on
+  `displayxr-service.exe`, not on the app.
+- **Not yet (each reports `willDraw = false`, so the app keeps its OS cursor):** the app's own
+  sprite swapchain over IPC (the client refuses it, `SPRITE_UNUSABLE`; resolving it to its IPC id
+  through whichever client compositor wraps it is the follow-up); display-zones requests (refused,
+  `ZONE_UNPLACEABLE`; the zones composite places zone tiles differently); multi-screen routed
+  direct-client frames (refused, `MULTI_SCREEN`, as in-process D3D11). The Amendment 3
+  measured-disparity source has since landed over IPC as well (Amendment 3, point 6).
+
+### Rollout
+
+1. **Groundwork:**
+   - the policy in A in `u_cursor_depth` (#1847, rebased onto A);
+   - the policy in A in the SDK core, with the stereo-tile cursor folded onto it;
+   - the lifted-video cursor (#1908) picks up A by calling `u_cursor_depth`.
+2. **B on Metal** with `cube_handle_metal_macos`, in both modes: mirrored OS cursor and a custom
+   sprite.
+3. **B on D3D11, D3D12, GL, Vulkan and the service**, plus a `displayxr-common` helper for the
+   app side: pointer → canvas UV on Win32, Cocoa, X11/Wayland and Android; the request; and
+   hiding the OS cursor per the report.
+4. **Adoption:**
+   - the `cube_*` reference apps;
+   - the demos: modelviewer, gaussiansplat, avatar, earthview, mediaplayer;
+   - the Unity and Unreal plug-ins;
+   - the browser's CSS-cursor feed (C);
+   - the shell (Phase 4).
+
+### Not changed
+
+- §0 (opt-in, zero cost otherwise), §1 (division of labour) and §2 (geometry from the views).
+- Amendment 1's API. Its policy constants come from A once it calls the shared module.
+
+## Amendment 3 (2026-10-11): measured disparity, an opt-in fallback for stereo content with no depth
+
+**Accepted** (David, 2026-10-11). This is Phase 3b, made concrete.
+
+### Why
+
+Most cursor surfaces have an exact depth source:
+- native, Unity and Unreal apps, and three.js / PlayCanvas / Spark pages have a depth buffer
+  (a hint point or a submitted depth layer);
+- lifted 2D→3D content has the conversion's depth map (Amendment 1).
+
+**Traditional stereo content has none:** SBS / stereo video in the mediaplayer, stereo photos,
+stereo camera tiles and legacy stereo apps. Its only depth cue is the disparity between the views
+the app submits. Some apps already estimate it; Holocall computes a low-res map for
+auto-convergence and can feed it through the hint path (§1) with no runtime work. Apps that have
+nothing need the runtime to measure it.
+
+### Decision
+
+1. **Measure a patch, never a map.** The cursor needs one number: the nearest *confident*
+   disparity under its footprint. The runtime block-matches a small patch around the pointer
+   (≈ 64 × 32 px, the cursor footprint dilated) between the **two outermost views of the
+   submitted atlas**, over a bounded disparity range (crossed side; ≈ ±64 px), on the GPU in the
+   compositor's cursor pass, before the DP. The result is read back asynchronously a frame or two
+   later, the same pattern as Phase 3a and Amendment 1, and **never stalls**.
+
+   Budget: well under 0.1 ms of GPU per measured frame. A full-frame depth map is out of scope:
+   it costs orders of magnitude more and the cursor would discard almost all of it.
+
+   *As built (#1976, 2026-10-11):* the GPU stage is only an asynchronous copy of the two
+   outer-view patches, which is never waited on. The matching runs on the CPU over that patch
+   (`u_cursor_measure`), because a patch this size is cheaper there than a compute dispatch on
+   five backends. Measured on Metal and Vulkan: 0.21–0.50 ms of CPU per measured frame (0.72 ms
+   max), 0.03–0.05 ms when the patch is unchanged and the cached result is reused, and 0.01–0.33
+   ms for the GPU copy. Frame time showed no measurable change. A GPU matcher stays an option if
+   a profile ever shows the CPU cost.
+
+   *Correction (2026-11-04):* "never stalls" holds for GPU waits only, and the figures above do
+   not cover a discrete GPU. The CPU match runs on the commit thread, and on Vulkan its readback
+   took the first `HOST_VISIBLE|HOST_COHERENT` type, which is uncached on an RTX 3080. A
+   fullscreen 8K video in the media player dropped from 60 to about 9 fps with a viewer tracked
+   and the pointer over the canvas. The readback now prefers `HOST_CACHED`, the matcher itself
+   was not the cost, and `DXR_CURSOR_MEASURE=0` declines every measured request.
+2. **Work in on-screen pixels.** Stereo media has no scene geometry, so none is invented. The
+   measured on-screen disparity (px, panel scale) becomes the content disparity directly, and
+   §A.1 applies in pixels:
+
+   `target = measured < 0 ? max(measured − margin_px, cap_px) : 0`
+
+   `margin_px` is A.2's 0.015 eye baselines converted with the panel's pixel pitch, the same
+   conversion the web stereo-tile cursor uses. Nothing ever goes behind the glass.
+
+   *Deadband (2026-10-12):* a confident match within 0.005 baselines of the glass (the draw
+   threshold) counts as on the glass. The media player found that without it, matcher noise
+   over on-glass texture (about −0.0001 baselines) went through the margin to −0.0151 and
+   lifted the cursor about 5 px where the OS cursor belonged.
+3. **Low confidence ⇒ the screen plane.** A match is used only if it passes all three checks:
+   - a distinct best match (best-to-second-best cost ratio);
+   - left-right consistency (L→R and R→L agree within 1 px);
+   - enough texture in the patch (variance above a floor).
+
+   The content disparity is the nearest **confident** match in the footprint. With no confident
+   match (blue sky, a flat wall, repetitive texture), the target is **0**: the cursor sits on the
+   screen plane, which under §A.3 means the plain OS cursor, with nothing drawn. The existing
+   fast-rise / slow-sink filter smooths the hand-off.
+4. **Opt-in, and only while useful (§0).** It is requested with the existing
+   `XrCursorDepthSourceDXR` and a new kind, `XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR`
+   (spec v7, no new struct). The runtime measures only on frames that chain the request, while the
+   pointer is over the 3D content, and at most once per new submitted frame (a paused video is not
+   re-measured). No request means nothing is measured, allocated or read back.
+5. **Same algorithm as the web.** The web stereo-tile cursor (`displayxr-web`
+   `js/camera/pair-cursor.js` and its matcher) already block-matches page-side. The runtime ports
+   its algorithm and constants, so web and native stereo cursors agree. Shared numbers live in
+   `u_cursor_depth`.
+6. **Where:** every native compositor's cursor pass and the service (IPC / shell clients), so it
+   also serves stereo content shown through the service.
+
+   *Service, as built (2026-10-13):* a new IPC call, `compositor_set_cursor_measure_request`,
+   carries the frame's request to the D3D11 service; it is sent only on a frame that chained the
+   source. The client's next commit copies the patch out of the two outermost views of its first
+   projection layer, before it releases them. That copy comes from the client's own submitted
+   images, not the composed atlas, so no cursor sprite and no compose path can reach it. Later
+   commits read the copy back without waiting and run the shared `u_cursor_measure_run`. Each
+   reply carries the service's newest result, which the state tracker ages exactly as it does an
+   in-process one. It serves direct IPC clients and workspace windows alike: under the shell the
+   measured placement feeds the Phase 4 lift. Display-zones frames still report no content, as
+   they do in-process.
+
+### Evidence required before merge
+
+- Cost on the mediaplayer for three cases: cursor off the video, over the video, and extension
+  disabled. Frame time and GPU time per frame, at 1080p and 4K SBS.
+- Correctness on a stereo photo with known disparities: textured foreground (confident, drawn in
+  front), sky (low confidence, OS cursor), and a repetitive pattern (rejected).
+
+### Not changed
+
+§0, §A (front-only, margin, threshold, hybrid anchor) and §B (the runtime draws, the app chooses
+the look). This adds a depth source; it doesn't change policy.
+
+## Amendment 4 (2026-10-13): the runtime draws the web cursor
+
+**Proposed** (design + estimate; nothing implemented). It realises Amendment 2 §C's second
+bullet ("the browser feeds the page's computed CSS `cursor` to the runtime as the sprite"),
+which was sketched and never built.
+
+### Why
+
+A panel test of an inline-3D page in the DisplayXR Browser showed two defects of the
+page-drawn cursor (Phase 5, the SDK's `DepthCursor` / `cursor: 'depth'`):
+
+1. **Wrong look.** The SDK draws its arrow while the page had asked for `grab` (an orbit
+   control). The page cannot draw the cursor the browser would have shown: it does not have
+   the platform's cursor images, and a `url(...)` cursor would have to be re-implemented.
+2. **Sluggish.** The sprite is part of the page's frame. It moves when the page's
+   `pointermove` handler has run, the page has rendered (at the page's frame rate: 30 fps on a
+   heavy splat page), and the result has gone through compositing, the weave and present. The
+   OS cursor next to it is a hardware overlay that moves at once.
+
+The native path already solves both. The runtime draws (Amendment 2 B), with the one policy
+(A), the line-of-sight anchor (A.5), the mirrored OS cursor as the default look (A.6) and the
+crosstalk softening (B.7). It reads the pointer itself, late (Amendment 1, point 4). Web pages
+reach the panel through `XR_DXR_weave`, which has no `xrLocateViews` hint or `xrEndFrame` to
+hang that on. Amendment 1 already added the weave-side equivalent for **lifted** rects. This
+amendment extends it to **every** woven rect whose page supplies a depth.
+
+### Decision
+
+The page supplies **only the depth under the pointer**. The browser supplies **the cursor it
+would have shown**. The runtime does **everything else**: where the pointer is (read at draw
+time), the policy, the filter, the anchor, the look, the softening and the drawing. It draws at
+the weave, after the page's tiles and before the display processor, and it reports per rect
+whether it drew. The browser hides the OS cursor exactly over the rect the runtime drew in, and
+only while it did.
+
+```
+page (SDK pick, per rAF)                              runtime (D3D11 service, weave thread)
+  layer.setCursorDepth({disparityPx,u,v})               GetCursorPos -> window px -> rect
+        |  rides the compositor frame, beside            filter (A.4) + anchor (A.5) + threshold (A.3)
+        |  the element's weave rect (renderer -> viz)    sprite = browser's cursor, B.7 softened
+        v                                                draw per view into the rect's tiles
+GPU process weave client --- xrWeaveSubmitDXR ---------> (service scratch, never the caller's input)
+  chains XrCursorDepthWeaveRequestDXR (v8)               weave (DP)
+        ^                                                 |
+        | sprite on change (browser -> GPU)               | XrCursorDepthWeaveStateDXR.drawnRectMask
+browser process: current cursor (HCURSOR / bitmap)  <-----+ (GPU -> browser, edge-triggered, as 0400)
+  hides the OS cursor while the pointer is in a drawn rect
+```
+
+#### 1. The page → browser API
+
+A method on the existing element-bound layer, so the request is scoped to the page's own woven
+element by construction:
+
+```webidl
+partial interface XRDisplayLayer {
+  // Per animation frame while the pointer is over this layer's element; null = withdraw.
+  undefined setCursorDepth(XRCursorDepthInit? depth);
+  // Resolved once per session: "runtime" when the browser AND the runtime can draw it.
+  Promise<DOMString> getCursorDepthSupport();   // "runtime" | "none"
+};
+dictionary XRCursorDepthInit {
+  double? disparityPx;   // nearest content under the cursor footprint; null = nothing 3D there
+  double u;  double v;   // where it was sampled: element-normalised, v down
+};
+```
+
+- **Unit: on-screen disparity in device pixels**, between the two outermost views the page
+  rendered, at the nearest content under the cursor footprint (§1's footprint rule, unchanged).
+  Negative = crossed = in front of the glass. Why not eye baselines, or a point:
+  - It is rig-agnostic. A page's views come from the runtime's per-rect `XR_DXR_view_rig`
+    locate, and a rig may scale the eye spread (`ipdFactor`), so "eye baselines of the rendered
+    views" and "the tracked eyes' baseline" differ. The pixels on the panel are what both the
+    viewer and the runtime see.
+  - It is the unit the runtime already uses for a depth it did not compute (Amendment 3: §A.1
+    applied in on-screen pixels, `margin_px` from the panel's pixel pitch). The runtime converts
+    to the policy unit with the tracked eyes: d = disparityPx × pitch / eye baseline.
+  - The SDK already has it: `CursorDepthPlacer` computes `pxPerBaseline`, so
+    `disparityPx = d × pxPerBaseline`; the stereo-tile cursor (`pair-cursor.js`) measures pixels
+    directly.
+  - A locate-space point (the native hint's unit) would make the page map its world point back
+    through its rig into the browser's locate space. That is the subtle math §2 exists to keep
+    out of apps.
+- **Raw, not filtered.** The page sends the content's disparity, not a target. Margin, clamp,
+  threshold, rise/sink and anchor are the runtime's, once, so a page cannot drift from native.
+- **Timing.** One call per animation frame while the pointer is over the element; latest wins.
+  It rides the element's **compositor frame**, next to the weave rect it belongs to (the same
+  renderer → viz path the weave rects take since patch 0026), so a depth always arrives with the
+  pixels it describes. It stays valid until replaced, withdrawn (`null`), until the element stops
+  weaving, or for 500 ms (the filter's stale gap); after that it counts as no content. Pages with
+  static content may call it only on change, within that window.
+- **Multi-tile pages.** Each layer reports for its own element, and only while the pointer is
+  over it (the SDK's `CursorPointer` already knows). The runtime draws at most one cursor per
+  window: on the rect the **live** pointer is in that carries a request, topmost (last in submit
+  order) when rects overlap.
+- **Feature detection.** `'setCursorDepth' in XRDisplayLayer.prototype` (a method, never an
+  attribute: the SDK's documented `Illegal invocation` trap), then `getCursorDepthSupport()`,
+  which resolves `"runtime"` only when the weave session enabled `XR_DXR_cursor_depth` ≥ 8 and
+  the service reported a drawer.
+- **Security and privacy.** Nothing flows back to the page: not the pointer, not the eyes, not
+  whether the runtime drew. The support string reveals one capability bit, in the DisplayXR
+  Browser on DisplayXR hardware only, which the existing `XRDisplayLayer` surface already
+  reveals. A request applies only to the calling layer's own rect, and only while that element is
+  being woven. A lying page can at most float the sprite in front of its own element, inside the
+  [−0.6, 0] clamp, at the true pointer position. It could already hide the cursor and draw a fake
+  one anywhere, so this adds no spoofing surface. Hit testing never changes.
+
+#### 2. The cursor image: the browser's real cursor
+
+The browser process already knows the cursor Blink computed for the element under the pointer:
+`pointer`, `grab`, `grabbing`, `text`, a `url(...)` bitmap with its hotspot. That cursor becomes
+the sprite. It is sent **only when it changes**, under a generation number, from the browser
+process to the GPU process, which chains it on the next submit.
+
+Two carriers, one struct:
+
+| Carrier | Where | What the runtime does |
+|---|---|---|
+| **OS cursor handle** | Windows | The browser passes the `HCURSOR` it would have set. Cursor handles are session-wide USER objects, so the service rasterises it with the **same** `comp_cursor_look_win.c` code the native path uses (two `DrawIconEx` renders, unblend, sized by `GetSystemMetricsForDpi(SM_CYCURSOR)` at the window's DPI, or the image's own size when larger), cached by handle and generation. The look and size are therefore native's exactly. The browser keeps a reference on the cursor while it is the advertised sprite. A handle that has died fails `GetIconInfo` and the runtime keeps the last look, never a wrong one. |
+| **Bitmap texture** | macOS, Android, desktop Linux; Windows fallback | A small premultiplied, sRGB-encoded RGBA8 shared texture (≤ 256 × 256), passed as an `XrWeaveHandleKindDXR` handle exactly like the overlay texture (an NT or legacy-DXGI handle on Windows for the low-integrity GPU process, an IOSurface on macOS). Hotspot in pixels. The GPU process creates and fills it per cursor change only. |
+
+**Size.** One image pixel is one panel pixel at the glass (Chromium already rasterises custom
+cursors at the device scale factor), so the sprite's physical height is image px × pitch, and
+it keeps that apparent size at any lift (§2's t scaling). `sizeMeters > 0` overrides it.
+
+A page whose CSS cursor is `none` gets no runtime cursor: the runtime draws nothing for a
+`none` sprite, and reports not drawn.
+
+#### 3. Runtime side: the weave-rect cursor (`XR_DXR_cursor_depth` spec v8)
+
+**What exists and is reused unchanged:**
+- the service drawer `svc_draw_cursor_quads`, with the B.7 style (Phase 4);
+- the lifted-rect path's frame of the weave (Amendment 1, `svc_lift_cursor_draw`): the OS
+  pointer read with `GetCursorPos` → bound window → rect, the viewpoint-midpoint E, the
+  per-view projection `u_lift_cursor_project`, the per-view tile mapping for both input
+  layouts (v3 squeezed SBS, v6 N-view atlas), drawing into the service's scratch or crop and
+  never into the caller's shared input, and the drawn mask on the weave output;
+- the one policy (`u_cursor_depth_target`, `_filter_step`, `_should_draw`), the pixel policy of
+  Amendment 3, `u_cursor_draw_soften_sized`, `comp_cursor_look`, the refusal latch (#1952) and
+  its one-WARN-per-reason logging.
+
+**What is new:**
+- **A depth source per rect from the caller**, besides the lifted rect's depth map. The
+  lifted-rect cursor becomes the *weave-rect cursor* with a source: conversion depth map
+  (Amendment 1) or caller disparity (this amendment); Amendment 3's measured disparity can be a
+  third later. Eyes: the tracked eyes the weave hands out (`XrWeaveOutputDXR::eyes`, display
+  space), expressed in the rect's frame. The page rendered from the previous output's eyes; the
+  difference is one frame of head motion × |d|, sub-pixel.
+- **The hybrid line-of-sight anchor at the weave.** The lifted path is screen-anchored today.
+  A.5 is ported to the weave frame (E₀, S₀ in rect metres; the same continuity, parallax and
+  no-drift properties, unit-tested against the `u_cursor_depth` fixtures). The lifted path gets
+  it too, closing Amendment 1's "adopts A.5 in its next revision".
+- **One filter and anchor per weave client** (one pointer per window), re-primed when the
+  hovered rect changes. Not per rect index, because rect indices are not stable across frames.
+- **The sprite from the caller** (above) instead of the fixed procedural arrow; lifted rects use
+  the same sprite.
+- **A cursor frame never zero-copies** (the v6 exact-fill path), the same rule as every
+  in-process backend.
+
+**The structs** (new only; no existing struct grows). The type values are 1004999328–329, the
+two values the README held for a Phase 3b struct that Amendment 3 ended up not needing.
+
+```c
+#define XR_DXR_cursor_depth_SPEC_VERSION 8
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_REQUEST_DXR ((XrStructureType)1004999328)
+#define XR_TYPE_CURSOR_DEPTH_WEAVE_STATE_DXR   ((XrStructureType)1004999329)
+
+typedef enum XrCursorDepthWeaveSpriteKindDXR {
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_KEEP_DXR      = 0, // unchanged since `generation` (no payload)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_DEFAULT_DXR   = 1, // the runtime's default look (A.6)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_NONE_DXR      = 2, // the page hides its cursor: draw nothing
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_OS_CURSOR_DXR = 3, // osCursor = an HCURSOR (Windows)
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_TEXTURE_DXR   = 4, // texture = shared premultiplied RGBA8
+    XR_CURSOR_DEPTH_WEAVE_SPRITE_MAX_ENUM_DXR  = 0x7FFFFFFF
+} XrCursorDepthWeaveSpriteKindDXR;
+
+typedef struct XrCursorDepthWeaveSpriteDXR {      // plain member, not chainable
+    XrCursorDepthWeaveSpriteKindDXR kind;
+    uint64_t             generation;   // bumps on every change; KEEP refers to it
+    uint64_t             osCursor;     // OS_CURSOR
+    void*                texture;      // TEXTURE: a shared handle of textureKind
+    XrWeaveHandleKindDXR textureKind;
+    XrExtent2Di          extent;       // TEXTURE: px (<= 256 x 256)
+    XrVector2f           hotSpotPx;    // TEXTURE: px from the top-left
+    float                sizeMeters;   // <= 0: image px x panel pitch (OS_CURSOR: A.6's size)
+} XrCursorDepthWeaveSpriteDXR;
+
+typedef struct XrCursorDepthWeaveRectDXR {        // plain member, not chainable
+    uint32_t   rectIndex;       // into this submit's XrWeaveSubmitRectsDXR::rects
+    XrBool32   hasContent;      // XR_FALSE: pointer over the element, nothing 3D under it
+    float      disparityPx;     // signed, device px, < 0 crossed (in front)
+    XrVector2f sampleUV;        // where the page sampled it, rect-normalised, v down
+    uint32_t   flags;           // reserved 0 (the "no softening" opt-out of B.7 lands here)
+} XrCursorDepthWeaveRectDXR;
+
+// Chained on XrWeaveSubmitInfoDXR::next. Chaining it IS the per-submit request (§0).
+typedef struct XrCursorDepthWeaveRequestDXR {
+    XrStructureType                  type;
+    const void* XR_MAY_ALIAS         next;
+    XrCursorDepthWeaveSpriteDXR      sprite;    // also the sprite of lifted rects' cursors
+    uint32_t                         rectCount; // 0..XR_WEAVE_SUBMIT_MAX_RECTS_DXR
+    const XrCursorDepthWeaveRectDXR* rects;
+} XrCursorDepthWeaveRequestDXR;
+
+// Chained on XrWeaveOutputDXR::next of a submit that carried a request.
+typedef struct XrCursorDepthWeaveStateDXR {
+    XrStructureType    type;
+    void* XR_MAY_ALIAS next;
+    uint32_t           drawnRectMask;    // bit i = drawn into rects[i] of XrWeaveSubmitRectsDXR
+    uint64_t           spriteGeneration; // the sprite the runtime now holds (0 = none)
+    XrRect2Di          drawnBounds;      // window px the drawn sprite covers (all views); 0 if none
+} XrCursorDepthWeaveStateDXR;
+```
+
+- **Zero cost (§0).** A submit without the request does no cursor work, holds no sprite and
+  sends nothing extra over IPC. The sprite is released when a request stops arriving for 1 s or
+  the session ends.
+- **Older runtimes.** A pre-v8 runtime skips unknown chained structs (the weave's established
+  behaviour), so the browser enables the request only when the weave session reports
+  `XR_DXR_cursor_depth` ≥ 8, and treats a missing state struct as "not drawn".
+- **The 32-bit mask** is enough because each submit carries at most
+  `XR_WEAVE_SUBMIT_MAX_RECTS_DXR` (32) rects. A frame split over several submits gets one state
+  per submit.
+- **The lifted rects' v6 structs stay.** A lifted rect's depth still comes from its conversion;
+  only its sprite comes from the request when one is chained.
+
+#### 4. Latency: what moves the cursor, and what is left
+
+| | Pointer position read | Moves at | Behind the OS cursor (estimate, to be measured) |
+|---|---|---|---|
+| Today: SDK sprite | page `pointermove`, then the page's rAF | the **page's** frame rate | page frame + composite + weave + present: about 3–5 frames, more on a slow page |
+| This amendment | `GetCursorPos` **inside the weave submit**, right before the draw | the **display compositor's** rate (see re-weave below) | present + scanout of the woven frame: about 1–2 frames |
+| Hardware cursor | the OS | scanout | 0 |
+
+- **Pointer-driven re-weave.** A static page produces no compositor frames when only the mouse
+  moves, because the hardware cursor needs none, and then a runtime-drawn cursor would freeze.
+  While a runtime cursor is drawn in a window, the browser asks the display compositor for a
+  redraw on every pointer move it routes. No renderer work is involved: it re-weaves the last
+  tiles. So the cursor moves at display rate **even when the page renders at 30 fps**, which is
+  the larger part of the "sluggish" report. Cost: one weave of the window per pointer-move frame
+  while the cursor is lifted. That is a DP pass the page was usually paying for anyway.
+- **What remains.** The cursor is in the woven frame, so it still waits for the GPU process's
+  present and the compositor's scanout: one to two frames, versus the overlay's zero. That is
+  inherent to any cursor with disparity (Consequences, last bullet). The **depth** is a page frame
+  old (two to four frames). The fast-rise filter absorbs that, as it does for every other source,
+  and it affects only depth, never position.
+
+#### 5. Hiding the OS cursor, and the fallback ladder
+
+**Hide in the browser process, not in CSS.** Patch 0400 (lifted video) hides the cursor by
+setting `cursor: none !important` on the lifted elements from an isolated world. That is fine
+for 0400, which draws a fixed arrow. Here it would **destroy the feed**: with the element's
+cursor forced to `none`, Blink's computed cursor is `none`, so the browser could no longer see
+the page switch `grab` → `grabbing` on mousedown, or `pointer` over a hotspot. Instead:
+
+- The browser process keeps receiving Blink's computed cursor (and forwards changes as the
+  sprite).
+- **Where that cursor becomes the window's OS cursor**, it substitutes "none" while the pointer
+  lies inside a `drawnBounds` the GPU process reported for that window, and the report is fresh.
+- The browser routes every mouse move, so it restores the OS cursor **the moment the pointer
+  leaves** the drawn area, with no round trip. The report is edge-triggered and withdrawn on
+  teardown or a GPU-process death, exactly like 0400's (`LiftCursorDrawn`), so a dead GPU process
+  cannot leave the cursor hidden.
+- **Hand-off without a gap.** Taking over can show both cursors for one or two frames. That is
+  benign, because the drawn cursor appears near the glass (A.3's threshold), almost on top of
+  the OS one. Handing back must never show **no** cursor. So the runtime reports "not drawn" two
+  frames **before** it stops drawing a cursor that is sinking to the glass, and keeps drawing
+  meanwhile. A pointer that leaves the rect is handled by the browser's own bounds test above.
+
+0400 should move to this mechanism when the lift cursor takes the browser's sprite.
+
+**Fallback ladder** (each rung keeps a cursor on screen; none shows two policies):
+
+| Situation | Cursor |
+|---|---|
+| Browser has the API, runtime spec ≥ 8 with a drawer | runtime-drawn: the page's real cursor, the one policy, B.7 |
+| Same, but the runtime declines a frame (2D mode, no tracking, a refusal reason) | the flat OS cursor for that frame. The SDK must **not** draw its own sprite: the policy says flat |
+| Browser has the API, runtime < 8 or no drawer (`getCursorDepthSupport()` = `"none"`) | SDK-drawn sprite, as today |
+| Browser without the API (older release, other browsers) | SDK-drawn sprite, as today |
+
+The SDK's fallback sprite does not have B.7 softening yet; porting the 13-tap kernel into the
+three.js and PlayCanvas sprite materials is optional (§7).
+
+**Platforms.** Windows (D3D11 service) first. **macOS**: the Metal weave backend has no cursor
+drawer; it needs a port of the Metal in-process cursor pass into the weave, plus the texture
+carrier fed from `NSCursor` in the browser process. **Desktop Linux**: the weave backend exists
+(#1699), but the browser's Linux lane has never run; it comes after that. **Android**: touch
+first, with no hover cursor, so out of scope. Until a platform has a drawer,
+`getCursorDepthSupport()` says `"none"` there and the SDK draws.
+
+#### 6. Native parity
+
+The same code decides and draws on both sides of the API:
+- the policy is `u_cursor_depth` (A.1–A.5), with the same constants;
+- the softening is `u_cursor_draw_soften_sized` with the same `DXR_CURSOR_SOFTEN*` knobs, read
+  from the service's environment as for Phase 4;
+- on Windows the look is `comp_cursor_look_win.c`, which rasterises an `HCURSOR` at the window's
+  DPI, so `grab` over a woven three.js canvas is drawn exactly as a native app's `grab`;
+- the refusal reasons and their WARNs are shared.
+
+The only web-specific pieces are the depth unit (pixels, as Amendment 3's measured source) and
+the sprite carrier. What stays different, deliberately: the web pointer is read at weave time,
+while native in-process apps still hand the pointer in with the hint. Native could adopt the
+late read later; that is a Phase 2 item, not this amendment.
+
+#### 7. Estimate, risks, tests, rollout
+
+**Estimate** (working days, one engineer per repo, Windows first):
+
+| Repo | Work | Days |
+|---|---|---|
+| runtime | spec v8 header + spec section + type registry; IPC fields on the weave submit/output | 1.5 |
+| | weave-rect cursor: caller-disparity source, one filter + hybrid anchor per client (ported to the weave frame, unit-tested), late pointer, no zero-copy on cursor frames | 3 |
+| | sprite: `HCURSOR` through `comp_cursor_look_win`, texture carrier open/cache, generations | 1.5 |
+| | state + `drawnBounds` + early "not drawn" on sink, refusal reasons | 1 |
+| | tests: pure-math units, `weave_rpc_probe_d3d11_win` extension, zero-cost check; docs | 2 |
+| | **runtime total (Windows)** | **≈ 9** |
+| browser | Blink `setCursorDepth` / `getCursorDepthSupport`, carried on the compositor frame next to the weave rects (patch-0026 path) | 2 |
+| | GPU weave client: element → rect index, chain v8 (gated ≥ 8), read the state, report edges (0400's channel) | 1.5 |
+| | cursor feed: browser-process cursor → sprite (`HCURSOR` + ref, generation) → GPU | 2 |
+| | OS-cursor override gated by `drawnBounds`, withdrawal on GPU death | 1.5 |
+| | pointer-driven re-weave | 1.5 |
+| | build and panel cycles (multi-hour builds) | 2 |
+| | **browser total (Windows)** | **≈ 10.5** |
+| SDK | feature detect; send `disparityPx` from `DepthCursor`, PlayCanvas and the stereo-tile cursor, and skip drawing and `hideCss` when the runtime draws; tests; docs | 3 |
+| | optional: B.7 softening for the fallback sprite | 1.5 |
+| later | macOS: Metal weave drawer (runtime ≈ 4) + `NSCursor` texture feed (browser ≈ 2) | ≈ 6 |
+
+**Risks:**
+1. **Cross-process `HCURSOR`.** `GetIconInfo` / `DrawIconEx` on a handle created in the browser
+   process, called from the service, with a low-integrity GPU process in between. This is a
+   half-day spike, run first. If it fails, Windows uses the texture carrier (+1 browser day).
+2. **Re-weave cost and plumbing.** Forcing a display-compositor redraw with no damage must
+   reach the weave, and not be skipped as "nothing changed".
+3. **Hide/show flicker** at the hand-off; mitigated as in §5 and to be judged on the panel.
+4. **Depth lag at edges.** The depth is a page frame old while the position is current, so a
+   fast sweep across an edge can show a frame below the nearer content. This is the same as
+   every source (Consequences) and is absorbed by the footprint and the fast rise.
+5. **Overlapping woven elements**: topmost by submit order, which assumes submit order is paint
+   order.
+
+**Test plan:**
+- *Unit (runtime, SDK):* px → d → placement; per-view positions for both input layouts; the
+  hybrid anchor's continuity, parallax and no-drift in the weave frame; SDK fixtures equal to
+  the C ones.
+- *Headless runtime:* `weave_rpc_probe_d3d11_win` (sim-display) submits a synthetic SBS input
+  with a request and reads the woven output back. It shows the sprite with disparity =
+  `disparityPx` − margin_px, nothing at `hasContent = XR_FALSE`, the right refusal under
+  `DXR_CURSOR_DRAW_REFUSE`, and a woven output bit-identical to a run without the request when
+  none is chained (§0).
+- *Browser (sim-display, then panel):* a three.js cube with OrbitControls. Check that:
+  - `grab` and `grabbing` show lifted;
+  - `pointer` over a link-styled hotspot and a `url()` cursor work;
+  - the OS cursor is hidden exactly while drawn, and restored instantly on leaving the element;
+  - DOM over the canvas keeps the OS cursor;
+  - a static page still moves the cursor (re-weave);
+  - a 30 fps splat page moves it at display rate;
+  - an older runtime gives the SDK fallback;
+  - killing the GPU process restores the cursor.
+- *Panel (Windows, head-tracked):* side by side with `cube_handle_d3d11_win` at the same
+  disparity: the same look, margin, softening and hybrid parallax with head motion. **Latency:**
+  film the OS cursor, the SDK sprite and the runtime cursor with a 240 fps camera during a fast
+  mouse sweep, and report frames behind the OS cursor for each.
+
+**Rollout:**
+1. **W1, runtime:** spec v8 + the D3D11 service weave-rect cursor + the probe; the `HCURSOR`
+   spike first.
+2. **W2, browser + SDK on Windows:** the API, the sprite feed, the hide override, the re-weave;
+   the SDK prefers the runtime and keeps the fallback. Panel check, then ship.
+3. **W3:** lifted rects take the browser's sprite and the hybrid anchor; 0400 moves to the
+   browser-process hide.
+4. **W4:** macOS (Metal weave drawer, `NSCursor` feed).
+5. **W5:** desktop Linux once the browser's Linux lane runs. Optionally, Amendment 3's measured
+   source on weave rects, for stereo-video pages with no depth.
+
+### Alternatives considered
+
+- **Keep the SDK drawing and only fix its look.** The page cannot read the browser's cursor
+  images and would still move at the page's frame rate. That fixes neither defect.
+- **Chain the native v5 hint on the browser's per-rect rig locate** (the browser already calls
+  `xrLocateViews` with the element's zone rect each frame, patch 0036). It reuses the hint
+  verbatim, but the page would have to express its point in that locate space, through its rig;
+  the weave session has no `xrEndFrame` or swapchain sprite, so the draw still has to happen at
+  the weave; and the locate runs for the **next** frame, which adds skew. Rejected for the weave
+  request above.
+- **Hide with 0400's isolated-world CSS.** It erases the computed cursor the feed needs (§5).
+- **Let the runtime mirror the OS cursor itself, as on native.** While the runtime draws, the
+  browser has hidden the OS cursor, so there is nothing left to mirror. The browser has to say
+  what it would have shown.
+
+### Decisions (David, 2026-10-13: "go with your recommendations")
+
+1. Hide in the browser process (the per-pointer override); 0400 migrates to it.
+2. Windows sprite: the `HCURSOR` carrier if the spike passes, the texture otherwise.
+3. The pointer-driven re-weave is accepted.
+4. Depth unit: device pixels.
+5. Lifted rects take the real cursor in the release after web pages (W3 stays separate).
+6. The SDK fallback gets B.7 softening.
+
+### Not changed
+
+§0 (no request, no work), §A (the one policy), §B (the runtime draws; the caller chooses the
+look), Amendment 1's API, Amendment 3. Hit testing is never moved.

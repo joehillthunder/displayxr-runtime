@@ -118,6 +118,7 @@
 #include <android/asset_manager.h>
 #include "crate_scene.h"
 #include "hud_font.h"
+#include <vk_frame_ring.h>
 
 #define LOG_TAG "cube_zones_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -342,6 +343,7 @@ struct Local2DSwapchain
 	uint32_t height{0};
 	XrSwapchainImageVulkanKHR images[8]{};
 	uint32_t image_count{0};
+	uint32_t uploaded_mask{0}; //!< bit i = image i already holds the pattern
 	VkBuffer staging{VK_NULL_HANDLE};
 	VkDeviceMemory staging_mem{VK_NULL_HANDLE};
 };
@@ -377,7 +379,24 @@ std::atomic<float> g_eye_y{0.0f};
 std::atomic<float> g_eye_z{0.0f};
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
-VkCommandPool g_app_cmd_pool = VK_NULL_HANDLE;
+// ADR-021 / INV-4.6: do the fragment shaders emit SCENE-LINEAR? Latched with
+// the colour format in create_swapchains() (true for an `_SRGB` swapchain, whose
+// attachment encodes on write). Every pipeline bakes it as the `uLinearize`
+// specialization constant (SpecId 0) and the clear colour follows the same flag.
+bool g_scene_linear = false;
+
+//! Standard sRGB EOTF: display-referred [0,1] -> scene-linear [0,1] (ADR-021 §2).
+static float
+srgb_to_linear(float c)
+{
+	return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+// Frame submission ring (dxr::VkFrameRing, displayxr-common): 3 frames in
+// flight, ONE submit per frame, never a wait on the frame just submitted —
+// INV-4.10 / #1917 (a per-frame submit + vkQueueWaitIdle parks the Adreno
+// governor at ~1/3 clock). Owns the per-frame command buffers + fences, and
+// the one-off submitImmediate() path the Local2D upload uses.
+dxr::VkFrameRing g_ring;
 
 // Graphics pipeline state for the triangle renderer.
 VkRenderPass g_render_pass = VK_NULL_HANDLE;
@@ -396,10 +415,13 @@ constexpr uint32_t kCubeVertexCount = 36;
 // In-frame HUD: a persistently-mapped host-visible vertex buffer of CubeVertex
 // quads, rebuilt each frame and drawn with an identity MVP (screen-space NDC).
 // Android widgets can't overlay the runtime's display window, so the HUD lives
-// inside the rendered frame.
+// inside the rendered frame. One kHudMaxVerts region PER FRAME-RING SLOT: with
+// several frames in flight, rebuilding a single shared region would overwrite
+// vertices a still-executing frame is reading.
 VkBuffer g_hud_vbuf = VK_NULL_HANDLE;
 VkDeviceMemory g_hud_vbuf_mem = VK_NULL_HANDLE;
 void *g_hud_mapped = nullptr;
+uint32_t g_hud_slots = 1;
 constexpr uint32_t kHudMaxVerts = 8192;
 
 // Authoritative 4-way display rotation, pushed from MainActivity (Surface
@@ -1221,10 +1243,13 @@ create_swapchains()
 		}
 	}
 
-	// Pick a swapchain format the runtime supports. Prefer 8-bit linear
-	// RGBA / BGRA — these line up with what the runtime's vk_native
-	// compositor and the DP expect. SRGB variants kicked out so we don't
-	// trip a gamma double-correction.
+	// Pick a swapchain format the runtime supports (ADR-021 / INV-4.6). Prefer
+	// an honest 8-bit `_SRGB` format: since runtime #1623, vk_native treats a
+	// UNORM swapchain as holding LINEAR values and encodes it on output, so the
+	// display-referred colour this app authors would be encoded twice (washed
+	// out) in UNORM. In `_SRGB` the colour attachment encodes on write, so the
+	// fragment shaders decode (g_scene_linear) and the stored bytes are exactly
+	// the authored ones. BGRA first keeps the runtime's preferred channel order.
 	uint32_t format_count = 0;
 	XrResult res = xrEnumerateSwapchainFormats(g_session, 0, &format_count, nullptr);
 	if (res != XR_SUCCESS || format_count == 0) {
@@ -1241,6 +1266,8 @@ create_swapchains()
 		return false;
 	}
 	const int64_t preferred[] = {
+	    VK_FORMAT_B8G8R8A8_SRGB,
+	    VK_FORMAT_R8G8B8A8_SRGB,
 	    VK_FORMAT_B8G8R8A8_UNORM,
 	    VK_FORMAT_R8G8B8A8_UNORM,
 	};
@@ -1255,11 +1282,19 @@ create_swapchains()
 		}
 	}
 	if (g_swapchain_format == VK_FORMAT_UNDEFINED) {
-		LOGE("Runtime didn't advertise a UNORM swapchain format; first supported = 0x%llx",
+		LOGE("Runtime didn't advertise an 8-bit RGBA/BGRA swapchain format; first supported = 0x%llx",
 		     (long long)formats[0]);
 		g_swapchain_format = (VkFormat)formats[0];
 	}
+	g_scene_linear = g_swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ||
+	                 g_swapchain_format == VK_FORMAT_R8G8B8A8_SRGB;
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
+	// One-off (never per frame): tells a washed-out capture apart from a
+	// mis-selected swapchain format without a rebuild.
+	LOGW("[color] colorFormat=%d sceneLinear=%s (%s)", (int)g_swapchain_format,
+	     g_scene_linear ? "yes" : "no",
+	     g_scene_linear ? "fragment shaders decode authored colour; the attachment re-encodes"
+	                    : "no _SRGB format advertised; fragment shaders write authored bytes raw");
 
 	// Atlas dims = worst case over all modes AND BOTH ORIENTATIONS (#518). The
 	// swapchain is never recreated on device rotation, so it must hold either
@@ -1438,6 +1473,7 @@ create_local2d_swapchain()
 	}
 	fill_local2d_pattern(static_cast<uint8_t *>(mapped), kLocal2DWidth, kLocal2DHeight);
 	vkUnmapMemory(g_vk_device, g_local2d.staging_mem);
+	g_local2d.uploaded_mask = 0;
 
 	LOGI("[zones] Local2D swapchain: %ux%u, %u images", kLocal2DWidth, kLocal2DHeight, n);
 	return true;
@@ -1445,60 +1481,46 @@ create_local2d_swapchain()
 
 //! Copy the staged pattern into Local2D image @p idx. The runtime hands these
 //! out in GENERAL (AHardwareBuffer-imported), so bracket the copy accordingly.
+//! The pattern is static, so each image is uploaded ONCE (uploaded_mask) via
+//! the ring's one-off submitImmediate() — not a blocking submit every frame
+//! (INV-4.10).
 static bool
 upload_local2d_image(uint32_t idx)
 {
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = g_app_cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) {
-		return false;
+	if (idx < 32 && (g_local2d.uploaded_mask & (1u << idx)) != 0) {
+		return true;
 	}
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	VkResult r = g_ring.submitImmediate([&](VkCommandBuffer cmd) {
+		VkImage img = g_local2d.images[idx].image;
+		VkImageMemoryBarrier to_dst = {};
+		to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+		to_dst.srcAccessMask = 0;
+		to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		to_dst.image = img;
+		to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+		                     nullptr, 0, nullptr, 1, &to_dst);
 
-	VkImage img = g_local2d.images[idx].image;
-	VkImageMemoryBarrier to_dst = {};
-	to_dst.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	to_dst.srcAccessMask = 0;
-	to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	to_dst.image = img;
-	to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-	                     nullptr, 0, nullptr, 1, &to_dst);
+		VkBufferImageCopy copy = {};
+		copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+		copy.imageExtent = {kLocal2DWidth, kLocal2DHeight, 1};
+		vkCmdCopyBufferToImage(cmd, g_local2d.staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-	VkBufferImageCopy copy = {};
-	copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-	copy.imageExtent = {kLocal2DWidth, kLocal2DHeight, 1};
-	vkCmdCopyBufferToImage(cmd, g_local2d.staging, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-	VkImageMemoryBarrier to_gen = to_dst;
-	to_gen.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-	to_gen.dstAccessMask = 0;
-	to_gen.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-	to_gen.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-	vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
-	                     0, nullptr, 0, nullptr, 1, &to_gen);
-
-	vkEndCommandBuffer(cmd);
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	VkResult r = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-	if (r == VK_SUCCESS) {
-		vkQueueWaitIdle(g_vk_queue);
+		VkImageMemoryBarrier to_gen = to_dst;
+		to_gen.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+		to_gen.dstAccessMask = 0;
+		to_gen.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+		to_gen.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+		vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
+		                     0, nullptr, 0, nullptr, 1, &to_gen);
+	});
+	if (r == VK_SUCCESS && idx < 32) {
+		g_local2d.uploaded_mask |= 1u << idx;
 	}
-	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
 	return r == VK_SUCCESS;
 }
 
@@ -1556,6 +1578,7 @@ destroy_local2d_swapchain()
 		g_local2d.staging_mem = VK_NULL_HANDLE;
 	}
 	g_local2d.image_count = 0;
+	g_local2d.uploaded_mask = 0;
 }
 
 // One reference space for the app — projection layer poses are expressed
@@ -1579,21 +1602,19 @@ bool
 create_scene()
 {
 	return crate_scene_init(g_scene, g_vk_device, g_vk_phys_device, g_vk_queue, g_vk_queue_family,
-	                        g_render_pass, g_asset_manager);
+	                        g_render_pass, g_asset_manager, g_scene_linear);
 }
 
-// Standalone command pool for the test app's per-frame cmd buffers.
-// Created lazily once the session + swapchains exist.
+// Frame ring for the per-frame command buffers (INV-4.10). Created lazily once
+// the session + swapchains exist. Android processes have no usable environment,
+// so the frames-in-flight count is passed explicitly.
 bool
-create_cmd_pool()
+create_frame_ring()
 {
-	VkCommandPoolCreateInfo ci = {};
-	ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	ci.queueFamilyIndex = g_vk_queue_family;
-	VkResult res = vkCreateCommandPool(g_vk_device, &ci, nullptr, &g_app_cmd_pool);
-	if (res != VK_SUCCESS) {
-		LOGE("vkCreateCommandPool failed: %d", res);
+	dxr::VkFrameRing::Config cfg;
+	cfg.framesInFlight = 3;
+	if (!g_ring.init(g_vk_device, g_vk_phys_device, g_vk_queue, g_vk_queue_family, cfg)) {
+		LOGE("frame ring init failed");
 		return false;
 	}
 	return true;
@@ -1623,12 +1644,9 @@ destroy_reference_space()
 }
 
 void
-destroy_cmd_pool()
+destroy_frame_ring()
 {
-	if (g_app_cmd_pool != VK_NULL_HANDLE && g_vk_device != VK_NULL_HANDLE) {
-		vkDestroyCommandPool(g_vk_device, g_app_cmd_pool, nullptr);
-		g_app_cmd_pool = VK_NULL_HANDLE;
-	}
+	g_ring.destroy();
 }
 
 // Record + submit a clear-to-color cmd buffer on the swapchain image
@@ -1871,6 +1889,20 @@ create_render_pass()
 	subpass.pColorAttachments = &color_ref;
 	subpass.pDepthStencilAttachment = &depth_ref;
 
+	// The single atlas depth image is shared by every frame, and with the frame
+	// ring (INV-4.10) several frames are in flight — order this frame's depth
+	// clear/writes after the previous frame's (WAW across submits).
+	VkSubpassDependency depth_dep = {};
+	depth_dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+	depth_dep.dstSubpass = 0;
+	depth_dep.srcStageMask =
+	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	depth_dep.dstStageMask =
+	    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	depth_dep.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	depth_dep.dstAccessMask =
+	    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
 	VkAttachmentDescription attachments[2] = {color, depth};
 	VkRenderPassCreateInfo rpci = {};
 	rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1878,6 +1910,8 @@ create_render_pass()
 	rpci.pAttachments = attachments;
 	rpci.subpassCount = 1;
 	rpci.pSubpasses = &subpass;
+	rpci.dependencyCount = 1;
+	rpci.pDependencies = &depth_dep;
 
 	VkResult res = vkCreateRenderPass(g_vk_device, &rpci, nullptr, &g_render_pass);
 	if (res != VK_SUCCESS) {
@@ -1921,6 +1955,15 @@ create_pipeline()
 	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
 	stages[1].module = g_fs_module;
 	stages[1].pName = "main";
+	// ADR-021 / INV-4.6: bake shaders/cube.frag's `uLinearize` from g_scene_linear.
+	const VkBool32 spec_linearize = g_scene_linear ? VK_TRUE : VK_FALSE;
+	const VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
+	VkSpecializationInfo frag_spec = {};
+	frag_spec.mapEntryCount = 1;
+	frag_spec.pMapEntries = &spec_entry;
+	frag_spec.dataSize = sizeof(spec_linearize);
+	frag_spec.pData = &spec_linearize;
+	stages[1].pSpecializationInfo = &frag_spec;
 
 	VkPushConstantRange pc_range = {};
 	pc_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
@@ -2283,7 +2326,8 @@ build_hud(CubeVertex *v)
 static bool
 create_hud_buffer()
 {
-	const VkDeviceSize size = sizeof(CubeVertex) * kHudMaxVerts;
+	g_hud_slots = g_ring.framesInFlight() > 0 ? g_ring.framesInFlight() : 1;
+	const VkDeviceSize size = sizeof(CubeVertex) * kHudMaxVerts * g_hud_slots;
 	VkBufferCreateInfo bci = {};
 	bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
 	bci.size = size;
@@ -2307,12 +2351,13 @@ create_hud_buffer()
 		return false;
 	}
 	vkBindBufferMemory(g_vk_device, g_hud_vbuf, g_hud_vbuf_mem, 0);
-	// Persistently mapped (host-coherent): rebuilt each frame in record_atlas.
+	// Persistently mapped (host-coherent): rebuilt each frame in record_atlas,
+	// into the current ring slot's region.
 	if (vkMapMemory(g_vk_device, g_hud_vbuf_mem, 0, size, 0, &g_hud_mapped) != VK_SUCCESS) {
 		LOGE("map HUD vertex buffer failed");
 		return false;
 	}
-	DXR_HW_DBG("HUD vertex buffer created (%u verts max)", kHudMaxVerts);
+	DXR_HW_DBG("HUD vertex buffer created (%u verts max x %u slots)", kHudMaxVerts, g_hud_slots);
 	return true;
 }
 
@@ -2476,20 +2521,13 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	(void)rows;
 	// DIAG (#1074): live-tunable flat per-view tint (see the clear below).
 	const bool tint_views = get_prop_float("debug.dxr.tintviews", 0.0f) != 0.0f;
-	VkCommandBufferAllocateInfo ai = {};
-	ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	ai.commandPool = g_app_cmd_pool;
-	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	ai.commandBufferCount = 1;
-	VkCommandBuffer cmd = VK_NULL_HANDLE;
-	if (vkAllocateCommandBuffers(g_vk_device, &ai, &cmd) != VK_SUCCESS) {
+	// The ring waits only the fence of the frame that used this slot N frames
+	// ago, then hands back its (reset, begun) command buffer.
+	VkCommandBuffer cmd = g_ring.beginFrame();
+	if (cmd == VK_NULL_HANDLE) {
 		return false;
 	}
-
-	VkCommandBufferBeginInfo bi = {};
-	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	vkBeginCommandBuffer(cmd, &bi);
+	const uint32_t slot = g_ring.slotIndex();
 
 	// LOAD_OP_CLEAR fills the WHOLE atlas (every tile) once at render-pass
 	// begin. Dark blue, matching cube_handle_vk_win's scene background.
@@ -2498,6 +2536,15 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	clears[0].color.float32[1] = 0.05f;
 	clears[0].color.float32[2] = 0.25f;
 	clears[0].color.float32[3] = 1.0f;
+	// ADR-021 / INV-4.6: a clear value is taken in the attachment's OWN space,
+	// so an `_SRGB` attachment encodes it — decode the display-referred
+	// background off the same flag the pipelines were specialized with. Alpha
+	// is linear in both spaces and is never converted.
+	if (g_scene_linear) {
+		for (int i = 0; i < 3; i++) {
+			clears[0].color.float32[i] = srgb_to_linear(clears[0].color.float32[i]);
+		}
+	}
 	clears[1].depthStencil.depth = 1.0f;
 
 	VkRenderPassBeginInfo rpbi = {};
@@ -2555,14 +2602,16 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	uint32_t hud_n = 0;
 	const Mat4 hud_mvp = mat4_identity();
 	const bool hud_ok = (g_hud_vbuf != VK_NULL_HANDLE && g_hud_mapped != nullptr);
+	const uint32_t hud_slot = slot % g_hud_slots;
 	if (hud_ok) {
-		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped));
+		hud_n = build_hud(reinterpret_cast<CubeVertex *>(g_hud_mapped) + hud_slot * kHudMaxVerts);
 	}
 
 	// Build the crisp stb_truetype text once per frame (drawn per tile below,
 	// on top of the translucent panel). The panel top-left is (-0.975,-0.800).
 	uint32_t hud_text_n = 0;
 	float hud_bbox[4] = {0, 0, 0, 0};  // tight text bounds (NDC) → snug panel
+	g_hud_font.slot = slot;  // per-slot glyph/panel vertex regions (frames in flight)
 	if (g_hud_font.ready) {
 		char xb[16], yb[16], zb[16], block[80];
 		hud_ftoa(g_eye_x.load(std::memory_order_relaxed), xb, sizeof xb);
@@ -2624,7 +2673,7 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline);
 			vkCmdPushConstants(cmd, g_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0,
 			                   sizeof(hud_mvp), &hud_mvp);
-			VkDeviceSize hud_off = 0;
+			VkDeviceSize hud_off = sizeof(CubeVertex) * kHudMaxVerts * hud_slot;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &g_hud_vbuf, &hud_off);
 			// Pass 1: translucent panel (blend-constant alpha < 1).
 			if (g_hud_panel_n > 0) {
@@ -2679,19 +2728,14 @@ record_atlas(uint32_t image_idx, const XrView *views, uint32_t view_count, uint3
 	}
 
 	vkCmdEndRenderPass(cmd);
-	vkEndCommandBuffer(cmd);
 
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &cmd;
-	VkResult res = vkQueueSubmit(g_vk_queue, 1, &si, VK_NULL_HANDLE);
-	if (res == VK_SUCCESS) {
-		// Host stall — acceptable for this test app; xrEndFrame needs the
-		// atlas image ready and there's no per-frame fence wired yet.
-		vkQueueWaitIdle(g_vk_queue);
+	// ONE submit with the slot fence and NO wait. The runtime composes on the
+	// same VkQueue, so the caller releases the swapchain image only after this
+	// (queue order puts our work ahead of the compose).
+	VkResult res = g_ring.endFrame();
+	if (res != VK_SUCCESS) {
+		LOGE("record_atlas: frame submit failed: %d", (int)res);
 	}
-	vkFreeCommandBuffers(g_vk_device, g_app_cmd_pool, 1, &cmd);
 
 	DXR_HW_DBG_ONCE("record_atlas: first successful tiled-atlas submit");
 	return res == VK_SUCCESS;
@@ -3035,6 +3079,7 @@ render_frame()
 				res = xrWaitSwapchainImage(g_atlas.swapchain, &wait_img);
 			}
 			if (res == XR_SUCCESS) {
+				// Submits the frame (ring endFrame) BEFORE the release below.
 				record_atlas(img_idx, views, submit_views, render_w, render_h, cols, rows, swap_lr,
 				             rig_pose);
 
@@ -3212,10 +3257,12 @@ destroy_vulkan()
 void
 destroy_instance()
 {
-	// Tear down in reverse-creation order: cmd_pool → space → swapchains
+	// Tear down in reverse-creation order: frame ring → space → swapchains
 	// → session → Vulkan → instance. Doing it any other way invalidates
 	// handles still referenced by the runtime / loader. Drain GPU
-	// before per-view image destruction (audit B6).
+	// before per-view image destruction (audit B6): the frame ring's
+	// in-flight frames first, then the whole device.
+	g_ring.waitAll();
 	if (g_vk_device != VK_NULL_HANDLE) {
 		vkDeviceWaitIdle(g_vk_device);
 	}
@@ -3232,7 +3279,7 @@ destroy_instance()
 	}
 	destroy_pipeline();
 	destroy_render_pass();
-	destroy_cmd_pool();
+	destroy_frame_ring();
 	destroy_reference_space();
 	destroy_swapchains();
 	destroy_session();
@@ -3278,7 +3325,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    // the plain full-canvas path, so this must not gate startup.
 			    (activate_zones(), true) &&
 			    create_reference_space() &&
-			    create_cmd_pool() &&
+			    create_frame_ring() &&
 			    create_render_pass() &&
 			    create_pipeline() &&
 			    create_scene() &&
@@ -3291,7 +3338,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 				// g_hud_font.ready stays false and the HUD falls back to the
 				// legacy bitmap glyphs.
 				hud_font_init(g_hud_font, g_vk_phys_device, g_vk_device, g_vk_queue,
-				              g_vk_queue_family, g_render_pass, 48.0f);
+				              g_vk_queue_family, g_render_pass, 48.0f, g_scene_linear);
 			} else {
 				LOGW("Bring-up chain failed; see logs above.");
 			}

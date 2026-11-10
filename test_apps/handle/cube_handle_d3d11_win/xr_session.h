@@ -15,6 +15,7 @@
 #include "xr_session_common.h"
 #include <openxr/XR_DXR_local_3d_zone.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_cursor_depth.h>
 
 // INV-1.3 (#715): 3D panel top-left in virtual-desktop pixels (top-down,
 // origin = primary top-left); (0,0) = primary/unknown. Filled by
@@ -27,10 +28,23 @@ extern int32_t g_displayScreenTop;
 // vehicle; promote to xr_session_common when more consumers adopt it.
 extern bool g_hasViewRigExt;
 
+// XR_DXR_cursor_depth (ADR-046) available + enabled on the instance, and the
+// spec version the runtime advertises (v5 = the runtime can draw the cursor).
+// Opt out with DISPLAYXR_CURSOR_DEPTH=0. App-local, like the view-rig flag.
+extern bool g_hasCursorDepthExt;
+extern uint32_t g_cursorDepthSpecVersion;
+
 // XR_EXT_hand_tracking available + enabled on the instance (#825 Tier 2).
 // App-local for the same reason as the view-rig flag — this app is the
 // hand-tracking verify vehicle (`--hands` joint markers).
 extern bool g_hasHandTrackingExt;
+
+// #1956 — DXR_SUBMIT_DEPTH_LAYER=1 and the runtime advertises
+// XR_KHR_composition_layer_depth: render the scene's depth into an OpenXR
+// depth swapchain and chain XrCompositionLayerDepthInfoKHR on every projection
+// view. The smoke test for depth swapchains, in-process and over IPC
+// (XRT_FORCE_MODE=ipc / the shell), where the D3D11 service allocates them.
+extern bool g_submitDepthLayer;
 
 // #1488 — XR_EXT_view_configuration_views_change available + enabled on the
 // instance. This app is the reference consumer: it enables the extension and

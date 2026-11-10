@@ -19,7 +19,8 @@ name: Build Linux
 #
 # Package job (#705): build in the OLDEST supported container (ubuntu:22.04,
 # #1656), produce the tarball, install from it, and gate on selftest resolving
-# everything from the installed XDG paths.
+# everything from the installed XDG paths, plus the headless displayxr-service
+# smoke (#1744) on the installed service.
 #
 # Newest job (#1656): the "still compiles on the newest release" coverage the
 # Package job used to provide before it moved to 22.04 — build + selftest in an
@@ -27,14 +28,20 @@ name: Build Linux
 #
 # Deb job (#781 Phase 3, #1656): build the runtime .deb
 # (scripts/package_deb_linux.sh) on every PR, in an ubuntu:22.04 container so
-# the shipped binaries carry the oldest supported release's glibc floor.
-# DebInstall then installs it into pristine 22.04 / 24.04 / 26.04 containers and
-# runs it there; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
+# the shipped binaries carry the oldest supported release's glibc floor. Since
+# #1744 it is the HYBRID runtime + displayxr-service + its socket-activated
+# systemd user units (the .deb used to be in-process only, so no installed box
+# could weave). DebInstall then installs it into pristine 22.04 / 24.04 / 26.04
+# containers and runs it there — selftest AND the headless service smoke; DebRelease attaches displayxr-runtime_<ver>_amd64.deb to a v*
 # GitHub Release — the asset the Linux meta-bundle (displayxr-installer)
 # fetches — only after that passes. Deb / DebInstall are not required contexts
 # themselves (DebInstall is a matrix, so its context names move when the
 # supported-release list changes); the LinuxPackaging aggregator below carries
 # the stable required context "Linux Packaging" on their behalf.
+#
+# DashboardLinux job: tests + publishes the DisplayXR Dashboard (src/dashboard,
+# Avalonia / .NET 10) as a self-contained linux-x64 single file, ONCE; Deb and
+# Package download that artifact so the .deb and the tarball ship the same bits.
 
 on:
   workflow_dispatch: {}
@@ -49,6 +56,7 @@ on:
 # The Deb job needs write access to create/attach release assets on tags.
 permissions:
   contents: write
+  packages: read   # pull the ghcr.io/displayxr/ci-ubuntu mirror (mirror-ci-images.yml)
 
 # Cancel any in-progress run for the same PR (or branch) when a new
 # push comes in. Only the latest commit's CI completes.
@@ -99,6 +107,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Install dependencies
         # GL/EGL dev libs flip XRT_HAVE_OPENGL/XRT_HAVE_EGL ON so CI configures
@@ -115,7 +124,7 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
@@ -127,6 +136,61 @@ jobs:
         # run here; compile+link green is the gate.
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh --apps
+
+  # The DisplayXR Dashboard for Linux (src/dashboard/README.md): xunit tests on
+  # Linux, then `dotnet publish` linux-x64, self-contained single file (no .NET
+  # runtime on the target, InvariantGlobalization = no ICU, the Skia / HarfBuzz
+  # natives inside the bundle). Built on the host runner, not in the 22.04
+  # container: the published ELF is Microsoft's prebuilt .NET host (glibc
+  # >= 2.23 floor) plus the app payload, so the build host's glibc does not
+  # reach it — the Deb job's DXR_DEB_MAX_GLIBC check re-proves that on every
+  # run. Deb and Package consume the artifact (DXR_DASHBOARD_BIN).
+  DashboardLinux:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          fetch-depth: 0 # git describe stamps the dashboard's --version
+
+      - uses: actions/setup-dotnet@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          dotnet-version: '10.x'
+
+      - name: Test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet test src/dashboard/DisplayXR.Dashboard.sln -c Release --nologo
+
+      - name: Publish displayxr-dashboard (linux-x64, self-contained single file)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          VERSION="$(git describe --tags --always 2>/dev/null || echo unknown)"
+          dotnet publish src/dashboard/DisplayXR.Dashboard/DisplayXR.Dashboard.csproj \
+            -c Release -r linux-x64 --self-contained true \
+            -p:PublishSingleFile=true -p:PublishTrimmed=false -p:EnableCompressionInSingleFile=true \
+            -p:InformationalVersion="$VERSION" -p:IncludeSourceRevisionInInformationalVersion=false \
+            -o dashboard-out --nologo
+          ls -l dashboard-out
+          # One file: every native library is inside the bundle.
+          [ "$(find dashboard-out -type f ! -name '*.pdb' | wc -l)" = 1 ]
+          echo "--- DT_NEEDED"; objdump -p dashboard-out/displayxr-dashboard | awk '/NEEDED/{print "  " $2}'
+          echo "--- glibc floor"; objdump -T dashboard-out/displayxr-dashboard | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          # No display server: --version must not open a window.
+          env -u DISPLAY -u WAYLAND_DISPLAY dashboard-out/displayxr-dashboard --version | tee /dev/stderr | grep -q "^displayxr-dashboard $VERSION$"
+
+      - name: Upload dashboard
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: dashboard-out/displayxr-dashboard
+          if-no-files-found: error
 
   # Packaging gate (#705): produce the tarball, run its own install.sh
   # (user-level), and prove the installed tree works end-to-end — selftest
@@ -141,9 +205,16 @@ jobs:
   # host below it. (Building on the NEXT LTS moved to the Newest job below, so
   # that toolchain coverage is kept.)
   Package:
-    needs: DetectChanges
+    needs: [DetectChanges, DashboardLinux]
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    # Org mirror of ubuntu:22.04, pulled authenticated: both public registries cap
+    # anonymous pulls from runner IPs (mirror-ci-images.yml).
+    container:
+      image: ghcr.io/displayxr/ci-ubuntu:22.04
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -159,7 +230,7 @@ jobs:
             build-essential cmake ninja-build pkg-config git ca-certificates python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
@@ -169,12 +240,32 @@ jobs:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the tarball version
 
-      - name: Build + package
+      - uses: actions/download-artifact@v6
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: ${{ runner.temp }}/dashboard
+
+      - name: Build + package
+        # --hybrid (#1744): the shipped configuration — in-process runtime for
+        # ordinary apps, IPC to displayxr-service for present-owners.
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DXR_DASHBOARD_BIN: ${{ runner.temp }}/dashboard/displayxr-dashboard
+          DXR_REQUIRE_DASHBOARD: "1"
         run: |
+          chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          ./scripts/build_linux.sh --service --no-test
+          ./scripts/build_linux.sh --hybrid --no-test
           ./scripts/package_linux.sh --no-build
+
+      - name: Runtime carries the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash
+        run: |
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --binary build/src/xrt/targets/openxr/openxr_displayxr.so \
+            --cli build/src/xrt/targets/cli/displayxr-cli
 
       - name: Install from tarball + selftest from installed paths
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -188,7 +279,23 @@ jobs:
           unset XRT_PLUGIN_SEARCH_PATH
           "$HOME/.local/share/displayxr/bin/displayxr-cli" info
           "$HOME/.local/share/displayxr/bin/displayxr-cli" selftest
+          # #1744: the installed service runs detached, answers IPC, stops on
+          # SIGTERM, recovers a stale socket, and socket-activates.
+          "$GITHUB_WORKSPACE/scripts/smoke_service_linux.sh" --bin-dir "$HOME/.local/share/displayxr/bin"
+          # install.sh wrote the socket-activated unit pair (no user manager in
+          # the container, so it is written but not enabled).
+          test -f "$HOME/.config/systemd/user/displayxr.socket"
+          grep -qx "ExecStart=$HOME/.local/share/displayxr/bin/displayxr-service" \
+            "$HOME/.config/systemd/user/displayxr.service"
+          # The dashboard: beside the CLI, in the menu, and it starts with no
+          # display server.
+          grep -qx "Exec=$HOME/.local/share/displayxr/bin/displayxr-dashboard" \
+            "$HOME/.local/share/applications/displayxr-dashboard.desktop"
+          test -f "$HOME/.local/share/icons/hicolor/256x256/apps/displayxr-dashboard.png"
+          env -u DISPLAY -u WAYLAND_DISPLAY "$HOME/.local/share/displayxr/bin/displayxr-dashboard" --version
           ./uninstall.sh
+          test ! -f "$HOME/.config/systemd/user/displayxr.socket"
+          test ! -f "$HOME/.local/share/applications/displayxr-dashboard.desktop"
           # Uninstall must leave no ActiveRuntime behind.
           test ! -f "$HOME/.config/openxr/1/active_runtime.json"
 
@@ -207,7 +314,14 @@ jobs:
   Newest:
     needs: DetectChanges
     runs-on: ubuntu-latest
-    container: ubuntu:26.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    # Org mirror of ubuntu:26.04, pulled authenticated: both public registries cap
+    # anonymous pulls from runner IPs (mirror-ci-images.yml).
+    container:
+      image: ghcr.io/displayxr/ci-ubuntu:26.04
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
@@ -223,7 +337,7 @@ jobs:
             build-essential cmake ninja-build pkg-config git ca-certificates python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
@@ -231,6 +345,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Build service + IPC-client runtime + headless selftest
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -250,6 +365,7 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           submodules: recursive
+          fetch-depth: 0 # the runtime versions itself from git describe (#1790)
 
       - name: Install dependencies
         # GL/EGL (+Xrandr/Xxf86vm) dev libs: same rationale as the Selftest
@@ -261,7 +377,7 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libgl-dev libglvnd-dev libegl1-mesa-dev libxrandr-dev libxxf86vm-dev libxcb-glx0-dev
 
@@ -298,9 +414,16 @@ jobs:
   # built here: Track B needs the commercial SR SDK, so it is produced on an
   # SR-equipped box, not public CI.
   Deb:
-    needs: DetectChanges
+    needs: [DetectChanges, DashboardLinux]
     runs-on: ubuntu-latest
-    container: ubuntu:22.04
+    # Canonical image from ECR Public: no anonymous pull limit (#1893)
+    # Org mirror of ubuntu:22.04, pulled authenticated: both public registries cap
+    # anonymous pulls from runner IPs (mirror-ci-images.yml).
+    container:
+      image: ghcr.io/displayxr/ci-ubuntu:22.04
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
@@ -338,7 +461,7 @@ jobs:
             python3 file binutils \
             libvulkan-dev glslang-tools \
             libeigen3-dev libcjson-dev libudev-dev \
-            libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libwayland-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libwayland-dev \
             libdbus-1-dev \
             libxrandr-dev \
             dpkg-dev fakeroot
@@ -350,12 +473,36 @@ jobs:
           submodules: recursive
           fetch-depth: 0 # git describe needs tags for the .deb version
 
+      - uses: actions/download-artifact@v6
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-dashboard-linux-x64
+          path: ${{ runner.temp }}/dashboard
+
       - name: Build runtime .deb (clean Release build)
         if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          DXR_DASHBOARD_BIN: ${{ runner.temp }}/dashboard/displayxr-dashboard
+          DXR_REQUIRE_DASHBOARD: "1"
         run: |
+          chmod +x "$DXR_DASHBOARD_BIN"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           ./scripts/package_deb_linux.sh
           echo "built:"; ls -lh dist/displayxr-runtime_*_amd64.deb
+
+      # #1790: the .deb's runtime reports the checkout's version (it said 1.6.0
+      # in every .deb up to here), and the .deb is named after it -- exactly the
+      # tag on a v* push, which is the asset DebRelease attaches.
+      - name: Runtime + .deb carry the checkout's version (#1790)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        shell: bash # container jobs default to sh: no shopt / arrays
+        run: |
+          shopt -s nullglob
+          debs=(dist/displayxr-runtime_*_amd64.deb)
+          [ "${#debs[@]}" -eq 1 ] || { echo "::error::expected exactly one .deb, found: ${debs[*]:-none}"; exit 1; }
+          ./scripts/check_runtime_version.sh --build-dir build \
+            --binary build/src/xrt/targets/openxr/openxr_displayxr.so \
+            --package "${debs[0]}"
 
       - name: Upload .deb artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -369,10 +516,13 @@ jobs:
   # supported release, without Recommends, and run it there
   # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
   # release's archive, `ldd -r` must be clean on every shipped ELF, every
-  # Depends/Recommends/Suggests name must exist there, and `displayxr-cli
-  # selftest` must pass env-free on the packaged sim-display. The Package job's
-  # tarball (which also carries displayxr-service) is checked for the same
-  # glibc / libstdc++ floor.
+  # Depends/Recommends/Suggests name must exist there, `displayxr-cli
+  # selftest` must pass env-free on the packaged sim-display, and (#1744)
+  # displayxr-service + its systemd user units must be installed and pass
+  # scripts/smoke_service_linux.sh — detached start, IPC handshake, SIGTERM,
+  # stale socket, socket activation + exit-when-idle (no systemd in the
+  # container: the sd_listen_fds hand-off is emulated). The Package job's
+  # tarball is checked for the same glibc / libstdc++ floor.
   DebInstall:
     name: DebInstall (Ubuntu ${{ matrix.release }})
     needs: [DetectChanges, Deb, Package]
@@ -404,7 +554,13 @@ jobs:
       - name: apt install + ldd -r + selftest in clean ubuntu:${{ matrix.release }}
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.release }}" \
+          # The org mirror of the canonical image, pulled authenticated. Docker Hub
+          # (#1893) and then ECR Public ("Data limit exceeded", v2.45.3) both cap
+          # anonymous pulls from runner IPs; see mirror-ci-images.yml.
+          img="ghcr.io/displayxr/ci-ubuntu:${{ matrix.release }}"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for i in 1 2 3; do docker pull "$img" && break; sleep $((i*10)); done
+          docker run --rm -v "$PWD:/w" -w /w "$img" \
             ./scripts/verify_deb_install_linux.sh \
               dist/displayxr-runtime_*_amd64.deb dist/displayxr-runtime-linux-*.tar.gz
 
@@ -435,7 +591,7 @@ jobs:
   # unconditionally and asserting on needs.*.result is what makes it a gate.
   LinuxPackaging:
     name: Linux Packaging
-    needs: [DetectChanges, Deb, Package, DebInstall]
+    needs: [DetectChanges, DashboardLinux, Deb, Package, DebInstall]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -450,6 +606,7 @@ jobs:
           # (!= 'true'), so we land here — and must fail rather than green-light
           # a run whose change classification never happened.
           RESULT_DETECTCHANGES: ${{ needs.DetectChanges.result }}
+          RESULT_DASHBOARDLINUX: ${{ needs.DashboardLinux.result }}
           RESULT_DEB: ${{ needs.Deb.result }}
           RESULT_PACKAGE: ${{ needs.Package.result }}
           # Matrix job: 'success' only when every leg succeeded (fail-fast is
@@ -458,10 +615,10 @@ jobs:
         run: |
           set -u
           rc=0
-          for leg in DETECTCHANGES DEB PACKAGE DEBINSTALL; do
+          for leg in DETECTCHANGES DASHBOARDLINUX DEB PACKAGE DEBINSTALL; do
             var="RESULT_${leg}"
             result="${!var}"
-            printf '%-14s %s\n' "$leg" "${result:-<missing>}"
+            printf '%-15s %s\n' "$leg" "${result:-<missing>}"
             # Anything that is not an outright success fails the gate —
             # including 'skipped', which on the non-docs_only path can only
             # mean a leg was bypassed by a condition it should not have been.

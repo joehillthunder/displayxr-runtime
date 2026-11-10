@@ -54,6 +54,14 @@ enum xrt_atlas_encoding
 {
 	XRT_ATLAS_ENCODING_ENCODED = 0, //!< sRGB / display-referred (Model A default).
 	XRT_ATLAS_ENCODING_LINEAR = 1,  //!< scene-referred / radiance (Model B).
+	/*!
+	 * SMPTE ST 2084 (PQ) code values, 1.0 linear = 203 cd/m^2 (BT.2408 reference
+	 * white), primaries passed through unchanged. Only ever sent to a DP that
+	 * accepted it through an `accepts_atlas_encoding` query — the D3D11 slot
+	 * (#2273) or the Vulkan one (#2340); a DP that never saw the query keeps
+	 * reading anything-but-LINEAR as ENCODED.
+	 */
+	XRT_ATLAS_ENCODING_PQ = 2,
 };
 
 /*!

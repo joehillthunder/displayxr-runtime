@@ -12,6 +12,7 @@
 #include "xrt/xrt_space.h"
 #include "xrt/xrt_system.h"
 #include "xrt/xrt_compositor.h"
+#include "xrt/xrt_screen.h"
 #include "xrt/xrt_config_build.h"
 #include "xrt/xrt_config_os.h"
 
@@ -42,6 +43,9 @@
 // longer link-includes any vendor drv_* code (ADR-019 / #256 / #263).
 
 #include "target_plugin_loader.h"
+#include "target_screens.h"
+#include "target_display_hotplug.h"
+#include "target_viewer_tracking.h"
 
 #include "target_instance_parts.h"
 
@@ -53,6 +57,7 @@
 #endif
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +121,8 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 	if (plugin->id != NULL) {
 		snprintf(info->active_plugin_id, sizeof(info->active_plugin_id), "%s", plugin->id);
 	}
+	// ADR-045: drives the service's slow fallback re-probe timer.
+	info->active_plugin_is_fallback = target_plugin_iface_is_fallback(plugin);
 	// #1243/#1244: this is the path Android takes, and it was NOT covered by the
 	// original guard — a config-skewed plug-in reached the compositor here and
 	// faulted inside the Adreno driver instead of being refused. Same check as
@@ -126,6 +133,14 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
 #ifdef XRT_OS_WINDOWS
 	if (plugin->create_dp_d3d11 != NULL) {
 		info->dp_factory_d3d11 = (void *)plugin->create_dp_d3d11;
+	}
+	// ADR-042: the optional lift-only factory, appended to the iface (read only
+	// when the plug-in's struct_size covers it).
+	info->dp_factory_d3d11_lift = NULL;
+	if (plugin->struct_size >= offsetof(struct xrt_plugin_iface, create_dp_d3d11_lift) +
+	                               sizeof(plugin->create_dp_d3d11_lift) &&
+	    plugin->create_dp_d3d11_lift != NULL) {
+		info->dp_factory_d3d11_lift = (void *)plugin->create_dp_d3d11_lift;
 	}
 	if (plugin->create_dp_d3d12 != NULL) {
 		info->dp_factory_d3d12 = (void *)plugin->create_dp_d3d12;
@@ -150,25 +165,136 @@ fill_dp_factories_from_plugin(struct xrt_system_compositor_info *info, const str
  * service compositor) via `comp_dp_factory_for_window`. They agree because the
  * loader now ENFORCES it (#1521): the active plug-in wins any monitor it claims,
  * so the primary-monitor winner is the active plug-in whenever it claims that
- * monitor — it is no longer merely assumed from EDID confidence. No-op (empty
- * registry) off-Windows, where the EDID enumerator returns no monitors.
+ * monitor — it is no longer merely assumed from EDID confidence. Populated on
+ * Windows, desktop Linux (RandR joined to DRM sysfs, multi-screen M0) and
+ * macOS (CoreGraphics displays joined to IOKit EDID); a no-op (empty
+ * registry) on Android, where the EDID enumerator returns no monitors.
  */
+/*!
+ * Enumerate the monitors and resolve every one's winner into @p out — the
+ * work of @ref build_dp_registry without the publish, so a caller may run it
+ * WITHOUT g_display_info_mutex (the display-hotplug sweep does: a vendor
+ * plug-in's probe_displays may wait seconds for its service to describe a
+ * panel that just came up, and readers of the screen list must not wait with
+ * it). Takes only the loader's lock, inside.
+ */
+static void
+resolve_dp_registry(struct xrt_dp_factory_registry *out)
+{
+	struct os_display_edid_list edid = {0};
+	os_display_edid_enumerate(&edid);
+
+	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
+	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
+	target_plugin_resolve_displays(descs, dn, out);
+}
+
 static void
 build_dp_registry(struct xrt_system_compositor_info *info)
 {
 	if (info == NULL) {
 		return;
 	}
-	struct os_display_edid_list edid = {0};
-	os_display_edid_enumerate(&edid);
+	// Resolve into a local and publish it in one copy: the resolver zeroes its
+	// output before it takes the loader's lock, so resolving in place would
+	// expose an empty / half-built registry to a concurrent reader. Callers
+	// hold g_display_info_mutex (lock order: g_display_info_mutex, then the
+	// loader's g_refresh_mutex inside the resolver), which is what
+	// t_instance_enumerate_displays reads under (multi-screen M1).
+	struct xrt_dp_factory_registry reg;
+	resolve_dp_registry(&reg);
+	info->dp_registry = reg;
 
-	struct xrt_display_descriptor descs[XRT_DP_REGISTRY_MAX_ENTRIES];
-	uint32_t dn = target_plugin_build_descriptors(&edid, descs, XRT_DP_REGISTRY_MAX_ENTRIES);
-	target_plugin_resolve_displays(descs, dn, &info->dp_registry);
+	// Resolving the claims loaded every registered plug-in once, so the
+	// loader now knows each one's DP factories — including one that declined
+	// (no panel attached yet). macOS VK routing reads this.
+	(void)target_plugin_find_metal_only(info->metal_only_plugin_id, sizeof(info->metal_only_plugin_id));
 }
 
 static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info);
+
+/*!
+ * #2305: the registry monitor the panel rect was last resolved to by the claim
+ * rule (0 = another rule, or no resolve yet), and the plug-in that claimed it.
+ * A re-resolve keeps that monitor while it is still claimed, and keeps the
+ * last rect while the claim is gone (target_screens_panel_reresolve_decide).
+ * Reset at system create, so a new system starts from the plain rules.
+ */
+static uint64_t g_panel_claim_monitor_id = 0;
+static char g_panel_claim_plugin[64] = "";
+static bool g_panel_kept_logged = false;
+
+static void
+panel_claim_state_reset(void)
+{
+	g_panel_claim_monitor_id = 0;
+	g_panel_claim_plugin[0] = '\0';
+	g_panel_kept_logged = false;
+}
+
+/*!
+ * Display dashboard phase 7: a per-screen preference that forces the
+ * SYSTEM-DEFAULT screen to a plug-in other than the active one moves that
+ * screen's DP — the session's own (primary) DP — to the preferred plug-in too:
+ * its registry entry is flagged `primary_override` (what the registry-routed
+ * compositors pick for `COMP_DP_PRIMARY_MONITOR`) and the scalar
+ * `dp_factory_*` (what the scalar-routed in-process compositors use) follow it,
+ * API by API where it offers a factory. The head device, eye tracking and the
+ * rendering modes stay the active plug-in's — only a global `dp use` changes
+ * those.
+ *
+ * Run after the registry and the desktop rect are built — at instance create
+ * (a new in-process session; the service at start) and on every refresh. A
+ * refresh only changes what the NEXT primary DP is made from: the service never
+ * swaps a live primary DP (plugin-discovery §4.2), so for the system-default
+ * screen a preference applies at the next session / service start.
+ */
+static void
+apply_default_screen_preference(struct xrt_system_compositor_info *info)
+{
+	struct xrt_dp_factory_registry *reg = &info->dp_registry;
+	for (uint32_t i = 0; i < reg->entry_count && i < XRT_DP_REGISTRY_MAX_ENTRIES; i++) {
+		reg->entries[i].primary_override = false;
+	}
+	if (reg->entry_count == 0) {
+		return;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(info, &sys);
+	const struct xrt_dp_registry_entry *def = target_screens_pick_default(reg, info->active_plugin_id, &sys, NULL);
+	if (def == NULL || !def->forced || strcmp(def->plugin_id, info->active_plugin_id) == 0) {
+		return;
+	}
+	struct xrt_dp_registry_entry *e = &reg->entries[def - reg->entries];
+	e->primary_override = true;
+	if (e->dp_factory_vk != NULL) {
+		info->dp_factory_vk = e->dp_factory_vk;
+	}
+	if (e->dp_factory_d3d11 != NULL) {
+		info->dp_factory_d3d11 = e->dp_factory_d3d11;
+	}
+	if (e->dp_factory_d3d12 != NULL) {
+		info->dp_factory_d3d12 = e->dp_factory_d3d12;
+	}
+	if (e->dp_factory_gl != NULL) {
+		info->dp_factory_gl = e->dp_factory_gl;
+	}
+	if (e->dp_factory_metal != NULL) {
+		info->dp_factory_metal = e->dp_factory_metal;
+	}
+	// Once per (monitor, plug-in): this runs on every client connect.
+	static uint64_t logged_monitor = 0;
+	static char logged_plugin[64] = {0};
+	if (logged_monitor != e->monitor_id || strcmp(logged_plugin, e->plugin_id) != 0) {
+		logged_monitor = e->monitor_id;
+		(void)snprintf(logged_plugin, sizeof(logged_plugin), "%s", e->plugin_id);
+		U_LOG_W(
+		    "per-screen preference: the system-default screen 0x%016llx is woven by '%s' (forced); the head "
+		    "device, eye tracking and rendering modes stay the active plug-in '%s''s",
+		    (unsigned long long)e->monitor_id, e->plugin_id, info->active_plugin_id);
+	}
+}
 
 /*
  *
@@ -192,6 +318,10 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info);
 
 //! The head device the display info describes; NULL until a system exists.
 static struct xrt_device *g_display_info_head = NULL;
+//! The system compositor info the per-monitor registry and the display info
+//! live in — what `xrt_instance::enumerate_displays` builds the screen list
+//! from (multi-screen M1). NULL until a system with a compositor exists.
+static const struct xrt_system_compositor_info *g_screens_info = NULL;
 //! The plug-in display info that was last APPLIED to `xsysc->info` — what the
 //! refresh compares against, so it is idempotent regardless of what
 //! `fill_display_desktop_info` later overrides on the info struct itself.
@@ -241,7 +371,8 @@ plugin_display_info_geometry_differs(const struct xrt_plugin_display_info *a, co
 	       a->display_pixel_width != b->display_pixel_width || a->display_pixel_height != b->display_pixel_height ||
 	       a->nominal_viewer_x_m != b->nominal_viewer_x_m || a->nominal_viewer_y_m != b->nominal_viewer_y_m ||
 	       a->nominal_viewer_z_m != b->nominal_viewer_z_m || a->display_screen_left != b->display_screen_left ||
-	       a->display_screen_top != b->display_screen_top;
+	       a->display_screen_top != b->display_screen_top ||
+	       ((a->display_flags ^ b->display_flags) & XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
 }
 
 /*!
@@ -261,6 +392,10 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
                           const struct xrt_plugin_iface *plugin,
                           const struct xrt_plugin_display_info *pdi)
 {
+	// Steers the active plug-in's back-compat display claim onto its panel's
+	// monitor when build_dp_registry runs next (multi-screen M0).
+	target_plugin_note_active_panel(pdi);
+
 	info->display_width_m = pdi->display_width_m;
 	info->display_height_m = pdi->display_height_m;
 	info->nominal_viewer_x_m = pdi->nominal_viewer_x_m;
@@ -297,6 +432,14 @@ apply_plugin_display_info(struct xrt_system_compositor_info *info,
 			    any_tracked ? "at least one" : "no");
 		}
 	}
+
+	// ADR-054 N6 Part 2: whose eyes the views follow on this screen, and the
+	// composed XR_DXR_display_info advertisement that follows from it (a
+	// display without its own tracker, policy EXTERNAL_OK, and a viewer-
+	// tracking provider with a usable source → MANAGED|MANUAL + HAS_TRACKING
+	// on the 3D modes). Runs AFTER the #441 check above: that check is about
+	// the plug-in's own honesty, the composition is the trunk's.
+	target_viewer_tracking_apply(info, head, plugin, pdi);
 
 	// Compute tiling once we have native pixel dims. The per-mode
 	// fields are filled for the current orientation, but the
@@ -380,17 +523,18 @@ enum display_info_refresh_result
  * changed — the plug-in contract is "false fast while the panel is unknown,
  * true with real numbers once identified" (see docs/reference/xrt_plugin_iface.md).
  *
+ * Caller holds @ref g_display_info_mutex.
+ *
  * @return @ref DISPLAY_INFO_REFRESH_APPLIED if `info` was re-applied and the
  *         caller should re-resolve the desktop rect; see the enum for the rest.
  */
 static enum display_info_refresh_result
 refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const struct xrt_plugin_iface *plugin)
 {
+	// Caller holds g_display_info_mutex (refresh_display_processors_cb).
 	if (info == NULL || plugin == NULL || !g_display_info_mutex_initialized) {
 		return g_display_info_applied_valid ? DISPLAY_INFO_REFRESH_UNCHANGED : DISPLAY_INFO_REFRESH_UNKNOWN;
 	}
-
-	os_mutex_lock(&g_display_info_mutex);
 
 	bool applied = false;
 	struct xrt_device *head = g_display_info_head;
@@ -431,7 +575,6 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
 		result = DISPLAY_INFO_REFRESH_UNCHANGED;
 	}
 
-	os_mutex_unlock(&g_display_info_mutex);
 	return result;
 }
 
@@ -448,7 +591,26 @@ refresh_display_info_from_plugin(struct xrt_system_compositor_info *info, const 
  * `target_plugin_refresh_active`.
  */
 static void
+refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool world_event);
+
+static bool
+publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *info);
+
+static void
 refresh_display_processors_cb(struct xrt_system_compositor_info *info)
+{
+	refresh_display_processors_impl(info, false);
+}
+
+/*!
+ * Shared body of @ref refresh_display_processors_cb and
+ * @ref refresh_display_processors_world_cb. A @p world_event refresh (a display
+ * was plugged / unplugged / reconfigured — ADR-045 R-c, ADR-051 D6) always
+ * re-resolves the per-monitor registry and the panel desktop rect and publishes
+ * the screen table; the client-event refresh keeps its cheap path.
+ */
+static void
+refresh_display_processors_impl(struct xrt_system_compositor_info *info, bool world_event)
 {
 	// refresh_active signals a swap through its return value only: it hands
 	// back the unchanged current iface, or the newly loaded one (the previous
@@ -456,7 +618,33 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	const struct xrt_plugin_iface *before = target_plugin_get_active();
 	const struct xrt_plugin_iface *plugin = target_plugin_refresh_active();
 	const bool swapped = plugin != before;
+	if (swapped && before != NULL && !info->head_device_stale) {
+		// ADR-045 complete adoption: the weaving DP and display info switch
+		// below, but the head device the system was built on (its rendering
+		// modes, eye tracking, pose binding) belongs to the previous plug-in
+		// and is referenced by the system compositor and every client's
+		// shared-memory snapshot — it cannot be replaced under them. Flag it;
+		// the service restarts once it is idle so the next client gets a
+		// system built on the new plug-in end to end.
+		info->head_device_stale = true;
+		U_LOG_W(
+		    "plug-in adoption: '%s' -> '%s' — weaving DP and display info follow now; the head device (modes, "
+		    "eye tracking) is still the previous plug-in's until the service restarts (when no client is "
+		    "connected).",
+		    before->id ? before->id : "?", plugin->id ? plugin->id : "?");
+	}
 	fill_dp_factories_from_plugin(info, plugin);
+
+	// One critical section for the display info, the per-monitor registry
+	// and the desktop rect: t_instance_enumerate_displays (multi-screen M1)
+	// reads all three under this mutex, and two client connects run this
+	// callback concurrently. Lock order: g_display_info_mutex, then the
+	// loader's g_refresh_mutex (taken inside build_dp_registry's resolver and
+	// target_plugin_note_active_panel) — never the reverse.
+	const bool locked = g_display_info_mutex_initialized;
+	if (locked) {
+		os_mutex_lock(&g_display_info_mutex);
+	}
 	const enum display_info_refresh_result refreshed = refresh_display_info_from_plugin(info, plugin);
 	// #1721/#1722: while the panel is still unidentified this runs once a
 	// second from the IPC main loop, and a registry rebuild is not free — it
@@ -465,7 +653,17 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	// hardware). Declined again with no new plug-in = nothing to re-resolve
 	// against; the registry from instance create still stands. Known geometry
 	// (client connect / compositor create, #342) keeps rebuilding as before.
-	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN) {
+	//
+	// A world event is the exception: the monitor list itself moved, so the
+	// registry (EDID claims) and the desktop rect are re-resolved whatever the
+	// active plug-in answered — otherwise a screen unplugged while the active
+	// plug-in declines keeps its stale claim row in every screen list.
+	if (!swapped && refreshed == DISPLAY_INFO_REFRESH_UNKNOWN && !world_event) {
+		// The scalars were just re-filled from the active plug-in.
+		apply_default_screen_preference(info);
+		if (locked) {
+			os_mutex_unlock(&g_display_info_mutex);
+		}
 		return;
 	}
 	// Rebuild the per-monitor registry too — refresh_active invalidates the
@@ -474,8 +672,251 @@ refresh_display_processors_cb(struct xrt_system_compositor_info *info)
 	build_dp_registry(info);
 	// New geometry means a new panel rect / device name for apps (#1301) —
 	// same order as instance create: apply, registry, then the desktop rect.
-	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED) {
+	if (refreshed == DISPLAY_INFO_REFRESH_APPLIED || world_event) {
 		fill_display_desktop_info(info);
+	}
+	apply_default_screen_preference(info);
+	if (world_event && locked) {
+		// Same publication as the hotplug sweep: bump the display-topology
+		// generation (and log the table) iff the screen list changed.
+		(void)publish_screens_if_hotplug_info_locked(info);
+	}
+	if (locked) {
+		os_mutex_unlock(&g_display_info_mutex);
+	}
+}
+
+/*
+ *
+ * Display hotplug (ADR-047 Amendment 8): the live claim sweep.
+ *
+ * The per-monitor registry was built once, here, at system create. A worker
+ * thread (target_display_hotplug) now re-runs the sweep when the OS reports a
+ * display reconfiguration, when the monitor list's signature changes, or when
+ * a plug-in asks (request_display_rescan): re-enumerate the monitors, load
+ * the plug-ins that are not claim sources yet (a vendor plug-in that declined
+ * at instance create), re-resolve every monitor's winner, re-resolve the panel
+ * desktop rect, and publish. The active plug-in, the head device and the
+ * session's own DP do NOT change (ADR-045 D3, no live swap): a hotplugged
+ * panel reaches a running session as a screen with its own segment DP.
+ *
+ * Publication: the whole rewrite happens under g_display_info_mutex (the lock
+ * t_instance_enumerate_displays / t_instance_get_display_snapshot read under),
+ * and the generation is bumped — under its own small lock, so the per-frame
+ * read in every session never waits on a sweep — only when the screen list a
+ * snapshot would return actually changed. Sessions poll the generation once
+ * per frame and re-push the screens (one snapshot) when it moved.
+ *
+ */
+
+static struct target_display_hotplug *g_hotplug = NULL;
+//! The info the sweep rewrites (the system compositor's own); NULL once it is destroyed.
+static struct xrt_system_compositor_info *g_hotplug_info = NULL;
+//! The screen list last published (what the current generation describes).
+static struct xrt_screen_list g_published_screens;
+//! The display-topology generation: 0 = no system; 1 = as created; +1 per published change.
+static uint64_t g_display_generation = 0;
+static pthread_mutex_t g_generation_lock = PTHREAD_MUTEX_INITIALIZER;
+//! The system compositor's own destroy, wrapped so the sweep stops before the info dies.
+static void (*g_syscomp_destroy_orig)(struct xrt_system_compositor *xsysc) = NULL;
+
+static uint64_t
+display_generation_read(void)
+{
+	pthread_mutex_lock(&g_generation_lock);
+	const uint64_t g = g_display_generation;
+	pthread_mutex_unlock(&g_generation_lock);
+	return g;
+}
+
+/*!
+ * Build the list a snapshot returns now; if it differs from the published one,
+ * publish it and bump the generation. Caller holds g_display_info_mutex.
+ */
+static bool
+publish_screens_locked(const struct xrt_system_compositor_info *info, bool initial)
+{
+	struct xrt_screen_list *now = U_TYPED_CALLOC(struct xrt_screen_list);
+	if (now == NULL) {
+		return false;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(info, &sys);
+	target_screens_build(&info->dp_registry, info->active_plugin_id, &sys, now);
+
+	bool changed = false;
+	if (initial) {
+		g_published_screens = *now;
+		pthread_mutex_lock(&g_generation_lock);
+		g_display_generation = 1;
+		pthread_mutex_unlock(&g_generation_lock);
+		// ADR-054 N6 Part 2: the per-screen viewer sources of the as-created table.
+		target_viewer_tracking_update_screens(now, &info->dp_registry);
+	} else {
+		struct target_screens_change c;
+		changed = target_screens_compare(&g_published_screens, now, &c);
+		if (changed) {
+			char line[1024];
+			target_screens_change_format(&g_published_screens, now, line, sizeof(line));
+			pthread_mutex_lock(&g_generation_lock);
+			const uint64_t gen = ++g_display_generation;
+			pthread_mutex_unlock(&g_generation_lock);
+			U_LOG_W(
+			    "display hotplug: screen table generation %llu — %u screen(s) (+%u -%u, %u re-claimed, %u "
+			    "moved, %u claim-level, %u other): %s",
+			    (unsigned long long)gen, now->count, c.added, c.removed, c.claimant_changed,
+			    c.geometry_changed, c.claim_changed, c.other_changed, line);
+			for (uint32_t i = 0; i < now->count && i < XRT_SCREEN_LIST_MAX; i++) {
+				const struct xrt_screen *sc = &now->screens[i];
+				U_LOG_W(
+				    "display hotplug:   [%u] 0x%016llx '%s' %d,%d %ux%u (native %ux%u, x%.2f) -> '%s' "
+				    "confidence=%u%s",
+				    i, (unsigned long long)sc->id, sc->device_name, sc->desktop_left, sc->desktop_top,
+				    sc->desktop_width, sc->desktop_height, sc->native_width, sc->native_height,
+				    (double)sc->desktop_scale, sc->plugin_id, sc->confidence,
+				    (sc->flags & XRT_SCREEN_FLAG_SYSTEM_DEFAULT) != 0 ? " (system default)" : "");
+			}
+			g_published_screens = *now;
+			// ADR-054 N6 Part 2: a new topology re-routes the viewer source
+			// per screen (a hotplugged EXTERNAL_OK screen takes the provider,
+			// a tracking one keeps its own; the primary stays as created).
+			target_viewer_tracking_update_screens(now, &info->dp_registry);
+		} else if (c.metadata_changed != 0) {
+			// Only an EDID physical size was refined (macOS: IOKit publishes
+			// the EDID blob ~0.5-1 s after CoreGraphics lists the monitor).
+			// Not a new generation — that would make every live session
+			// re-table and rebuild its segment DPs for nothing — but the
+			// baseline follows, so the next sweep compares against it.
+			char line[1024];
+			target_screens_change_format(&g_published_screens, now, line, sizeof(line));
+			U_LOG_I("display hotplug: screen table unchanged (generation %llu kept): %s",
+			        (unsigned long long)display_generation_read(), line);
+			g_published_screens = *now;
+		}
+	}
+	free(now);
+	return changed;
+}
+
+//! The sweep (worker thread). Returns true when the published list changed.
+static bool
+hotplug_rebuild_cb(void *user, uint32_t sources, bool followup)
+{
+	(void)user;
+	(void)sources;
+	(void)followup;
+	if (!g_display_info_mutex_initialized) {
+		return false;
+	}
+	// The slow half runs WITHOUT g_display_info_mutex: plug-ins that were not
+	// claim sources (declined at instance create: no panel then) are probed
+	// again — existing sources are kept as they are — and every monitor is
+	// resolved into a local registry. A vendor plug-in may wait here for its
+	// service to describe a panel that just came up; screen-list readers do not.
+	const uint32_t added = target_plugin_rescan_claim_sources();
+	if (added > 0) {
+		U_LOG_W("display hotplug: %u plug-in(s) newly loaded as display-claim source(s)", added);
+	}
+	struct xrt_dp_factory_registry *reg = U_TYPED_CALLOC(struct xrt_dp_factory_registry);
+	if (reg == NULL) {
+		return false;
+	}
+	resolve_dp_registry(reg);
+
+	os_mutex_lock(&g_display_info_mutex);
+	struct xrt_system_compositor_info *info = g_hotplug_info;
+	if (info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		free(reg);
+		return false;
+	}
+	// Same order as system create: registry, desktop rect, per-screen preference.
+	info->dp_registry = *reg;
+	free(reg);
+	fill_display_desktop_info(info);
+	apply_default_screen_preference(info);
+	const bool changed = publish_screens_locked(info, false);
+	os_mutex_unlock(&g_display_info_mutex);
+	return changed;
+}
+
+/*!
+ * Publish the screen table for @p info when it is the info the sweep tracks
+ * (the system compositor's own). Caller holds g_display_info_mutex.
+ */
+static bool
+publish_screens_if_hotplug_info_locked(const struct xrt_system_compositor_info *info)
+{
+	if (info == NULL || info != g_hotplug_info) {
+		return false;
+	}
+	return publish_screens_locked(info, false);
+}
+
+/*!
+ * Installed on @ref xrt_system_compositor_info::refresh_display_processors_world:
+ * the service's display re-probe worker calls it for world events (Windows
+ * WM_DISPLAYCHANGE / WM_DEVICECHANGE, desktop-Linux DRM hotplug, the fallback
+ * timer). Debounced by the worker, so the unconditional registry rebuild is
+ * rare.
+ */
+static void
+refresh_display_processors_world_cb(struct xrt_system_compositor_info *info)
+{
+	refresh_display_processors_impl(info, true);
+}
+
+static void
+t_syscomp_destroy_hook(struct xrt_system_compositor *xsysc)
+{
+	// Stop the sweep before the info it rewrites goes away.
+	target_display_hotplug_stop(&g_hotplug);
+	// ADR-054 N6 Part 2: stop the viewer-tracking provider (it restarts on demand for the next system).
+	target_viewer_tracking_shutdown();
+	if (g_display_info_mutex_initialized) {
+		os_mutex_lock(&g_display_info_mutex);
+	}
+	if (xsysc != NULL && g_screens_info == &xsysc->info) {
+		g_screens_info = NULL;
+	}
+	if (xsysc != NULL && g_hotplug_info == &xsysc->info) {
+		g_hotplug_info = NULL;
+	}
+	if (g_display_info_mutex_initialized) {
+		os_mutex_unlock(&g_display_info_mutex);
+	}
+	pthread_mutex_lock(&g_generation_lock);
+	g_display_generation = 0;
+	pthread_mutex_unlock(&g_generation_lock);
+
+	void (*orig)(struct xrt_system_compositor *) = g_syscomp_destroy_orig;
+	g_syscomp_destroy_orig = NULL;
+	if (orig != NULL) {
+		orig(xsysc);
+	}
+}
+
+/*!
+ * Publish the as-created screen table (generation 1) and start the sweep for
+ * @p xsysc. Called once the system's registry and desktop rect are built.
+ */
+static void
+display_hotplug_begin(struct xrt_system_compositor *xsysc)
+{
+	if (xsysc == NULL || !g_display_info_mutex_initialized) {
+		return;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	g_hotplug_info = &xsysc->info;
+	(void)publish_screens_locked(&xsysc->info, true);
+	os_mutex_unlock(&g_display_info_mutex);
+
+	if (g_hotplug == NULL && g_syscomp_destroy_orig == NULL && xsysc->destroy != NULL) {
+		g_hotplug = target_display_hotplug_start(hotplug_rebuild_cb, NULL);
+		if (g_hotplug != NULL) {
+			g_syscomp_destroy_orig = xsysc->destroy;
+			xsysc->destroy = t_syscomp_destroy_hook;
+		}
 	}
 }
 
@@ -599,22 +1040,120 @@ resolve_render_adapter_luid(const struct xrt_plugin_display_info *pdi)
  * On a size match this function also becomes the AUTHORITY on the panel's
  * origin, overriding the plug-in's (0, 0) — see the comment at the assignment
  * for why a wrong origin is worse than an unknown one.
+ *
+ * Before any of that, the active plug-in's own per-monitor claim (the
+ * registry `build_dp_registry` just resolved) is consulted — the claim rule,
+ * displayxr-leia-plugin#430: a plug-in that identified its panel through
+ * `probe_displays` but could not report an origin from `get_display_info`
+ * used to get the primary monitor on Windows, which has no enumeration for
+ * the size rules. Callers must build the registry first.
  */
 static void
 fill_display_desktop_info(struct xrt_system_compositor_info *info)
 {
 	struct os_display_desktop_info desktop = {0};
 	struct os_display_panel_match match = {0};
+	// The origin the PLUG-IN reported, not info->display_screen_left: this
+	// function overwrites that field below with the resolver's answer, so on a
+	// re-resolve (a world event — a hotplug, a live display-scale or
+	// arrangement change, #2251) the field holds the PREVIOUS layout's panel
+	// origin. Fed back as the hint it reads as a reported position, flips the
+	// rule to ORIGIN (nearest monitor to a stale point: after a laptop-scale
+	// change that is the laptop, or the panel by luck) and is never corrected.
+	// The plug-in's own answer re-runs exactly the rule instance create ran.
+	const bool have_plugin_origin = g_display_info_applied_valid;
+	const int32_t plugin_left =
+	    have_plugin_origin ? g_display_info_applied.display_screen_left : info->display_screen_left;
+	const int32_t plugin_top =
+	    have_plugin_origin ? g_display_info_applied.display_screen_top : info->display_screen_top;
+	// Only the plug-in's own answer can vouch for (0, 0) (#2577); the
+	// fallback above is the published field, which says nothing about it.
+	const bool plugin_origin_valid = have_plugin_origin && (g_display_info_applied.display_flags &
+	                                                        XRT_PLUGIN_DISPLAY_FLAG_SCREEN_ORIGIN_VALID) != 0;
 	const struct os_display_panel_hint hint = {
-	    .screen_left = info->display_screen_left,
-	    .screen_top = info->display_screen_top,
+	    .screen_left = plugin_left,
+	    .screen_top = plugin_top,
 	    .pixel_width = info->display_pixel_width,
 	    .pixel_height = info->display_pixel_height,
 	    .width_m = info->display_width_m,
 	    .height_m = info->display_height_m,
+	    .origin_valid = plugin_origin_valid,
 	};
 
-	if (!os_display_desktop_info_for_panel(&hint, &desktop, &match)) {
+	// The claim rule first (displayxr-leia-plugin#430): the monitor the
+	// active plug-in's own probe_displays claimed — the per-screen registry
+	// every screen list, the Dashboard and the segment DPs are built from —
+	// resolved by OS identity. It fires when the plug-in reported no origin
+	// (which on Windows used to go straight to the primary monitor, since
+	// Windows has no enumeration for the size rules), or reported one that
+	// lands on none of its claimed monitors while one of them is VERIFIED.
+	// An origin that agrees with a claim keeps the origin rule untouched.
+	bool claim_overrides_origin = false;
+	bool resolved = false;
+	uint64_t claim_monitor_id = 0;
+	const bool same_plugin =
+	    strncmp(g_panel_claim_plugin, info->active_plugin_id, sizeof(g_panel_claim_plugin)) == 0;
+	// #2305: on a re-resolve the monitor the rect is already on stays the pick
+	// while the active plug-in still claims it (a second claimed panel plugged
+	// in must not move the rect off the one a live session's DP weaves).
+	const uint64_t incumbent = same_plugin ? g_panel_claim_monitor_id : 0;
+	const bool claim_resolved =
+	    target_screens_panel_from_claims_ex(&info->dp_registry, info->active_plugin_id, &hint, incumbent, &desktop,
+	                                        &claim_overrides_origin, &claim_monitor_id);
+	// The claim rule also declines when the plug-in's origin agrees with one of
+	// its claims; after a claim-rule pick that is the panel coming back (under
+	// a new, position-derived id on Windows), not the claim going away.
+	const bool claimed_at_origin =
+	    !claim_resolved && incumbent != 0 &&
+	    target_screens_panel_claimed_at_origin(&info->dp_registry, info->active_plugin_id, &hint, incumbent);
+	const enum target_panel_reresolve decision =
+	    target_screens_panel_reresolve_decide(g_panel_claim_monitor_id, same_plugin, claim_resolved, claimed_at_origin);
+	switch (decision) {
+	case TARGET_PANEL_TAKE_CLAIM:
+		match.rule = OS_DISPLAY_DESKTOP_RULE_CLAIM;
+		resolved = true;
+		g_panel_claim_monitor_id = claim_monitor_id;
+		(void)snprintf(g_panel_claim_plugin, sizeof(g_panel_claim_plugin), "%s", info->active_plugin_id);
+		if (g_panel_kept_logged) {
+			U_LOG_W("Panel rect: '%s' claims a monitor again (0x%016llx) — re-resolving the panel rect.",
+			        info->active_plugin_id, (unsigned long long)claim_monitor_id);
+			g_panel_kept_logged = false;
+		}
+		break;
+	case TARGET_PANEL_KEEP_PREVIOUS:
+		// The claimed panel is gone (unplugged, its service restarting, a
+		// cable blink): the origin / primary rules would hand the panel rect
+		// to the nearest monitor — possibly a virtual one in its place. Keep
+		// the last rect; the claim's return re-resolves it.
+		if (!g_panel_kept_logged) {
+			U_LOG_W(
+			    "Panel rect: '%s' no longer claims monitor 0x%016llx (unplugged / not ready) — keeping the "
+			    "last panel rect (%d, %d) %ux%u on '%s' instead of falling back to the origin / primary "
+			    "rule "
+			    "(#2305).",
+			    info->active_plugin_id, (unsigned long long)g_panel_claim_monitor_id,
+			    (int)info->display_screen_left, (int)info->display_screen_top, info->display_desktop_width,
+			    info->display_desktop_height, info->display_device_name);
+			g_panel_kept_logged = true;
+		}
+		return;
+	case TARGET_PANEL_TAKE_FALLBACK:
+	default:
+		if (claimed_at_origin) {
+			U_LOG_W(
+			    "Panel rect: '%s' claims the monitor at its reported origin (%d, %d) again (the last pick, "
+			    "0x%016llx, is gone) — re-resolving the panel rect by the origin rule (#2305).",
+			    info->active_plugin_id, (int)plugin_left, (int)plugin_top,
+			    (unsigned long long)g_panel_claim_monitor_id);
+			g_panel_kept_logged = false;
+		}
+		g_panel_claim_monitor_id = 0;
+		g_panel_claim_plugin[0] = '\0';
+		resolved = os_display_desktop_info_for_panel(&hint, &desktop, &match);
+		break;
+	}
+
+	if (!resolved) {
 		// No implementation on this platform, or the query failed. Leave the
 		// zeroed defaults, which XR_DXR_display_info defines as "unknown".
 		U_LOG_I("Panel desktop rect unavailable for origin (%d, %d); apps get 'unknown'.",
@@ -625,6 +1164,9 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	info->display_desktop_width = desktop.width;
 	info->display_desktop_height = desktop.height;
 	info->display_is_primary = desktop.is_primary;
+	info->display_desktop_native_width = desktop.native_width;
+	info->display_desktop_native_height = desktop.native_height;
+	info->display_desktop_scale = (float)desktop.scale;
 
 	(void)snprintf(info->display_device_name, sizeof(info->display_device_name), "%s", desktop.device_name);
 
@@ -656,18 +1198,35 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 	//
 	// Never on the primary fallback: there the rect origin IS the desktop
 	// origin, so the assignment would be a no-op dressed as a decision.
+	//
+	// The connector rule (#1831) earns the same authority with or without a
+	// 1:1 rect: it identified the panel by the mode its connector is running,
+	// so the rect's origin IS the panel's origin in the placement space even
+	// when that space is scaled — and an app that cannot weave there still
+	// belongs on the panel, not on the laptop.
 	const bool origin_from_plugin = match.rule == OS_DISPLAY_DESKTOP_RULE_ORIGIN;
+	//
+	// The claim rule earns it too, for the same reason as the connector rule:
+	// the monitor was identified (by the plug-in's own claim, resolved by OS
+	// identity), so its origin IS the panel's, whatever the plug-in reported.
 	const bool origin_from_size_match =
-	    match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel;
+	    (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && info->display_desktop_rect_is_panel) ||
+	    match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE || match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM;
 
 	if (origin_from_size_match &&
 	    (desktop.left != info->display_screen_left || desktop.top != info->display_screen_top)) {
 		U_LOG_W(
 		    "Plug-in reported panel origin (%d, %d); the desktop resolver found the panel at "
-		    "(%d, %d) on '%s' by size — using that. Window placement and the weave present "
+		    "(%d, %d) on '%s' by %s — using that. Window placement and the weave present "
 		    "origin both follow the resolver.",
-		    (int)info->display_screen_left, (int)info->display_screen_top, (int)desktop.left, (int)desktop.top,
-		    desktop.device_name[0] != '\0' ? desktop.device_name : "?");
+		    (int)plugin_left, (int)plugin_top, (int)desktop.left, (int)desktop.top,
+		    desktop.device_name[0] != '\0' ? desktop.device_name : "?",
+		    match.rule == OS_DISPLAY_DESKTOP_RULE_CLAIM
+		        ? (claim_overrides_origin ? "the plug-in's VERIFIED display claim (its origin is on no "
+		                                    "monitor it claims)"
+		                                  : "the plug-in's display claim")
+		    : match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE ? "its connector's mode"
+		                                                           : "size");
 	}
 
 	if (origin_from_plugin || origin_from_size_match) {
@@ -675,17 +1234,48 @@ fill_display_desktop_info(struct xrt_system_compositor_info *info)
 		info->display_screen_top = desktop.top;
 	}
 
-	U_LOG_W("XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s", desktop.width,
-	        desktop.height, (int)desktop.left, (int)desktop.top,
-	        desktop.device_name[0] != '\0' ? desktop.device_name : "?", desktop.is_primary ? ", primary" : "",
-	        os_display_desktop_rule_str(match.rule),
-	        info->display_desktop_rect_is_panel ? "" : " (size != panel native — not panel-confirmed)");
+	// The device mode behind the rect, when the platform knows it — the one
+	// number that tells "this rect is the panel, scaled" from "this rect is
+	// some other monitor".
+	char device_mode[96] = "";
+	if (desktop.native_width > 0 && desktop.native_height > 0) {
+		char scale_str[32] = "";
+		if (desktop.scale > 0.0) {
+			(void)snprintf(scale_str, sizeof(scale_str), " at %.0f%%", desktop.scale * 100.0);
+		}
+		(void)snprintf(device_mode, sizeof(device_mode), "; connector mode %ux%u%s (%s)", desktop.native_width,
+		               desktop.native_height, scale_str, os_display_native_source_str(desktop.native_source));
+	}
+
+	const int one_to_one = os_display_desktop_info_is_1to1(&desktop);
+	char line[512];
+	(void)snprintf(line, sizeof(line), "XR_DXR_display_info panel rect: %ux%u at (%d, %d) on '%s'%s [rule: %s]%s%s",
+	               desktop.width, desktop.height, (int)desktop.left, (int)desktop.top,
+	               desktop.device_name[0] != '\0' ? desktop.device_name : "?",
+	               desktop.is_primary ? ", primary" : "", os_display_desktop_rule_str(match.rule), device_mode,
+	               info->display_desktop_rect_is_panel ? ""
+	               : (match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE && one_to_one == 0)
+	                   ? " (panel identified; its X11 rect is not device pixels — X11 windows there are resampled)"
+	                   : " (size != panel native — not panel-confirmed)");
+	// One WARN per distinct answer: world-event re-resolves (a hotplug, a live
+	// display-scale change and its follow-up, #2251) repeat it unchanged.
+	static char last_line[sizeof(line)] = "";
+	const bool line_changed = strcmp(line, last_line) != 0;
+	if (line_changed) {
+		(void)snprintf(last_line, sizeof(last_line), "%s", line);
+		U_LOG_W("%s", line);
+	} else {
+		U_LOG_I("%s (unchanged)", line);
+	}
 
 	// Two monitors matched the panel's pixel size, so the pick was a
 	// tie-break (closest physical size, else the non-primary one) rather than
 	// a deduction. Say so once, at init: it is the one case where the rect
 	// above could be the wrong monitor while still looking confident.
-	if (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH && match.candidate_count > 1) {
+	if (line_changed &&
+	    (match.rule == OS_DISPLAY_DESKTOP_RULE_PIXEL_MATCH ||
+	     match.rule == OS_DISPLAY_DESKTOP_RULE_CONNECTOR_MODE) &&
+	    match.candidate_count > 1) {
 		U_LOG_W(
 		    "Panel selection was AMBIGUOUS: %u of %u monitors are %ux%u — picked '%s'. "
 		    "A plug-in that reports its panel origin would settle this.",
@@ -756,6 +1346,11 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// in the normal case.
 	uint64_t scanout_adapter_luid = 0;
 	uint64_t render_adapter_luid = 0;
+	// The head panel's origin as the plug-in reports it, for the service
+	// compositor's create-time adapter + split decisions (the system info's
+	// origin is filled only after the compositor exists). 0,0 = unknown.
+	int32_t create_panel_left = 0;
+	int32_t create_panel_top = 0;
 	{
 		const struct xrt_plugin_iface *rr_plugin = target_plugin_get_active();
 		struct xrt_plugin_display_info rr_pdi;
@@ -765,6 +1360,8 @@ t_instance_create_system(struct xrt_instance *xinst,
 			}
 			scanout_adapter_luid = resolve_scanout_adapter_luid(&rr_pdi);
 			render_adapter_luid = resolve_render_adapter_luid(&rr_pdi);
+			create_panel_left = rr_pdi.display_screen_left;
+			create_panel_top = rr_pdi.display_screen_top;
 		} else {
 			resolve_scanout_adapter_luid(NULL);
 			render_adapter_luid = resolve_render_adapter_luid(NULL);
@@ -788,7 +1385,7 @@ t_instance_create_system(struct xrt_instance *xinst,
 	// Try D3D11 service compositor first (preferred for Windows service mode)
 	if (xret == XRT_SUCCESS && xsysc == NULL && debug_get_bool_option_use_d3d11_service()) {
 		U_LOG_W("Using D3D11 service compositor");
-		xret = comp_d3d11_service_create_system(head, xsysd, usys, &xsysc);
+		xret = comp_d3d11_service_create_system(head, xsysd, usys, create_panel_left, create_panel_top, &xsysc);
 		if (xret == XRT_SUCCESS && xsysc != NULL) {
 			U_LOG_W("Service compositor ready: D3D11 service compositor (pure D3D11, no Vulkan)");
 		}
@@ -823,6 +1420,10 @@ t_instance_create_system(struct xrt_instance *xinst,
 	}
 
 out:
+	// ADR-054 N6 Part 2: the viewer source for look-around eyes (decided when
+	// the display info is applied below; DP eyes until then).
+	xsysd->viewer_tracking = target_viewer_tracking_get_iface();
+
 	*out_xsys = &usys->base;
 	*out_xsysd = xsysd;
 	*out_xso = xso;
@@ -847,6 +1448,7 @@ out:
 		g_display_info_head = head;
 		g_display_info_applied_valid = false;
 		xsysc->info.refresh_display_processors = refresh_display_processors_cb;
+		xsysc->info.refresh_display_processors_world = refresh_display_processors_world_cb;
 
 		// Vendor-neutral display-info population through the plug-in
 		// iface (issue #256 / ADR-019). Runs FIRST regardless of whether
@@ -881,7 +1483,26 @@ out:
 		// plug-in branch above on purpose: a (0,0) origin — no plug-in, or
 		// sim_display expressing no preference — resolves to the primary
 		// monitor, which is the right answer for both readings.
+		panel_claim_state_reset(); // #2305: a new system resolves from the plain rules
 		fill_display_desktop_info(&xsysc->info);
+
+		// Display dashboard phase 7: a per-screen preference on the
+		// system-default screen moves the primary DP with it.
+		apply_default_screen_preference(&xsysc->info);
+
+		// Publish the system to xrt_instance::enumerate_displays only now that
+		// its display info, registry and desktop rect are all built.
+		if (g_display_info_mutex_initialized) {
+			os_mutex_lock(&g_display_info_mutex);
+		}
+		g_screens_info = &xsysc->info;
+		if (g_display_info_mutex_initialized) {
+			os_mutex_unlock(&g_display_info_mutex);
+		}
+
+		// Display hotplug (ADR-047 Amendment 8): generation 1 is the table
+		// just built; the sweep keeps it live from here.
+		display_hotplug_begin(xsysc);
 
 		// All display-info + DP factories are sourced from the plug-in
 		// iface above (ADR-019 / #256 / #263). The runtime DLL no longer
@@ -910,6 +1531,108 @@ err_destroy:
  *
  */
 
+/*!
+ * xrt_instance::get_active_plugin — the plug-in that claimed the system. The
+ * service's stereo camera manager (ADR-043) reads its camera slots through it.
+ */
+static bool
+t_instance_get_active_plugin(struct xrt_instance *xinst,
+                             const struct xrt_plugin_iface **out_iface,
+                             struct xrt_plugin_instance **out_inst)
+{
+	(void)xinst;
+	const struct xrt_plugin_iface *iface = target_plugin_get_active();
+	*out_iface = iface;
+	*out_inst = iface != NULL ? target_plugin_get_active_instance() : NULL;
+	return iface != NULL;
+}
+
+/*!
+ * xrt_instance::enumerate_displays (multi-screen M1) — the screen list of the
+ * system this instance created, built from its per-monitor registry and the
+ * display info applied to it. The service answers `system_enumerate_displays`
+ * through this too. Reads under g_display_info_mutex, the lock
+ * refresh_display_processors_cb holds across its whole rewrite (display info,
+ * then the registry — resolved into a local and published in one copy — then
+ * the desktop rect), so a reader never sees an empty or half-built registry
+ * while another client's connect refreshes it.
+ */
+static xrt_result_t
+t_instance_enumerate_displays(struct xrt_instance *xinst, struct xrt_screen_list *out_list)
+{
+	(void)xinst;
+	if (out_list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	memset(out_list, 0, sizeof(*out_list));
+	if (!g_display_info_mutex_initialized) {
+		return XRT_SUCCESS; // no system (or no compositor) yet: no screens
+	}
+
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		return XRT_SUCCESS;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(g_screens_info, &sys);
+	target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, out_list);
+	os_mutex_unlock(&g_display_info_mutex);
+	return XRT_SUCCESS;
+}
+
+/*!
+ * xrt_instance::get_display_generation (ADR-047 Amendment 8) — per frame from
+ * every session; never waits on a claim sweep.
+ */
+static uint64_t
+t_instance_get_display_generation(struct xrt_instance *xinst)
+{
+	(void)xinst;
+	return display_generation_read();
+}
+
+/*!
+ * xrt_instance::get_display_snapshot (ADR-047 Amendment 8) — the screen list,
+ * the system info it was built from, and their generation, all under
+ * g_display_info_mutex (the lock the sweep rewrites them under).
+ */
+static xrt_result_t
+t_instance_get_display_snapshot(struct xrt_instance *xinst,
+                                struct xrt_screen_list *out_list,
+                                struct xrt_system_compositor_info *out_info,
+                                uint64_t *out_generation)
+{
+	(void)xinst;
+	if (out_list == NULL) {
+		return XRT_ERROR_ALLOCATION;
+	}
+	memset(out_list, 0, sizeof(*out_list));
+	if (out_generation != NULL) {
+		*out_generation = 0;
+	}
+	if (!g_display_info_mutex_initialized) {
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	os_mutex_lock(&g_display_info_mutex);
+	if (g_screens_info == NULL) {
+		os_mutex_unlock(&g_display_info_mutex);
+		return XRT_ERROR_FEATURE_NOT_SUPPORTED;
+	}
+	struct target_screens_system sys;
+	target_screens_system_from_info(g_screens_info, &sys);
+	target_screens_build(&g_screens_info->dp_registry, g_screens_info->active_plugin_id, &sys, out_list);
+	if (out_info != NULL) {
+		*out_info = *g_screens_info;
+	}
+	if (out_generation != NULL) {
+		// Bumped only under g_display_info_mutex too: consistent with the list.
+		*out_generation = display_generation_read();
+	}
+	os_mutex_unlock(&g_display_info_mutex);
+	return XRT_SUCCESS;
+}
+
 #ifdef XRT_FEATURE_HYBRID_MODE
 // In hybrid mode, export as native_instance_create to avoid symbol conflict
 // with ipc_instance_create from the IPC client library
@@ -935,6 +1658,10 @@ xrt_instance_create(struct xrt_instance_info *ii, struct xrt_instance **out_xins
 	tinst->base.create_system = t_instance_create_system;
 	tinst->base.get_prober = t_instance_get_prober;
 	tinst->base.destroy = t_instance_destroy;
+	tinst->base.get_active_plugin = t_instance_get_active_plugin;
+	tinst->base.enumerate_displays = t_instance_enumerate_displays;
+	tinst->base.get_display_generation = t_instance_get_display_generation;
+	tinst->base.get_display_snapshot = t_instance_get_display_snapshot;
 	tinst->xp = xp;
 
 	tinst->base.startup_timestamp = os_monotonic_get_ns();

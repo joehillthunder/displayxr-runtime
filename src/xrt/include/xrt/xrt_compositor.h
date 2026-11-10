@@ -629,6 +629,14 @@ enum xrt_swapchain_create_flags
 	XRT_SWAPCHAIN_CREATE_PROTECTED_CONTENT = (1u << 0u),
 	//! Signals that the allocator should only allocate one image.
 	XRT_SWAPCHAIN_CREATE_STATIC_IMAGE = (1u << 1u),
+	/*!
+	 * The colour images hold display-encoded (sRGB) values although the
+	 * format may be UNORM: read them exactly like the format's `_SRGB`
+	 * sibling (XR_DXR_swapchain_color_encoding, ADR-044 Amendment 1). Only
+	 * set when the compositor declares
+	 * @ref xrt_compositor_info::color_encoded_srgb_swapchains.
+	 */
+	XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB = (1u << 2u),
 };
 
 /*!
@@ -1063,6 +1071,14 @@ struct xrt_session_info
 	bool is_overlay;
 	//! alignas for 32 bit client support, see @ref ipc-design
 	XRT_ALIGNAS(8) uint64_t flags;
+	/*!
+	 * XR_DXR_display_info `XrSessionDisplayBindingDXR::displayId` (0 = not bound): the
+	 * display the app pinned the session to. An in-process compositor creates its
+	 * display processor from THAT monitor's registry entry (#2218), so a session bound
+	 * to another vendor's screen is woven by that vendor; over IPC the service still
+	 * weaves it with its own processor.
+	 */
+	XRT_ALIGNAS(8) uint64_t bound_display_id;
 	uint32_t z_order;
 
 	//! External window handle for session target extension (HWND on Windows)
@@ -1081,6 +1097,11 @@ struct xrt_session_info
 	//! preview fetch + analysis, which never runs for a session that did not
 	//! ask for it.
 	bool rear_depth_budget_requested;
+
+	//! XR_DXR_app_share: the app chained XrSessionShareabilityDXR with
+	//! shareable = XR_FALSE — never list this session as an app-share source
+	//! (ADR-061 spec §5). Read by the service at session create.
+	bool app_share_not_shareable;
 
 	//! Readback callback for offscreen compositing (called with composited RGBA pixels)
 	void (*readback_callback)(const uint8_t *pixels, uint32_t w, uint32_t h, void *userdata);
@@ -1154,6 +1175,14 @@ struct xrt_compositor_info
 
 	//! Initial focus state (returned from server to avoid race condition in IPC mode)
 	bool initial_focused;
+
+	/*!
+	 * The compositor honours @ref XRT_SWAPCHAIN_CREATE_COLOR_ENCODED_SRGB on
+	 * its colour formats (XR_DXR_swapchain_color_encoding). False makes the
+	 * state tracker refuse the declaration with XR_ERROR_FEATURE_UNSUPPORTED
+	 * rather than let the compositor read the values as linear.
+	 */
+	bool color_encoded_srgb_swapchains;
 };
 
 /*!
@@ -2607,6 +2636,19 @@ struct xrt_image_native
 	 *   which has awkward limitations, such as "usually no depth images allowed".
 	 */
 	bool is_dxgi_handle;
+
+	/*!
+	 * Is the (non-DXGI) NT handle the shared handle of a D3D11 texture
+	 * (IDXGIResource1::CreateSharedHandle), rather than memory some Vulkan
+	 * device exported?
+	 *
+	 * Only meaningful on Windows when @ref is_dxgi_handle is false. Vulkan must
+	 * import such a handle as VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
+	 * importing it as OPAQUE_WIN32 (the default for NT handles) is outside the
+	 * spec and NVIDIA rejects it for some image sizes with
+	 * VK_ERROR_OUT_OF_DEVICE_MEMORY (#1767).
+	 */
+	bool is_d3d11_texture;
 };
 
 /*!
@@ -2759,6 +2801,34 @@ struct xrt_dp_registry_entry
 	//! struct xrt_plugin_instance *), for a future per-display lifecycle.
 	const void *owning_iface;
 	void *owning_instance;
+
+	/*
+	 * Display dashboard phase 7: the per-screen display-processor
+	 * preference (`displayxr-cli dp use <id> --screen <key>`). Sources are
+	 * `enum u_setting_source` values: 0 none, 1 env, 2 user, 3 machine.
+	 */
+	//! The winning claim's `supported_apis` as the plug-in reported it, incl.
+	//! hint bits such as XRT_DP_API_BIT_HINT_WINDOWLESS_PHASE (ADR-060 R2).
+	uint32_t claim_apis;
+	//! A per-screen preference won this monitor (over confidence and the active plug-in).
+	bool forced;
+	//! Where the preference that forced it came from; 0 when not forced.
+	uint32_t forced_source;
+	//! The preference set for this monitor, honoured or not ("" = none).
+	char preferred_plugin[32];
+	//! Where @ref preferred_plugin came from; 0 = none.
+	uint32_t preferred_source;
+	//! The system-default screen, forced to a plug-in other than the active
+	//! one: the primary DP weaves with this entry (set by the instance).
+	bool primary_override;
+	//! The OS's handle for the output this boot (macOS: CGDirectDisplayID; a
+	//! replug renumbers it); 0 = none. Display hotplug (ADR-047 Amendment 8):
+	//! part of what a session's own DP must find unchanged to keep its screen.
+	uint64_t platform_id;
+	//! The winning claim is XRT_DISPLAY_CLAIM_PRESENT_NOT_READY: the plug-in
+	//! owns the panel but cannot drive it yet. Every dp_factory_* is NULL, so
+	//! no display processor is made for it and it shows flat 2D.
+	bool not_ready;
 };
 
 /*!
@@ -2774,6 +2844,50 @@ struct xrt_dp_factory_registry
 	uint32_t entry_count;
 	struct xrt_dp_registry_entry entries[XRT_DP_REGISTRY_MAX_ENTRIES];
 };
+
+/*!
+ * The registry entry a "don't care which monitor" caller (the D3D11 service
+ * compositor, in-process GL — `COMP_DP_PRIMARY_MONITOR`) should weave with:
+ * the system-default screen when a per-screen preference forced it
+ * (`primary_override`), else the first monitor the ACTIVE plug-in won, else
+ * entries[0].
+ *
+ * entries[0] alone is the first monitor in OS enumeration order — normally
+ * the Windows primary. On a laptop driving an external 3D panel that is the
+ * built-in screen, which only sim_display claims (FALLBACK), so the service
+ * wove with sim_display while standalone apps used the vendor DP (#1521 fixed
+ * the per-monitor winner, not which monitor the sentinel picks).
+ *
+ * Returns NULL only on an empty registry. @p active_plugin_id may be NULL/"".
+ */
+static inline const struct xrt_dp_registry_entry *
+xrt_dp_registry_primary_entry(const struct xrt_dp_factory_registry *reg, const char *active_plugin_id)
+{
+	if (reg == NULL || reg->entry_count == 0) {
+		return NULL;
+	}
+	// A per-screen preference on the system-default screen (display
+	// dashboard phase 7) names the primary DP's plug-in explicitly.
+	for (uint32_t i = 0; i < reg->entry_count; i++) {
+		if (reg->entries[i].primary_override) {
+			return &reg->entries[i];
+		}
+	}
+	if (active_plugin_id != NULL && active_plugin_id[0] != '\0') {
+		for (uint32_t i = 0; i < reg->entry_count; i++) {
+			const char *a = reg->entries[i].plugin_id;
+			const char *b = active_plugin_id;
+			while (*a != '\0' && *a == *b) {
+				a++;
+				b++;
+			}
+			if (*a == *b) {
+				return &reg->entries[i];
+			}
+		}
+	}
+	return &reg->entries[0];
+}
 
 /*!
  * Capabilities and information about the system compositor (and its wrapped native compositor, if any),
@@ -2948,6 +3062,22 @@ struct xrt_system_compositor_info
 	//! Windows: the GDI name, e.g. `\\.\DISPLAY1`. Empty when unknown.
 	char display_device_name[128];
 
+	/*!
+	 * The DEVICE mode the panel monitor's connector is running, and the
+	 * compositor's scale for it (desktop Linux; #1831). 0 = unknown.
+	 *
+	 * @ref display_desktop_width / @ref display_desktop_height are in the
+	 * space windows are placed in, which under XWayland is the scaled X
+	 * screen: a 3840x2160 panel at 150 % reads 5120x2880 there. When these
+	 * are known and differ from the desktop rect, an X11 window on the panel
+	 * is resampled by the display server on its way to the glass, so it can
+	 * never carry a correct weave — see the X11 arm of the compositor's 1:1
+	 * gate.
+	 */
+	uint32_t display_desktop_native_width;
+	uint32_t display_desktop_native_height;
+	float display_desktop_scale;
+
 	/*! @} */
 
 	//! Workspace mode: multi-compositor with shared window for all clients.
@@ -2988,6 +3118,13 @@ struct xrt_system_compositor_info
 	//! Signature: xrt_dp_factory_gl_fn_t (see xrt_display_processor_gl.h).
 	void *dp_factory_gl;
 
+	//! ADR-042: the plug-in's LIFT-ONLY D3D11 display processor factory
+	//! (xrt_plugin_iface::create_dp_d3d11_lift) — a DP that serves only the
+	//! lift slots and builds no weaver. NULL = the plug-in has none; the D3D11
+	//! service then falls back to dp_factory_d3d11 with a NULL window.
+	//! Signature: xrt_dp_factory_d3d11_fn_t.
+	void *dp_factory_d3d11_lift;
+
 	/*!
 	 * Optional callback: re-derive the dp_factory_* pointers above from the
 	 * runtime's plug-in loader, and re-pull the plug-in's display info
@@ -3008,6 +3145,17 @@ struct xrt_system_compositor_info
 	 */
 	void (*refresh_display_processors)(struct xrt_system_compositor_info *info);
 
+	/*!
+	 * Optional: the world-event variant of @ref refresh_display_processors
+	 * (ADR-045 R-c, ADR-051 D6). Called by the service's display re-probe
+	 * worker when a display was plugged, unplugged or reconfigured. Same work,
+	 * except it always re-resolves the per-monitor registry and the panel
+	 * desktop rect (the client-event refresh skips both while the active
+	 * plug-in declines its display info) and publishes the screen table. NULL
+	 * = use @ref refresh_display_processors.
+	 */
+	void (*refresh_display_processors_world)(struct xrt_system_compositor_info *info);
+
 	/*! @} */
 
 	/*!
@@ -3023,6 +3171,28 @@ struct xrt_system_compositor_info
 	//! dp_factory_* came from; "" if none. Lets comp_dp_factory_for_window name
 	//! both plug-ins when the registry and scalar diverge (#1521).
 	char active_plugin_id[64];
+
+	/*!
+	 * macOS Vulkan-app routing (oxr_vk_route_via_metal): the discovery id of a
+	 * REGISTERED display plug-in whose iface offers a Metal DP factory but no
+	 * Vulkan one — whether or not it claimed a display at start (a plug-in
+	 * that declined still names its factories before probe()); "" if none.
+	 * A Vulkan app is then presented by the Metal compositor from the start,
+	 * so a panel hot-plugged later (ADR-047 Amendment 7) can be woven in a
+	 * segment; vk_native could never weave it. Filled with the DP registry.
+	 */
+	char metal_only_plugin_id[64];
+
+	//! ADR-045: the active plug-in is a FALLBACK (XRT_PLUGIN_PLATFORM_FLAG_FALLBACK).
+	//! A long-lived service keeps re-probing on a slow timer only while this is set.
+	bool active_plugin_is_fallback;
+
+	//! ADR-045: a refresh adopted a better plug-in AFTER the system's head device
+	//! was created by the previous one. The weaving DP and display info follow
+	//! the new plug-in at once, but the head device (mode table, eye tracking)
+	//! cannot be swapped under live sessions, so a complete adoption needs a new
+	//! system: the service restarts itself once no client is connected.
+	bool head_device_stale;
 };
 
 struct xrt_system_compositor;

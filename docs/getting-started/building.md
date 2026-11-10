@@ -104,6 +104,10 @@ brew install cmake ninja eigen vulkan-sdk
 
 Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compositor runs via MoltenVK over a CAMetalLayer-backed surface (see `cube_handle_vk_macos`); an earlier `VK_ERROR_EXTENSION_NOT_PRESENT` runtime failure was a MoltenVK-era issue that has since been resolved. The remaining macOS-Vulkan dev gotcha is a two-`libvulkan` loader-image conflict (the dev build's image vs the installed runtime's) — share one loader image / pin `XR_RUNTIME_JSON` to avoid it.
 
+**Which compositor presents a Vulkan app on macOS.** vk_native by default; the Metal compositor (Vulkan app → `comp_vk_client` → `comp_metal`, MoltenVK imports the Metal swapchain images) when the active display processor offers a Metal weaver but no Vulkan one — the Leia SR plug-in on macOS is Metal-only, so this is how a Vulkan app weaves on a Leia panel. `DXR_MACOS_VK_VIA_METAL=1|0` forces either route; the decision is logged once (`macOS Vulkan app route: …`). On the Metal route the session is a Metal-native session in every respect (placement, segments, zones Tier 1/2, `/tmp/dxr_atlas_trigger` capture), with the Metal compositor's colour model (ADR-044 §1).
+
+**`DYLD_LIBRARY_PATH` replaces the runtime the manifest names.** dyld resolves `DYLD_LIBRARY_PATH` by the library's LEAF name even for the loader's absolute `dlopen` of `library_path`, so any other `openxr_displayxr.dylib` on that path (`_package/DisplayXR-macOS/lib`, or a vendor plug-in tree's `env.sh`, which adds its own runtime build) silently wins over the one `XR_RUNTIME_JSON` points at. When mixing trees, put the intended runtime's directory FIRST on `DYLD_LIBRARY_PATH`, and confirm with a log line only that build emits.
+
 ### Linux
 
 > **Ubuntu 22.04, 24.04 and 26.04 are supported.** On 22.04, use an X11
@@ -120,17 +124,70 @@ Builds the runtime, OpenXR loader, and test apps. The macOS Vulkan native compos
 
 ```bash
 ./scripts/build_linux.sh              # headless build + selftest (deps list in the script header)
-./scripts/build_linux.sh --service    # + displayxr-service / IPC
+./scripts/build_linux.sh --service    # + displayxr-service; the runtime is then IPC-ONLY
+./scripts/build_linux.sh --hybrid     # + displayxr-service, HYBRID runtime (what the packages ship)
 ./scripts/package_linux.sh            # tarball + install.sh (user-level install, #705)
 ```
 
 `package_linux.sh` emits `dist/displayxr-runtime-linux-<arch>-<ver>.tar.gz`; its
 `install.sh` registers the OpenXR ActiveRuntime (`~/.config/openxr/1/`), the
 sim-display display processor (`~/.local/share/DisplayXR/DisplayProcessors/`),
-and a systemd `--user` unit — no root. `sudo ./install.sh --system` for
-machine-wide. Every `v*` release also attaches `displayxr-runtime_<ver>_amd64.deb`
-(`scripts/package_deb_linux.sh`). Dev iteration without installing stays
-`XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH` per `docs/roadmap/linux-support.md`.
+and the `displayxr-service` systemd user units (below) — no root.
+`sudo ./install.sh --system` for machine-wide. Every `v*` release also attaches
+`displayxr-runtime_<ver>_amd64.deb` (`scripts/package_deb_linux.sh`). Dev
+iteration without installing stays `XR_RUNTIME_JSON` + `XRT_PLUGIN_SEARCH_PATH`
+per `docs/roadmap/linux-support.md`.
+
+**What the `.deb` installs** (#781, #1744):
+
+| Path | What |
+|---|---|
+| `/usr/lib/displayxr/lib/openxr_displayxr.so` | The **hybrid** runtime: ordinary apps (including window-bound apps that enable `XR_DXR_weave` only for drag phase-snap) run in-process; `XR_DXR_weave` present-owners that bind no window of their own (the DisplayXR browser) and workspace controllers go to `displayxr-service` over IPC. |
+| `/usr/lib/displayxr/bin/displayxr-service` (+ `/usr/bin/` link) | The out-of-process compositor (the weave engine lives only here). |
+| `/usr/lib/displayxr/bin/displayxr-cli` (+ `/usr/bin/` link) | `selftest`, `info`, `clients`, … |
+| `/usr/lib/displayxr/bin/displayxr-dashboard` (+ `/usr/bin/` link, menu entry, icon) | The DisplayXR Dashboard (below). |
+| `/usr/lib/displayxr/plugins/` | sim-display fallback DP + its manifest; a vendor plug-in package adds its own. |
+| `/usr/lib/displayxr/lib/libVkLayer_DXR_queue_lock.so` + `/usr/share/vulkan/explicit_layer.d/VkLayer_DXR_queue_lock.json` | The Vulkan queue-lock layer (below). |
+| `/usr/lib/systemd/user/displayxr.{socket,service}` | The service's start mechanism (below). |
+| `/etc/xdg/openxr/1/active_runtime.json` | Written by `postinst` — the Khronos loader's ActiveRuntime. |
+| GNOME Shell extension + `/etc/xdg/autostart` entry | See below. |
+
+**How the service starts (systemd user socket activation).** `postinst` enables
+`displayxr.socket` for every user (`systemctl --global enable`) and starts it
+in the user sessions already running. The socket listens on
+`$XDG_RUNTIME_DIR/displayxr_comp_ipc`, the path clients dial; the first client
+that needs the service starts `displayxr.service`, which exits 30 s after its
+last client leaves (`IPC_EXIT_WHEN_IDLE`). A user who never runs a present-owner
+or a workspace client never starts it. Check with
+`systemctl --user status displayxr.socket displayxr.service`; logs with
+`journalctl --user -u displayxr.service`. A present-owner that finds no socket
+(the unit disabled, a container) falls back to in-process and logs
+`Hybrid mode: XR_DXR_weave present-owner but no displayxr-service socket`; its
+weave calls then return `XR_ERROR_FEATURE_UNSUPPORTED`. To run the service by
+hand instead (e.g. with a different plug-in path), stop the socket first
+(`systemctl --user stop displayxr.socket`) and start `displayxr-service` from a
+terminal or detached — it no longer needs a terminal on stdin, and SIGTERM /
+Ctrl+C stop it cleanly. The tarball's `install.sh` installs the same unit pair
+under `~/.config/systemd/user/` (`--system`: `/usr/local/lib/systemd/user/`).
+
+**The Vulkan queue-lock layer (`VK_LAYER_DXR_queue_lock`, #902 / #2036).** On a
+GPU whose graphics family has a single queue (Intel iGPUs), the #868 repaint loop
+can only run by sharing the app's queue, and that needs this layer to serialise
+submits. The runtime enables it by name at `xrCreateVulkanInstanceKHR`; it is an
+*explicit* layer, so no other Vulkan process loads it. The `.deb` installs the
+`.so` beside the runtime and its manifest in `/usr/share/vulkan/explicit_layer.d/`
+with an absolute `library_path`, on the loader's default search path. The tarball's `install.sh` writes the
+manifest to `$XDG_DATA_HOME/vulkan/explicit_layer.d/` (`--system`:
+`/usr/local/share/vulkan/explicit_layer.d/`), pointing into the install. Check it
+with `displayxr-cli info` (section *VK late-weave repaint*: `VK_LAYER_DXR_queue_lock
+reachable (…)`). If an app log says `#902: VK_LAYER_DXR_queue_lock not found by
+the Vulkan loader — retrying without it`, the manifest is missing or not on the
+loader's path. One case causes this even when the package is installed: a process
+that sets `VK_LAYER_PATH` replaces the default directories, whereas
+`VK_ADD_LAYER_PATH` adds to them. The app still runs; on a single-queue GPU the
+compositor then logs `repaint disabled` and the weave rate follows the app's
+present rate. Before #2036 neither package shipped the layer, so every Vulkan app
+on such a GPU ran without repaint.
 
 **Why the release artifacts are built on the oldest supported release
 (#1656).** The published `.deb` and tarball must install and run on **Ubuntu
@@ -151,15 +208,31 @@ that impossible to ship:
 - the **`DebInstall`** CI matrix installs the built `.deb` into pristine
   `ubuntu:22.04`, `24.04` and `26.04` containers without Recommends, runs
   `ldd -r` on every shipped ELF, checks every `Depends`/`Recommends`/`Suggests`
-  name exists there, and runs `displayxr-cli info` + `selftest` env-free on the
-  packaged sim-display. `DebRelease` attaches the asset to the GitHub Release
-  only after that passes. Locally: `scripts/test_deb_linux.sh` (Docker) does the
+  name exists there, runs `displayxr-cli info` + `selftest` env-free on the
+  packaged sim-display, and checks `displayxr-service` + its units and runs
+  `scripts/smoke_service_linux.sh` against it (detached start, IPC handshake,
+  SIGTERM, stale socket, socket activation + idle exit — no GPU needed).
+  `DebRelease` attaches the asset to the GitHub Release only after that passes. Locally: `scripts/test_deb_linux.sh` (Docker) does the
   same build + tri-release verify, and
   `scripts/verify_deb_install_linux.sh <deb> [tarball]` is the verifier itself.
 
 The tarball carries no dependency metadata, so `package_linux.sh` records the
 same floor in a `GLIBC_FLOOR` file and its `install.sh` refuses a host below it
 rather than unpacking a tree that cannot `dlopen`.
+
+**The DisplayXR Dashboard on Linux.** Both packages ship `displayxr-dashboard`
+(`src/dashboard/`, Avalonia / .NET 10) beside the `displayxr-cli` it runs, with a
+"DisplayXR Dashboard" applications-menu entry (`Settings;System;`) and a 256 px icon.
+It is a self-contained single file: no .NET runtime to install, invariant globalization
+(no ICU), and the Skia / HarfBuzz natives inside the bundle, extracted on first run to
+`~/.net` (`DOTNET_BUNDLE_EXTRACT_BASE_DIR` moves it), never next to the binary. Its ELF
+host is Microsoft's prebuilt .NET host (glibc >= 2.23), so the package's glibc floor is
+unchanged; the window needs fontconfig and the X11 client libraries, which the `.deb`
+lists as `Recommends`. CI publishes it once (the `DashboardLinux` job) for both the
+`.deb` and the tarball, and `DebInstall` runs `displayxr-dashboard --version` (no display
+server) on all three releases. `package_*_linux.sh` take a prebuilt binary from
+`DXR_DASHBOARD_BIN`, else publish it with a local .NET 10 SDK, else package without it
+(a WARN; `DXR_REQUIRE_DASHBOARD=1` makes that an error).
 
 **GNOME Shell extension (GNOME on Wayland).** Windowed weaving under Wayland
 and transparent apps on a Leia panel both depend on the
@@ -321,6 +394,29 @@ register at `HKLM\Software\DisplayXR\DisplayProcessors\<id>`.
 |--------|-------------|
 | `XRT_FEATURE_SERVICE` | Out-of-process service mode (IPC) |
 | `BUILD_TESTING` | Build test suite |
+| `DXR_RUNTIME_VERSION_OVERRIDE` | Version for a tree with no git metadata (see below); normally unset |
+
+### Runtime version
+
+There is no version number in the tree. `cmake/DisplayXRVersion.cmake` derives it at
+configure time, the same way on every platform (#1790), and the configure log prints it
+(`-- DisplayXR runtime version 2.51.1 (v2.51.1-3-g1a2b3c4d5, from git)`):
+
+| Build of | `runtimeVersion` (`xrGetInstanceProperties`) | git tag (`runtimeName`, `displayxr-cli info`) | Installer / `.pkg` / `.deb` named |
+|---|---|---|---|
+| the `v2.51.1` tag | `2.51.1` | `v2.51.1` | `2.51.1` |
+| 3 commits after it (main, a PR, a local branch) | `2.51.1` | `v2.51.1-3-g<sha>` | `2.51.1+3.g<sha>` |
+
+The number of an untagged build is the release it descends from: never lower (a feature
+gate the release passes, the dev build passes too) and never a release that does not exist
+yet. The describe string next to it is what marks it as a dev build. It needs the
+checkout's history and tags (`git fetch --tags`; in CI `actions/checkout` with
+`fetch-depth: 0`). Without them the version comes from, in order: `.git_archival.txt`
+(filled in by `git archive`, so a GitHub "Source code" tarball knows its exact version),
+then `versions.json`'s `runtime` (the last release, with a CMake warning and a
+`-dev` tag). `-DDXR_RUNTIME_VERSION_OVERRIDE=X.Y.Z` overrides all of it. The resolved
+values are also written to `build/displayxr-version.txt`, which the packaging scripts
+read. After tagging the commit you have checked out, re-run CMake.
 
 ## Local Dev Iteration
 
@@ -490,9 +586,8 @@ Prefer VS Code over the Visual Studio IDE? It debugs the **Ninja** build (no
    **`install`** target → a Debug runtime + sim-display land in `_package\`.
 3. **Activate it (elevated, once):** `scripts\register_dev_plugin.bat` registers
    the `_package` sim-display, and point the active runtime at the Debug build:
-   `reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\bin\DisplayXR_win64.json" /f` (note `bin\` — the top-level
-   `_package\DisplayXR_win64.json` is the installer's copy, and its `library_path`
-   only resolves once installed) (or just `scripts\dev-setup.bat --no-vs`,
+   `reg add "HKLM\Software\Khronos\OpenXR\1" /v ActiveRuntime /t REG_SZ /d "%CD%\_package\bin\DisplayXR_win64.json" /f` (the manifest lives next to
+   `DisplayXRClient.dll` in `_package\bin\`; there is no top-level copy) (or just `scripts\dev-setup.bat --no-vs`,
    which builds + registers + activates in one shot — Release, fine for stepping
    the runtime). Verify: `_package\bin\displayxr-cli.exe selftest`.
 4. **Debug:** add a launch config (`.vscode/launch.json`, `type: cppvsdbg`) that

@@ -33,6 +33,14 @@ cli_cmd_perf(int argc, const char **argv);
 int
 cli_cmd_input(int argc, const char **argv);
 
+//! `tracking` - viewer-tracking providers (ADR-054 N6 Part 2).
+int
+cli_cmd_tracking(int argc, const char **argv);
+
+//! `tracking calibrate [solve|apply]` - mirror-alignment camera-pose calibration (tracking-provider-discovery.md).
+int
+cli_cmd_tracking_calibrate(int argc, const char **argv);
+
 int
 cli_cmd_runtime(int argc, const char **argv);
 
@@ -42,11 +50,94 @@ cli_cmd_displays(int argc, const char **argv);
 int
 cli_cmd_probe(int argc, const char **argv);
 
+//! `status [--json] [--watch [--interval ms]]` — the display status snapshot (ADR-051).
+int
+cli_cmd_status(int argc, const char **argv);
+
+struct xrt_status_snapshot;
+
+/*!
+ * Build the HEADLESS status snapshot in this process (an instance + system,
+ * no compositor — what a process starting now would get). Shared by `status`
+ * and `dp list`'s `screens[]`.
+ */
+void
+cli_status_build_headless(struct xrt_status_snapshot *out);
+
 int
 cli_cmd_clients(int argc, const char **argv);
 
+//! `camera calibration list|show|set-placement|reset` — the camera calibration store (local).
+int
+cli_cmd_camera_calibration(int argc, const char **argv);
+
+struct cJSON;
+
+//! `status --json`: each `screens[i]` gains `camera_calibrations`, the root `camera_calibration`.
+void
+cli_camera_calibration_annotate_status(struct cJSON *root);
+
+//! `info --json`: the root gains `camera_calibration` (store paths, viewer iris scale, every record).
+void
+cli_camera_calibration_annotate_info(struct cJSON *root);
+
+/*! ADR-057: `conv run <task> <in> [<in-right>] <out>` (a job, file to file),
+ *  `conv consent <id> grant|revoke|status` and `conv camera-block <sog> --facts <json>`. */
+int
+cli_cmd_conv_run(int argc, const char **argv);
+
+int
+cli_cmd_conv_consent(int argc, const char **argv);
+
+int
+cli_cmd_conv_camera_block(int argc, const char **argv);
+
+//! `conv credential set|delete|status <name>`: the OS credential store a provider setting names.
+int
+cli_cmd_conv_credential(int argc, const char **argv);
+
+//! `conv list|status|warm|enable|disable|use|reset|models` — conversion providers (ADR-053).
+int
+cli_cmd_conv(int argc, const char **argv);
+
+struct cli_query_result;
+
+/*!
+ * `lift_caps` from the RUNNING service (ADR-053 §7.1: the CLI never loads a
+ * second model instance): one DIAG `lift_get_properties` when a service is
+ * listening (never launched), recorded with @ref cli_query_set_lift_caps.
+ * No service, or a build without IPC: @p r is left as the headless pass
+ * filled it (the static dp-lift row note).
+ *
+ * TODO(#2003): once the service publishes its `dp-lift` conversion row, read
+ * that row from the snapshot instead (same `lift_caps` JSON shape).
+ */
+void
+cli_query_lift_caps_from_service(struct cli_query_result *r);
+
+//! `workspace list|set|reset|launch` — workspace controllers + launch settings (dashboard phase 8).
+int
+cli_cmd_workspace(int argc, const char **argv);
+
 int
 cli_cmd_test(int argc, const char **argv);
+
+//! `lift` — XR_DXR_lift (ADR-042): `lift caps`, `lift probe <image|dir>`.
+int
+cli_cmd_lift(int argc, const char **argv);
+
+//! `camera` — XR_DXR_stereo_camera (ADR-043): `camera list|calib|probe`, over IPC (DIAG).
+int
+cli_cmd_camera(int argc, const char **argv);
+
+//! `share` — XR_DXR_app_share (ADR-061): `share list|probe` aliases of `camera` for app entries, `share settings`.
+int
+cli_cmd_share(int argc, const char **argv);
+
+//! `desktop` — XR_DXR_desktop_control (ADR-056): `desktop status|stop|resume|allow|deny|forget|audit`
+//! over the user's store and audit log (local; never a backend, never the desktop).
+int
+cli_cmd_desktop(int argc, const char **argv);
 
 /*!
  * True if @p flag appears anywhere in argv[2..]. Commands take raw

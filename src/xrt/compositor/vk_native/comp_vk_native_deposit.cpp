@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <string.h>
 
+static_assert(COMP_VK_DEPOSIT_RING <= COMP_HUB_D3D11_DIRECT_RING,
+              "the hub's DIRECT ingress indexes deposit slots modulo COMP_HUB_D3D11_DIRECT_RING");
+
 // The deposit is a Windows mechanism end to end (D3D11 shared textures,
 // ID3D11Fence, DXGI adapter LUIDs). Everything below compiles to nothing
 // elsewhere; the header's entry points keep their signatures so call sites need
@@ -57,6 +60,9 @@ struct comp_vk_deposit_slot
 	 * waits for exactly this. 0 while no consumer has taken it.
 	 */
 	uint64_t release_value;
+	//! #2317 P2a: the hub's consumer-fence value covering its DIRECT reads of
+	//! this slot (on @ref comp_vk_deposit::hub_timeline). 0 = nothing owed.
+	uint64_t hub_release;
 };
 
 /*!
@@ -89,6 +95,9 @@ struct comp_vk_deposit
 
 	struct comp_vk_deposit_slot ring[COMP_VK_DEPOSIT_RING];
 	uint32_t slot;
+	//! #2317 P2a review: @ref slot was handed to the consumer since it was
+	//! chosen; only then may @ref comp_vk_deposit_advance move past it.
+	bool handed;
 
 	//! VK-1b — the plane surfaces, and the one release value they all share.
 	struct comp_vk_deposit_plane_slot plane[COMP_VK_DEPOSIT_PLANE_COUNT];
@@ -98,6 +107,12 @@ struct comp_vk_deposit
 	ID3D11Fence *fence;
 	HANDLE fence_nt;
 	VkSemaphore timeline;
+
+	//! #2317 P2a: the hub's consumer fence, imported as a timeline (fence
+	//! mode, DIRECT ingress only), else VK_NULL_HANDLE.
+	VkSemaphore hub_timeline;
+	//! #2317 P2a: bumped on every ring (re)allocation — the hub's re-open key.
+	uint64_t ring_generation;
 
 	/*!
 	 * KEYED-MUTEX mode (ADR-039 Phase A): the driver exposes no D3D12_FENCE
@@ -159,6 +174,10 @@ deposit_dxgi_format(VkFormat vk_format)
 	switch (vk_format) {
 	case VK_FORMAT_B8G8R8A8_UNORM: return DXGI_FORMAT_B8G8R8A8_UNORM;
 	case VK_FORMAT_R8G8B8A8_UNORM: return DXGI_FORMAT_R8G8B8A8_UNORM;
+	// #2273 deep atlases (DXR_ATLAS_FORMAT): same bit layout on both ends (R in
+	// bits 0-9 / the first half), so the split carries them instead of retiring.
+	case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case VK_FORMAT_R16G16B16A16_SFLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
 	// VK-1b: the authored zone mask is a scalar coverage plane, R8 on both ends.
 	case VK_FORMAT_R8_UNORM: return DXGI_FORMAT_R8_UNORM;
 	default: return DXGI_FORMAT_UNKNOWN;
@@ -196,6 +215,7 @@ deposit_free_ring(struct comp_vk_deposit *dep)
 			s->tex->Release();
 			s->tex = NULL;
 		}
+		s->hub_release = 0;
 	}
 }
 
@@ -431,6 +451,7 @@ deposit_alloc_ring(struct comp_vk_deposit *dep)
 		U_LOG_W("vk deposit: no DXGI equivalent for VkFormat %d", (int)dep->format);
 		return false;
 	}
+	dep->ring_generation++;
 
 	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
 		struct comp_vk_deposit_slot *s = &dep->ring[i];
@@ -777,6 +798,10 @@ comp_vk_deposit_destroy(struct comp_vk_deposit **deposit_ptr)
 		deposit_free_plane(dep, p);
 	}
 
+	if (dep->hub_timeline != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, dep->hub_timeline, NULL);
+		dep->hub_timeline = VK_NULL_HANDLE;
+	}
 	if (dep->timeline != VK_NULL_HANDLE) {
 		vk->vkDestroySemaphore(vk->device, dep->timeline, NULL);
 		dep->timeline = VK_NULL_HANDLE;
@@ -829,6 +854,7 @@ comp_vk_deposit_resize(struct comp_vk_deposit *dep, uint32_t width, uint32_t hei
 	dep->width = width;
 	dep->height = height;
 	dep->slot = 0;
+	dep->handed = false;
 
 	if (!deposit_alloc_ring(dep)) {
 		U_LOG_W("vk deposit: resize to %ux%u failed — deposit is now INACTIVE", width, height);
@@ -846,8 +872,20 @@ comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64
 	if (dep == NULL) {
 		return;
 	}
-	dep->slot = (dep->slot + 1) % COMP_VK_DEPOSIT_RING;
+	// #2317 P2a review: a slot that never reached the consumer is reused.
+	if (dep->handed) {
+		dep->slot = (dep->slot + 1) % COMP_VK_DEPOSIT_RING;
+		dep->handed = false;
+	}
 	comp_vk_deposit_get_current(dep, out_image, out_view);
+}
+
+extern "C" void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep)
+{
+	if (dep != NULL) {
+		dep->handed = true;
+	}
 }
 
 extern "C" void
@@ -985,6 +1023,87 @@ comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
 	return dep != NULL ? dep->timeline : VK_NULL_HANDLE;
 }
 
+extern "C" bool
+comp_vk_deposit_bind_consumer_fence(struct comp_vk_deposit *dep, void *nt_handle)
+{
+	if (dep == NULL || dep->vk == NULL) {
+		return false;
+	}
+	struct vk_bundle *vk = dep->vk;
+	if (dep->hub_timeline != VK_NULL_HANDLE) {
+		vk->vkDestroySemaphore(vk->device, dep->hub_timeline, NULL);
+		dep->hub_timeline = VK_NULL_HANDLE;
+	}
+	for (uint32_t i = 0; i < COMP_VK_DEPOSIT_RING; i++) {
+		dep->ring[i].hub_release = 0;
+	}
+	if (nt_handle == NULL) {
+		return true;
+	}
+	// Fence mode only: the same import the deposit's own timeline proved.
+	if (dep->keyed_mutex_mode || dep->timeline == VK_NULL_HANDLE) {
+		return false;
+	}
+
+	VkSemaphoreTypeCreateInfo type_info = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+	    .pNext = NULL,
+	    .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+	    .initialValue = 0,
+	};
+	VkSemaphoreCreateInfo sem_ci = {
+	    .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+	    .pNext = &type_info,
+	};
+	VkResult res = vk->vkCreateSemaphore(vk->device, &sem_ci, NULL, &dep->hub_timeline);
+	if (res != VK_SUCCESS) {
+		dep->hub_timeline = VK_NULL_HANDLE;
+		U_LOG_W("vk deposit: vkCreateSemaphore(TIMELINE) for the hub's consumer fence failed: %d", res);
+		return false;
+	}
+	VkImportSemaphoreWin32HandleInfoKHR import = {
+	    .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR,
+	    .semaphore = dep->hub_timeline,
+	    .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT,
+	    .handle = (HANDLE)nt_handle,
+	};
+	res = vk->vkImportSemaphoreWin32HandleKHR(vk->device, &import);
+	if (res != VK_SUCCESS) {
+		vk->vkDestroySemaphore(vk->device, dep->hub_timeline, NULL);
+		dep->hub_timeline = VK_NULL_HANDLE;
+		U_LOG_W("vk deposit: importing the hub's consumer fence failed: %d", res);
+		return false;
+	}
+	return true;
+}
+
+extern "C" void
+comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uint64_t value)
+{
+	if (dep == NULL || slot >= COMP_VK_DEPOSIT_RING || dep->hub_timeline == VK_NULL_HANDLE) {
+		return;
+	}
+	dep->ring[slot].hub_release = value;
+}
+
+extern "C" VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep)
+{
+	return dep != NULL ? dep->hub_timeline : VK_NULL_HANDLE;
+}
+
+extern "C" void
+comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value)
+{
+	*out_semaphore = VK_NULL_HANDLE;
+	*out_value = 0;
+	if (dep == NULL || dep->hub_timeline == VK_NULL_HANDLE || dep->ring[dep->slot].hub_release == 0) {
+		return;
+	}
+	*out_semaphore = dep->hub_timeline;
+	*out_value = dep->ring[dep->slot].hub_release;
+}
+
 
 /*
  *
@@ -1089,6 +1208,7 @@ comp_vk_deposit_plane_get(struct comp_vk_deposit *dep, uint32_t plane, struct co
 	out->view = (uint64_t)(uintptr_t)p->view;
 	out->width = p->width;
 	out->height = p->height;
+	out->format = p->format;
 	out->generation = p->generation;
 	return true;
 }
@@ -1131,7 +1251,7 @@ comp_vk_deposit_plane_wait_value(struct comp_vk_deposit *dep)
 }
 
 extern "C" bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out)
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out)
 {
 	if (dep == NULL || out == NULL || dep->dx == NULL) {
 		return false;
@@ -1155,6 +1275,7 @@ comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_
 	out->height = dep->height;
 	out->slot = dep->slot;
 	out->dxgi_format = (uint32_t)deposit_dxgi_format(dep->format);
+	out->generation = dep->ring_generation;
 	return true;
 }
 
@@ -1377,6 +1498,12 @@ comp_vk_deposit_advance(struct comp_vk_deposit *dep, uint64_t *out_image, uint64
 }
 
 extern "C" void
+comp_vk_deposit_note_handed(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+}
+
+extern "C" void
 comp_vk_deposit_get_current(struct comp_vk_deposit *dep, uint64_t *out_image, uint64_t *out_view)
 {
 	comp_vk_deposit_advance(dep, out_image, out_view);
@@ -1422,7 +1549,37 @@ comp_vk_deposit_get_timeline(struct comp_vk_deposit *dep)
 }
 
 extern "C" bool
-comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_vk_deposit_handoff *out)
+comp_vk_deposit_bind_consumer_fence(struct comp_vk_deposit *dep, void *nt_handle)
+{
+	(void)dep;
+	return nt_handle == NULL;
+}
+
+extern "C" void
+comp_vk_deposit_note_hub_release(struct comp_vk_deposit *dep, uint32_t slot, uint64_t value)
+{
+	(void)dep;
+	(void)slot;
+	(void)value;
+}
+
+extern "C" void
+comp_vk_deposit_current_slot_hub_wait(struct comp_vk_deposit *dep, VkSemaphore *out_semaphore, uint64_t *out_value)
+{
+	(void)dep;
+	*out_semaphore = VK_NULL_HANDLE;
+	*out_value = 0;
+}
+
+extern "C" VkSemaphore
+comp_vk_deposit_get_hub_timeline(struct comp_vk_deposit *dep)
+{
+	(void)dep;
+	return VK_NULL_HANDLE;
+}
+
+extern "C" bool
+comp_vk_deposit_get_handoff(struct comp_vk_deposit *dep, struct comp_hub_d3d11_handoff *out)
 {
 	(void)dep;
 	(void)out;

@@ -17,7 +17,7 @@
 #   sudo apt-get install -y build-essential cmake ninja-build pkg-config \
 #       libvulkan-dev vulkan-validationlayers glslang-tools \
 #       libeigen3-dev libcjson-dev \
-#       libxcb1-dev libxcb-randr0-dev libx11-dev libx11-xcb-dev libxrandr-dev \
+#       libxcb1-dev libxcb-randr0-dev libxcb-shape0-dev libx11-dev libx11-xcb-dev libxrandr-dev \
 #       libwayland-dev libdbus-1-dev
 #   # libwayland-dev enables the XR_DXR_wayland_surface_binding present path;
 #   # libdbus-1-dev adds the Wayland window-geometry provider (#817) so
@@ -56,11 +56,39 @@
 #
 # Usage:
 #   ./scripts/build_linux.sh             # in-process headless build + selftest
-#   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC)
+#   ./scripts/build_linux.sh --service   # also build displayxr-service (IPC);
+#                                        # the runtime .so is then IPC-ONLY:
+#                                        # every app needs the running service
+#   ./scripts/build_linux.sh --hybrid    # the SHIPPED configuration (#1744):
+#                                        # --service + XRT_FEATURE_HYBRID_MODE,
+#                                        # one runtime .so that runs ordinary
+#                                        # apps in-process and routes
+#                                        # XR_DXR_weave present-owners (the
+#                                        # browser) + workspace controllers to
+#                                        # displayxr-service. What the .deb and
+#                                        # the tarball ship.
 #   ./scripts/build_linux.sh --no-test   # build only, skip the selftest run
 #   ./scripts/build_linux.sh --clean     # drop the CMake cache first — REQUIRED
 #                                        # after installing a dependency into a
 #                                        # tree that was already configured
+#   ./scripts/build_linux.sh --no-qwerty # leave out the qwerty keyboard/mouse
+#                                        # driver. It is ON by default (#2355),
+#                                        # as on Windows and macOS, because the
+#                                        # .deb and the tarball are built by
+#                                        # this script: without qwerty no pose
+#                                        # source is bound to the display head,
+#                                        # so a legacy/hosted app's head sits at
+#                                        # the display's static pose (0.1 m above
+#                                        # STAGE, 1.5 m under LOCAL) and the
+#                                        # legacy camera rig (#1381,
+#                                        # DXR_LEGACY_CAMERA_RIG) compiles out.
+#                                        # qwerty also drives the self-created
+#                                        # X11 window's fly camera + hand
+#                                        # controllers (#1727), which the
+#                                        # interactive CTS categories need. Its
+#                                        # XCB backend needs only <X11/keysym.h>
+#                                        # (a header): no new DT_NEEDED.
+#                                        # (--qwerty is still accepted, a no-op.)
 #   ./scripts/build_linux.sh --apps      # also build the OpenXR loader + the
 #                                        # test apps: cube_hosted_legacy_vk_linux
 #                                        # (hosted, Phase 1b) and cube_handle_vk_linux
@@ -77,15 +105,20 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
 
 SERVICE_MODE=OFF
+HYBRID_MODE=OFF
 RUN_TEST=ON
 BUILD_APPS=OFF
 CLEAN=OFF
+QWERTY=ON
 for arg in "$@"; do
   case "$arg" in
     --service) SERVICE_MODE=ON ;;
+    --hybrid) SERVICE_MODE=ON; HYBRID_MODE=ON ;;
     --no-test) RUN_TEST=OFF ;;
     --apps) BUILD_APPS=ON ;;
     --clean) CLEAN=ON ;;
+    --qwerty) QWERTY=ON ;;
+    --no-qwerty) QWERTY=OFF ;;
     *) echo "Unknown arg: $arg" >&2; exit 2 ;;
   esac
 done
@@ -127,17 +160,16 @@ OPENXR_DIR="$BUILD_DIR/_openxr-$OPENXR_VERSION"
 # (NDEBUG-conditional layout) is a candidate cause of the VK-DP-factory
 # null-dispatch crash seen with a Debug .deb runtime (cube-hw finding C), and a
 # Debug runtime is the wrong (36 MB, unoptimized) release artifact regardless.
-echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
+echo "=== Configuring DisplayXR runtime (Linux, SERVICE=$SERVICE_MODE, HYBRID=$HYBRID_MODE, QWERTY=$QWERTY, TYPE=${CMAKE_BUILD_TYPE:-Debug}) ==="
 cmake -B "$BUILD_DIR" -S "$ROOT" -G Ninja \
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Debug}" \
   -DXRT_FEATURE_SERVICE=$SERVICE_MODE \
+  -DXRT_FEATURE_HYBRID_MODE=$HYBRID_MODE \
   -DXRT_MODULE_CLI=ON \
-  -DXRT_BUILD_DRIVER_QWERTY=OFF \
+  -DXRT_BUILD_DRIVER_QWERTY=$QWERTY \
   -DXRT_FEATURE_DEBUG_GUI=OFF \
   -DXRT_FEATURE_WINDOW_PEEK=OFF \
-  -DXRT_HAVE_SDL2=OFF \
-  -DXRT_HAVE_OPENCV=OFF \
-  -DXRT_HAVE_LIBUSB=OFF
+  -DXRT_HAVE_SDL2=OFF
 
 echo "=== Building runtime + displayxr-cli + sim_display plug-in ==="
 cmake --build "$BUILD_DIR"
@@ -225,6 +257,81 @@ if [ -n "$SIMINPUT_PLUGIN" ]; then
 EOF
 else
   echo "Note: DisplayXR-SimInput.so not found — no input provider staged (qwerty keeps the hand roles)."
+fi
+
+# Viewer-tracking provider (ADR-054 N6 Part 2): the scripted viewer; probe()
+# declines unless `displayxr-cli tracking set sim-tracking ENABLE 1`.
+SIMTRACK_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimTracking.so" -type f | head -1)"
+if [ -n "$SIMTRACK_PLUGIN" ]; then
+  cp "$SIMTRACK_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/200-sim-tracking-tracking-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-tracking",
+        "display_name": "DisplayXR Sim Tracking",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimTracking.so",
+        "probe_order":  200
+    }
+}
+EOF
+fi
+
+# Gamepad input provider (ADR-034 / ADR-054). Desktop Linux has no pad reader
+# yet (evdev follow-up): the provider DECLINES at probe, so staging the
+# manifest costs nothing and the dev tree matches macOS / Windows.
+GAMEPAD_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-Gamepad.so" -type f | head -1)"
+if [ -n "$GAMEPAD_PLUGIN" ]; then
+  cp "$GAMEPAD_PLUGIN" "$PLUGIN_DIR/"
+  cat > "$PLUGIN_DIR/150-gamepad-input-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "gamepad",
+        "display_name": "DisplayXR Gamepad",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-Gamepad.so",
+        "probe_order":  150
+    }
+}
+EOF
+else
+  echo "Note: DisplayXR-Gamepad.so not found — no gamepad provider staged."
+fi
+
+# Conversion-provider plug-in (ADR-053): the hardware-free reference provider.
+# Same search dir; the `-conversion-provider.json` suffix routes the manifest
+# to the conversion loader (the DP and input loaders skip it). Staging it is
+# harmless: sim-conversion's probe() declines unless its ENABLE setting is 1
+# (DXR_CONV_SIM_CONVERSION_ENABLE=1), and it is FALLBACK at ProbeOrder 250.
+SIMCONV_PLUGIN="$(find "$BUILD_DIR/src/xrt/drivers" -name "DisplayXR-SimConversion.so" -type f | head -1)"
+if [ -n "$SIMCONV_PLUGIN" ]; then
+  cp "$SIMCONV_PLUGIN" "$PLUGIN_DIR/"
+  # ADR-053 P4 (#2108): its fake model pack (the DOWNLOAD_MS knob's file:// source).
+  SIMCONV_DIR="$(dirname "$SIMCONV_PLUGIN")"
+  if [ -f "$SIMCONV_DIR/sim-conversion.models.json" ]; then
+    cp "$SIMCONV_DIR/sim-conversion.models.json" "$PLUGIN_DIR/"
+    cp -r "$SIMCONV_DIR/sim-conversion-blobs" "$PLUGIN_DIR/"
+  fi
+  cat > "$PLUGIN_DIR/250-sim-conversion-conversion-provider.json" <<EOF
+{
+    "file_format_version": "1.0",
+    "plugin": {
+        "id":           "sim-conversion",
+        "display_name": "DisplayXR Sim Conversion",
+        "vendor":       "DisplayXR",
+        "version":      "dev",
+        "binary_path":  "$PLUGIN_DIR/DisplayXR-SimConversion.so",
+        "probe_order":  250,
+        "packs":        ["sim-conversion.models.json"]
+    }
+}
+EOF
+else
+  echo "Note: DisplayXR-SimConversion.so not found — no conversion provider staged."
 fi
 
 export XRT_PLUGIN_SEARCH_PATH="$PLUGIN_DIR"

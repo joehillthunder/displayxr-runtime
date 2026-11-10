@@ -12,6 +12,7 @@
 
 #include "util/u_logging.h"
 #include "util/u_debug.h"
+#include "util/u_setting.h"
 
 #include "os/os_time.h"
 
@@ -47,8 +48,12 @@ dxr_late_weave_enabled(void)
 	if (enabled < 0) {
 		// Default ON: late-weave is the product behavior on every path
 		// (measured 96->17 ms VK, 62->17 D3D12, 32->17 D3D11, 29->17
-		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage.
-		const char *e = getenv("DXR_LATE_WEAVE");
+		// workspace). DXR_LATE_WEAVE=0 opts out for A/B or triage. Read
+		// through u_setting so the Dashboard's Developer settings can set
+		// it for apps it never launched (perf-settings Phase 2B); the
+		// environment still wins. Same parse as before.
+		char lw_buf[16];
+		const char *e = u_setting_get_raw("DXR_LATE_WEAVE", lw_buf, sizeof(lw_buf), nullptr);
 		enabled = (e != nullptr && e[0] == '0') ? 0 : 1;
 	}
 	return enabled == 1;
@@ -139,6 +144,10 @@ static bool g_repaint_holds_token = false;
  * compositor mutex. An unlocked present path would need an atomic here.
  */
 static bool g_app_holds_token = false;
+//! #2564: frame-latency token ledger and stage-2 gate for this chain (see
+//! comp_weave_latency_win.h). One target per process on this path.
+static late_weave_token_ledger g_lw_ledger_d3d11;
+static late_weave_stage2_gate g_lw_stage2_d3d11;
 // A repaint has been marked and its present is next on the repaint thread;
 // that present (and only a present on that thread) settles the token.
 static bool g_repaint_present_pending = false;
@@ -386,12 +395,17 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 	// unreliable on composition swapchains.
 	if (dxr_late_weave_enabled()) {
 		desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-		if (use_transparent) {
-			// bc=2 cannot realize governor depths 3–4: Present would block
-			// on buffer availability, the interval never improves, and the
-			// governor escalates and sticks at max. Match the opaque path.
-			desc.BufferCount = 3;
-		}
+		// A waitable chain needs one buffer more than the deepest governor
+		// level it must realize. With bc=2 any depth above 1 is a lie: the
+		// waitable hands out a second token, the second Present finds no free
+		// buffer, and the #925 bound below turns Present(DO_NOT_WAIT) into a
+		// Present + Sleep(1) retry loop for a whole period on EVERY frame —
+		// ~85 % of a core on the app's main thread and R one frame late,
+		// until the governor's probe dwell (30 s) returns it to depth 1
+		// (#2402: 3 of 33 single-GPU runs, latched by start-up jitter on the
+		// first slip window). The composition chain carried this fix since
+		// the live-path late-weave landed; the opaque HWND chain did not.
+		desc.BufferCount = 3;
 	}
 	target->swapchain_flags = desc.Flags;
 
@@ -418,7 +432,10 @@ comp_d3d11_target_create(struct comp_d3d11_compositor *c,
 		if (SUCCEEDED(target->swapchain->QueryInterface(__uuidof(IDXGISwapChain2),
 		                                                reinterpret_cast<void **>(&sc2)))) {
 			const int lat = g_lw_gov_d3d11.base_latency();
-			sc2->SetMaximumFrameLatency(lat);
+			// #2564: a fresh chain owes no tokens and has no presentation mode yet.
+			g_lw_ledger_d3d11.reset();
+			g_lw_stage2_d3d11.reset();
+			g_lw_ledger_d3d11.apply(sc2, lat);
 			g_frame_latency_waitable = sc2->GetFrameLatencyWaitableObject();
 			// #1571: a fresh semaphore owes nobody anything. These statics
 			// outlive a session (one target per process on this path), so a
@@ -568,6 +585,8 @@ comp_d3d11_target_destroy(struct comp_d3d11_target **target_ptr)
 		// #1571: the semaphore is gone; no token is outstanding against it.
 		g_app_holds_token = false;
 		g_repaint_holds_token = false;
+		g_lw_ledger_d3d11.reset();
+		g_lw_stage2_d3d11.reset();
 	}
 
 	if (target->rtv != nullptr) {
@@ -650,8 +669,38 @@ comp_d3d11_target_bind(struct comp_d3d11_target *target)
  * loop needs (measured on the D3D12 leg: 31.9 -> 16.9 fps with essentially zero
  * repaints issued). Scanout pacing alone is passive and costs nothing.
  */
+static void
+d3d11_target_repaint_pace_on(IDXGISwapChain1 *swapchain);
+
 extern "C" void
 comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
+{
+	d3d11_target_repaint_pace_on(target->swapchain);
+}
+
+extern "C" void *
+comp_d3d11_target_repaint_pace_hold(struct comp_d3d11_target *target)
+{
+	if (target == nullptr || target->swapchain == nullptr) {
+		return nullptr;
+	}
+	target->swapchain->AddRef();
+	return target->swapchain;
+}
+
+extern "C" void
+comp_d3d11_target_repaint_pace_held(void *hold)
+{
+	if (hold == nullptr) {
+		return;
+	}
+	auto *sc = static_cast<IDXGISwapChain1 *>(hold);
+	d3d11_target_repaint_pace_on(sc);
+	sc->Release();
+}
+
+static void
+d3d11_target_repaint_pace_on(IDXGISwapChain1 *swapchain)
 {
 	// Composed chains: statistics are unusable and measured_r is 0, so BOTH
 	// pacers below no-op — leaving Present(1) as the only throttle, blocking
@@ -677,8 +726,8 @@ comp_d3d11_target_repaint_pace(struct comp_d3d11_target *target)
 	if (g_frame_latency_waitable != nullptr && g_scanout_stats_strikes >= 0) {
 		const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
 		if (g_last_present_count > relax) {
-			late_weave_wait_scanout(target->swapchain, g_last_present_count - relax,
-			                        g_lw_gov_d3d11.period_ns, g_weave_latency_d3d11.freq());
+			late_weave_wait_scanout(swapchain, g_last_present_count - relax, g_lw_gov_d3d11.period_ns,
+			                        g_weave_latency_d3d11.freq());
 		}
 	}
 
@@ -806,6 +855,7 @@ comp_d3d11_target_app_take_wait_instant(void)
 	return g_app_wait_instant.exchange(0, std::memory_order_relaxed);
 }
 
+
 extern "C" void
 comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicted_display_time_ns, bool mode_3d)
 {
@@ -854,6 +904,8 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 				        drained);
 			}
 		}
+		// #2564: take back tokens a governor depth decrease left behind.
+		g_lw_ledger_d3d11.pay(g_frame_latency_waitable, "d3d11");
 		const uint64_t wait_t0 = os_monotonic_get_ns();
 		if (g_app_holds_token) {
 			// #1571: the previous app frame took a token here and then
@@ -921,7 +973,14 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 				        (clocked || wait_blocked) ? "DComp compositor clock / tick-aligned pickup"
 				                                  : "none (waitable only)");
 			}
-		} else if (g_scanout_stats_strikes >= 0) {
+		} else if (g_scanout_stats_strikes >= 0 && !g_lw_gov_d3d11.in_resize_hold() &&
+		           g_lw_stage2_d3d11.allowed(target->swapchain, "d3d11")) {
+			// #2564: not during a resize. ResizeBuffers makes the frame
+			// statistics disjoint, so this wait ran to its 3-period bound
+			// on most drag steps (a ~50 ms hitch each, 40 fps for the whole
+			// drag), and those timeouts are not evidence against the chain:
+			// they must not count toward the strike gate below either.
+			//
 			// At effective depth L>1 (#850) the pacer targets the present
 			// L-1 back instead, restoring L-1 frames of CPU/GPU overlap.
 			const UINT relax = (UINT)(g_lw_gov_d3d11.effective - 1);
@@ -962,7 +1021,7 @@ comp_d3d11_target_weave_mark(struct comp_d3d11_target *target, uint64_t predicte
 			IDXGISwapChain2 *sc2 = nullptr;
 			if (SUCCEEDED(target->swapchain->QueryInterface(
 			        __uuidof(IDXGISwapChain2), reinterpret_cast<void **>(&sc2)))) {
-				sc2->SetMaximumFrameLatency((UINT)g_lw_gov_d3d11.effective);
+				g_lw_ledger_d3d11.apply(sc2, g_lw_gov_d3d11.effective);
 				sc2->Release();
 			}
 			static bool logged_backoff = false, logged_return = false;
@@ -1156,6 +1215,15 @@ comp_d3d11_target_get_back_buffer(struct comp_d3d11_target *target)
 	return target->back_buffer;
 }
 
+extern "C" void *
+comp_d3d11_target_get_rtv(struct comp_d3d11_target *target)
+{
+	if (target == nullptr) {
+		return nullptr;
+	}
+	return target->rtv;
+}
+
 extern "C" xrt_result_t
 comp_d3d11_target_resize(struct comp_d3d11_target *target,
                          uint32_t width,
@@ -1163,6 +1231,12 @@ comp_d3d11_target_resize(struct comp_d3d11_target *target,
 {
 	if (width == target->width && height == target->height) {
 		return XRT_SUCCESS;
+	}
+
+	// #2564: a resize drag's frame cadence must not drive the late-weave
+	// governor (see late_weave_governor::on_resize).
+	if (g_frame_latency_waitable != nullptr) {
+		g_lw_gov_d3d11.on_resize(g_weave_latency_d3d11.freq());
 	}
 
 	// Release current back buffer and RTV
